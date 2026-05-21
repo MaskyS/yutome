@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ytkb": {
+      "command": "uv",
+      "args": ["run", "ytkb", "mcp", "serve", "--config", "ytkb.toml"]
+    }
+  }
+}
