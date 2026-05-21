@@ -9,22 +9,22 @@ from pathlib import Path
 import pytest
 
 from test_mcp_server import _fixture_project
-import ytkb.mcp_server as mcp_server
+import yutome.mcp_server as mcp_server
 
 
 @pytest.fixture
 def http_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _fixture_project(tmp_path)
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     mcp_server._RUNTIME = None
-    mcp_server.configure(Path("ytkb.toml"))
+    mcp_server.configure(Path("yutome.toml"))
 
     from fastapi.testclient import TestClient
-    from ytkb.http_server import build_app
+    from yutome.http_server import build_app
 
-    monkeypatch.delenv("YTKB_HTTP_TOKEN", raising=False)
+    monkeypatch.delenv("YUTOME_HTTP_TOKEN", raising=False)
     app = build_app()
     yield TestClient(app)
     mcp_server._RUNTIME = None
@@ -36,6 +36,22 @@ def test_healthz(http_client) -> None:  # noqa: ANN001
     body = response.json()
     assert body["ok"] is True
     assert body["auth_required"] is False
+    assert body["cors_enabled"] is False
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_readyz_requires_auth_when_token_configured(http_client_with_token) -> None:  # noqa: ANN001
+    client, token = http_client_with_token
+
+    missing = client.get("/readyz")
+    ok = client.get("/readyz", headers={"Authorization": f"Bearer {token}"})
+
+    assert missing.status_code == 401
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["ok"] is True
+    assert body["videos"] == 1
+    assert body["chunks"] >= 2
 
 
 def test_status(http_client) -> None:  # noqa: ANN001
@@ -56,7 +72,7 @@ def test_search(http_client) -> None:  # noqa: ANN001
     assert hits, "expected at least one hit"
     first = hits[0]
     assert "chunk_id" in first
-    assert first["resource_uri"].startswith("ytkb://chunk/")
+    assert first["resource_uri"].startswith("yutome://chunk/")
     assert first["youtube_url"].startswith("https://youtube.com/watch?v=")
     assert "text" not in first
 
@@ -135,16 +151,16 @@ def test_open_source_missing(http_client) -> None:  # noqa: ANN001
 @pytest.fixture
 def http_client_with_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _fixture_project(tmp_path)
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     mcp_server._RUNTIME = None
-    mcp_server.configure(Path("ytkb.toml"))
+    mcp_server.configure(Path("yutome.toml"))
 
     from fastapi.testclient import TestClient
-    from ytkb.http_server import build_app
+    from yutome.http_server import build_app
 
-    monkeypatch.setenv("YTKB_HTTP_TOKEN", "secret-abc123")
+    monkeypatch.setenv("YUTOME_HTTP_TOKEN", "secret-abc123")
     app = build_app()
     yield TestClient(app), "secret-abc123"
     mcp_server._RUNTIME = None
@@ -174,3 +190,45 @@ def test_healthz_skips_auth(http_client_with_token) -> None:  # noqa: ANN001
     # /healthz is intentionally not gated so liveness checks work without a token.
     assert response.status_code == 200
     assert response.json()["auth_required"] is True
+
+
+def test_cors_origins_are_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fixture_project(tmp_path)
+    config_path = tmp_path / "yutome.toml"
+    config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    mcp_server._RUNTIME = None
+    mcp_server.configure(Path("yutome.toml"))
+    monkeypatch.setenv("YUTOME_HTTP_CORS_ORIGINS", "https://client.example")
+
+    from fastapi.testclient import TestClient
+    from yutome.http_server import build_app
+
+    client = TestClient(build_app())
+    response = client.options(
+        "/find",
+        headers={
+            "Origin": "https://client.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://client.example"
+    mcp_server._RUNTIME = None
+
+
+def test_http_server_refuses_non_loopback_without_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fixture_project(tmp_path)
+    config_path = tmp_path / "yutome.toml"
+    config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("YUTOME_HTTP_TOKEN", raising=False)
+    mcp_server._RUNTIME = None
+
+    from yutome.http_server import run_http_server
+
+    with pytest.raises(RuntimeError, match="YUTOME_HTTP_TOKEN is required"):
+        run_http_server(config_path=Path("yutome.toml"), host="0.0.0.0", port=8765)
+
+    mcp_server._RUNTIME = None

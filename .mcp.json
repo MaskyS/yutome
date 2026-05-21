@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "ytkb": {
+    "yutome": {
       "command": "uv",
-      "args": ["run", "ytkb", "mcp", "serve", "--config", "ytkb.toml"]
+      "args": ["run", "yutome", "mcp", "serve", "--config", "yutome.toml"]
     }
   }
 }

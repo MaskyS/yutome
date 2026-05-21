@@ -1,6 +1,6 @@
-# ytkb Project Guide
+# yutome Project Guide
 
-`ytkb` is a local-first YouTube channel knowledge base indexer. It discovers channel videos without the YouTube Data API, captures transcripts and metadata, stores durable artifacts, builds retrieval indexes, and exposes compact commands that agents, humans, and later applications can use.
+`yutome` is a local-first YouTube channel knowledge base indexer. It discovers channel videos without the YouTube Data API, captures transcripts and metadata, stores durable artifacts, builds retrieval indexes, and exposes compact commands that agents, humans, and later applications can use.
 
 The project is optimized for:
 
@@ -83,11 +83,11 @@ The system has four useful surfaces.
 
 4. Query API
 
-   A shared declarative `QueryRequest` primitive in `src/ytkb/query.py` powers CLI, MCP, and HTTP retrieval. The transport-neutral verbs in `src/ytkb/api.py` are `find`, `list`, `show`, and `q`.
+   A shared declarative `QueryRequest` primitive in `src/yutome/query.py` powers CLI, MCP, and HTTP retrieval. The transport-neutral verbs in `src/yutome/api.py` are `find`, `list`, `show`, and `q`.
 
 5. CLI
 
-   The `ytkb` CLI is the current product interface. It can initialize, index, resume, list status, test proxies/providers, search with `find`, expand citations with `show context`, rebuild indexes, and export Markdown.
+   The `yutome` CLI is the current product interface. It can initialize, index, resume, list status, test proxies/providers, search with `find`, expand citations with `show context`, rebuild indexes, and export Markdown.
 
 6. Scheduler and job model
 
@@ -148,44 +148,50 @@ Implemented commands:
 
 | Command | Purpose |
 | --- | --- |
-| `ytkb init` | Create `ytkb.toml`, base directories, and SQLite catalog. |
-| `ytkb doctor` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
-| `ytkb channels add URL_OR_HANDLE` | Add a channel URL, handle, or id to the local channel library. |
-| `ytkb channels import FILE` | Import channel library entries from CSV, OPML/XML, or a plain URL list. |
-| `ytkb channels import-youtube` | Import YouTube subscriptions through local OAuth and the read-only YouTube Data API scope. |
-| `ytkb channels select/unselect` | Include or exclude channel library entries from default library syncs. |
-| `ytkb sync TARGET` | Discover and index a channel. |
-| `ytkb sync --all` | Sync every selected channel in the local channel library. |
-| `ytkb find QUERY` | Ranked retrieval over chunks, titles, or descriptions with lexical/semantic/hybrid modes. |
-| `ytkb list videos` | Enumerate videos by status, channel, source, language, and date filters. |
-| `ytkb list channels` | Show selected and unselected local channel library entries. |
-| `ytkb list attention` | Show failed/deferred videos with latest provider-attempt details. |
-| `ytkb list status` | Show catalog counts, index percentages, statuses, and job breakdowns. |
-| `ytkb show chunk/video/channel/transcript` | Fetch one resource by id or selector. |
-| `ytkb show source` | Resolve a citation anchor to a YouTube timestamp and provenance. |
-| `ytkb show context` | Expand a selected hit into bounded neighboring transcript context. |
-| `ytkb q` | Execute a raw QueryRequest JSON object. |
-| `ytkb rebuild-chunks` | Rebuild chunk rows/artifacts from active normalized transcripts. |
-| `ytkb rebuild-vectors` | Rebuild or resume embeddings and LanceDB rows from canonical chunks. |
-| `ytkb proxy-info` | Show proxy policy and supported env config. |
-| `ytkb proxy-test` | Test transcript API and yt-dlp subtitle paths through configured proxy. |
-| `ytkb gemini-test` | Test Gemini video-understanding fallback on one video. |
-| `ytkb export portable-md` | Export indexed videos as portable Markdown. |
-| `ytkb export obsidian` | Export indexed videos as Obsidian-friendly Markdown. |
-| `ytkb quality upgrade` | Create LLM-cleaned transcript versions from already-indexed active transcripts. |
+| `yutome setup [CHANNEL]` | Guided first-run setup: config, `.env`, Webshare proxy secrets, semantic search, YouTube subscription import, channel picker, and optional first sync. |
+| `yutome init` | Create `yutome.toml`, base directories, and SQLite catalog. |
+| `yutome doctor` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
+| `yutome channels add URL_OR_HANDLE` | Add a channel URL, handle, or id to the local channel library. |
+| `yutome channels import FILE` | Import channel library entries from CSV, OPML/XML, or a plain URL list. |
+| `yutome channels import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
+| `yutome channels select/unselect` | Include or exclude channel library entries from default library syncs. |
+| `yutome sync TARGET` | Discover and index a channel. |
+| `yutome sync --all` | Sync every selected channel in the local channel library. |
+| `yutome find QUERY` | Ranked retrieval over chunks, titles, or descriptions with lexical/semantic/hybrid modes. |
+| `yutome list videos` | Enumerate videos by status, channel, source, language, and date filters. |
+| `yutome list channels` | Show selected and unselected local channel library entries. |
+| `yutome list attention` | Show failed/deferred videos with latest provider-attempt details. |
+| `yutome list status` | Show catalog counts, index percentages, statuses, and job breakdowns. |
+| `yutome show chunk/video/channel/transcript` | Fetch one resource by id or selector. |
+| `yutome show source` | Resolve a citation anchor to a YouTube timestamp and provenance. |
+| `yutome show context` | Expand a selected hit into bounded neighboring transcript context. |
+| `yutome q` | Execute a raw QueryRequest JSON object. |
+| `yutome eval run FILE` | Run corpus-relative retrieval evals from a JSON fixture. |
+| `yutome remote prepare` | Generate and store the authenticated HTTP API token for remote clients. |
+| `yutome remote serve` | Serve the authenticated HTTP API for private-network or reverse-proxy remote access. |
+| `yutome remote mcp` | Serve the authenticated MCP streamable HTTP endpoint for remote agent clients. |
+| `yutome remote check URL` | Verify remote liveness and authenticated readiness from a client machine. |
+| `yutome rebuild-chunks` | Rebuild chunk rows/artifacts from active normalized transcripts. |
+| `yutome rebuild-vectors` | Rebuild or resume embeddings and LanceDB rows from canonical chunks. |
+| `yutome proxy-info` | Show proxy policy and supported env config. |
+| `yutome proxy-test` | Test transcript API and yt-dlp subtitle paths through configured proxy. |
+| `yutome gemini-test` | Test Gemini video-understanding fallback on one video. |
+| `yutome export portable-md` | Export indexed videos as portable Markdown. |
+| `yutome export obsidian` | Export indexed videos as Obsidian-friendly Markdown. |
+| `yutome quality upgrade` | Create LLM-cleaned transcript versions from already-indexed active transcripts. |
 
 Target command surface not yet implemented:
 
 | Target command | Intended purpose |
 | --- | --- |
-| `ytkb sync --channel ID` | Sync one registered channel by local/channel id. |
-| `ytkb backfill --channel ID --limit N --workers N` | Controlled historical ingest for an existing channel. Current `sync --use-catalog --max-process --workers` covers part of this need. |
-| `ytkb transcribe VIDEO_ID` | Force transcript acquisition or fallback processing for one video. Current implementation uses `sync` filters instead. |
-| `ytkb index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `rebuild-chunks` and `rebuild-vectors`. |
-| `ytkb scheduler install` | Install a cron/launchd schedule for bounded recurring syncs. |
-| `ytkb inspect video VIDEO_ID` | Inspect one video, active transcript version, artifacts, chunks, and status. |
-| `ytkb inspect chunk CHUNK_ID` | Inspect one chunk, text, timestamps, source, and neighboring chunks. |
-| `ytkb inspect attempts VIDEO_ID` | Inspect provider attempts and retry classification for one video. |
+| `yutome sync --channel ID` | Sync one registered channel by local/channel id. |
+| `yutome backfill --channel ID --limit N --workers N` | Controlled historical ingest for an existing channel. Current `sync --use-catalog --max-process --workers` covers part of this need. |
+| `yutome transcribe VIDEO_ID` | Force transcript acquisition or fallback processing for one video. Current implementation uses `sync` filters instead. |
+| `yutome index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `rebuild-chunks` and `rebuild-vectors`. |
+| `yutome scheduler install` | Install a cron/launchd schedule for bounded recurring syncs. |
+| `yutome inspect video VIDEO_ID` | Inspect one video, active transcript version, artifacts, chunks, and status. |
+| `yutome inspect chunk CHUNK_ID` | Inspect one chunk, text, timestamps, source, and neighboring chunks. |
+| `yutome inspect attempts VIDEO_ID` | Inspect provider attempts and retry classification for one video. |
 
 This distinction matters during review: implemented commands should be runnable now; target commands should be treated as design requirements or next-slice candidates.
 
@@ -201,20 +207,20 @@ Important `sync` options:
 | `--status-filter` | Process only matching statuses, for example `--status-filter 'deferred: rate_limited'`. |
 | `--source-filter` | Refresh only videos whose active transcript source matches a prefix, usually with `--force`. |
 | `--force` | Reprocess videos that already have an active transcript. |
-| `--fetch-metadata` | Fetch full per-video metadata during transcript backfill. This is the default complete path. |
-| `--defer-metadata` | Explicitly keep the default fast path: title/duration/thumbnail/approximate upload date from discovery plus transcript/chunks/embeddings, without full description or exact video-page metadata. |
-| `--yt-dlp-first` | Try `yt-dlp` subtitle files before `youtube-transcript-api`. Useful when transcript API is blocked. Default is transcript API first. |
-| `--no-yt-dlp-fallback` | Fast transcript-API-only pass: failed transcript API calls are marked failed/deferred instead of occupying workers with slow `yt-dlp` subtitle fallback. |
-| `--staged-fallback` | Single-command staged import: run transcript API across all candidates first, queue unresolved videos, then immediately retry that queue with `yt-dlp` fallback. Logs include explicit stage banners and queue counts. |
 | `--gemini-fallback` | Use Gemini video understanding when caption/subtitle paths fail. |
 | `--asr-fallback` | Use local ASR when caption/subtitle paths fail. This is a last-resort path. |
-| `--fallback-only` | Skip caption providers for known fallback rows and go straight to configured fallback. |
 | `--stop-on-rate-limit` | Stop the run when a likely block/rate limit appears. Default behavior. |
 | `--continue-on-rate-limit` | Keep processing after block/rate-limit signals. Higher risk for large runs. |
 | `--sleep` | Per-video delay between transcript requests. |
 | `--shortest-first` | Process shorter candidate videos first. Useful for fallback testing or quick coverage. |
 | `--max-duration-seconds` | Restrict processing by duration. |
 | `--proxy-retries-when-blocked` | Override Webshare transcript retry count for one run. |
+
+`sync` intentionally does not expose provider-order flags in the normal command surface. The default
+policy is staged and logged: discovery stores cheap catalog metadata, stage 1 runs the transcript API
+across candidates, stage 2 immediately retries unresolved videos with `yt-dlp` subtitles, and stage 3
+backfills exact per-video metadata. The logs print stage banners and queue counts so the operator can see
+when fallback and metadata backfill are happening without having to orchestrate those phases.
 
 Important `find` options:
 
@@ -243,9 +249,9 @@ Important `show context` inputs:
 
 ## Configuration
 
-The config file is `ytkb.toml`. The runtime config is the parsed TOML plus Pydantic defaults for any fields not present in the local file.
+The config file is `yutome.toml`. The runtime config is the parsed TOML plus Pydantic defaults for any fields not present in the local file.
 
-Core defaults in `src/ytkb/config.py`:
+Core defaults in `src/yutome/config.py`:
 
 ```toml
 [storage]
@@ -330,8 +336,8 @@ Secrets and local provider credentials should live in `.env`, not in checked-in 
 
 - Voyage API key through the provider's normal environment variable.
 - Gemini API key through `GEMINI_API_KEY`.
-- Webshare credentials through `YTKB_WEBSHARE_USERNAME` and `YTKB_WEBSHARE_PASSWORD`.
-- Generic proxies through `YTKB_PROXY_URLS`, `YTKB_HTTP_PROXY`, and `YTKB_HTTPS_PROXY`.
+- Webshare credentials through `YUTOME_WEBSHARE_USERNAME` and `YUTOME_WEBSHARE_PASSWORD`.
+- Generic proxies through `YUTOME_PROXY_URLS`, `YUTOME_HTTP_PROXY`, and `YUTOME_HTTPS_PROXY`.
 
 ## Architecture
 
@@ -354,17 +360,17 @@ YouTube channel
 
 Main boundaries:
 
-- `src/ytkb/youtube.py` owns YouTube discovery, metadata fetches, transcript API calls, subtitle fetches, proxy selection, and ASR audio download.
-- `src/ytkb/transcripts.py` owns transcript normalization and transcript artifacts.
-- `src/ytkb/chunking.py` owns chunk construction.
-- `src/ytkb/store.py` owns catalog persistence and FTS writes.
-- `src/ytkb/embeddings.py` owns Voyage embedding calls and LanceDB writes.
-- `src/ytkb/query.py` owns QueryRequest compile/execute and SQL/LanceDB dispatch.
-- `src/ytkb/api.py` owns transport-neutral `find`, `list`, `show`, and `q` verbs.
-- `src/ytkb/retrieval.py` owns shared citation/context helper functions.
-- `src/ytkb/exports.py` owns portable and Obsidian Markdown output.
-- `src/ytkb/indexer.py` orchestrates discovery, per-video indexing, fallback decisions, statuses, and attempts.
-- `src/ytkb/maintenance.py` owns rebuild routines.
+- `src/yutome/youtube.py` owns YouTube discovery, metadata fetches, transcript API calls, subtitle fetches, proxy selection, and ASR audio download.
+- `src/yutome/transcripts.py` owns transcript normalization and transcript artifacts.
+- `src/yutome/chunking.py` owns chunk construction.
+- `src/yutome/store.py` owns catalog persistence and FTS writes.
+- `src/yutome/embeddings.py` owns Voyage embedding calls and LanceDB writes.
+- `src/yutome/query.py` owns QueryRequest compile/execute and SQL/LanceDB dispatch.
+- `src/yutome/api.py` owns transport-neutral `find`, `list`, `show`, and `q` verbs.
+- `src/yutome/retrieval.py` owns shared citation/context helper functions.
+- `src/yutome/exports.py` owns portable and Obsidian Markdown output.
+- `src/yutome/indexer.py` orchestrates discovery, per-video indexing, fallback decisions, statuses, and attempts.
+- `src/yutome/maintenance.py` owns rebuild routines.
 
 Discovery policy:
 
@@ -379,22 +385,22 @@ Discovery policy:
 
 Read these files first:
 
-- CLI entrypoint: `src/ytkb/cli.py`
-- Configuration: `src/ytkb/config.py`
-- Environment overrides: `src/ytkb/env.py`
-- Path layout: `src/ytkb/paths.py`
-- SQLite schema/bootstrap: `src/ytkb/db.py`
-- Ingest orchestration: `src/ytkb/indexer.py`
-- YouTube/transcript providers: `src/ytkb/youtube.py`
-- Gemini fallback: `src/ytkb/gemini.py`
-- ASR fallback: `src/ytkb/asr.py`
-- Transcript normalization/artifacts: `src/ytkb/transcripts.py`
-- Chunking: `src/ytkb/chunking.py`
-- Catalog writes and FTS rebuild: `src/ytkb/store.py`
-- Embeddings and LanceDB: `src/ytkb/embeddings.py`
-- Retrieval and context expansion: `src/ytkb/retrieval.py`
-- Markdown exports: `src/ytkb/exports.py`
-- Maintenance rebuilds: `src/ytkb/maintenance.py`
+- CLI entrypoint: `src/yutome/cli.py`
+- Configuration: `src/yutome/config.py`
+- Environment overrides: `src/yutome/env.py`
+- Path layout: `src/yutome/paths.py`
+- SQLite schema/bootstrap: `src/yutome/db.py`
+- Ingest orchestration: `src/yutome/indexer.py`
+- YouTube/transcript providers: `src/yutome/youtube.py`
+- Gemini fallback: `src/yutome/gemini.py`
+- ASR fallback: `src/yutome/asr.py`
+- Transcript normalization/artifacts: `src/yutome/transcripts.py`
+- Chunking: `src/yutome/chunking.py`
+- Catalog writes and FTS rebuild: `src/yutome/store.py`
+- Embeddings and LanceDB: `src/yutome/embeddings.py`
+- Retrieval and context expansion: `src/yutome/retrieval.py`
+- Markdown exports: `src/yutome/exports.py`
+- Maintenance rebuilds: `src/yutome/maintenance.py`
 - Tests: `tests/test_config_paths_db.py`, `tests/test_retrieval_exports.py`
 - Proxy strategy: `docs/proxy-strategy.md`
 - Review checklist: `docs/reviewer-handoff.md`
@@ -404,7 +410,7 @@ Read these files first:
 Default layout:
 
 ```text
-ytkb.toml
+yutome.toml
 data/
   artifacts/
     channels/{channel_id}/channel.json
@@ -542,8 +548,8 @@ Why LanceDB is rebuildable:
 
 - SQLite and artifacts are the source of truth.
 - Embeddings are deterministic enough for a selected provider/model/dimension.
-- If LanceDB table shape is missing required columns, `find --mode hybrid` and semantic retrieval fail with a clear message to run `ytkb rebuild-vectors`.
-- If hybrid search fails because the LanceDB FTS index is not ready, the error tells the user to run `ytkb rebuild-vectors`.
+- If LanceDB table shape is missing required columns, `find --mode hybrid` and semantic retrieval fail with a clear message to run `yutome rebuild-vectors`.
+- If hybrid search fails because the LanceDB FTS index is not ready, the error tells the user to run `yutome rebuild-vectors`.
 
 Why SQLite is still needed when LanceDB exists:
 
@@ -667,9 +673,9 @@ The default operational posture is:
 
 Proxy support:
 
-- Generic proxy pool through `YTKB_PROXY_URLS`.
-- Single HTTP/HTTPS proxies through `YTKB_HTTP_PROXY` and `YTKB_HTTPS_PROXY`.
-- Webshare rotating residential through `YTKB_WEBSHARE_USERNAME` and `YTKB_WEBSHARE_PASSWORD`.
+- Generic proxy pool through `YUTOME_PROXY_URLS`.
+- Single HTTP/HTTPS proxies through `YUTOME_HTTP_PROXY` and `YUTOME_HTTPS_PROXY`.
+- Webshare rotating residential through `YUTOME_WEBSHARE_USERNAME` and `YUTOME_WEBSHARE_PASSWORD`.
 - `youtube-transcript-api` can use its native Webshare proxy config.
 - `yt-dlp` receives a proxy URL through `--proxy`.
 
@@ -771,7 +777,7 @@ Embedding behavior:
 - Query only chunks that do not already have an indexed embedding record for the selected provider/model/dimension.
 - Fetch embeddings in bounded concurrent batches.
 - Retry transient and rate-limit provider errors with exponential backoff.
-- Leave failed batches pending so `ytkb rebuild-vectors --resume` can continue.
+- Leave failed batches pending so `yutome rebuild-vectors --resume` can continue.
 - Write LanceDB rows and SQLite embedding status after successful batches.
 - Create or refresh the LanceDB FTS index on `text` when vectors are ingested.
 
@@ -779,8 +785,8 @@ Important implementation detail:
 
 - Embedding API calls are parallelized.
 - LanceDB/SQLite writes are kept controlled so one failed batch does not corrupt the whole rebuild.
-- Full `ytkb rebuild-vectors` drops the existing LanceDB table and clears matching embedding records.
-- `ytkb rebuild-vectors --resume` preserves existing indexed rows and embeds only pending chunks.
+- Full `yutome rebuild-vectors` drops the existing LanceDB table and clears matching embedding records.
+- `yutome rebuild-vectors --resume` preserves existing indexed rows and embeds only pending chunks.
 
 Future embedding work:
 
@@ -814,15 +820,15 @@ https://youtube.com/watch?v={video_id}&t={seconds}s
 Internal resource URI format:
 
 ```text
-ytkb://chunk/{chunk_id}
+yutome://chunk/{chunk_id}
 ```
 
 Future resource URI targets:
 
 ```text
-ytkb://video/{video_id}
-ytkb://transcript/{transcript_version_id}
-ytkb://segment/{transcript_version_id}/{sequence}
+yutome://video/{video_id}
+yutome://transcript/{transcript_version_id}
+yutome://segment/{transcript_version_id}/{sequence}
 ```
 
 The citation model is deliberately transcript-first. Video descriptions, summaries, and topic cards can help discovery, but claims about what was said should cite transcript timestamps.
@@ -834,7 +840,7 @@ Retrieval is intentionally two-stage.
 Stage 1 returns compact hits:
 
 ```bash
-uv run ytkb find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
 ```
 
 Defaults:
@@ -863,7 +869,7 @@ Thin result shape:
 ```json
 {
   "chunk_id": "...",
-  "resource_uri": "ytkb://chunk/...",
+  "resource_uri": "yutome://chunk/...",
   "video_id": "...",
   "title": "...",
   "youtube_url": "https://youtube.com/watch?v=VIDEO_ID&t=123s",
@@ -915,9 +921,9 @@ Important retrieval rule:
 Stage 2 expands a selected hit:
 
 ```bash
-uv run ytkb show context CHUNK_ID --token-budget 3000
-uv run ytkb show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
-uv run ytkb show context --video-id VIDEO_ID --time 123
+uv run yutome show context CHUNK_ID --token-budget 3000
+uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
+uv run yutome show context --video-id VIDEO_ID --time 123
 ```
 
 Output shape:
@@ -1019,7 +1025,7 @@ Recommended next ranking improvements:
 Portable Markdown:
 
 ```bash
-uv run ytkb export portable-md
+uv run yutome export portable-md
 ```
 
 Output:
@@ -1042,7 +1048,7 @@ Output:
 Obsidian Markdown:
 
 ```bash
-uv run ytkb export obsidian
+uv run yutome export obsidian
 ```
 
 Output:
@@ -1122,7 +1128,7 @@ Useful later:
 
 ## Built-In Answer Mode
 
-The project does not currently include `ytkb answer`.
+The project does not currently include `yutome answer`.
 
 Recommended future answer flow:
 
@@ -1136,21 +1142,21 @@ Recommended future answer flow:
 
 Do not add answer synthesis before retrieval evaluation exists. Otherwise answer quality issues will be hard to separate from retrieval quality issues.
 
-## Local Agent Connector
+## Agent And Multi-Device Connector
 
-The product promise is that a user's daily-driver LLM can query their local YouTube corpus without a centralized server. The connector layer is how that promise is delivered.
+The product promise is that a user's daily-driver LLM can query their YouTube corpus from the places they actually work. Local-first still matters for ownership and inspection, but laptop-only querying is too narrow: a useful corpus should be reachable from multiple agents, devices, and surfaces.
 
 Decided direction:
 
 - The first connector is a local **MCP server** over stdio.
 - A thin local **HTTP/JSON API** is added underneath so scripts, future browser inspectors, and non-MCP clients share the same core.
-- **Remote MCP** (ChatGPT-style web connectors with OAuth) is deferred until the local surface is stable.
+- **Remote access** is promoted from "later integration" to a core product track. The likely shapes are hosted authenticated HTTP, remote MCP on top of the same API, or a hosted read-only replica of the local corpus/indexes.
 - Both adapters call the same in-process Python functions that already back the CLI; no new orchestration logic lives in the connector layer.
 
 ### Architecture
 
 ```text
-ytkb CLI ────────────┐
+yutome CLI ────────────┐
                      │
 MCP server (stdio) ──┼──> api.py verbs: find/list/show/q
                      │       query.py compiler/executor
@@ -1174,7 +1180,7 @@ Deferred to a later slice (need either a job model or evaluation work first):
 
 - `sync` / `sync_channel` — long-running, needs the planned `jobs` table to be writable and a job-status tool. Exposing it synchronously over MCP would block the agent.
 - `quality_upgrade` — same reason.
-- `inspect_*` — wait until the planned `ytkb inspect video|chunk|attempts` CLI commands land so MCP and CLI ship one definition.
+- `inspect_*` — wait until the planned `yutome inspect video|chunk|attempts` CLI commands land so MCP and CLI ship one definition.
 - `answer` — gated on retrieval evaluation per the existing Built-In Answer Mode section.
 
 ### Resource Catalog (MCP)
@@ -1183,10 +1189,10 @@ Resources are addressable read-only artifacts. The URI scheme is already drafted
 
 | URI | Backed by | Returns |
 | --- | --- | --- |
-| `ytkb://chunk/{chunk_id}` | `chunks` table | Full chunk text, timestamps, transcript provenance, citation URL. |
-| `ytkb://video/{video_id}` | `videos` table + active transcript | Video metadata, active transcript version, plain transcript text path, indexing status. |
-| `ytkb://channel/{channel_id}` | `channels` / `library_channels` | Channel metadata, local-library selection, and indexed counts. |
-| `ytkb://transcript/{transcript_version_id}` | `transcript_versions` + artifact path | Provenance, language, generated/manual, link to `normalized.jsonl` / `transcript.txt`. |
+| `yutome://chunk/{chunk_id}` | `chunks` table | Full chunk text, timestamps, transcript provenance, citation URL. |
+| `yutome://video/{video_id}` | `videos` table + active transcript | Video metadata, active transcript version, plain transcript text path, indexing status. |
+| `yutome://channel/{channel_id}` | `channels` / `library_channels` | Channel metadata, local-library selection, and indexed counts. |
+| `yutome://transcript/{transcript_version_id}` | `transcript_versions` + artifact path | Provenance, language, generated/manual, link to `normalized.jsonl` / `transcript.txt`. |
 
 Resource bytes for transcripts come from the existing artifact files on disk; the connector never re-fetches from YouTube.
 
@@ -1196,9 +1202,11 @@ Resource bytes for transcripts come from the existing artifact files on disk; th
 | --- | --- | --- | --- |
 | Local MCP | stdio | none (process-local) | First slice. |
 | Local HTTP | HTTP on `127.0.0.1` | optional bearer token from `.env` | First slice, opt-in. |
-| Remote MCP | HTTP + SSE | OAuth | Deferred. Needs a hosted client or BYO Google-style flow before it is safe to expose. |
+| Hosted HTTP API | HTTPS | user auth + corpus ACL | Next architecture track. |
+| Authenticated HTTP API | HTTP/HTTPS behind private network or reverse proxy | bearer token | Current multi-device slice. |
+| Remote MCP | MCP streamable HTTP behind private network or reverse proxy | same bearer token | Current multi-device slice for agent clients. |
 
-The local HTTP surface is bound to loopback by default. A future remote-MCP rollout is out of scope until rate-limit, abuse, and provenance disclosure stories are written.
+The local HTTP surface is bound to loopback by default. `yutome remote serve` and `yutome remote mcp` are the current authenticated remote-read shapes; both refuse non-loopback binding without `YUTOME_HTTP_TOKEN`. Public hosted remote access still needs per-user data isolation, rate limits, audit logging, and a decision about whether remote writes can start sync jobs or remote is read-only over already-indexed corpus data.
 
 ### Beginner Vs Expert Shape
 
@@ -1212,29 +1220,30 @@ Per the product-design split, connector outputs follow the same two-register rul
 Shipped (query/API slice):
 
 1. `mcp` optional dependency group pinned to `mcp[cli]>=1.20,<2` in `pyproject.toml`.
-2. `src/ytkb/query.py` defines `QueryRequest`, projections, compiler, SQL/FTS/LanceDB execution, two-stage pushdown, and status breakdowns.
-3. `src/ytkb/api.py` exposes transport-neutral `find`, `list`, `show`, and `q` verbs plus resources.
-4. `src/ytkb/mcp_server.py` implements four tools and four resources wired through `api.py`.
-5. `src/ytkb/http_server.py` exposes the same verbs/resources as REST endpoints: `POST /find`, `POST /list`, `POST /show`, `POST /q`, `GET /chunks/{id}`, `GET /videos/{id}`, `GET /channels/{id}`, `GET /transcripts/{id}`, plus unauthenticated `GET /healthz`.
-6. `ytkb mcp serve` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, LanceDB, and Voyage credentials are inherited.
-7. `ytkb http serve --config ytkb.toml --port 8765` CLI entrypoint runs uvicorn on `127.0.0.1`.
-8. Optional bearer auth via the `YTKB_HTTP_TOKEN` env var. Unset = open on the bound interface (loopback by default).
+2. `src/yutome/query.py` defines `QueryRequest`, projections, compiler, SQL/FTS/LanceDB execution, two-stage pushdown, and status breakdowns.
+3. `src/yutome/api.py` exposes transport-neutral `find`, `list`, `show`, and `q` verbs plus resources.
+4. `src/yutome/mcp_server.py` implements four tools and four resources wired through `api.py`.
+5. `src/yutome/http_server.py` exposes the same verbs/resources as REST endpoints: `POST /find`, `POST /list`, `POST /show`, `POST /q`, `GET /chunks/{id}`, `GET /videos/{id}`, `GET /channels/{id}`, `GET /transcripts/{id}`, plus unauthenticated `GET /healthz` and authenticated `GET /readyz`.
+6. `yutome mcp serve` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, LanceDB, and Voyage credentials are inherited.
+7. `yutome http serve --config yutome.toml --port 8765` CLI entrypoint runs uvicorn on `127.0.0.1`.
+8. Optional bearer auth via the `YUTOME_HTTP_TOKEN` env var for loopback HTTP; required for non-loopback remote serving.
 9. Tests: `tests/test_mcp_server.py`, `tests/test_http_server.py`, `tests/test_retrieval_exports.py`, plus subprocess smoke helpers.
+10. `yutome remote prepare|serve|mcp|check` for authenticated remote HTTP and MCP access from other devices/private agents.
 
 Still to do:
 
-10. Optional Claude skill bundling few-shot examples of good ytkb queries (Scry-style).
-11. Long-running tools (`sync`, `quality_upgrade`) once the `jobs` table is writable.
-12. Remote MCP / ChatGPT connector shape with OAuth.
+11. Optional Claude skill bundling few-shot examples of good yutome queries (Scry-style).
+12. Long-running tools (`sync`, `quality_upgrade`) once the `jobs` table is writable.
+13. Remote MCP / ChatGPT connector shape with OAuth or app-issued tokens.
 
 ### Client Setup
 
 For Claude Code, the project-scoped `.mcp.json` at the repo root is read automatically; Claude Code prompts once to enable it on first launch. To install as a user-scoped server (available from any working directory):
 
 ```bash
-claude mcp add --scope user ytkb -- \
-  uv run --directory /absolute/path/to/yt-indexer ytkb mcp serve \
-  --config /absolute/path/to/yt-indexer/ytkb.toml
+claude mcp add --scope user yutome -- \
+  uv run --directory /absolute/path/to/yutome yutome mcp serve \
+  --config /absolute/path/to/yutome/yutome.toml
 ```
 
 For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -1242,11 +1251,11 @@ For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_
 ```json
 {
   "mcpServers": {
-    "ytkb": {
+    "yutome": {
       "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/yt-indexer",
-               "ytkb", "mcp", "serve",
-               "--config", "/absolute/path/to/yt-indexer/ytkb.toml"]
+      "args": ["run", "--directory", "/absolute/path/to/yutome",
+               "yutome", "mcp", "serve",
+               "--config", "/absolute/path/to/yutome/yutome.toml"]
     }
   }
 }
@@ -1263,78 +1272,78 @@ For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_
 Initialize:
 
 ```bash
-uv run ytkb init
-uv run ytkb doctor
+uv run yutome init
+uv run yutome doctor
 ```
 
 Index or resume Leo and Longevity from catalog:
 
 ```bash
-uv run ytkb sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25
+uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25
 ```
 
 Run with embeddings:
 
 ```bash
-uv run ytkb sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25 --embed
+uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25 --embed
 ```
 
-Prefer `yt-dlp` subtitles first:
+Test provider/proxy paths:
 
 ```bash
-uv run ytkb sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --yt-dlp-first --max-process 25
+uv run yutome proxy-test --video-id VIDEO_ID
 ```
 
 Retry deferred rows:
 
 ```bash
-uv run ytkb sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --status-filter "deferred: rate_limited" --max-process 10
+uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --status-filter "deferred: rate_limited" --max-process 10
 ```
 
 Use Gemini fallback for known fallback rows:
 
 ```bash
-uv run ytkb sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --gemini-fallback --fallback-only --max-process 5
+uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --gemini-fallback --max-process 5
 ```
 
 Check status:
 
 ```bash
-uv run ytkb list status
+uv run yutome list status
 ```
 
 Rebuild chunks from active normalized transcripts:
 
 ```bash
-uv run ytkb rebuild-chunks
+uv run yutome rebuild-chunks
 ```
 
 Resume vector indexing for pending chunks:
 
 ```bash
-uv run ytkb rebuild-vectors --resume --batch-size 128 --concurrency 4
+uv run yutome rebuild-vectors --resume --batch-size 128 --concurrency 4
 ```
 
 Full vector rebuild:
 
 ```bash
-uv run ytkb rebuild-vectors
+uv run yutome rebuild-vectors
 ```
 
 Run retrieval checks:
 
 ```bash
-uv run ytkb find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run ytkb find "donepezil AChEI" --mode hybrid --limit 5 --json
-uv run ytkb find "neuroautoimmune disease" --mode hybrid --limit 5 --json
-uv run ytkb show context CHUNK_ID --token-budget 3000
+uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome find "donepezil AChEI" --mode hybrid --limit 5 --json
+uv run yutome find "neuroautoimmune disease" --mode hybrid --limit 5 --json
+uv run yutome show context CHUNK_ID --token-budget 3000
 ```
 
 Export:
 
 ```bash
-uv run ytkb export portable-md
-uv run ytkb export obsidian
+uv run yutome export portable-md
+uv run yutome export obsidian
 ```
 
 Test:
@@ -1348,8 +1357,8 @@ uv run pytest -q
 Expected current checks:
 
 ```bash
-uv run ytkb doctor
-uv run ytkb list status
+uv run yutome doctor
+uv run yutome list status
 uv run pytest -q
 ```
 
@@ -1594,11 +1603,12 @@ Exports:
 
 Future application/API:
 
-- Connector shape decided: local MCP first, thin local HTTP underneath, remote MCP deferred. See the Local Agent Connector section.
-- Resource URIs decided: `ytkb://chunk/...`, `ytkb://video/...`, `ytkb://transcript/...`. Segment-level URIs remain a future option.
+- Connector shape decided: local MCP first, thin local HTTP underneath, remote access promoted to a core architecture track. See the Agent And Multi-Device Connector section.
+- Resource URIs decided: `yutome://chunk/...`, `yutome://video/...`, `yutome://transcript/...`. Segment-level URIs remain a future option.
 - Should `show context` accept multiple chunk ids in one call so an agent can merge several hits without N round trips?
 - Should the MCP server expose a long-running `sync` tool once the `jobs` table is writable, or stay read-only until then?
 - What is the right beginner/expert split inside MCP responses (default beginner badges, expert details under `debug`)?
+- What is the first remote shape: hosted read-only HTTP API, remote MCP adapter, or corpus/index sync to a private server?
 
 Scheduler and catalog:
 
@@ -1611,12 +1621,15 @@ Scheduler and catalog:
 
 Recommended immediate slice:
 
-1. Add retrieval evaluation fixtures.
-2. Add per-video result caps.
-3. Add adjacent chunk collapse.
-4. Add `ytkb inspect video VIDEO_ID`.
-5. Add `ytkb inspect chunk CHUNK_ID`.
-6. Add `ytkb inspect attempts VIDEO_ID`.
+1. Finish guided setup and first-run checks.
+2. Add retrieval evaluation fixtures.
+3. Improve big-import progress/resume ergonomics.
+4. Add per-video result caps.
+5. Add adjacent chunk collapse.
+6. Add `yutome inspect video VIDEO_ID`.
+7. Add `yutome inspect chunk CHUNK_ID`.
+8. Add `yutome inspect attempts VIDEO_ID`.
+9. Design hosted read-only API / remote MCP architecture.
 
 Why this order:
 
@@ -1639,21 +1652,21 @@ Suggested retrieval eval queries:
 - `small fiber neuropathy`
 - `probiotics Crohn diet`
 
-Shipped: local MCP server (`ytkb mcp serve`) and local HTTP API (`ytkb http serve`) sharing the same in-process handlers. See the Local Agent Connector section.
+Shipped: local MCP server (`yutome mcp serve`) and local HTTP API (`yutome http serve`) sharing the same in-process handlers. See the Agent And Multi-Device Connector section.
 
 Next slice:
 
-- Optional Claude skill with few-shot ytkb query examples.
+- Optional Claude skill with few-shot yutome query examples.
 
 Later slices:
 
 - Optional per-video summaries/topic cards.
-- Built-in `ytkb answer`.
-- Remote MCP (ChatGPT-style web connector) with OAuth.
+- Built-in `yutome answer`.
+- Hosted API / remote MCP for multi-device access.
 - Web UI or local browser transcript navigator.
-- `ytkb channel add`, `ytkb sync --all`, and scheduler install/run commands.
-- `ytkb transcribe VIDEO_ID` for forced one-video processing.
-- `ytkb index --lexical --vectors` as a unified rebuild command.
+- `yutome channel add`, `yutome sync --all`, and scheduler install/run commands.
+- `yutome transcribe VIDEO_ID` for forced one-video processing.
+- `yutome index --lexical --vectors` as a unified rebuild command.
 - Incremental scheduler for new channel videos.
 - Topic/entity extraction.
 - Tool/provider version manifests.

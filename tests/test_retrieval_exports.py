@@ -6,22 +6,23 @@ from pathlib import Path
 
 import pytest
 
-from ytkb.chunking import build_chunks
-from ytkb.config import default_config
-from ytkb.db import bootstrap_catalog, connect_catalog
-from ytkb.exports import export_markdown
-from ytkb.paths import ProjectPaths
-from ytkb.quality_llm import (
+from yutome.chunking import build_chunks
+from yutome.config import default_config
+from yutome.db import bootstrap_catalog, connect_catalog
+from yutome.evals import EvalCase, EvalSuite, run_eval_suite
+from yutome.exports import export_markdown
+from yutome.paths import ProjectPaths
+from yutome.quality_llm import (
     TranscriptCorrection,
     TranscriptCorrectionResponse,
     _cleanup_batch_with_generator,
     cleanup_transcript_with_gemini,
 )
-import ytkb.quality_upgrade as quality_upgrade_module
-from ytkb.quality_upgrade import upgrade_active_transcripts
-from ytkb.api import ContextRequest, context_expand, find as api_find
-from ytkb.store import rebuild_fts
-from ytkb.transcripts import TranscriptSegment, normalize_transcript
+import yutome.quality_upgrade as quality_upgrade_module
+from yutome.quality_upgrade import upgrade_active_transcripts
+from yutome.api import ContextRequest, context_expand, find as api_find
+from yutome.store import rebuild_fts
+from yutome.transcripts import TranscriptSegment, normalize_transcript
 
 
 def _sample_project(tmp_path: Path) -> ProjectPaths:
@@ -132,7 +133,7 @@ def test_retrieve_thin_omits_full_text(tmp_path: Path) -> None:
     assert results
     assert "text" not in results[0]
     assert results[0]["chunk_id"] == "chunk-b"
-    assert results[0]["resource_uri"] == "ytkb://chunk/chunk-b"
+    assert results[0]["resource_uri"] == "yutome://chunk/chunk-b"
     assert results[0]["transcript_source"] == "youtube-transcript-api"
 
 
@@ -150,6 +151,27 @@ def test_retrieve_chunk_detail_includes_text(tmp_path: Path) -> None:
 
     assert "text" in results[0]
     assert "probiotics" in results[0]["text"]
+
+
+def test_eval_suite_checks_expected_video_and_terms(tmp_path: Path) -> None:
+    paths = _sample_project(tmp_path)
+    suite = EvalSuite(
+        cases=[
+            EvalCase(
+                name="crohn-probiotics",
+                query="Crohn probiotics",
+                mode="lexical",
+                expected_video_ids=["vid123"],
+                expected_terms=["probiotics"],
+            )
+        ]
+    )
+
+    result = run_eval_suite(config=default_config(), paths=paths, suite=suite)
+
+    assert result["passed"] == 1
+    assert result["failed"] == 0
+    assert result["cases"][0]["passed"] is True
 
 
 def test_context_expands_within_token_budget(tmp_path: Path) -> None:
@@ -312,7 +334,7 @@ def test_quality_upgrade_creates_new_active_transcript_version(monkeypatch, tmp_
             )
             for segment in transcript.segments
         ]
-        from ytkb.quality import derived_transcript
+        from yutome.quality import derived_transcript
 
         stats = type("Stats", (), {"segments_changed": 1, "requests": 1})()
         return (
@@ -336,6 +358,22 @@ def test_quality_upgrade_creates_new_active_transcript_version(monkeypatch, tmp_
     assert stats.failed == 0
     assert row["source"] == "youtube-transcript-api+llm-cleanup:gemini-3.1-flash-lite"
     assert "tx123" not in row["normalized_path"]
+
+
+def test_quality_upgrade_quality_gate_skips_clean_transcript(monkeypatch, tmp_path: Path) -> None:
+    paths = _sample_project(tmp_path)
+
+    def fail_cleanup(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("clean transcript should not call LLM cleanup")
+
+    monkeypatch.setattr(quality_upgrade_module, "cleanup_transcript_with_gemini", fail_cleanup)
+
+    stats = upgrade_active_transcripts(config=default_config(), paths=paths, quality_gate=True)
+
+    assert stats.scanned == 1
+    assert stats.upgraded == 0
+    assert stats.skipped_quality == 1
+    assert stats.failed == 0
 
 
 def test_hybrid_retrieval_reports_stale_lancedb_table(tmp_path: Path) -> None:

@@ -14,13 +14,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import anyio
 import pytest
 
-from ytkb.config import default_config
-from ytkb.db import bootstrap_catalog, connect_catalog
-from ytkb.paths import ProjectPaths
-from ytkb.store import rebuild_fts
-import ytkb.mcp_server as mcp_server
+from yutome.config import default_config
+from yutome.db import bootstrap_catalog, connect_catalog
+from yutome.paths import ProjectPaths
+from yutome.store import rebuild_fts
+import yutome.mcp_server as mcp_server
 
 
 def _fixture_project(tmp_path: Path) -> ProjectPaths:
@@ -122,11 +123,11 @@ def _fixture_project(tmp_path: Path) -> ProjectPaths:
 @pytest.fixture
 def configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     paths = _fixture_project(tmp_path)
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     mcp_server._RUNTIME = None
-    mcp_server.configure(Path("ytkb.toml"))
+    mcp_server.configure(Path("yutome.toml"))
     yield paths
     mcp_server._RUNTIME = None
 
@@ -138,7 +139,7 @@ def test_search_lexical_returns_thin_hits(configured: ProjectPaths) -> None:
     hit = hits[0]
     for field in ("chunk_id", "resource_uri", "video_id", "youtube_url", "start_ms", "snippet"):
         assert field in hit
-    assert hit["resource_uri"].startswith("ytkb://chunk/")
+    assert hit["resource_uri"].startswith("yutome://chunk/")
     assert hit["youtube_url"].startswith("https://youtube.com/watch?v=")
     assert "text" not in hit, "thin hits must not include full chunk text"
 
@@ -206,7 +207,7 @@ def test_chunk_resource_returns_full_text(configured: ProjectPaths) -> None:
     payload = mcp_server.resource_chunk(chunk_id)
     assert payload["chunk_id"] == chunk_id
     assert payload["text"], "chunk resource must include full text"
-    assert payload["resource_uri"] == f"ytkb://chunk/{chunk_id}"
+    assert payload["resource_uri"] == f"yutome://chunk/{chunk_id}"
 
 
 def test_video_resource_includes_active_transcript(configured: ProjectPaths) -> None:
@@ -234,11 +235,49 @@ def test_build_server_registers_tools_and_resources(configured: ProjectPaths) ->
     templates = server._resource_manager.list_templates()
     template_uris = {t.uri_template for t in templates}
     assert {
-        "ytkb://chunk/{chunk_id}",
-        "ytkb://video/{video_id}",
-        "ytkb://channel/{channel_id}",
-        "ytkb://transcript/{transcript_version_id}",
+        "yutome://chunk/{chunk_id}",
+        "yutome://video/{video_id}",
+        "yutome://channel/{channel_id}",
+        "yutome://transcript/{transcript_version_id}",
     } <= template_uris
+
+
+def test_build_server_can_enable_remote_bearer_auth(configured: ProjectPaths) -> None:
+    server = mcp_server.build_server(
+        host="127.0.0.1",
+        port=8766,
+        auth_token="secret-abc123",
+        auth_base_url="http://127.0.0.1:8766",
+    )
+
+    assert server.settings.auth is not None
+    assert server.settings.streamable_http_path == "/mcp"
+    access = anyio.run(server._token_verifier.verify_token, "secret-abc123")
+    rejected = anyio.run(server._token_verifier.verify_token, "wrong")
+    assert access is not None
+    assert access.scopes == ["yutome:read"]
+    assert rejected is None
+
+
+def test_remote_mcp_refuses_non_loopback_without_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fixture_project(tmp_path)
+    config_path = tmp_path / "yutome.toml"
+    config_path.write_text("[storage]\ndata_dir = 'data'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("YUTOME_HTTP_TOKEN", raising=False)
+    mcp_server._RUNTIME = None
+
+    with pytest.raises(RuntimeError, match="YUTOME_HTTP_TOKEN is required"):
+        mcp_server.run_streamable_http_server(
+            config_path=Path("yutome.toml"),
+            host="0.0.0.0",
+            port=8766,
+        )
+
+    mcp_server._RUNTIME = None
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +293,7 @@ def test_live_corpus_search_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(Path(__file__).resolve().parent.parent)
     mcp_server._RUNTIME = None
     try:
-        mcp_server.configure(Path("ytkb.toml"))
+        mcp_server.configure(Path("yutome.toml"))
         hits = mcp_server.tool_find(text="Crohn probiotics", mode="lexical", limit=3)["rows"]
         assert hits, "live lexical search returned no hits"
         for hit in hits:

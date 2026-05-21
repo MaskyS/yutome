@@ -1,6 +1,6 @@
 # Product Design Notes
 
-`ytkb` should be understood as a local-first YouTube antilibrary, not only as a channel scraper or transcript index.
+`yutome` should be understood as a local-first YouTube antilibrary, not only as a channel scraper or transcript index.
 
 The user has a set of channels they care about, and that corpus contains far more latent value than they can watch, remember, or manually organize. The product promise is that those unwatched or half-remembered videos become searchable, citable, exportable, and available to the user's normal agent or chat workflow without requiring a centralized server.
 
@@ -17,10 +17,9 @@ The first-class user object is a channel library.
 The default flow should be:
 
 ```bash
-ytkb init
-ytkb channels add https://www.youtube.com/@SomeChannel
-ytkb sync
-ytkb find "topic I remember"
+yutome setup https://www.youtube.com/@SomeChannel
+yutome sync
+yutome find "topic I remember"
 ```
 
 The broader import flow should support:
@@ -40,16 +39,18 @@ OAuth is the preferred subscription-import experience because Takeout is too hea
 The local OAuth design is:
 
 1. User provides a Google OAuth desktop/local client secrets file.
-2. `ytkb` opens a system-browser consent page with the read-only YouTube scope.
+2. `yutome` opens a system-browser consent page with the read-only YouTube scope.
 3. The callback returns to a localhost redirect.
 4. The refresh/access token is stored locally under `data/auth/`.
-5. `ytkb` calls YouTube Data API subscription listing and stores channels in the local library.
+5. `yutome` calls YouTube Data API subscription listing and stores channels in the local library.
 
 This is less polished than a hosted broker, but it keeps the trust boundary local. A hosted broker can be considered later if onboarding friction is too high.
 
 ## Daily-Driver LLM Integration
 
-The important product surface is not a standalone chat UI. A standalone `ytkb ask` command can exist, but the main product promise is that a user's regular agent or chat app can query their local YouTube corpus.
+The important product surface is not a standalone chat UI. A standalone `yutome ask` command can exist, but the main product promise is that a user's regular agent or chat app can query their YouTube corpus.
+
+Multi-device access is part of that promise. Local-first storage is useful for ownership, but a laptop-only MCP process is not enough for a user who wants the same corpus available from multiple agents, phones, tablets, work machines, or hosted chat surfaces. The product needs a remote access track: an authenticated hosted API, remote MCP adapter, or private corpus/index replica that uses the same retrieval contract as the local CLI/MCP/HTTP surfaces.
 
 The local connector should expose:
 
@@ -59,7 +60,7 @@ The local connector should expose:
 - List channels and corpus health.
 - Explain unresolved indexing problems.
 
-This makes `ytkb` closer to a local Scry-like capability for a personal media diet than a destination app. A web UI can still be useful as an inspector, but it should not be required for the core experience.
+This makes `yutome` closer to a local Scry-like capability for a personal media diet than a destination app. A web UI can still be useful as an inspector, but it should not be required for the core experience.
 
 ## Search Modes
 
@@ -76,9 +77,9 @@ Caption quality is part of retrieval quality. Many YouTube captions are good eno
 The primary optional quality path is LLM transcript cleanup:
 
 ```bash
-ytkb quality upgrade --limit 10
-ytkb quality upgrade --video-id VIDEO_ID --rebuild-vectors
-ytkb quality upgrade --limit 50 --video-workers 2 --concurrency 3
+yutome quality upgrade --limit 10
+yutome quality upgrade --video-id VIDEO_ID --rebuild-vectors
+yutome quality upgrade --limit 50 --video-workers 2 --concurrency 3
 ```
 
 This path uses the existing timestamped caption segments plus bounded metadata context as input. The metadata context should include channel title/handle, video title, and truncated video/channel descriptions, because those fields often contain the spelling of names, supplements, drugs, chapters, sponsors, and technical terms that captions miss. The model is asked to return a sparse correction patch, not a rewritten transcript: only changed segment sequences and their corrected text. That keeps unchanged segments byte-for-byte stable, reduces output tokens, and makes review/diff UX natural. Patches are verified before being applied: unexpected sequence numbers, duplicate edits, empty edits, no-op edits, and oversized changes are rejected, and invalid patches are retried with the validation error before the video is marked failed. The upgrade writes a new active transcript version with provenance such as `+llm-cleanup:{model}` and preserves the original transcript version, because LLM cleanup can still be wrong. For cost control and smooth rollout, it supports limits, source filters, per-video upgrades, video-level workers, per-video request concurrency, request timeouts, and later background scheduling.
@@ -98,7 +99,7 @@ The design principle is that transcript improvement should be incremental and in
 ## Open Questions
 
 - Should OAuth onboarding remain bring-your-own Google client credentials, or should a future hosted broker exist for less technical users?
-- Should `ytkb sync` with no target always mean "sync selected channels," or should it require `--all` for safety once schedules exist?
+- Should `yutome sync` with no target always mean "sync selected channels," or should it require `--all` for safety once schedules exist?
 - Should LLM cleanup run automatically after ingest for selected channels, or should it remain an explicit/background upgrade?
-- ~~Should the first local agent connector be MCP, an OpenAI/ChatGPT app connector shape, a plain HTTP API, or all of these over the same service?~~ Decided: local MCP first, thin local HTTP underneath sharing the same core functions, remote MCP/ChatGPT connector deferred. See the Local Agent Connector section of `plan.md`.
+- ~~Should the first local agent connector be MCP, an OpenAI/ChatGPT app connector shape, a plain HTTP API, or all of these over the same service?~~ Decided: local MCP first, thin local HTTP underneath sharing the same core functions. Remote access is now a core architecture track rather than a distant integration. See the Agent And Multi-Device Connector section of `plan.md`.
 - How much should the beginner surface expose unresolved videos and transcript quality warnings before it becomes anxiety-inducing instead of helpful?

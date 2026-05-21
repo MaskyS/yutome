@@ -1,4 +1,4 @@
-"""End-to-end HTTP smoke test against `uv run ytkb http serve` + live corpus.
+"""End-to-end HTTP smoke test against `uv run yutome http serve` + live corpus.
 
 Not part of pytest (spawns a subprocess, needs the indexed data dir).
 """
@@ -47,9 +47,9 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     port = 8766  # use a non-default port to avoid colliding with a real server.
     env = os.environ.copy()
-    env.pop("YTKB_HTTP_TOKEN", None)
+    env.pop("YUTOME_HTTP_TOKEN", None)
     proc = subprocess.Popen(
-        ["uv", "run", "ytkb", "http", "serve", "--config", "ytkb.toml", "--port", str(port)],
+        ["uv", "run", "yutome", "http", "serve", "--config", "yutome.toml", "--port", str(port)],
         cwd=str(repo_root),
         env=env,
         stdout=subprocess.PIPE,

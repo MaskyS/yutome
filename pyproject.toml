@@ -1,12 +1,14 @@
 [project]
-name = "yt-indexer"
+name = "yutome"
 version = "0.1.0"
 description = "Local-first YouTube channel knowledge base indexer"
 readme = "docs/plan.md"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.8,<3",
+    "rapidfuzz>=3.14.5",
     "typer>=0.12,<1",
+    "wordfreq>=3.1.1",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +50,7 @@ all = [
 ]
 
 [project.scripts]
-ytkb = "ytkb.cli:app"
+yutome = "yutome.cli:app"
 
 [dependency-groups]
 dev = [
@@ -60,7 +62,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ytkb"]
+packages = ["src/yutome"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

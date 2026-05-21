@@ -1,6 +1,6 @@
 """End-to-end MCP smoke test.
 
-Launches `uv run ytkb mcp serve --config ytkb.toml` as a subprocess and drives
+Launches `uv run yutome mcp serve --config yutome.toml` as a subprocess and drives
 it through the MCP Python client over stdio. Not part of the pytest run by
 default (subprocess + live LanceDB makes it slow and environment-dependent).
 """
@@ -20,7 +20,7 @@ async def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     params = StdioServerParameters(
         command="uv",
-        args=["run", "ytkb", "mcp", "serve", "--config", "ytkb.toml"],
+        args=["run", "yutome", "mcp", "serve", "--config", "yutome.toml"],
         cwd=str(repo_root),
         env=os.environ.copy(),
     )
@@ -40,10 +40,10 @@ async def main() -> int:
             template_uris = sorted(t.uriTemplate for t in templates.resourceTemplates)
             print("RESOURCE TEMPLATES:", template_uris)
             expected_uris = {
-                "ytkb://chunk/{chunk_id}",
-                "ytkb://video/{video_id}",
-                "ytkb://channel/{channel_id}",
-                "ytkb://transcript/{transcript_version_id}",
+                "yutome://chunk/{chunk_id}",
+                "yutome://video/{video_id}",
+                "yutome://channel/{channel_id}",
+                "yutome://transcript/{transcript_version_id}",
             }
             assert expected_uris <= set(template_uris), f"missing resource templates: {expected_uris - set(template_uris)}"
 
@@ -96,7 +96,7 @@ async def main() -> int:
                 f"chunks={len(ctx_payload['chunks'])} citations={len(ctx_payload['citations'])}",
             )
 
-            chunk_uri = f"ytkb://chunk/{first['chunk_id']}"
+            chunk_uri = f"yutome://chunk/{first['chunk_id']}"
             res = await session.read_resource(chunk_uri)
             res_payload = json.loads(res.contents[0].text)
             assert res_payload["chunk_id"] == first["chunk_id"]

@@ -1,46 +1,94 @@
 # Query API
 
-`ytkb` exposes one retrieval model through three surfaces:
+`yutome` exposes one retrieval model through three surfaces:
 
-- CLI: `ytkb find`, `ytkb list`, `ytkb show`, `ytkb q`
+- CLI: `yutome find`, `yutome list`, `yutome show`, `yutome q`
 - MCP: tools named `find`, `list`, `show`, `q`
 - HTTP: `POST /find`, `POST /list`, `POST /show`, `POST /q`
 
-The raw primitive is `QueryRequest` in `src/ytkb/query.py`. The transport-neutral convenience verbs live in `src/ytkb/api.py`.
+The raw primitive is `QueryRequest` in `src/yutome/query.py`. The transport-neutral convenience verbs live in `src/yutome/api.py`.
+
+For multi-device use, run the authenticated HTTP API with `yutome remote prepare` and `yutome remote serve`. See `docs/remote-access.md`.
+
+## HTTP Examples
+
+Start a local authenticated server:
+
+```bash
+uv run yutome remote prepare --show-token
+uv run yutome remote serve --host 127.0.0.1 --port 8765
+```
+
+Check readiness:
+
+```bash
+curl -H "Authorization: Bearer $YUTOME_HTTP_TOKEN" \
+  http://127.0.0.1:8765/readyz
+```
+
+Run a search:
+
+```bash
+curl -s http://127.0.0.1:8765/find \
+  -H "Authorization: Bearer $YUTOME_HTTP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Crohn probiotics","mode":"hybrid","limit":5}'
+```
+
+Expand one hit:
+
+```bash
+curl -s http://127.0.0.1:8765/show \
+  -H "Authorization: Bearer $YUTOME_HTTP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kind":"context","id":"CHUNK_ID","token_budget":3000}'
+```
+
+Fetch the full active transcript path by first reading the video metadata, then the returned `transcript_version_id`:
+
+```bash
+curl -s http://127.0.0.1:8765/videos/VIDEO_ID \
+  -H "Authorization: Bearer $YUTOME_HTTP_TOKEN"
+
+curl -s http://127.0.0.1:8765/transcripts/TRANSCRIPT_VERSION_ID \
+  -H "Authorization: Bearer $YUTOME_HTTP_TOKEN"
+```
+
+FastAPI also exposes interactive OpenAPI docs at `/docs` when you are serving the HTTP API.
 
 ## Verbs
 
 `find` ranks results by relevance. It searches transcript chunks by default and can search video titles or descriptions lexically.
 
 ```bash
-uv run ytkb find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run ytkb find "cerebrolysin" --in titles --mode lexical --json
+uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome find "cerebrolysin" --in titles --mode lexical --json
 ```
 
 `list` enumerates corpus objects by filter.
 
 ```bash
-uv run ytkb list videos --status 'indexed' --limit 20
-uv run ytkb list channels --selected
-uv run ytkb list attention
-uv run ytkb list status
+uv run yutome list videos --status 'indexed' --limit 20
+uv run yutome list channels --selected
+uv run yutome list attention
+uv run yutome list status
 ```
 
 `show` fetches resources or resolves citations.
 
 ```bash
-uv run ytkb show chunk CHUNK_ID
-uv run ytkb show video VIDEO_ID
-uv run ytkb show transcript TRANSCRIPT_VERSION_ID
-uv run ytkb show source CHUNK_ID
-uv run ytkb show context CHUNK_ID --token-budget 3000
-uv run ytkb show context "https://youtube.com/watch?v=VIDEO_ID&t=123s"
+uv run yutome show chunk CHUNK_ID
+uv run yutome show video VIDEO_ID
+uv run yutome show transcript TRANSCRIPT_VERSION_ID
+uv run yutome show source CHUNK_ID
+uv run yutome show context CHUNK_ID --token-budget 3000
+uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s"
 ```
 
 `q` accepts a raw `QueryRequest` JSON object.
 
 ```bash
-uv run ytkb q '{"entity":"video","filter":{"ingest_status":{"eq":"indexed"}},"project":"video_card","limit":5}'
+uv run yutome q '{"entity":"video","filter":{"ingest_status":{"eq":"indexed"}},"project":"video_card","limit":5}'
 ```
 
 ## Projections

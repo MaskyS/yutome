@@ -26,23 +26,23 @@ Do not use free proxy lists for real indexing. They are unreliable, commonly abu
 
 ## Local Configuration
 
-Copy `.env.example` to `.env`.
+Run `yutome setup` for the guided path. In interactive mode it can write the Webshare environment keys into `.env` without printing credentials. For manual setup, copy `.env.example` to `.env`.
 
 Generic proxy:
 
 ```text
-YTKB_PROXY_URLS=http://user:pass@host1:port,socks5://user:pass@host2:port
-YTKB_HTTP_PROXY=http://user:pass@host:port
-YTKB_HTTPS_PROXY=http://user:pass@host:port
+YUTOME_PROXY_URLS=http://user:pass@host1:port,socks5://user:pass@host2:port
+YUTOME_HTTP_PROXY=http://user:pass@host:port
+YUTOME_HTTPS_PROXY=http://user:pass@host:port
 ```
 
 Webshare:
 
 ```text
-YTKB_WEBSHARE_USERNAME=...
-YTKB_WEBSHARE_PASSWORD=...
-YTKB_WEBSHARE_DOMAIN=p.webshare.io
-YTKB_WEBSHARE_PORT=80
+YUTOME_WEBSHARE_USERNAME=...
+YUTOME_WEBSHARE_PASSWORD=...
+YUTOME_WEBSHARE_DOMAIN=p.webshare.io
+YUTOME_WEBSHARE_PORT=80
 ```
 
 Gemini fallback:
@@ -51,7 +51,7 @@ Gemini fallback:
 GEMINI_API_KEY=...
 ```
 
-`ytkb` keeps proxy config disabled by default in `ytkb.toml`; environment variables can enable a local proxy profile without committing secrets.
+`yutome` keeps proxy config disabled by default in `yutome.toml`; environment variables can enable a local proxy profile without committing secrets.
 
 ## Operational Policy
 
@@ -61,8 +61,7 @@ GEMINI_API_KEY=...
 - Stop the run on rate limits by default.
 - Resume with `--max-process` for small batches.
 - Retry deferred items only with `--retry-failed`.
-- Run `ytkb proxy-test` against one video after changing proxy config.
+- Run `yutome proxy-test` against one video after changing proxy config.
 - Keep `yt-dlp` subprocesses under a fixed timeout so a hung provider request becomes a retryable per-video outcome.
-- For fastest single-command bulk import, keep metadata deferred and use `--staged-fallback`; the run first sweeps with `youtube-transcript-api`, queues unresolved rows, then immediately drains that queue with `yt-dlp` fallback. Logs print explicit stage banners and queue counts.
-- Use `--no-yt-dlp-fallback` only for a transcript-API-only diagnostic pass where unresolved rows should remain queued for a later run.
-- When `youtube-transcript-api` is broadly hitting Google `/sorry`, resume with `--yt-dlp-first` to use `yt-dlp` subtitle files before the transcript API.
+- `sync` uses a staged provider policy by default: transcript API first, unresolved queue second with `yt-dlp` fallback, then exact metadata backfill. Logs print explicit stage banners and queue counts.
+- Use `proxy-test` for provider/proxy diagnostics instead of changing normal `sync` provider order.

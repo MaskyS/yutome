@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from ytkb.store import _published_at_from_flat_discovery
-from ytkb.youtube import _validate_video_metadata_row
+from yutome.store import _published_at_from_flat_discovery
+from yutome.youtube import _validate_video_metadata_row
 
 
 def test_rejects_url_stub() -> None:

@@ -1,27 +1,37 @@
+import json
+import time
+import urllib.parse
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-from ytkb.cli import app
-from ytkb.channels import channel_from_input, import_channels_from_file, list_library_channels
-from ytkb.config import load_config, write_default_config
-from ytkb.db import bootstrap_catalog, catalog_is_initialized, catalog_tables, connect_catalog, fts5_available
-from ytkb.embeddings import _lancedb_table_names
-from ytkb.env import apply_env_to_config
-from ytkb.gemini import _drop_blank_segment_text, _window_bounds
-from ytkb.indexer import (
+from yutome.cli import _parse_channel_selection, app
+from yutome.channels import (
+    channel_from_input,
+    import_channels_from_file,
+    list_library_channels,
+    upsert_library_channel,
+)
+from yutome.config import load_config, write_default_config
+from yutome.db import bootstrap_catalog, catalog_is_initialized, catalog_tables, connect_catalog, fts5_available
+from yutome.embeddings import _lancedb_table_names
+from yutome.env import apply_env_to_config
+from yutome.gemini import _drop_blank_segment_text, _window_bounds
+from yutome.indexer import (
     _fallback_only_for_status,
     _matches_source_filters,
     _matches_status_filters,
     classify_transcript_error,
     is_rate_limit_error,
 )
-from ytkb.paths import ProjectPaths
-from ytkb.youtube import _is_ytdlp_block_error, proxy_url_for_ytdlp, redact_proxy_url
+from yutome.paths import ProjectPaths
+from yutome.store import list_catalog_videos
+from yutome.youtube import _is_ytdlp_block_error, proxy_url_for_ytdlp, redact_proxy_url
+from yutome.youtube_oauth import OAuthClient, _authorization_url, _token_is_valid, load_oauth_client
 
 
 def test_default_config_round_trip(tmp_path: Path) -> None:
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
 
     written = write_default_config(config_path)
     config = load_config(config_path)
@@ -30,11 +40,15 @@ def test_default_config_round_trip(tmp_path: Path) -> None:
     assert config.backfill.workers == 2
     assert config.backfill.batch_size == 25
     assert config.scheduler.cadence_hours == 3
+    assert config.youtube.api_key_env == "YUTOME_YOUTUBE_API_KEY"
+    assert "chrome" in config.youtube.browser_cookie_browsers
     assert config.asr.provider == "faster-whisper"
     assert config.asr.model == "small.en"
     assert config.transcripts.allow_translated_captions is False
     assert config.transcripts.request_timeout_seconds == 30.0
     assert config.transcripts.prefer_ytdlp_subtitles is False
+    assert config.transcript_cleanup.enabled is True
+    assert config.transcript_cleanup.auto_after_sync is True
     assert config.transcript_cleanup.video_workers == 1
     assert config.transcript_cleanup.batch_segments == 80
     assert config.transcript_cleanup.concurrency == 4
@@ -63,7 +77,7 @@ def test_default_config_round_trip(tmp_path: Path) -> None:
 
 
 def test_project_paths_include_timestamped_and_plain_transcript_artifacts(tmp_path: Path) -> None:
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     config = load_config(config_path)
     paths = ProjectPaths.from_config(config, project_root=tmp_path)
@@ -125,7 +139,7 @@ def test_import_takeout_subscriptions_csv(tmp_path: Path) -> None:
 
 def test_channels_cli_add_and_list(tmp_path: Path) -> None:
     runner = CliRunner()
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
 
     add_result = runner.invoke(app, ["channels", "add", "@LeoandLongevity", "--config", str(config_path)])
@@ -137,51 +151,57 @@ def test_channels_cli_add_and_list(tmp_path: Path) -> None:
     assert channels[0].handle == "LeoandLongevity"
 
 
-def test_sync_rejects_staged_fallback_without_yt_dlp_fallback(tmp_path: Path) -> None:
-    runner = CliRunner()
-    config_path = tmp_path / "ytkb.toml"
-    write_default_config(config_path)
-
-    result = runner.invoke(
-        app,
-        [
-            "sync",
-            "@Example",
-            "--config",
-            str(config_path),
-            "--staged-fallback",
-            "--no-yt-dlp-fallback",
-        ],
+def test_upsert_library_channel_with_channel_id_creates_catalog_placeholder(tmp_path: Path) -> None:
+    db_path = tmp_path / "data/indexes/catalog.sqlite"
+    bootstrap_catalog(db_path)
+    channel = channel_from_input(
+        "UCabc12345678901234567890",
+        title="Example Channel",
+        import_source="youtube-oauth",
     )
 
-    assert result.exit_code != 0
-    assert "--staged-fallback needs yt-dlp fallback enabled" in result.output
+    assert channel is not None
+    with connect_catalog(db_path) as connection:
+        upsert_library_channel(connection, channel)
+        connection.commit()
+        library_rows = connection.execute(
+            "SELECT channel_id, title, import_source FROM library_channels"
+        ).fetchall()
+        catalog_rows = connection.execute(
+            "SELECT channel_id, title, source_url FROM channels"
+        ).fetchall()
+
+    assert [dict(row) for row in library_rows] == [
+        {
+            "channel_id": "UCabc12345678901234567890",
+            "title": "Example Channel",
+            "import_source": "youtube-oauth",
+        }
+    ]
+    assert [dict(row) for row in catalog_rows] == [
+        {
+            "channel_id": "UCabc12345678901234567890",
+            "title": "Example Channel",
+            "source_url": "https://www.youtube.com/channel/UCabc12345678901234567890",
+        }
+    ]
 
 
-def test_sync_rejects_staged_fallback_with_yt_dlp_first(tmp_path: Path) -> None:
+def test_sync_help_hides_provider_policy_flags() -> None:
     runner = CliRunner()
-    config_path = tmp_path / "ytkb.toml"
-    write_default_config(config_path)
 
-    result = runner.invoke(
-        app,
-        [
-            "sync",
-            "@Example",
-            "--config",
-            str(config_path),
-            "--staged-fallback",
-            "--yt-dlp-first",
-        ],
-    )
+    result = runner.invoke(app, ["sync", "--help"])
 
-    assert result.exit_code != 0
-    assert "--staged-fallback is transcript-API-first" in result.output
+    assert result.exit_code == 0
+    assert "--staged-fallback" not in result.output
+    assert "--yt-dlp-first" not in result.output
+    assert "--no-yt-dlp-fallback" not in result.output
+    assert "--defer-metadata" not in result.output
 
 
 def test_init_command_creates_config_dirs_and_catalog(tmp_path: Path) -> None:
     runner = CliRunner()
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
 
     result = runner.invoke(app, ["init", "--config", str(config_path)])
 
@@ -191,6 +211,578 @@ def test_init_command_creates_config_dirs_and_catalog(tmp_path: Path) -> None:
     assert (tmp_path / "data/artifacts/videos").is_dir()
     assert (tmp_path / "data/indexes/lancedb").is_dir()
     assert catalog_is_initialized(tmp_path / "data/indexes/catalog.sqlite")
+
+
+def test_setup_command_creates_first_run_files_without_prompting(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["setup", "--config", str(config_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert config_path.exists()
+    assert (tmp_path / ".env").exists()
+    assert catalog_is_initialized(tmp_path / "data/indexes/catalog.sqlite")
+    assert "Next steps:" in result.output
+    assert "Optional semantic search" in result.output
+    assert "Use Yutome from Claude/ChatGPT:" in result.output
+    assert "Remote MCP means Claude/ChatGPT call one public Yutome connector URL" in result.output
+    assert "this computer and `yutome remote bridge` must be on" in result.output
+    assert "+ > More" in result.output
+    assert "does not require Voyage, Webshare, Gemini, or proxy credentials" in result.output
+    assert "Optional next step: uv run yutome connect" in result.output
+
+
+def test_setup_command_can_add_initial_channel(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["setup", "@YesTheory", "--config", str(config_path), "--yes"])
+
+    assert result.exit_code == 0
+    with connect_catalog(tmp_path / "data/indexes/catalog.sqlite") as connection:
+        channels = list_library_channels(connection)
+    assert len(channels) == 1
+    assert channels[0].handle == "YesTheory"
+
+
+def test_setup_command_can_write_webshare_credentials_interactively(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(
+        app,
+        ["setup", "@YesTheory", "--config", str(config_path)],
+        input="y\nproxy-user\nproxy-pass\n\n\nn\nn\nn\nn\nn\nn\n",
+    )
+
+    assert result.exit_code == 0
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "YUTOME_WEBSHARE_USERNAME=proxy-user" in env_text
+    assert "YUTOME_WEBSHARE_PASSWORD=proxy-pass" in env_text
+    assert "YUTOME_WEBSHARE_DOMAIN=p.webshare.io" in env_text
+    assert "YUTOME_WEBSHARE_PORT=80" in env_text
+    assert "proxy-pass" not in result.output
+
+
+def test_setup_command_can_enable_semantic_search_interactively(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input="n\nn\ny\nvoyage-test-key\nn\nn\nn\nn\n",
+    )
+
+    assert result.exit_code == 0
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    config = load_config(config_path)
+    assert "VOYAGE_API_KEY=voyage-test-key" in env_text
+    assert "voyage-test-key" not in result.output
+    assert config.embeddings.enabled is True
+    assert 'uv run yutome find "topic I remember" --mode hybrid' in result.output
+
+
+def test_setup_imports_subscriptions_then_selects_channels(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    def fake_fetch(**kwargs):  # noqa: ANN003
+        return [
+            channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+            channel_from_input("UC2222222222222222222222", title="Beta", import_source="youtube-browser-cookies"),
+            channel_from_input("UC3333333333333333333333", title="Gamma", import_source="youtube-browser-cookies"),
+        ]
+
+    monkeypatch.setattr("yutome.cli.fetch_user_subscription_channels_from_browser", fake_fetch)
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input="n\nn\nn\ny\nn\nn\n1,3\nn\nn\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Added 2 selected channels to the library; skipped 1" in result.output
+    with connect_catalog(tmp_path / "data/indexes/catalog.sqlite") as connection:
+        channels = list_library_channels(connection)
+    selected = {channel.title for channel in channels if channel.selected}
+    unselected = {channel.title for channel in channels if not channel.selected}
+    assert selected == {"Alpha", "Gamma"}
+    assert unselected == set()
+    assert {channel.title for channel in channels} == {"Alpha", "Gamma"}
+
+
+def test_setup_can_index_subset_of_added_channels(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    captured: dict[str, object] = {}
+
+    def fake_fetch(**kwargs):  # noqa: ANN003
+        return [
+            channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+            channel_from_input("UC2222222222222222222222", title="Beta", import_source="youtube-browser-cookies"),
+            channel_from_input("UC3333333333333333333333", title="Gamma", import_source="youtube-browser-cookies"),
+        ]
+
+    def fake_run_sync_targets(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    monkeypatch.setattr("yutome.cli.fetch_user_subscription_channels_from_browser", fake_fetch)
+    monkeypatch.setattr("yutome.cli._run_sync_targets", fake_run_sync_targets)
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input="n\nn\nn\ny\nn\nn\nall\ny\n1-2\nn\n",
+    )
+
+    assert result.exit_code == 0
+    with connect_catalog(tmp_path / "data/indexes/catalog.sqlite") as connection:
+        channels = list_library_channels(connection)
+    assert {channel.title for channel in channels} == {"Alpha", "Beta", "Gamma"}
+    assert all(channel.selected for channel in channels)
+    assert captured["sync_targets"] == [
+        ("https://www.youtube.com/channel/UC1111111111111111111111", "Alpha"),
+        ("https://www.youtube.com/channel/UC2222222222222222222222", "Beta"),
+    ]
+
+
+def test_channel_selection_parser_supports_ranges_and_sentinels() -> None:
+    assert _parse_channel_selection("1,3-4", 5) == {0, 2, 3}
+    assert _parse_channel_selection("all", 3) == {0, 1, 2}
+    assert _parse_channel_selection("none", 3) == set()
+
+
+def test_channel_selection_parser_rejects_invalid_indexes() -> None:
+    try:
+        _parse_channel_selection("0", 3)
+    except ValueError as exc:
+        assert "out of range" in str(exc)
+    else:  # pragma: no cover - assertion guard.
+        raise AssertionError("expected invalid selection")
+
+
+def test_channels_import_youtube_uses_browser_cookie_source(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+
+    def fake_fetch(**kwargs):  # noqa: ANN003
+        return [
+            channel_from_input(
+                "UC9999999999999999999999",
+                title="Cookie Channel",
+                import_source="youtube-browser-cookies",
+            )
+        ]
+
+    monkeypatch.setattr("yutome.cli.fetch_user_subscription_channels_from_browser", fake_fetch)
+
+    result = runner.invoke(app, ["channels", "import-youtube", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "youtube-browser-cookies" in result.output
+    with connect_catalog(tmp_path / "data/indexes/catalog.sqlite") as connection:
+        channels = list_library_channels(connection)
+    assert len(channels) == 1
+    assert channels[0].title == "Cookie Channel"
+    assert channels[0].selected is True
+
+
+def test_channels_import_youtube_public_target_uses_api_when_key_exists(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    (tmp_path / ".env").write_text("YUTOME_YOUTUBE_API_KEY=test-api-key\n", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    def fake_api(target: str, *, api_key: str):  # noqa: ANN001
+        calls.append((target, api_key))
+        return [
+            channel_from_input(
+                "UC8888888888888888888888",
+                title="Public API Channel",
+                import_source="youtube-public-api",
+            )
+        ]
+
+    monkeypatch.setattr("yutome.cli.fetch_public_subscription_channels_from_api", fake_api)
+
+    result = runner.invoke(app, ["channels", "import-youtube", "@source", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert calls == [("@source", "test-api-key")]
+    assert "youtube-public-api" in result.output
+
+
+def test_remote_prepare_generates_http_token_without_printing_by_default(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["remote", "prepare", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    env_values = {}
+    for line in (tmp_path / ".env").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            env_values[key] = value
+    assert env_values["YUTOME_HTTP_TOKEN"]
+    assert env_values["YUTOME_HTTP_TOKEN"] not in result.output
+
+
+def test_connect_with_endpoint_writes_remote_state(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev"])
+
+    assert result.exit_code == 0
+    state_path = tmp_path / "data/remote/connection.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["provider"] == "cloudflare"
+    assert state["mode"] == "connector_only"
+    assert state["endpoint_url"] == "https://example.workers.dev"
+    assert state["mcp_url"] == "https://example.workers.dev/mcp"
+    assert state["cloud_resources"] == {}
+    assert "Connect this MCP URL" in result.output
+    assert "across your devices" in result.output
+    assert "same Claude account" in result.output
+    assert "Customize > Connectors" in result.output
+    assert "Settings > Connectors" in result.output
+    assert "Apps" in result.output
+    assert "Apps & Connectors" in result.output
+    assert "developer mode is available" in result.output
+    assert "Settings > Connectors > Create" in result.output
+    assert "MCP Server URL" in result.output
+    assert "authenticated/OAuth option" in result.output
+    assert "+ > More" in result.output
+    assert "yutome remote bridge" in result.output
+    assert "Yutome Desktop offline" in result.output
+    assert "No Yutome account, Auth0, Clerk, or Cloudflare Access" in result.output
+    assert "VOYAGE_API_KEY" not in result.output
+    assert "YUTOME_WEBSHARE" not in result.output
+
+
+def test_connect_without_endpoint_prints_deploy_instructions_without_provider_keys(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["connect", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "Prepared Cloudflare Worker project" in result.output
+    assert "yutome connect --endpoint" in result.output
+    assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
+    assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
+    assert "create or sign into a Cloudflare account" in result.output
+    assert (tmp_path / "data/remote/cloudflare-worker/wrangler.toml").exists()
+    assert (tmp_path / "data/remote/cloudflare-worker/src/index.js").exists()
+    wrangler = (tmp_path / "data/remote/cloudflare-worker/wrangler.toml").read_text(encoding="utf-8")
+    assert "YUTOME_RELAY_TOKEN" in wrangler
+    assert "YUTOME_PAIRING_CODE" in wrangler
+    assert "YUTOME_TOKEN_SECRET" in wrangler
+    assert 'YUTOME_DEV_NO_AUTH = "false"' in wrangler
+    assert "new_sqlite_classes" in wrangler
+    assert "YutomeRelay" in wrangler
+    assert not (tmp_path / "data/remote/connection.json").exists()
+    assert "VOYAGE_API_KEY" not in result.output
+    assert "YUTOME_WEBSHARE" not in result.output
+
+
+def test_connect_without_endpoint_prefers_assisted_deploy_when_node_is_available(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    monkeypatch.setattr(
+        "yutome.cli.shutil.which",
+        lambda name: f"/usr/local/bin/{name}" if name in {"node", "npm", "npx"} else None,
+    )
+
+    result = runner.invoke(app, ["connect", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "Yutome can deploy this from here" in result.output
+    assert "Cloudflare sign-in" in result.output
+    assert "basic connector should fit Cloudflare's free Workers plan" in result.output
+    assert "uv run yutome connect --deploy" in result.output
+
+
+def test_connect_deploy_saves_oauth_pairing_state(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    monkeypatch.setattr(
+        "yutome.cli.shutil.which",
+        lambda name: f"/usr/local/bin/{name}" if name in {"node", "npm", "npx"} else None,
+    )
+    monkeypatch.setattr("yutome.cli._deploy_worker_project", lambda project: "https://example.workers.dev")
+
+    result = runner.invoke(app, ["connect", "--config", str(config_path), "--deploy"])
+
+    assert result.exit_code == 0
+    state = json.loads((tmp_path / "data/remote/connection.json").read_text(encoding="utf-8"))
+    assert state["relay_token"]
+    assert state["pairing_code"]
+    assert state["token_secret"]
+    assert "Pair this connector once" in result.output
+    assert "https://example.workers.dev/pair?code=" in result.output
+    assert "authenticated/OAuth option" in result.output
+
+
+def test_connect_without_endpoint_explains_dashboard_fallback_when_node_is_missing(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    monkeypatch.setattr("yutome.cli.shutil.which", lambda _name: None)
+
+    result = runner.invoke(app, ["connect", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "This computer cannot run Cloudflare's deploy tool yet" in result.output
+    assert "Install Node.js LTS" in result.output
+    assert "Cloudflare Workers dashboard" in result.output
+    assert "skip paid/always-on features" in result.output
+    assert "free Workers path for the basic connector" in result.output
+    assert "src/index.js" in result.output
+
+
+def test_status_reports_remote_unconfigured_and_configured(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+
+    missing = runner.invoke(app, ["status", "--config", str(config_path)])
+    assert missing.exit_code == 0
+    assert "Remote connector:" in missing.output
+    assert "not configured" in missing.output
+
+    connect_result = runner.invoke(app, ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev/mcp"])
+    assert connect_result.exit_code == 0
+    configured = runner.invoke(app, ["status", "--config", str(config_path)])
+    assert configured.exit_code == 0
+    assert "mcp_url=https://example.workers.dev/mcp" in configured.output
+    assert "bridge_token=missing" in configured.output
+    assert "offline_search=disabled" in configured.output
+
+
+def test_remote_status_reports_unconfigured_and_configured(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+
+    missing = runner.invoke(app, ["remote", "status", "--config", str(config_path)])
+    assert missing.exit_code == 0
+    assert "Remote connector is not configured" in missing.output
+
+    connect_result = runner.invoke(app, ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev"])
+    assert connect_result.exit_code == 0
+    configured = runner.invoke(app, ["remote", "status", "--config", str(config_path), "--json"])
+    assert configured.exit_code == 0
+    payload = json.loads(configured.output)
+    assert payload["configured"] is True
+    assert payload["mcp_url"] == "https://example.workers.dev/mcp"
+    assert payload["relay_token_configured"] is False
+    assert payload["pairing_code_configured"] is False
+    assert payload["token_secret_configured"] is False
+
+
+def test_disconnect_dry_run_reports_worker_without_removing_state(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    connect_result = runner.invoke(
+        app,
+        ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
+    )
+    assert connect_result.exit_code == 0
+
+    result = runner.invoke(app, ["disconnect", "--config", str(config_path), "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "Cloudflare Worker: worker-to-delete" in result.output
+    assert "Dry run only" in result.output
+    assert (tmp_path / "data/remote/connection.json").exists()
+
+
+def test_disconnect_can_remove_local_state_after_cloud_delete(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    deleted: list[str] = []
+
+    def fake_delete(project):  # noqa: ANN001
+        deleted.append(project.worker_name)
+
+    monkeypatch.setattr("yutome.cli._remove_worker_project", fake_delete)
+    connect_result = runner.invoke(
+        app,
+        ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
+    )
+    assert connect_result.exit_code == 0
+
+    result = runner.invoke(app, ["disconnect", "--config", str(config_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert deleted == ["worker-to-delete"]
+    assert not (tmp_path / "data/remote/connection.json").exists()
+
+
+def test_remote_disconnect_alias_uses_disconnect_language(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    monkeypatch.setattr("yutome.cli._remove_worker_project", lambda project: None)
+    connect_result = runner.invoke(
+        app,
+        ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
+    )
+    assert connect_result.exit_code == 0
+
+    result = runner.invoke(app, ["remote", "disconnect", "--config", str(config_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "Disconnect complete" in result.output
+
+
+def test_setup_yes_skips_remote_prompt_and_points_to_connect(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(app, ["setup", "--config", str(config_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "Use Yutome from Claude/ChatGPT:" in result.output
+    assert "ask your normal assistant about your YouTube library" in result.output
+    assert "Remote MCP means Claude/ChatGPT call one public Yutome connector URL" in result.output
+    assert "+ > More" in result.output
+    assert "this computer and `yutome remote bridge` must be on" in result.output
+    assert "does not require Voyage, Webshare, Gemini, or proxy credentials" in result.output
+    assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
+    assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
+    assert "Optional next step: uv run yutome connect" in result.output
+    assert "Connect Yutome to Claude/ChatGPT now?" not in result.output
+    assert not (tmp_path / "data/remote/connection.json").exists()
+
+
+def test_setup_can_prepare_remote_mcp_worker_project_interactively(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input="n\nn\nn\nn\nn\nn\ny\n\nn\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Use Yutome from Claude/ChatGPT:" in result.output
+    assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
+    assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
+    assert "ChatGPT also asks you to select the Yutome app" in result.output
+    assert "Prepared Cloudflare Worker project" in result.output
+    assert (tmp_path / "data/remote/cloudflare-worker/package.json").exists()
+    worker = (tmp_path / "data/remote/cloudflare-worker/src/index.js").read_text(encoding="utf-8")
+    assert 'case "initialize"' in worker
+    assert 'case "tools/list"' in worker
+    assert 'case "tools/call"' in worker
+    assert "instructions: SERVER_INSTRUCTIONS" in worker
+    assert "Use find when the user asks a topic or semantic search question" in worker
+    assert "Use this when the user asks to list newest videos" in worker
+    assert "readOnlyHint: true" in worker
+    assert 'type: "oauth2"' in worker
+    assert 'type: "noauth"' in worker
+    assert "/.well-known/oauth-protected-resource" in worker
+    assert "/.well-known/oauth-authorization-server" in worker
+    assert 'url.pathname === "/authorize"' in worker
+    assert 'url.pathname === "/token"' in worker
+    assert "YUTOME_PAIRING_CODE" in worker
+    assert "YUTOME_TOKEN_SECRET" in worker
+    assert "export class YutomeRelay" in worker
+    assert "/bridge/next" in worker
+    assert "/bridge/result" in worker
+    assert 'if (request.method === "GET")' in worker
+    assert "status: 405" in worker
+    assert '"allow": "POST"' in worker
+    assert "Yutome Desktop is not connected" in worker
+    assert not (tmp_path / "data/remote/connection.json").exists()
+
+
+def test_remote_sync_dry_run_reports_manifest_and_excludes_secrets(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    db_path = tmp_path / "data/indexes/catalog.sqlite"
+    bootstrap_catalog(db_path)
+    with connect_catalog(db_path) as connection:
+        connection.execute(
+            "INSERT INTO channels(channel_id, title) VALUES ('UCyes', 'Yes Theory')"
+        )
+        connection.execute(
+            "INSERT INTO videos(video_id, channel_id, title, ingest_status) VALUES ('yes1', 'UCyes', 'Yes video', 'indexed')"
+        )
+        connection.execute(
+            """
+            INSERT INTO transcript_versions(
+                transcript_version_id, video_id, source, raw_path, normalized_path, text_hash, segment_count, active
+            ) VALUES ('tv1', 'yes1', 'captions', 'raw.json', 'normalized.jsonl', 'hash', 1, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks(
+                chunk_id, transcript_version_id, video_id, channel_id, sequence, start_ms, end_ms, text, text_hash, chunker_version
+            ) VALUES ('c1', 'tv1', 'yes1', 'UCyes', 0, 0, 1000, 'hello world', 'chunkhash', 'v1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO embeddings(chunk_id, provider, model, dimension, artifact_status, index_status)
+            VALUES ('c1', 'voyage', 'voyage-4-lite', 1024, 'embedded', 'indexed')
+            """
+        )
+        connection.commit()
+
+    result = runner.invoke(app, ["remote", "sync", "--dry-run", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    manifest = json.loads(result.output)
+    assert manifest["upload_performed"] is False
+    assert manifest["would_sync"]["channels"] == 1
+    assert manifest["would_sync"]["videos"] == 1
+    assert manifest["would_sync"]["chunks"] == 1
+    rendered = json.dumps(manifest)
+    assert "YUTOME_WEBSHARE_PASSWORD" not in rendered
+    assert "GEMINI_API_KEY" not in rendered
+    assert "VOYAGE_API_KEY" not in rendered
+
+
+def test_catalog_video_listing_can_filter_by_channel_selector(tmp_path: Path) -> None:
+    db_path = tmp_path / "data/indexes/catalog.sqlite"
+    bootstrap_catalog(db_path)
+    with connect_catalog(db_path) as connection:
+        connection.execute(
+            "INSERT INTO channels(channel_id, handle, title, source_url) VALUES ('UCyes', '@YesTheory', 'Yes Theory', 'https://www.youtube.com/@YesTheory')"
+        )
+        connection.execute(
+            "INSERT INTO channels(channel_id, handle, title, source_url) VALUES ('UCleo', '@LeoandLongevity', 'Leo', 'https://www.youtube.com/@LeoandLongevity')"
+        )
+        connection.execute(
+            "INSERT INTO videos(video_id, channel_id, title, ingest_status) VALUES ('yes1', 'UCyes', 'Yes video', 'discovered')"
+        )
+        connection.execute(
+            "INSERT INTO videos(video_id, channel_id, title, ingest_status) VALUES ('leo1', 'UCleo', 'Leo video', 'discovered')"
+        )
+        connection.commit()
+
+        videos = list_catalog_videos(connection, channel_selector="https://www.youtube.com/@YesTheory")
+
+    assert [video.video_id for video in videos] == ["yes1"]
 
 
 def test_rate_limit_detection_catches_common_youtube_block_messages() -> None:
@@ -276,7 +868,7 @@ def test_ytdlp_bot_block_messages_are_retryable() -> None:
 
 
 def test_generic_proxy_pool_is_selected_deterministically(tmp_path: Path) -> None:
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     config = load_config(config_path).model_copy(
         update={
@@ -302,17 +894,17 @@ def test_generic_proxy_pool_is_selected_deterministically(tmp_path: Path) -> Non
 
 
 def test_env_can_enable_webshare_proxy_and_gemini(monkeypatch, tmp_path: Path) -> None:
-    config_path = tmp_path / "ytkb.toml"
+    config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
-    monkeypatch.setenv("YTKB_WEBSHARE_USERNAME", "proxy-user")
-    monkeypatch.setenv("YTKB_WEBSHARE_PASSWORD", "proxy-pass")
-    monkeypatch.setenv("YTKB_WEBSHARE_DOMAIN", "p.webshare.io")
-    monkeypatch.setenv("YTKB_WEBSHARE_PORT", "80")
+    monkeypatch.setenv("YUTOME_WEBSHARE_USERNAME", "proxy-user")
+    monkeypatch.setenv("YUTOME_WEBSHARE_PASSWORD", "proxy-pass")
+    monkeypatch.setenv("YUTOME_WEBSHARE_DOMAIN", "p.webshare.io")
+    monkeypatch.setenv("YUTOME_WEBSHARE_PORT", "80")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setenv("YTKB_GEMINI_MODEL", "gemini-test-model")
-    monkeypatch.setenv("YTKB_GEMINI_MEDIA_RESOLUTION", "medium")
-    monkeypatch.setenv("YTKB_GEMINI_REQUEST_TIMEOUT_SECONDS", "45")
-    monkeypatch.setenv("YTKB_GEMINI_WINDOW_SECONDS", "600")
+    monkeypatch.setenv("YUTOME_GEMINI_MODEL", "gemini-test-model")
+    monkeypatch.setenv("YUTOME_GEMINI_MEDIA_RESOLUTION", "medium")
+    monkeypatch.setenv("YUTOME_GEMINI_REQUEST_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("YUTOME_GEMINI_WINDOW_SECONDS", "600")
 
     config = apply_env_to_config(load_config(config_path))
 
@@ -324,3 +916,39 @@ def test_env_can_enable_webshare_proxy_and_gemini(monkeypatch, tmp_path: Path) -
     assert config.gemini.media_resolution == "medium"
     assert config.gemini.request_timeout_seconds == 45.0
     assert config.gemini.window_seconds == 600
+
+
+def test_oauth_client_secrets_loader_accepts_installed_shape(tmp_path: Path) -> None:
+    secrets_path = tmp_path / "client_secret.json"
+    secrets_path.write_text(
+        '{"installed":{"client_id":"client-123","client_secret":"secret-abc"}}',
+        encoding="utf-8",
+    )
+
+    client = load_oauth_client(secrets_path)
+
+    assert client.client_id == "client-123"
+    assert client.client_secret == "secret-abc"
+
+
+def test_oauth_authorization_url_uses_readonly_scope_and_pkce() -> None:
+    url = _authorization_url(
+        client=OAuthClient(client_id="client-123"),
+        redirect_uri="http://127.0.0.1:8765/",
+        state="state-abc",
+        challenge="challenge-xyz",
+    )
+
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+
+    assert params["client_id"] == ["client-123"]
+    assert params["scope"] == ["https://www.googleapis.com/auth/youtube.readonly"]
+    assert params["code_challenge"] == ["challenge-xyz"]
+    assert params["code_challenge_method"] == ["S256"]
+    assert params["access_type"] == ["offline"]
+
+
+def test_oauth_token_validity_requires_unexpired_access_token() -> None:
+    assert _token_is_valid({"access_token": "token", "expires_at": time.time() + 3600})
+    assert not _token_is_valid({"access_token": "token", "expires_at": time.time() - 1})
+    assert not _token_is_valid({"expires_at": time.time() + 3600})

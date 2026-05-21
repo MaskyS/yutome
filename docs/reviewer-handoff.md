@@ -1,6 +1,6 @@
 # Fresh Review Handoff
 
-This checklist is for an engineer or agent reviewing `ytkb` from a clean start. The canonical guide is `docs/plan.md`; read it first. This handoff is a task-oriented companion that says where to look, what to run, and what questions to answer.
+This checklist is for an engineer or agent reviewing `yutome` from a clean start. The canonical guide is `docs/plan.md`; read it first. This handoff is a task-oriented companion that says where to look, what to run, and what questions to answer.
 
 ## Review Objective
 
@@ -33,23 +33,23 @@ Read in this order:
 2. `docs/query-api.md`
 3. `docs/proxy-strategy.md`
 4. `pyproject.toml`
-5. `ytkb.toml`
-6. `src/ytkb/cli.py`
-7. `src/ytkb/config.py`
-8. `src/ytkb/db.py`
-9. `src/ytkb/indexer.py`
-10. `src/ytkb/youtube.py`
-11. `src/ytkb/transcripts.py`
-12. `src/ytkb/chunking.py`
-13. `src/ytkb/store.py`
-14. `src/ytkb/embeddings.py`
-15. `src/ytkb/query.py`
-16. `src/ytkb/api.py`
-17. `src/ytkb/retrieval.py`
-18. `src/ytkb/mcp_server.py`
-19. `src/ytkb/http_server.py`
-20. `src/ytkb/exports.py`
-21. `src/ytkb/maintenance.py`
+5. `yutome.toml`
+6. `src/yutome/cli.py`
+7. `src/yutome/config.py`
+8. `src/yutome/db.py`
+9. `src/yutome/indexer.py`
+10. `src/yutome/youtube.py`
+11. `src/yutome/transcripts.py`
+12. `src/yutome/chunking.py`
+13. `src/yutome/store.py`
+14. `src/yutome/embeddings.py`
+15. `src/yutome/query.py`
+16. `src/yutome/api.py`
+17. `src/yutome/retrieval.py`
+18. `src/yutome/mcp_server.py`
+19. `src/yutome/http_server.py`
+20. `src/yutome/exports.py`
+21. `src/yutome/maintenance.py`
 22. `tests/test_config_paths_db.py`
 23. `tests/test_retrieval_exports.py`
 
@@ -61,7 +61,7 @@ Why these files matter:
 | `docs/query-api.md` | Current query verbs, raw primitive, and projections. |
 | `docs/proxy-strategy.md` | Provider order, proxy policy, block handling, ASR policy. |
 | `pyproject.toml` | Dependency boundaries and optional extras. |
-| `ytkb.toml` | Active local config and defaults supplied by code. |
+| `yutome.toml` | Active local config and defaults supplied by code. |
 | `cli.py` | Current user-facing API and option semantics. |
 | `config.py` | Defaults and validation. |
 | `db.py` | Canonical schema and invariants. |
@@ -85,40 +85,40 @@ Why these files matter:
 Health and status:
 
 ```bash
-uv run ytkb doctor
-uv run ytkb list status
+uv run yutome doctor
+uv run yutome list status
 uv run pytest -q
 ```
 
 Retrieval smoke tests:
 
 ```bash
-uv run ytkb find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run ytkb find "donepezil AChEI" --mode hybrid --limit 5 --json
-uv run ytkb find "neuroautoimmune disease" --mode hybrid --limit 5 --json
-uv run ytkb find "complex disease diagnosis" --mode hybrid --limit 5 --json
+uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome find "donepezil AChEI" --mode hybrid --limit 5 --json
+uv run yutome find "neuroautoimmune disease" --mode hybrid --limit 5 --json
+uv run yutome find "complex disease diagnosis" --mode hybrid --limit 5 --json
 ```
 
 Compare retrieval modes:
 
 ```bash
-uv run ytkb find "Crohn probiotics" --mode lexical --limit 5 --json
-uv run ytkb find "Crohn probiotics" --mode semantic --limit 5 --json
-uv run ytkb find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome find "Crohn probiotics" --mode lexical --limit 5 --json
+uv run yutome find "Crohn probiotics" --mode semantic --limit 5 --json
+uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
 ```
 
 Context expansion:
 
 ```bash
-uv run ytkb show context CHUNK_ID --token-budget 3000
-uv run ytkb show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
+uv run yutome show context CHUNK_ID --token-budget 3000
+uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
 ```
 
 Export checks:
 
 ```bash
-uv run ytkb export portable-md
-uv run ytkb export obsidian
+uv run yutome export portable-md
+uv run yutome export obsidian
 ```
 
 Index consistency:
@@ -147,7 +147,7 @@ PY
 
 ## Expected Current State
 
-Expected `ytkb list status`:
+Expected `yutome list status`:
 
 ```text
 {
@@ -227,10 +227,8 @@ Check:
 - Generic proxy pool selection and Webshare behavior match `docs/proxy-strategy.md`.
 - `yt-dlp` subprocess timeout prevents long hangs.
 - ASR audio downloads do not use residential proxy bandwidth by default.
-- Backfill fetches full metadata by default. `--defer-metadata` is an explicit faster historical-import mode; discovery still stores title/duration/thumbnail and an approximate upload date when YouTube's channel listing exposes one.
-- `--staged-fallback` is available for single-command fast import: transcript API first, unresolved queue second with `yt-dlp` fallback, with explicit stage logs.
-- `--no-yt-dlp-fallback` remains available only for a transcript-API-only diagnostic pass.
-- `--yt-dlp-first` is available for transcript API block situations.
+- `sync` uses a staged default policy: transcript API first, unresolved queue second with `yt-dlp` fallback, then exact metadata backfill. Discovery still stores title/duration/thumbnail and an approximate upload date before exact metadata lands.
+- Provider-order controls are not part of the normal `sync` CLI surface; use `proxy-test` for provider/proxy diagnostics.
 - Provider-level circuit breakers are designed, or clearly identified as missing work.
 
 ### Rebuild Reliability
@@ -284,7 +282,7 @@ Answer these during review:
 7. Should `yt-dlp` subtitle fallback become the first provider for large runs when transcript API block rates are high?
 8. Should Gemini fallback be duration-capped by default?
 9. Should exports include `resource_uri` values in frontmatter?
-10. Should `ytkb inspect` commands be added before any answer-synthesis command?
+10. Should `yutome inspect` commands be added before any answer-synthesis command?
 11. Should channel registration be introduced before scheduler implementation?
 12. What block/error threshold should trigger a provider-level circuit breaker?
 13. Should RSS be used as a new-upload hint after channel id resolution?
@@ -301,9 +299,9 @@ Implement retrieval evaluation and result shaping:
 - Add per-video caps.
 - Add adjacent chunk collapse.
 - Add `--diversify` and `--dense`.
-- Add `ytkb inspect video VIDEO_ID`.
-- Add `ytkb inspect chunk CHUNK_ID`.
-- Add `ytkb inspect attempts VIDEO_ID`.
+- Add `yutome inspect video VIDEO_ID`.
+- Add `yutome inspect chunk CHUNK_ID`.
+- Add `yutome inspect attempts VIDEO_ID`.
 
 This comes before built-in LLM answers because answer quality is not diagnosable until retrieval quality is measurable.
 
