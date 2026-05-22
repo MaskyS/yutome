@@ -8,20 +8,30 @@ Yutome is a command-line tool. You set it up from the terminal; from there it ha
 
 ## Install
 
-Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
-
 ```bash
 uv tool install 'yutome[all]'
 ```
 
 This puts a single `yutome` command on your PATH. The `[all]` extra pulls in the full feature set (yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API). Without it you'll hit ImportErrors on first run.
 
-If your default `python3` is older than 3.11, add `--python 3.11` to that command — uv will fetch a 3.11 for you.
+**Don't have uv or Python yet?** uv installs itself in one command and will fetch Python for you if it's missing.
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then run the `uv tool install` line above. If your shell can't find `uv` right after install, open a new terminal — the installer adds it to PATH but existing shells need to reload. If your `python3` is older than 3.11 (or missing entirely), add `--python 3.11` to the install command and uv will fetch a 3.11 for you.
+
+**Why `uv tool install` and not `pip install`?** `uv tool install` (and its older cousin `pipx install`) puts yutome in its own isolated environment and symlinks the `yutome` command into your PATH, so it works from anywhere like `git` or `node`. Plain `pip install` would tie yutome to whichever Python venv you happened to be in at install time, and the `yutome` command would only work while that venv is active.
 
 **Alternatives:**
 
 ```bash
-# pipx — uses whichever python3 is on your PATH; needs 3.11+
+# pipx — needs python 3.11+ already on your PATH
 pipx install 'yutome[all]'
 
 # Install the latest unreleased commit
