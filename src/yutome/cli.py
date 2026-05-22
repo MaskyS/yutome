@@ -744,6 +744,12 @@ def _prompt_channels_to_select(
     ordered = _sorted_picker_channels(channels)
     labels = _channel_picker_labels(ordered)
     if setup_prompts.is_interactive():
+        typer.clear()
+        typer.echo(f"Found {len(ordered)} channel{'s' if len(ordered) != 1 else ''}.")
+        typer.echo("Type to filter; use space to select; enter to continue.")
+        if allow_back:
+            typer.echo("Choose Back to return to the previous step.")
+        typer.echo("")
         default_indexes = _parse_channel_selection(default, len(ordered))
         select_all_label = "All channels"
         back_label = BACK_CHOICE
@@ -765,6 +771,7 @@ def _prompt_channels_to_select(
                 "Choose 'All channels' to select everything."
             ),
             use_search_filter=True,
+            erase_when_done=True,
         )
         if allow_back and back_label in selected_labels:
             return None

@@ -565,6 +565,7 @@ def test_interactive_channel_picker_uses_searchable_checkbox(monkeypatch) -> Non
         channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
     ]
     captured: dict[str, object] = {}
+    cleared: list[bool] = []
 
     def fake_checkbox(message: str, choices: list[str], **kwargs):  # noqa: ANN003
         captured.update({"message": message, "choices": choices, **kwargs})
@@ -572,16 +573,53 @@ def test_interactive_channel_picker_uses_searchable_checkbox(monkeypatch) -> Non
 
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
     monkeypatch.setattr("yutome.setup_prompts.checkbox", fake_checkbox)
+    monkeypatch.setattr("yutome.cli.typer.clear", lambda: cleared.append(True))
 
     selected = _prompt_channels_to_select(channels, title="Choose channels", allow_back=True)
 
     assert [channel.title for channel in selected or []] == ["Alpha", "Beta"]
+    assert cleared == [True]
     assert captured["message"] == "Choose channels"
     assert captured["use_search_filter"] is True
+    assert captured["erase_when_done"] is True
     assert BACK_CHOICE in captured["choices"]
     rendered = " ".join(captured["choices"])
     assert "UC1111111111111111111111" not in rendered
     assert "youtube-browser-cookies" not in rendered
+
+
+def test_interactive_channel_picker_prints_compact_context(monkeypatch, capsys) -> None:  # noqa: ANN001
+    channels = [
+        channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+    ]
+
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr("yutome.setup_prompts.checkbox", lambda *args, **kwargs: [])
+    monkeypatch.setattr("yutome.cli.typer.clear", lambda: None)
+
+    _prompt_channels_to_select(channels, title="Choose channels", allow_back=True)
+
+    output = capsys.readouterr().out
+    assert "Found 1 channel." in output
+    assert "Type to filter; use space to select; enter to continue." in output
+    assert "Choose Back to return to the previous step." in output
+
+
+def test_interactive_channel_picker_omits_back_context_without_back(monkeypatch, capsys) -> None:  # noqa: ANN001
+    channels = [
+        channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+        channel_from_input("UC2222222222222222222222", title="Beta", import_source="youtube-browser-cookies"),
+    ]
+
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr("yutome.setup_prompts.checkbox", lambda *args, **kwargs: [])
+    monkeypatch.setattr("yutome.cli.typer.clear", lambda: None)
+
+    _prompt_channels_to_select(channels, title="Choose channels", allow_back=False)
+
+    output = capsys.readouterr().out
+    assert "Found 2 channels." in output
+    assert "Choose Back to return to the previous step." not in output
 
 
 def test_searchable_checkbox_disables_jk_navigation(monkeypatch) -> None:  # noqa: ANN001
@@ -598,11 +636,12 @@ def test_searchable_checkbox_disables_jk_navigation(monkeypatch) -> None:  # noq
     monkeypatch.setattr("yutome.setup_prompts._is_tty", lambda: True)
     monkeypatch.setattr("questionary.checkbox", fake_checkbox)
 
-    selected = setup_prompts.checkbox("Choose", ["Alpha"], use_search_filter=True)
+    selected = setup_prompts.checkbox("Choose", ["Alpha"], use_search_filter=True, erase_when_done=True)
 
     assert selected == ["Alpha"]
     assert captured["use_search_filter"] is True
     assert captured["use_jk_keys"] is False
+    assert captured["erase_when_done"] is True
 
 
 def test_public_subscription_prompt_can_go_back_from_choice(monkeypatch) -> None:  # noqa: ANN001

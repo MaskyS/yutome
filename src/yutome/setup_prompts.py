@@ -117,6 +117,7 @@ def checkbox(
     defaults: Iterable[str] = (),
     instruction: str | None = None,
     use_search_filter: bool = False,
+    erase_when_done: bool = False,
 ) -> list[str]:
     if not _is_tty():
         default_set = set(defaults)
@@ -147,6 +148,7 @@ def checkbox(
         "choices": choice_objs,
         "instruction": instruction,
         "use_search_filter": use_search_filter,
+        "erase_when_done": erase_when_done,
         "style": _style(),
     }
     if use_search_filter:
