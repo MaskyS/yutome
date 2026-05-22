@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 import webbrowser
-from typing import Iterable
+from typing import Callable, Iterable
 
 import typer
 
@@ -118,6 +118,7 @@ def checkbox(
     instruction: str | None = None,
     use_search_filter: bool = False,
     erase_when_done: bool = False,
+    validate: Callable[[list[str]], bool | str] | None = None,
 ) -> list[str]:
     if not _is_tty():
         default_set = set(defaults)
@@ -153,6 +154,8 @@ def checkbox(
     }
     if use_search_filter:
         checkbox_kwargs["use_jk_keys"] = False
+    if validate is not None:
+        checkbox_kwargs["validate"] = validate
     return _ask(
         questionary.checkbox(**checkbox_kwargs)
     )

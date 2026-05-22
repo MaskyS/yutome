@@ -746,7 +746,7 @@ def _prompt_channels_to_select(
     if setup_prompts.is_interactive():
         typer.clear()
         typer.echo(f"Found {len(ordered)} channel{'s' if len(ordered) != 1 else ''}.")
-        typer.echo("Type to filter; use space to select; enter to continue.")
+        typer.echo("Type to filter; press space to select; press enter to confirm.")
         if allow_back:
             typer.echo("Choose Back to return to the previous step.")
         typer.echo("")
@@ -762,16 +762,22 @@ def _prompt_channels_to_select(
         choices = [select_all_label, *labels.values()]
         if allow_back:
             choices.append(back_label)
+        empty_selection_message = (
+            "Select at least one channel, All channels, or Back."
+            if allow_back
+            else "Select at least one channel or All channels."
+        )
         selected_labels = setup_prompts.checkbox(
             title,
             choices=choices,
             defaults=default_labels,
             instruction=(
-                "Use arrows to move, space to select, type to search, enter to continue. "
+                "Use arrows to move, space to select, type to search, enter to confirm. "
                 "Choose 'All channels' to select everything."
             ),
             use_search_filter=True,
             erase_when_done=True,
+            validate=lambda selected: bool(selected) or empty_selection_message,
         )
         if allow_back and back_label in selected_labels:
             return None
