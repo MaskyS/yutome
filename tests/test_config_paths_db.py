@@ -11,6 +11,7 @@ from yutome.cli import (
     _ensure_oauth_kv_namespace,
     _push_wrangler_secret,
     _strip_oauth_kv_binding,
+    _tracked_capsule_path,
     _write_generated_wrangler_config,
     app,
     _parse_channel_selection,
@@ -30,6 +31,7 @@ from yutome.indexer import (
     _fallback_only_for_status,
     _matches_source_filters,
     _matches_status_filters,
+    _metadata_artifact_payload,
     classify_transcript_error,
     is_rate_limit_error,
 )
@@ -106,6 +108,35 @@ def test_project_paths_include_timestamped_and_plain_transcript_artifacts(tmp_pa
     assert transcript_paths.transcript_md == tmp_path / "data/artifacts/videos/video123/transcripts/transcript456/transcript.md"
     assert transcript_paths.transcript_vtt == tmp_path / "data/artifacts/videos/video123/transcripts/transcript456/transcript.vtt"
     assert transcript_paths.transcript_srt == tmp_path / "data/artifacts/videos/video123/transcripts/transcript456/transcript.srt"
+
+
+def test_metadata_artifact_payload_omits_bulky_ytdlp_fields() -> None:
+    compacted = _metadata_artifact_payload(
+        {
+            "id": "video123",
+            "title": "Example",
+            "duration": 120,
+            "automatic_captions": {"en": [{"url": "https://example.com/caption.json3"}]},
+            "subtitles": {"en": [{"url": "https://example.com/manual.vtt"}]},
+            "formats": [{"format_id": "18", "url": "https://example.com/video.mp4"}],
+            "heatmap": [{"start_time": 0, "value": 0.5}],
+        }
+    )
+
+    assert compacted["id"] == "video123"
+    assert compacted["title"] == "Example"
+    assert "automatic_captions" not in compacted
+    assert "subtitles" not in compacted
+    assert "formats" not in compacted
+    assert "heatmap" not in compacted
+    assert compacted["_yutome_artifact"]["compacted"] is True
+    assert compacted["_yutome_artifact"]["omitted_fields"] == [
+        "automatic_captions",
+        "formats",
+        "heatmap",
+        "subtitles",
+    ]
+    assert compacted["_yutome_artifact"]["source_metadata_hash"]
 
 
 def test_bootstrap_catalog_creates_expected_schema(tmp_path: Path) -> None:
@@ -644,13 +675,27 @@ def test_connect_without_endpoint_prints_deploy_instructions_without_provider_ke
     assert "yutome connect --deploy" in result.output
     assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
     assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
-    assert "Tracked TypeScript Worker subproject lives at:" in result.output
+    assert "Tracked TypeScript Worker project lives at:" in result.output
     # The new connect flow does NOT generate files under data/remote — the
-    # tracked TypeScript project at cloudflare/yutome-capsule/ is the source.
+    # tracked TypeScript Worker project at cloudflare/yutome-capsule/ is the source.
     assert not (tmp_path / "data/remote/cloudflare-worker").exists()
     assert not (tmp_path / "data/remote/connection.json").exists()
     assert "VOYAGE_API_KEY" not in result.output
     assert "YUTOME_WEBSHARE" not in result.output
+
+
+def test_tracked_capsule_path_uses_packaged_bundle_when_repo_sibling_missing(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    package_dir = tmp_path / "tools" / "yutome" / "lib" / "python3.13" / "site-packages" / "yutome"
+    capsule = package_dir / "cloudflare" / "yutome-capsule"
+    capsule.mkdir(parents=True)
+    fake_cli = package_dir / "cli.py"
+    fake_cli.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr("yutome.cli.__file__", str(fake_cli))
+
+    assert _tracked_capsule_path() == capsule
 
 
 def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

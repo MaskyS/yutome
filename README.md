@@ -11,10 +11,10 @@ Yutome is a command-line tool. You set it up from the terminal; from there it ha
 ## Install
 
 ```bash
-uv tool install 'yutome[all]'
+uv tool install yutome
 ```
 
-This puts a single `yutome` command on your PATH. The `[all]` extra pulls in the full feature set (yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API). Without it you'll hit ImportErrors on first run.
+This puts a single `yutome` command on your PATH. For now the package installs the full feature set by default: yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API, and the bundled Cloudflare Worker used by remote connectors.
 
 **Don't have uv or Python yet?** uv installs itself in one command and will fetch Python for you if it's missing.
 
@@ -34,15 +34,15 @@ Then run the `uv tool install` line above. If your shell can't find `uv` right a
 
 ```bash
 # pipx — needs python 3.11+ already on your PATH
-pipx install 'yutome[all]'
+pipx install yutome
 
 # Install the latest unreleased commit
-uv tool install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+uv tool install 'yutome @ git+https://github.com/MaskyS/yutome.git'
 
 # For hacking on the code
 git clone https://github.com/MaskyS/yutome.git
 cd yutome
-uv sync --extra all
+uv sync
 uv run yutome --help
 ```
 

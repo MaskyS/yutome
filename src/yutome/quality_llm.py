@@ -217,7 +217,7 @@ async def _cleanup_batches_with_gemini_async(
         from google import genai
         from google.genai import types
     except ImportError as exc:
-        raise RuntimeError("google-genai is not installed; run `uv sync --extra gemini`") from exc
+        raise RuntimeError("google-genai is not installed; run `uv sync` or reinstall yutome") from exc
 
     client = genai.Client(http_options=types.HttpOptions(timeout=int(config.request_timeout_seconds * 1000)))
     cache_name = await _maybe_create_cleanup_cache(
@@ -326,7 +326,7 @@ def _cleanup_batch(
         from google import genai
         from google.genai import types
     except ImportError as exc:
-        raise RuntimeError("google-genai is not installed; run `uv sync --extra gemini`") from exc
+        raise RuntimeError("google-genai is not installed; run `uv sync` or reinstall yutome") from exc
 
     http_options = types.HttpOptions(timeout=int(config.request_timeout_seconds * 1000))
     client = genai.Client(http_options=http_options)

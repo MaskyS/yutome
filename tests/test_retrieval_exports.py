@@ -22,7 +22,7 @@ import yutome.quality_upgrade as quality_upgrade_module
 from yutome.quality_upgrade import upgrade_active_transcripts
 from yutome.api import ContextRequest, context_expand, find as api_find
 from yutome.store import rebuild_fts, upsert_video_metadata
-from yutome.transcripts import TranscriptSegment, normalize_transcript
+from yutome.transcripts import TranscriptSegment, normalize_transcript, write_transcript_artifacts
 
 
 def _sample_project(tmp_path: Path) -> ProjectPaths:
@@ -153,6 +153,51 @@ def test_retrieve_chunk_detail_includes_text(tmp_path: Path) -> None:
     assert "probiotics" in results[0]["text"]
 
 
+def test_hybrid_falls_back_to_lexical_when_voyage_key_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    paths = _sample_project(tmp_path)
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("VOYAGE_API_KEY_PATH", raising=False)
+    import voyageai
+
+    monkeypatch.setattr(voyageai, "api_key", None, raising=False)
+    monkeypatch.setattr(voyageai, "api_key_path", None, raising=False)
+
+    result = api_find(
+        config=default_config(),
+        paths=paths,
+        text="Crohn probiotics",
+        mode="hybrid",
+        project="thin",
+        limit=5,
+    )
+
+    assert result.rows
+    assert result.rows[0]["match_type"] == "lexical"
+    assert any("Vector search unavailable" in note for note in result.notes)
+
+
+def test_semantic_search_fails_loudly_when_voyage_key_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = _sample_project(tmp_path)
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("VOYAGE_API_KEY_PATH", raising=False)
+    import voyageai
+
+    monkeypatch.setattr(voyageai, "api_key", None, raising=False)
+    monkeypatch.setattr(voyageai, "api_key_path", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="Vector search unavailable"):
+        api_find(
+            config=default_config(),
+            paths=paths,
+            text="Crohn probiotics",
+            mode="semantic",
+            project="thin",
+            limit=5,
+        )
+
+
 def test_eval_suite_checks_expected_video_and_terms(tmp_path: Path) -> None:
     paths = _sample_project(tmp_path)
     suite = EvalSuite(
@@ -251,6 +296,33 @@ def test_oversized_segments_are_split_under_hard_cap() -> None:
     assert len(chunks) == 2
     assert max(chunk.token_count for chunk in chunks) <= 1000
     assert any(chunk.forced_split for chunk in chunks)
+
+
+def test_write_transcript_artifacts_preserves_raw_caption_json(tmp_path: Path) -> None:
+    raw_snippets = [
+        {"start": 0.0, "duration": 2.5, "text": "first raw caption"},
+        {"start": 2.5, "duration": 1.5, "text": "second raw caption"},
+    ]
+    transcript = normalize_transcript(
+        video_id="vid123",
+        raw_snippets=raw_snippets,
+        source="yt-dlp-json3:en-orig",
+        language="en-orig",
+        is_generated=True,
+    )
+
+    write_transcript_artifacts(
+        paths_root=tmp_path,
+        raw_snippets=raw_snippets,
+        transcript=transcript,
+        include_markdown=True,
+        include_srt=True,
+    )
+
+    assert json.loads((tmp_path / "raw.json").read_text(encoding="utf-8")) == raw_snippets
+    assert (tmp_path / "transcript.vtt").exists()
+    assert (tmp_path / "transcript.srt").exists()
+    assert (tmp_path / "transcript.md").exists()
 
 
 def test_llm_cleanup_parallel_batches_preserve_sequence_order() -> None:
@@ -399,10 +471,11 @@ def test_quality_upgrade_quality_gate_skips_clean_transcript(monkeypatch, tmp_pa
     assert stats.failed == 0
 
 
-def test_hybrid_retrieval_reports_stale_lancedb_table(tmp_path: Path) -> None:
+def test_hybrid_retrieval_reports_stale_lancedb_table(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     pytest.importorskip("lancedb")
     import lancedb
 
+    monkeypatch.setenv("VOYAGE_API_KEY", "dummy-key")
     paths = _sample_project(tmp_path)
     db = lancedb.connect(paths.lancedb_dir)
     db.create_table(

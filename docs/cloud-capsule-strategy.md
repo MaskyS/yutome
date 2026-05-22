@@ -455,7 +455,7 @@ Advanced detail can map this to:
 
 1. User runs `yutome setup` and accepts the "Connect Claude/ChatGPT" step, or runs `yutome connect`.
 2. User chooses "Use while this computer is on."
-3. CLI deploys the tracked TypeScript Worker subproject at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures an account-local `OAUTH_KV` namespace exists (auto-creates it on first deploy), writes the real KV binding to ignored generated config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
+3. CLI deploys the tracked TypeScript Worker project at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures an account-local `OAUTH_KV` namespace exists (auto-creates it on first deploy), writes the real KV binding to ignored generated config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
 4. If Node/npm/npx are available, `yutome connect --deploy` is the default assisted path: Yutome uses `npx` to run Wrangler, downloading it if needed, runs the deploy, and lets Wrangler open Cloudflare sign-in if needed. The user does not need a global Wrangler install.
 5. If Node/npm/npx are not available, Yutome explains the missing runtime in plain language and asks the user to install Node.js LTS, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
 6. Future no-node best path should be a public Deploy-to-Cloudflare template. Cloudflare documents Deploy buttons as a way to let users deploy a Workers app into their own account, with resource provisioning from the app configuration. Source: [Cloudflare Deploy Buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
@@ -580,7 +580,7 @@ Local state should live under `data/remote/` or another project data path, not i
 
 ### Worker code
 
-The Worker should be a deployable subproject, likely under a directory such as `cloudflare/yutome-capsule/`, with:
+The Worker should be a deployable project, likely under a directory such as `cloudflare/yutome-capsule/`, with:
 
 - `/mcp` Streamable HTTP endpoint;
 - OAuth metadata, authorize, token, and registration endpoints;

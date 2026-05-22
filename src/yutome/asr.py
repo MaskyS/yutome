@@ -32,7 +32,7 @@ def transcribe_with_faster_whisper(
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
-        raise RuntimeError("faster-whisper is not installed; run uv sync --extra asr") from exc
+        raise RuntimeError("faster-whisper is not installed; run `uv sync` or reinstall yutome") from exc
     del WhisperModel
 
     temp_dir = Path(tempfile.mkdtemp(prefix="yutome-asr-"))

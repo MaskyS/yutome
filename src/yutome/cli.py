@@ -504,7 +504,7 @@ def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> b
     typer.echo("  Docs:     https://docs.voyageai.com/docs/embeddings")
     typer.echo("")
     if not deps_ready:
-        _status(False, "Semantic search dependencies", "run `uv sync --extra vectors --extra embeddings`")
+        _status(False, "Semantic search dependencies", "run `uv sync` or reinstall yutome")
     if not setup_prompts.confirm("Enable semantic/hybrid search now?", default=False):
         _status(False, "Semantic/hybrid search", "skipped; lexical search still works")
         return False
@@ -612,7 +612,7 @@ def _setup_gemini(config_path: Path, env_path: Path, *, yes: bool) -> None:
     typer.echo("  Docs:     https://ai.google.dev/gemini-api/docs")
     typer.echo("")
     if not deps_ready:
-        _status(False, "Gemini dependency", "run `uv sync --extra gemini`")
+        _status(False, "Gemini dependency", "run `uv sync` or reinstall yutome")
     if not setup_prompts.confirm("Enable Gemini transcript repair and fallback now?", default=False):
         _status(False, "Gemini (transcript repair + fallback)", "skipped; yutome can ask again before transcript repair/fallback")
         return
@@ -1566,9 +1566,16 @@ GENERATED_WRANGLER_FILENAME = "wrangler.generated.toml"
 
 
 def _tracked_capsule_path() -> Path:
-    """Repo path to the tracked TypeScript Worker subproject."""
+    """Path to the tracked TypeScript Worker project.
+
+    Editable checkouts use the repo-level cloudflare/ tree. Wheels include the
+    same files under yutome/cloudflare/ so uv/pipx installs can deploy too.
+    """
     here = Path(__file__).resolve()
-    return here.parents[2] / "cloudflare" / "yutome-capsule"
+    repo_capsule = here.parents[2] / "cloudflare" / "yutome-capsule"
+    if repo_capsule.exists():
+        return repo_capsule
+    return here.parent / "cloudflare" / "yutome-capsule"
 
 
 def _ensure_capsule_node_modules(capsule: Path) -> None:
@@ -1767,7 +1774,15 @@ def _deploy_tracked_capsule(
     """
     capsule = _tracked_capsule_path()
     if not capsule.exists():
-        typer.echo(f"Expected TypeScript Worker subproject at {capsule}, but it is missing.", err=True)
+        typer.echo(
+            f"Expected bundled TypeScript Worker project at {capsule}, but it is missing.",
+            err=True,
+        )
+        typer.echo(
+            "Reinstall yutome from a build that includes cloudflare/yutome-capsule, "
+            "or run the deploy from a repository checkout.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     effective_relay_token = relay_token or secrets.token_urlsafe(32)
@@ -1802,7 +1817,7 @@ def _deploy_tracked_capsule(
 
 
 def _delete_tracked_capsule(worker_name: str) -> None:
-    """Run `wrangler delete` from the tracked subproject directory."""
+    """Run `wrangler delete` from the tracked Worker project directory."""
     capsule = _tracked_capsule_path()
     if shutil.which("npx") is None:
         typer.echo("`npx` is not installed. Delete the Worker manually in the Cloudflare dashboard.", err=True)
@@ -1948,9 +1963,9 @@ def setup(
     ingest_ok = _module_available("yt_dlp") and _module_available("youtube_transcript_api")
     vectors_ok = _module_available("lancedb")
     embeddings_ok = _module_available("voyageai")
-    _status(ingest_ok, "Ingest dependencies", "uv sync --extra ingest" if not ingest_ok else "ready")
-    _status(vectors_ok, "Vector database dependency", "uv sync --extra vectors" if not vectors_ok else "ready")
-    _status(embeddings_ok, "Embedding client", "uv sync --extra embeddings if you want semantic search" if not embeddings_ok else "ready")
+    _status(ingest_ok, "Ingest dependencies", "uv sync" if not ingest_ok else "ready")
+    _status(vectors_ok, "Vector database dependency", "uv sync" if not vectors_ok else "ready")
+    _status(embeddings_ok, "Embedding client", "uv sync" if not embeddings_ok else "ready")
     _setup_webshare(env_path, yes=yes)
     _setup_gemini(config, env_path, yes=yes)
     semantic_enabled = _setup_semantic_search(config, env_path, yes=yes)
@@ -2034,7 +2049,6 @@ def setup(
     else:
         typer.echo("  # Optional semantic search:")
         typer.echo("  #   add VOYAGE_API_KEY to .env")
-        typer.echo("  #   uv sync --extra vectors --extra embeddings")
         typer.echo("  #   yutome setup")
     typer.echo("  yutome status")
     typer.echo('  yutome find "topic I remember"')
@@ -2224,7 +2238,7 @@ def connect_command(
 
         if not deploy:
             typer.echo("")
-            typer.echo("Tracked TypeScript Worker subproject lives at:")
+            typer.echo("Tracked TypeScript Worker project lives at:")
             typer.echo(f"  {_tracked_capsule_path()}")
             typer.echo("")
             typer.echo("Run the assisted deploy with:")
@@ -2394,7 +2408,7 @@ def doctor(
     """Check local project readiness."""
     failures = 0
 
-    python_ok = sys.version_info >= (3, 12)
+    python_ok = sys.version_info >= (3, 11)
     _status(
         python_ok,
         "Python runtime",
@@ -2436,31 +2450,31 @@ def doctor(
         "python module" if ytdlp_module else ytdlp_command_detail,
     )
     if not (ytdlp_module or ytdlp_command_ok):
-        typer.echo("      install with: uv sync --extra ingest")
+        typer.echo("      install with: uv sync")
     _status(
         _module_available("youtube_transcript_api"),
         "youtube-transcript-api availability",
-        "install with: uv sync --extra ingest",
+        "install with: uv sync",
     )
     _status(
         _module_available("lancedb"),
         "LanceDB availability",
-        "install with: uv sync --extra vectors",
+        "install with: uv sync",
     )
     _status(
         _module_available("faster_whisper"),
         "faster-whisper availability",
-        "install with: uv sync --extra asr",
+        "install with: uv sync",
     )
     _status(
         _module_available("voyageai"),
         "Voyage client availability",
-        "install with: uv sync --extra embeddings",
+        "install with: uv sync",
     )
     _status(
         _module_available("google.genai"),
         "Gemini client availability",
-        "install with: uv sync --extra gemini",
+        "install with: uv sync",
     )
 
     if failures:

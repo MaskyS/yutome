@@ -154,6 +154,28 @@ def _metadata_version_id(metadata: dict) -> str:
     return sha256_json(metadata)[:24]
 
 
+_METADATA_ARTIFACT_OMIT_KEYS = {
+    "automatic_captions",
+    "formats",
+    "heatmap",
+    "requested_formats",
+    "subtitles",
+}
+
+
+def _metadata_artifact_payload(metadata: dict) -> dict:
+    omitted = sorted(key for key in _METADATA_ARTIFACT_OMIT_KEYS if key in metadata)
+    if not omitted:
+        return metadata
+    compacted = {key: value for key, value in metadata.items() if key not in _METADATA_ARTIFACT_OMIT_KEYS}
+    compacted["_yutome_artifact"] = {
+        "compacted": True,
+        "source_metadata_hash": sha256_json(metadata),
+        "omitted_fields": omitted,
+    }
+    return compacted
+
+
 def _matches_status_filters(status: str | None, status_filters: list[str] | None) -> bool:
     if not status_filters:
         return True
@@ -235,7 +257,10 @@ def _fetch_metadata_block(
             ytdlp_config=config.yt_dlp,
         )
     metadata_version_id = _metadata_version_id(metadata)
-    write_json(paths.video_metadata_dir(video.video_id) / f"{metadata_version_id}.json", metadata)
+    write_json(
+        paths.video_metadata_dir(video.video_id) / f"{metadata_version_id}.json",
+        _metadata_artifact_payload(metadata),
+    )
     channel_id = metadata.get("channel_id") or video.channel_id
     with connect_catalog(paths.catalog_db) as connection:
         upsert_video_metadata(

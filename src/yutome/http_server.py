@@ -158,7 +158,7 @@ def build_app() -> Any:
                 offset=req.offset,
                 project=req.project,
             ).model_dump()
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/list", dependencies=auth)
@@ -181,7 +181,7 @@ def build_app() -> Any:
                 offset=req.offset,
                 project=req.project,
             ).model_dump()
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/show", dependencies=auth)
@@ -209,7 +209,7 @@ def build_app() -> Any:
         runtime = _runtime()
         try:
             return api_q(config=runtime.config, paths=runtime.paths, request=req).model_dump()
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/chunks/{chunk_id}", dependencies=auth)

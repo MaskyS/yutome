@@ -1,6 +1,6 @@
 [project]
 name = "yutome"
-version = "0.1.3"
+version = "0.1.4"
 description = "A local transcript library for the YouTube channels you point at"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,56 +33,29 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
 ]
 dependencies = [
+    "curl-cffi>=0.11,<0.15",
+    "fastapi>=0.115,<1",
+    "faster-whisper>=1.1",
+    "google-genai>=1.40",
+    "lancedb>=0.20",
+    "mcp[cli]>=1.27,<2",
     "pydantic>=2.8,<3",
     "questionary>=2.0,<3",
     "rapidfuzz>=3.14.5",
+    "requests>=2.32,<3",
     "typer>=0.12,<1",
-    "websockets>=13",
+    "uvicorn>=0.30,<1",
+    "voyageai>=0.3",
+    "websockets>=15",
     "wordfreq>=3.1.1",
+    "yt-dlp>=2025.6.9",
+    "youtube-transcript-api>=1.2",
 ]
 
 [project.urls]
 Homepage = "https://github.com/MaskyS/yutome"
 Repository = "https://github.com/MaskyS/yutome"
 Issues = "https://github.com/MaskyS/yutome/issues"
-
-[project.optional-dependencies]
-ingest = [
-    "curl-cffi>=0.11,<0.15",
-    "yt-dlp>=2025.6.9",
-    "youtube-transcript-api>=1.2",
-]
-vectors = [
-    "lancedb>=0.20",
-]
-asr = [
-    "faster-whisper>=1.1",
-]
-embeddings = [
-    "voyageai>=0.3",
-]
-gemini = [
-    "google-genai>=1.40",
-]
-mcp = [
-    "mcp[cli]>=1.27,<2",
-]
-http = [
-    "fastapi>=0.115,<1",
-    "uvicorn>=0.30,<1",
-]
-all = [
-    "curl-cffi>=0.11,<0.15",
-    "yt-dlp>=2025.6.9",
-    "youtube-transcript-api>=1.2",
-    "lancedb>=0.20",
-    "faster-whisper>=1.1",
-    "voyageai>=0.3",
-    "google-genai>=1.40",
-    "mcp[cli]>=1.27,<2",
-    "fastapi>=0.115,<1",
-    "uvicorn>=0.30,<1",
-]
 
 [project.scripts]
 yutome = "yutome.cli:app"
@@ -99,16 +72,29 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/yutome"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"cloudflare/yutome-capsule/README.md" = "yutome/cloudflare/yutome-capsule/README.md"
+"cloudflare/yutome-capsule/package-lock.json" = "yutome/cloudflare/yutome-capsule/package-lock.json"
+"cloudflare/yutome-capsule/package.json" = "yutome/cloudflare/yutome-capsule/package.json"
+"cloudflare/yutome-capsule/src" = "yutome/cloudflare/yutome-capsule/src"
+"cloudflare/yutome-capsule/tsconfig.json" = "yutome/cloudflare/yutome-capsule/tsconfig.json"
+"cloudflare/yutome-capsule/wrangler.toml" = "yutome/cloudflare/yutome-capsule/wrangler.toml"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "src/yutome",
     "tests",
+    "cloudflare/yutome-capsule/README.md",
+    "cloudflare/yutome-capsule/package-lock.json",
+    "cloudflare/yutome-capsule/package.json",
+    "cloudflare/yutome-capsule/src",
+    "cloudflare/yutome-capsule/tsconfig.json",
+    "cloudflare/yutome-capsule/wrangler.toml",
     "README.md",
     "LICENSE",
     "pyproject.toml",
 ]
 exclude = [
-    "cloudflare",
     "docs",
     "data",
     ".env*",

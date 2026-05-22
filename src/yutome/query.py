@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -242,9 +243,14 @@ def execute_query(compiled: CompiledQuery, config: AppConfig, paths: ProjectPath
             rows = _execute_sql_channel(connection, request=request)
         elif compiled.kind in {"lance_chunk", "two_stage"}:
             if not _vectors_available_for_chunks(config, paths):
-                # Fall back to lexical FTS so a noob without VOYAGE_API_KEY
-                # or a populated vector index still gets results instead of
-                # a setup error.
+                vector_message = (
+                    "Vector search unavailable. Configure VOYAGE_API_KEY and run "
+                    "`yutome rebuild-vectors` to enable hybrid/semantic recall."
+                )
+                if request.search is not None and request.search.mode == "semantic":
+                    raise RuntimeError(vector_message)
+                # Fall back to lexical FTS when Voyage credentials or vector
+                # rows are missing, so default search still returns results.
                 lexical_request = request.model_copy(deep=True)
                 if lexical_request.search is not None:
                     lexical_request.search = lexical_request.search.model_copy(update={"mode": "lexical"})
@@ -252,8 +258,7 @@ def execute_query(compiled: CompiledQuery, config: AppConfig, paths: ProjectPath
                 fallback_result = execute_query(lexical_compiled, config, paths)
                 fallback_result.notes = [
                     *compiled.notes,
-                    "Vector search unavailable — ran lexical search instead. "
-                    "Configure VOYAGE_API_KEY and run `yutome rebuild-vectors` to enable hybrid/semantic recall.",
+                    f"{vector_message} Ran lexical search instead.",
                     *fallback_result.notes,
                 ]
                 return fallback_result
@@ -444,6 +449,8 @@ def _vectors_available_for_chunks(config: AppConfig, paths: ProjectPaths) -> boo
         return False
     if config.embeddings.provider != "voyage":
         return False
+    if not _voyage_credentials_available():
+        return False
     try:
         import lancedb
     except ImportError:
@@ -455,6 +462,22 @@ def _vectors_available_for_chunks(config: AppConfig, paths: ProjectPaths) -> boo
     if not _lancedb_has_table(db, LANCEDB_CHUNKS_TABLE):
         return False
     return True
+
+
+def _voyage_credentials_available() -> bool:
+    """Voyage's client raises at construction time when no key is configured.
+
+    Treat a missing key like a missing vector backend so default hybrid search
+    falls back to lexical, matching the setup copy and README. Invalid keys
+    still surface from the provider when a user explicitly configured one.
+    """
+    if os.environ.get("VOYAGE_API_KEY") or os.environ.get("VOYAGE_API_KEY_PATH"):
+        return True
+    try:
+        import voyageai
+    except ImportError:
+        return False
+    return bool(getattr(voyageai, "api_key", None) or getattr(voyageai, "api_key_path", None))
 
 
 def _execute_lance_chunk(

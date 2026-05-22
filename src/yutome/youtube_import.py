@@ -33,7 +33,7 @@ def fetch_user_subscription_channels_from_browser(
     try:
         from yt_dlp.cookies import extract_cookies_from_browser
     except ImportError as exc:  # pragma: no cover - exercised by CLI dependency checks.
-        raise YouTubeImportError("yt-dlp is not installed; run `uv sync --extra ingest`") from exc
+        raise YouTubeImportError("yt-dlp is not installed; run `uv sync` or reinstall yutome") from exc
 
     failures: list[str] = []
     for browser in browsers:

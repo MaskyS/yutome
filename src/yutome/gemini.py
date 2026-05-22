@@ -196,7 +196,7 @@ def transcribe_youtube_url_with_gemini(
         from google import genai
         from google.genai import types
     except ImportError as exc:
-        raise RuntimeError("google-genai is not installed; run `uv sync --extra gemini`") from exc
+        raise RuntimeError("google-genai is not installed; run `uv sync` or reinstall yutome") from exc
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     client = genai.Client()

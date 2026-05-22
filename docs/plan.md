@@ -97,7 +97,7 @@ The system has four useful surfaces.
 
 Project and packaging:
 
-- Python `>=3.12`
+- Python `>=3.11`
 - `uv`
 - `typer` for CLI
 - `pydantic` for config validation
@@ -131,15 +131,10 @@ Scheduler target:
 - The default intended cadence is every 3 hours.
 - Scheduled runs should be bounded: 2 workers, batch size 25, max 50 videos per scheduled run, jittered request delays, and resumable checkpoints.
 
-Dependency groups are in `pyproject.toml`:
+Feature dependencies are mandatory for now; install the development environment with:
 
 ```bash
-uv sync --extra ingest
-uv sync --extra embeddings
-uv sync --extra vectors
-uv sync --extra gemini
-uv sync --extra asr
-uv sync --extra all
+uv sync
 ```
 
 ## Current CLI Surface
