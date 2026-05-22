@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -1629,16 +1630,102 @@ def _reveal_in_file_manager(path: Path) -> bool:
         return False
 
 
+MCPB_MANIFEST_VERSION = "0.3"
+
+
+def _yutome_icon_for_bundle() -> Path | None:
+    candidate = Path(__file__).resolve().parent / "assets" / "yutome-icon-256.png"
+    return candidate if candidate.exists() else None
+
+
+def _yutome_mcpb_manifest(yutome_cmd: str, abs_config: Path) -> dict[str, Any]:
+    from yutome import __version__
+
+    return {
+        "manifest_version": MCPB_MANIFEST_VERSION,
+        "name": "yutome",
+        "display_name": "Yutome",
+        "version": __version__,
+        "description": "Search your local YouTube transcript library from any MCP-aware assistant.",
+        "author": {"name": "Kifah Meeran", "url": "https://github.com/MaskyS/yutome"},
+        "icon": "icon.png",
+        "server": {
+            "type": "binary",
+            "entry_point": yutome_cmd,
+            "mcp_config": {
+                "command": yutome_cmd,
+                "args": ["mcp", "serve", "--config", str(abs_config)],
+            },
+        },
+    }
+
+
+def _build_yutome_mcpb(config_path: Path, *, output_path: Path) -> Path:
+    yutome_cmd = shutil.which("yutome") or "yutome"
+    abs_config = config_path.resolve()
+    manifest = _yutome_mcpb_manifest(yutome_cmd, abs_config)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    icon = _yutome_icon_for_bundle()
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        if icon is not None:
+            zf.write(icon, "icon.png")
+    return output_path
+
+
+def _open_with_default_app(path: Path) -> bool:
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+
+
+def _offer_claude_desktop_bundle(config_path: Path) -> bool:
+    """Offer to build a Claude Desktop `.mcpb` bundle and open it for one-click install.
+
+    Returns True if a bundle was built and opened (or the user accepted and we tried),
+    False if declined or the platform doesn't support Claude Desktop.
+    """
+    if sys.platform != "darwin" and not sys.platform.startswith("win"):
+        return False
+    typer.echo("")
+    typer.echo("Claude Desktop one-click installer (.mcpb bundle)")
+    typer.echo("  Yutome can build a bundle pointing at this machine's config and open it so")
+    typer.echo("  Claude Desktop pops its 'Install Extension' dialog. No JSON editing.")
+    if not setup_prompts.confirm("Build the .mcpb bundle and open it now?", default=True):
+        return False
+    output_path = config_path.parent.resolve() / "yutome.mcpb"
+    bundle = _build_yutome_mcpb(config_path, output_path=output_path)
+    typer.echo(f"[OK] Built {bundle}")
+    if _open_with_default_app(bundle):
+        typer.echo("Claude Desktop should pop the install dialog. Click 'Install' to add Yutome.")
+    else:
+        typer.echo(f"[WARN] Couldn't open it automatically. Double-click {bundle} to install.")
+    return True
+
+
 def _setup_local_mcp(config_path: Path) -> None:
     """Help a user wire yutome into Claude Desktop / Code / Cursor on this machine.
 
-    Doesn't modify any files. Claude Desktop's config is often touched by
-    hand or by other installers (Smithery, DXT/MCPB bundles, other MCP
-    servers), and JSON-merging into it from a CLI is a foot-gun: comments
-    don't round-trip, key ordering changes, and a botched write loses other
-    server entries. We show the snippet, offer to put it on the clipboard,
-    and offer to open the config file's location.
+    On macOS / Windows we first offer a one-click `.mcpb` bundle for Claude Desktop.
+    For everything else (Cursor, Cherry Studio, Claude Code, Goose) we fall through
+    to a generic JSON snippet — Claude Desktop's config is often touched by hand
+    or by other installers, and JSON-merging into it from a CLI is a foot-gun:
+    comments don't round-trip, key ordering changes, and a botched write loses
+    other server entries.
     """
+    if _offer_claude_desktop_bundle(config_path):
+        if not setup_prompts.confirm(
+            "Also show the JSON snippet for other apps (Cursor, Claude Code, Cherry Studio, ...)?",
+            default=False,
+        ):
+            return
     abs_config = config_path.resolve()
     yutome_cmd = shutil.which("yutome") or "yutome"
     snippet = json.dumps(

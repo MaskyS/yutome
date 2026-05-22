@@ -2,6 +2,7 @@ import json
 import subprocess
 import time
 import urllib.parse
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,9 @@ from typer.testing import CliRunner
 from yutome import setup_prompts
 from yutome.cli import (
     BACK_CHOICE,
+    MCPB_MANIFEST_VERSION,
     _active_oauth_kv_id,
+    _build_yutome_mcpb,
     _channel_picker_labels,
     _cloudflare_deploy_runtime_problem,
     _deploy_tracked_capsule,
@@ -26,6 +29,7 @@ from yutome.cli import (
     _tracked_capsule_path,
     _wrangler_whoami_authenticated,
     _write_generated_wrangler_config,
+    _yutome_mcpb_manifest,
     app,
     _parse_channel_selection,
 )
@@ -694,6 +698,44 @@ def test_public_subscription_prompt_can_go_back_from_target(monkeypatch) -> None
     monkeypatch.setattr("yutome.setup_prompts.text", lambda message: "b")
 
     assert _prompt_public_subscription_target() == BACK_CHOICE
+
+
+def test_yutome_mcpb_manifest_shape() -> None:
+    manifest = _yutome_mcpb_manifest("/usr/local/bin/yutome", Path("/tmp/yutome.toml"))
+
+    assert manifest["manifest_version"] == MCPB_MANIFEST_VERSION
+    assert manifest["name"] == "yutome"
+    assert manifest["display_name"] == "Yutome"
+    assert manifest["server"]["type"] == "binary"
+    assert manifest["server"]["entry_point"] == "/usr/local/bin/yutome"
+    assert manifest["server"]["mcp_config"]["command"] == "/usr/local/bin/yutome"
+    assert manifest["server"]["mcp_config"]["args"] == [
+        "mcp",
+        "serve",
+        "--config",
+        "/tmp/yutome.toml",
+    ]
+    # Version must come from the installed package, not be empty.
+    assert manifest["version"]
+
+
+def test_build_yutome_mcpb_writes_zip_with_manifest(tmp_path: Path) -> None:
+    config_path = tmp_path / "yutome.toml"
+    config_path.write_text("# stub\n", encoding="utf-8")
+    output_path = tmp_path / "yutome.mcpb"
+
+    bundle = _build_yutome_mcpb(config_path, output_path=output_path)
+
+    assert bundle == output_path
+    assert bundle.exists()
+    with zipfile.ZipFile(bundle) as zf:
+        names = set(zf.namelist())
+        assert "manifest.json" in names
+        manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["server"]["type"] == "binary"
+    # Bundled config path must be absolute so Claude Desktop can launch the binary
+    # from anywhere — relative paths break the install on macOS sandbox launches.
+    assert Path(manifest["server"]["mcp_config"]["args"][-1]).is_absolute()
 
 
 def test_node_version_parser() -> None:
