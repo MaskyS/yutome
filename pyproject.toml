@@ -98,6 +98,22 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/yutome"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/yutome",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "cloudflare",
+    "docs",
+    "data",
+    ".env*",
+    "*.log",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

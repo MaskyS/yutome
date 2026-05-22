@@ -11,7 +11,7 @@ Yutome is a command-line tool. You set it up from the terminal; from there it ha
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-uv tool install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+uv tool install 'yutome[all]'
 ```
 
 This puts a single `yutome` command on your PATH. The `[all]` extra pulls in the full feature set (yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API). Without it you'll hit ImportErrors on first run.
@@ -22,7 +22,10 @@ If your default `python3` is older than 3.11, add `--python 3.11` to that comman
 
 ```bash
 # pipx — uses whichever python3 is on your PATH; needs 3.11+
-pipx install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+pipx install 'yutome[all]'
+
+# Install the latest unreleased commit
+uv tool install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
 
 # For hacking on the code
 git clone https://github.com/MaskyS/yutome.git
@@ -89,19 +92,19 @@ yutome remote bridge      # keep this running while you want queries to work
 
 `connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, and prints a pairing code. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
 
-The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "desktop offline". Full setup walkthrough: [`docs/remote-access.md`](docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](cloudflare/yutome-capsule/README.md).
+The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "desktop offline". Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
 
 ## Docs
 
-See [`docs/README.md`](docs/README.md) for an index. The most useful starting points:
+See [`docs/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/README.md) for an index. The most useful starting points:
 
-- [`docs/remote-access.md`](docs/remote-access.md) — connecting Claude / ChatGPT / agents
-- [`docs/cloud-capsule-strategy.md`](docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
-- [`docs/query-api.md`](docs/query-api.md) — the query language `find` / `q` speak
-- [`docs/plan.md`](docs/plan.md) — internal architecture history (not a usage guide)
+- [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) — connecting Claude / ChatGPT / agents
+- [`docs/cloud-capsule-strategy.md`](https://github.com/MaskyS/yutome/blob/main/docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
+- [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md) — the query language `find` / `q` speak
+- [`docs/plan.md`](https://github.com/MaskyS/yutome/blob/main/docs/plan.md) — internal architecture history (not a usage guide)
 
 ## Status
 
-**v0.1.0 — private preview.** Released under the MIT license; the API and CLI surface may shift between point releases. Not on PyPI yet; install from git as shown above.
+**v0.1.0 — early release.** Released under the MIT license; the API and CLI surface may shift between point releases.
 
 Found a bug or a confusing doc? Open an issue: <https://github.com/MaskyS/yutome/issues>.
