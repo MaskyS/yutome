@@ -64,7 +64,7 @@ gemini = [
     "google-genai>=1.40",
 ]
 mcp = [
-    "mcp[cli]>=1.20,<2",
+    "mcp[cli]>=1.27,<2",
 ]
 http = [
     "fastapi>=0.115,<1",
@@ -78,7 +78,7 @@ all = [
     "faster-whisper>=1.1",
     "voyageai>=0.3",
     "google-genai>=1.40",
-    "mcp[cli]>=1.20,<2",
+    "mcp[cli]>=1.27,<2",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
 ]

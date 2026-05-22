@@ -1,4 +1,6 @@
-# Yutome
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MaskyS/yutome/main/docs/assets/yutome-wordmark.png" alt="Yutome" width="420">
+</p>
 
 Yutome ingests transcripts from the YouTube channels you point at, stores them on your machine, and connects to whichever AI app you already use — Claude, ChatGPT, Cursor, anything MCP-compatible.
 

@@ -17,6 +17,7 @@ import type { Env } from "./env";
 import { YutomeMcpAgent } from "./yutome-mcp-agent";
 import { YutomeRelay } from "./yutome-relay";
 import { handleAuthorizeRequest, handlePairingRequest } from "./pairing";
+import { iconResponse } from "./icon-asset";
 
 interface DefaultHandlerEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -30,6 +31,18 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
 
     if (url.pathname === "/healthz") {
       return Response.json({ ok: true, service: "yutome-remote-mcp", mode: env.YUTOME_WORKER_MODE });
+    }
+
+    if (url.pathname === "/icon.png") {
+      return iconResponse(256);
+    }
+
+    if (url.pathname === "/icon-48.png") {
+      return iconResponse(48);
+    }
+
+    if (url.pathname === "/favicon.ico") {
+      return iconResponse(48);
     }
 
     if (url.pathname === "/relay/connect" || url.pathname === "/relay/status") {

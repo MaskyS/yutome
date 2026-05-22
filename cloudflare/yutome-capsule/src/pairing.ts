@@ -147,8 +147,13 @@ export function renderForm(url: URL, error: string, authState?: RenderAuthorizat
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Pair Yutome Remote MCP</title>
+  <link rel="icon" type="image/png" sizes="48x48" href="/icon-48.png" />
+  <link rel="apple-touch-icon" sizes="256x256" href="/icon.png" />
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 2.5rem auto; max-width: 38rem; padding: 0 1rem; color: #111; }
+    .brand { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+    .brand img { width: 48px; height: 48px; }
+    .brand h1 { margin: 0; }
     h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
     label { display: grid; gap: 0.4rem; margin: 1.25rem 0; font-weight: 500; }
     input { padding: 0.7rem; border: 1px solid #999; border-radius: 8px; font: inherit; }
@@ -163,7 +168,10 @@ export function renderForm(url: URL, error: string, authState?: RenderAuthorizat
   </style>
 </head>
 <body>
-  <h1>Pair Yutome with this assistant</h1>
+  <div class="brand">
+    <img src="/icon-48.png" alt="" width="48" height="48" />
+    <h1>Pair Yutome with this assistant</h1>
+  </div>
   <p class="hint">Claude or ChatGPT wants permission to search this Yutome library while your computer is online.</p>
   <p class="hint">Enter the latest pairing code printed by <code>uv run yutome connect --deploy</code> or saved with <code>uv run yutome connect --endpoint ... --pairing-code ...</code>. No Yutome account is needed.</p>
   <p class="hint">If you reran <code>yutome connect</code> or have several Yutome tabs open, use the newest tab and the newest code.</p>
@@ -295,7 +303,7 @@ function securityHeaders(contentType = "text/html; charset=utf-8"): HeadersInit 
   return {
     "content-type": contentType,
     "cache-control": "no-store",
-    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "content-security-policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
     "referrer-policy": "no-referrer",
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",

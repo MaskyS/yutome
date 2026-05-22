@@ -3075,7 +3075,7 @@ wheels = [
 
 [[package]]
 name = "yutome"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
@@ -3140,8 +3140,8 @@ requires-dist = [
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=1.40" },
     { name = "lancedb", marker = "extra == 'all'", specifier = ">=0.20" },
     { name = "lancedb", marker = "extra == 'vectors'", specifier = ">=0.20" },
-    { name = "mcp", extras = ["cli"], marker = "extra == 'all'", specifier = ">=1.20,<2" },
-    { name = "mcp", extras = ["cli"], marker = "extra == 'mcp'", specifier = ">=1.20,<2" },
+    { name = "mcp", extras = ["cli"], marker = "extra == 'all'", specifier = ">=1.27,<2" },
+    { name = "mcp", extras = ["cli"], marker = "extra == 'mcp'", specifier = ">=1.27,<2" },
     { name = "pydantic", specifier = ">=2.8,<3" },
     { name = "rapidfuzz", specifier = ">=3.14.5" },
     { name = "typer", specifier = ">=0.12,<1" },

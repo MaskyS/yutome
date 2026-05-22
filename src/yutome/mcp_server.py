@@ -4,10 +4,13 @@ come from :mod:`yutome.contract`; this module is just an adapter that wires
 the registry into a FastMCP server."""
 from __future__ import annotations
 
+import base64
 import functools
 import inspect
 import json
 import secrets
+from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +19,42 @@ from yutome.contract import AUTH_SCOPE
 
 
 SERVER_NAME = "Yutome (My YouTube Library)"
+SERVER_WEBSITE_URL = "https://github.com/MaskyS/yutome"
 REMOTE_TOKEN_ENV_VAR = "YUTOME_HTTP_TOKEN"
 REMOTE_READ_SCOPE = AUTH_SCOPE  # kept for back-compat with callers that imported the old name
 # Re-exported for adapters that still import from mcp_server. The single
 # source of truth is contract.SERVER_INSTRUCTIONS.
 SERVER_INSTRUCTIONS = contract.SERVER_INSTRUCTIONS
+
+# Sizes shipped under src/yutome/assets/yutome-icon-<size>.png. Offered to
+# clients via MCP `Implementation.icons` so connector UIs can pick whichever
+# size fits. Spec: SEP-973 / schema 2025-11-25.
+_ICON_SIZES_PX = (48, 128, 256)
+
+
+@lru_cache(maxsize=1)
+def _server_icons() -> list[Any]:
+    from mcp.types import Icon
+
+    icons: list[Icon] = []
+    for size in _ICON_SIZES_PX:
+        try:
+            data = (
+                resources.files("yutome")
+                .joinpath(f"assets/yutome-icon-{size}.png")
+                .read_bytes()
+            )
+        except (FileNotFoundError, ModuleNotFoundError):
+            continue
+        encoded = base64.b64encode(data).decode("ascii")
+        icons.append(
+            Icon(
+                src=f"data:image/png;base64,{encoded}",
+                mimeType="image/png",
+                sizes=[f"{size}x{size}"],
+            )
+        )
+    return icons
 
 
 class _StaticBearerVerifier:
@@ -62,10 +96,14 @@ def build_server(
     server_kwargs: dict[str, Any] = {
         "name": SERVER_NAME,
         "instructions": SERVER_INSTRUCTIONS,
+        "website_url": SERVER_WEBSITE_URL,
         "host": host,
         "port": port,
         "streamable_http_path": streamable_http_path,
     }
+    icons = _server_icons()
+    if icons:
+        server_kwargs["icons"] = icons
     if auth_token:
         from mcp.server.auth.settings import AuthSettings
 
