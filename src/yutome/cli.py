@@ -88,6 +88,7 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local MC
 http_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local HTTP API server.")
 eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run retrieval quality checks.")
 remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Prepare and serve authenticated remote access.")
+contract_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Inspect and export the MCP contract.")
 app.add_typer(export_app, name="export")
 app.add_typer(channels_app, name="channels")
 app.add_typer(list_app, name="list")
@@ -97,6 +98,7 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(http_app, name="http")
 app.add_typer(eval_app, name="eval")
 app.add_typer(remote_app, name="remote")
+app.add_typer(contract_app, name="contract")
 
 
 ENV_TEMPLATE = """# Local secrets and proxy configuration. This file is ignored by git.
@@ -3440,3 +3442,22 @@ def _http_json(method: str, url: str, *, timeout: float, headers: dict[str, str]
     request = urllib.request.Request(url, method=method, headers=headers or {})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+@contract_app.command("emit")
+def contract_emit(
+    output: Path = typer.Option(
+        Path("cloudflare/yutome-capsule/src/contract.json"),
+        "--output",
+        "-o",
+        help="Destination JSON path. Defaults to the TS Worker's expected location.",
+    ),
+    show: bool = typer.Option(False, "--show", help="Print the emitted JSON to stdout."),
+) -> None:
+    """Serialize the contract registry to JSON for the TypeScript Worker."""
+    from yutome.contract_export import emit_contract_json
+
+    path = emit_contract_json(output)
+    typer.echo(f"[OK] Wrote contract JSON: {path}")
+    if show:
+        typer.echo(path.read_text(encoding="utf-8"))

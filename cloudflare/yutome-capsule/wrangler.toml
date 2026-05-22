@@ -1,0 +1,32 @@
+name = "yutome-remote-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-06-18"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Vars are non-secret. Real tokens live in `wrangler secret put`:
+#   - YUTOME_RELAY_TOKEN   (bridge -> Worker auth on /relay/connect)
+#   - YUTOME_PAIRING_CODE  (printed by `yutome connect`, consumed at /pair)
+#   - OAUTH_KV (KV namespace bound below by `workers-oauth-provider`)
+[vars]
+YUTOME_WORKER_MODE = "connector_only"
+
+# Durable Object that holds (a) the laptop bridge WebSocket
+# (WebSocket Hibernation) and (b) per-session MCP state from McpAgent.
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "YutomeRelay"
+
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "YutomeMcpAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["YutomeRelay", "YutomeMcpAgent"]
+
+# KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).
+# Provision once with `wrangler kv namespace create OAUTH_KV` and paste id here.
+# [[kv_namespaces]]
+# binding = "OAUTH_KV"
+# id = "<paste-from-wrangler-kv-namespace-create>"

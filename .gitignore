@@ -11,4 +11,9 @@ __pycache__/
 
 data/
 
+# Cloudflare Worker subproject — track source, ignore build/runtime artifacts
+cloudflare/*/node_modules/
+cloudflare/*/.wrangler/
+cloudflare/*/dist/
+
 .DS_Store

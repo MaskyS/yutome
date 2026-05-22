@@ -1,0 +1,443 @@
+{
+  "$schema_version": 1,
+  "auth_scope": "yutome.search.read",
+  "tools": [
+    {
+      "name": "find",
+      "title": "Search Yutome corpus",
+      "description": "Use this when the user asks to search their Yutome YouTube corpus by topic, phrase, meaning, channel, date, source, or transcript content. Do not use it for newest-video lists; use list instead.",
+      "inputSchema": {
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "in_": {
+            "default": "chunks",
+            "enum": [
+              "chunks",
+              "titles",
+              "descriptions"
+            ],
+            "title": "In",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "lexical",
+                  "semantic",
+                  "hybrid",
+                  "none"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Mode"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Channel"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Since"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Until"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "group_by": {
+            "anyOf": [
+              {
+                "enum": [
+                  "video",
+                  "channel",
+                  "transcript_source"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Group By"
+          },
+          "limit": {
+            "default": 10,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "tool_findArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Search Yutome corpus",
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "list",
+      "title": "List videos, channels, or status",
+      "description": "Use this when the user asks to list newest videos, channels, corpus status, selected items, or attention rows. For newest videos, use entity=videos, order_by=newest, and a small limit.",
+      "inputSchema": {
+        "properties": {
+          "entity": {
+            "enum": [
+              "video",
+              "videos",
+              "channel",
+              "channels",
+              "attention",
+              "status"
+            ],
+            "title": "Entity",
+            "type": "string"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Channel"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Since"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Until"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "selected": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Selected"
+          },
+          "order_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Order By"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project"
+          }
+        },
+        "required": [
+          "entity"
+        ],
+        "title": "tool_listArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "List videos, channels, or status",
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "show",
+      "title": "Open a chunk, video, channel, or transcript",
+      "description": "Use this when the user asks to open or inspect a specific Yutome chunk, video, channel, transcript, source, citation, or surrounding context.",
+      "inputSchema": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "chunk",
+              "video",
+              "channel",
+              "transcript",
+              "context",
+              "source"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "id_": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Id"
+          },
+          "token_budget": {
+            "default": 3000,
+            "title": "Token Budget",
+            "type": "integer"
+          },
+          "video_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Video Id"
+          },
+          "time_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Time Seconds"
+          },
+          "youtube_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Youtube Url"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "tool_showArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Open a chunk, video, channel, or transcript",
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "q",
+      "title": "Run a raw Yutome query",
+      "description": "Use this only for advanced raw Yutome QueryRequest JSON when find, list, and show cannot express the request.",
+      "inputSchema": {
+        "properties": {
+          "request": {
+            "additionalProperties": true,
+            "title": "Request",
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "title": "tool_qArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Run a raw Yutome query",
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    }
+  ],
+  "resource_templates": [
+    {
+      "uriTemplate": "yutome://chunk/{chunk_id}",
+      "name": "yutome_chunk",
+      "description": "Full chunk text and provenance for a transcript chunk.",
+      "mimeType": "application/json",
+      "host": "chunk"
+    },
+    {
+      "uriTemplate": "yutome://video/{video_id}",
+      "name": "yutome_video",
+      "description": "Video metadata and active transcript provenance.",
+      "mimeType": "application/json",
+      "host": "video"
+    },
+    {
+      "uriTemplate": "yutome://channel/{channel_id}",
+      "name": "yutome_channel",
+      "description": "Channel metadata and local library status.",
+      "mimeType": "application/json",
+      "host": "channel"
+    },
+    {
+      "uriTemplate": "yutome://transcript/{transcript_version_id}",
+      "name": "yutome_transcript",
+      "description": "Transcript provenance plus plain text (capped at 200k chars).",
+      "mimeType": "application/json",
+      "host": "transcript"
+    }
+  ]
+}
