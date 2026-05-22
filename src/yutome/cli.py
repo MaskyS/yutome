@@ -1110,12 +1110,24 @@ def _print_connector_next_steps(mcp_url: str) -> None:
 
 
 def _print_pairing_next_steps(state: Any) -> None:
-    if not getattr(state, "pairing_code", None):
+    pairing_code = getattr(state, "pairing_code", None)
+    endpoint = getattr(state, "endpoint_url", None)
+    if not endpoint:
         return
     typer.echo("")
     typer.echo("Pair this connector once:")
-    typer.echo(f"  {_pairing_url(state.endpoint_url, state.pairing_code)}")
-    typer.echo("This lets Claude/ChatGPT complete OAuth without a Yutome account.")
+    if pairing_code:
+        typer.echo(f"  Open: {endpoint}/pair")
+        typer.echo(f"  Code: {pairing_code}")
+        typer.echo("  (Claude/ChatGPT will prompt you in a browser tab during OAuth setup.")
+        typer.echo("  Paste the code there.)")
+    else:
+        typer.echo(f"  Open {endpoint}/pair after adding the connector to your assistant.")
+        typer.echo("  You will need the YUTOME_PAIRING_CODE secret you set on the Worker.")
+    typer.echo("")
+    typer.echo("Tip: in Claude Desktop, after pairing succeeds, open the connector settings,")
+    typer.echo("expand 'Read-only tools', and switch the per-group permission from")
+    typer.echo("'Needs approval' to 'Allowed always' — otherwise every tool call will prompt.")
 
 
 def _print_setup_mcp_section(*, yes: bool) -> None:
@@ -1281,15 +1293,114 @@ def _ensure_capsule_node_modules(capsule: Path) -> None:
         raise typer.Exit(code=returncode)
 
 
-def _deploy_tracked_capsule(*, refresh_contract: bool = True) -> tuple[str | None, str]:
+_OAUTH_KV_ID_RE = re.compile(r'id\s*=\s*"([0-9a-f]{8,})"')
+
+
+def _ensure_oauth_kv_namespace(capsule: Path) -> None:
+    """If wrangler.toml has no active OAUTH_KV binding, create the namespace
+    and write the resulting id into the config. Idempotent — re-runs are
+    cheap because we check for an existing uncommented binding first."""
+    wrangler_path = capsule / "wrangler.toml"
+    content = wrangler_path.read_text(encoding="utf-8")
+
+    # Strip comment-only lines to test whether OAUTH_KV is actually bound.
+    active = "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+    if 'binding = "OAUTH_KV"' in active and _OAUTH_KV_ID_RE.search(
+        active.split('binding = "OAUTH_KV"', 1)[1]
+    ):
+        return  # already configured
+
+    typer.echo("Creating Cloudflare KV namespace OAUTH_KV (one-time setup)…")
+    completed = subprocess.run(
+        ["npx", "--yes", "wrangler", "kv", "namespace", "create", "OAUTH_KV"],
+        cwd=capsule,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if completed.returncode != 0:
+        typer.echo("Failed to create OAUTH_KV namespace.", err=True)
+        if completed.stdout:
+            typer.echo(completed.stdout.rstrip(), err=True)
+        raise typer.Exit(code=completed.returncode)
+
+    match = _OAUTH_KV_ID_RE.search(completed.stdout or "")
+    if not match:
+        typer.echo(
+            "OAUTH_KV namespace created but Wrangler's id could not be parsed. "
+            "Paste the binding block manually into wrangler.toml.",
+            err=True,
+        )
+        if completed.stdout:
+            typer.echo(completed.stdout.rstrip(), err=True)
+        raise typer.Exit(code=1)
+    namespace_id = match.group(1)
+    typer.echo(f"[OK] Created OAUTH_KV namespace id={namespace_id}")
+
+    new_block = (
+        "\n# KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).\n"
+        "# Auto-created by `yutome connect --deploy`.\n"
+        '[[kv_namespaces]]\n'
+        'binding = "OAUTH_KV"\n'
+        f'id = "{namespace_id}"\n'
+    )
+    if "binding = \"OAUTH_KV\"" in content:
+        # Replace any commented-out template block with the real one.
+        content = re.sub(
+            r"(?:^#[^\n]*\n)*#?\s*\[\[kv_namespaces\]\][^\n]*\n(?:#?[^\n]*\n)*",
+            new_block.lstrip("\n"),
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        content = content.rstrip() + "\n" + new_block
+    wrangler_path.write_text(content, encoding="utf-8")
+    typer.echo(f"[OK] Wrote OAUTH_KV binding to {wrangler_path}")
+
+
+def _push_wrangler_secret(capsule: Path, name: str, value: str) -> None:
+    """Push a secret to the deployed Worker via `wrangler secret put`."""
+    typer.echo(f"Setting Cloudflare secret {name}")
+    completed = subprocess.run(
+        ["npx", "--yes", "wrangler", "secret", "put", name],
+        cwd=capsule,
+        input=value,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        typer.echo(f"Failed to set {name}.", err=True)
+        if completed.stderr:
+            typer.echo(completed.stderr.rstrip(), err=True)
+        raise typer.Exit(code=completed.returncode)
+
+
+def _deploy_tracked_capsule(
+    *,
+    refresh_contract: bool = True,
+    relay_token: str | None = None,
+    pairing_code: str | None = None,
+) -> tuple[str | None, str, str, str]:
     """Deploy the tracked TypeScript Worker from cloudflare/yutome-capsule.
 
-    Returns ``(deployed_url, worker_name)``. The worker_name comes from
-    wrangler.toml (currently the fixed CAPSULE_PROJECT_NAME)."""
+    Generates ``YUTOME_RELAY_TOKEN`` and ``YUTOME_PAIRING_CODE`` if not
+    supplied, pushes them to Cloudflare as encrypted secrets, and returns
+    ``(deployed_url, worker_name, relay_token, pairing_code)`` so the caller
+    can persist them to local state.
+    """
     capsule = _tracked_capsule_path()
     if not capsule.exists():
         typer.echo(f"Expected TypeScript Worker subproject at {capsule}, but it is missing.", err=True)
         raise typer.Exit(code=1)
+
+    effective_relay_token = relay_token or secrets.token_urlsafe(32)
+    effective_pairing_code = pairing_code or secrets.token_hex(5).upper()
 
     if refresh_contract:
         from yutome.contract_export import emit_contract_json
@@ -1299,6 +1410,7 @@ def _deploy_tracked_capsule(*, refresh_contract: bool = True) -> tuple[str | Non
         typer.echo(f"[OK] Refreshed contract: {contract_path}")
 
     _ensure_capsule_node_modules(capsule)
+    _ensure_oauth_kv_namespace(capsule)
 
     typer.echo(f"Deploying Cloudflare Worker from {capsule}")
     command = ["npx", "--yes", "wrangler", "deploy"]
@@ -1310,7 +1422,12 @@ def _deploy_tracked_capsule(*, refresh_contract: bool = True) -> tuple[str | Non
         )
         raise typer.Exit(code=returncode)
 
-    return _extract_worker_url(output), CAPSULE_PROJECT_NAME
+    # Worker is up. Push secrets so OAuth pairing + bridge auth work.
+    _push_wrangler_secret(capsule, "YUTOME_RELAY_TOKEN", effective_relay_token)
+    _push_wrangler_secret(capsule, "YUTOME_PAIRING_CODE", effective_pairing_code)
+
+    deployed_url = _extract_worker_url(output)
+    return deployed_url, CAPSULE_PROJECT_NAME, effective_relay_token, effective_pairing_code
 
 
 def _delete_tracked_capsule(worker_name: str) -> None:
@@ -1582,13 +1699,20 @@ def setup(
                     typer.echo("Opened Cloudflare Workers. Install Node.js LTS, then run:")
                     typer.echo("  uv run yutome connect --deploy")
                     return
-                deployed_url, deployed_worker_name = _deploy_tracked_capsule()
+                (
+                    deployed_url,
+                    deployed_worker_name,
+                    deployed_relay_token,
+                    deployed_pairing_code,
+                ) = _deploy_tracked_capsule()
                 if deployed_url:
                     _save_deployed_worker_endpoint(
                         config,
                         endpoint=deployed_url,
                         mode="connector_only",
                         worker_name=deployed_worker_name,
+                        relay_token=deployed_relay_token,
+                        pairing_code=deployed_pairing_code,
                     )
                 else:
                     typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
@@ -1648,7 +1772,9 @@ def connect_command(
             typer.echo("  uv run yutome connect --deploy")
             return
 
-        deployed_url, deployed_worker_name = _deploy_tracked_capsule()
+        deployed_url, deployed_worker_name, deployed_relay_token, deployed_pairing_code = (
+            _deploy_tracked_capsule()
+        )
         if deployed_url is None:
             typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
             typer.echo("Save the endpoint manually with `uv run yutome connect --endpoint <url>`.")
@@ -1658,6 +1784,8 @@ def connect_command(
             endpoint=deployed_url,
             mode=remote_mode,
             worker_name=deployed_worker_name,
+            relay_token=deployed_relay_token,
+            pairing_code=deployed_pairing_code,
         )
         return
     try:

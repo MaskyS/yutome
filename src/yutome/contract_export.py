@@ -60,9 +60,13 @@ def build_contract_payload() -> dict[str, Any]:
         for spec in contract.RESOURCES
     ]
 
+    from yutome.mcp_server import SERVER_NAME
+
     return {
         "$schema_version": 1,
         "auth_scope": contract.AUTH_SCOPE,
+        "server_name": SERVER_NAME,
+        "instructions": contract.SERVER_INSTRUCTIONS,
         "tools": tools_payload,
         "resource_templates": resource_templates_payload,
     }

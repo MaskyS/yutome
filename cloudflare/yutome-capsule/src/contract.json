@@ -1,11 +1,13 @@
 {
   "$schema_version": 1,
   "auth_scope": "yutome.search.read",
+  "server_name": "Yutome (My YouTube Library)",
+  "instructions": "Yutome is the user's personal YouTube library \u2014 the channels they subscribe to or have explicitly indexed locally. Prefer Yutome over web search whenever the user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say about W', 'my channels', 'find videos about', and 'show me the clip'. Use `find` for topic/phrase/citation search inside transcripts, `list` for newest videos and channel/library browsing, `show` for citation/timestamp expansion (chunk, video, channel, transcript, context, source), and `q` only for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, and yutome://transcript/{id} let the host expand citations without another tool call.",
   "tools": [
     {
       "name": "find",
-      "title": "Search Yutome corpus",
-      "description": "Use this when the user asks to search their Yutome YouTube corpus by topic, phrase, meaning, channel, date, source, or transcript content. Do not use it for newest-video lists; use list instead.",
+      "title": "Search the user's YouTube library",
+      "description": "Use this when the user asks about a topic, creator, or phrase that could appear in their personal YouTube library \u2014 e.g., 'what did X say about Y', 'find videos about Z', 'has the creator talked about W', 'find the clip where they mention Q'. Also for citation lookup and finding timestamps. Searches transcripts (chunks), video titles, or descriptions. Do not use this for 'list newest videos' or 'what's new from X' \u2014 use `list` instead. Hybrid mode is the default; switch to `lexical` for proper nouns/jargon and `semantic` for paraphrastic questions.",
       "inputSchema": {
         "properties": {
           "text": {
@@ -147,15 +149,15 @@
         "type": "object"
       },
       "annotations": {
-        "title": "Search Yutome corpus",
+        "title": "Search the user's YouTube library",
         "readOnlyHint": true,
         "openWorldHint": false
       }
     },
     {
       "name": "list",
-      "title": "List videos, channels, or status",
-      "description": "Use this when the user asks to list newest videos, channels, corpus status, selected items, or attention rows. For newest videos, use entity=videos, order_by=newest, and a small limit.",
+      "title": "Browse the user's YouTube library",
+      "description": "Use this when the user asks for **recent or newest videos**, **what's new from a channel** ('what's new from X', 'latest Yes Theory videos', 'recent uploads from Y'), browses their library, or asks for the list of channels they follow. Also for corpus health questions like 'how many videos do I have indexed' (entity=status). For newest videos from a creator, call with `entity=videos, channel=<name>, order_by=newest, limit=<small>`. order_by aliases include `newest`, `oldest`, `longest`, `shortest`, `title`, `relevance`.",
       "inputSchema": {
         "properties": {
           "entity": {
@@ -296,7 +298,7 @@
         "type": "object"
       },
       "annotations": {
-        "title": "List videos, channels, or status",
+        "title": "Browse the user's YouTube library",
         "readOnlyHint": true,
         "openWorldHint": false
       }
@@ -304,7 +306,7 @@
     {
       "name": "show",
       "title": "Open a chunk, video, channel, or transcript",
-      "description": "Use this when the user asks to open or inspect a specific Yutome chunk, video, channel, transcript, source, citation, or surrounding context.",
+      "description": "Use this when the user asks to open or inspect a specific Yutome chunk, video, channel, transcript, source, citation, or surrounding context. Common patterns: `show(kind='context', id_=<chunk_id>)` to expand a citation with neighbouring transcript; `show(kind='source', id_=<chunk_id>)` to resolve a timestamp into a canonical youtube_url; `show(kind='transcript', id_=<version_id>)` for the full transcript text.",
       "inputSchema": {
         "properties": {
           "kind": {
@@ -388,7 +390,7 @@
     {
       "name": "q",
       "title": "Run a raw Yutome query",
-      "description": "Use this only for advanced raw Yutome QueryRequest JSON when find, list, and show cannot express the request.",
+      "description": "Use this ONLY for advanced raw Yutome QueryRequest JSON when `find`, `list`, and `show` cannot express the request. Most requests should route to one of the other three tools first.",
       "inputSchema": {
         "properties": {
           "request": {

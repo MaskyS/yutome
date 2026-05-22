@@ -26,7 +26,7 @@ tag = "v1"
 new_sqlite_classes = ["YutomeRelay", "YutomeMcpAgent"]
 
 # KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).
-# Provision once with `wrangler kv namespace create OAUTH_KV` and paste id here.
-# [[kv_namespaces]]
-# binding = "OAUTH_KV"
-# id = "<paste-from-wrangler-kv-namespace-create>"
+# Created with `wrangler kv namespace create OAUTH_KV`.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "785d8e1a702f4815b99c807a805a4e10"

@@ -15,16 +15,12 @@ from yutome import contract, runtime
 from yutome.contract import AUTH_SCOPE
 
 
-SERVER_NAME = "yutome"
+SERVER_NAME = "Yutome (My YouTube Library)"
 REMOTE_TOKEN_ENV_VAR = "YUTOME_HTTP_TOKEN"
 REMOTE_READ_SCOPE = AUTH_SCOPE  # kept for back-compat with callers that imported the old name
-SERVER_INSTRUCTIONS = (
-    "yutome is a local-first YouTube channel knowledge base. Use `find` for ranked "
-    "relevance, `list` for enumeration by filter, `show` for resource-by-id or "
-    "citation/context expansion, and `q` for the raw QueryRequest primitive. "
-    "Use show(kind='source') for citation URL/provenance only; use "
-    "show(kind='context') for neighboring transcript text within a token budget."
-)
+# Re-exported for adapters that still import from mcp_server. The single
+# source of truth is contract.SERVER_INSTRUCTIONS.
+SERVER_INSTRUCTIONS = contract.SERVER_INSTRUCTIONS
 
 
 class _StaticBearerVerifier:

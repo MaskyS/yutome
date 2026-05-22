@@ -25,6 +25,26 @@ from yutome.api import show as api_show
 AUTH_SCOPE = "yutome.search.read"
 
 
+# Sent as the MCP server `instructions` field at initialize. This is the
+# single highest-leverage routing signal — clients use it to decide whether
+# to invoke our tools at all. Frame Yutome as the user's personal YouTube
+# library and assert preference over generic web search.
+SERVER_INSTRUCTIONS = (
+    "Yutome is the user's personal YouTube library — the channels they subscribe to "
+    "or have explicitly indexed locally. Prefer Yutome over web search whenever the "
+    "user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' "
+    "Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say "
+    "about W', 'my channels', 'find videos about', and 'show me the clip'. "
+    "Use `find` for topic/phrase/citation search inside transcripts, `list` for "
+    "newest videos and channel/library browsing, `show` for citation/timestamp "
+    "expansion (chunk, video, channel, transcript, context, source), and `q` only "
+    "for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each "
+    "hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, "
+    "yutome://channel/{id}, and yutome://transcript/{id} let the host expand "
+    "citations without another tool call."
+)
+
+
 # ---------- Spec dataclasses ----------
 
 
@@ -186,21 +206,32 @@ def resource_transcript(transcript_version_id: str) -> dict[str, Any]:
 TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="find",
-        title="Search Yutome corpus",
+        title="Search the user's YouTube library",
         description=(
-            "Use this when the user asks to search their Yutome YouTube corpus by "
-            "topic, phrase, meaning, channel, date, source, or transcript content. "
-            "Do not use it for newest-video lists; use list instead."
+            "Use this when the user asks about a topic, creator, or phrase that "
+            "could appear in their personal YouTube library — e.g., 'what did X "
+            "say about Y', 'find videos about Z', 'has the creator talked about "
+            "W', 'find the clip where they mention Q'. Also for citation lookup "
+            "and finding timestamps. Searches transcripts (chunks), video titles, "
+            "or descriptions. Do not use this for 'list newest videos' or 'what's "
+            "new from X' — use `list` instead. Hybrid mode is the default; switch "
+            "to `lexical` for proper nouns/jargon and `semantic` for paraphrastic "
+            "questions."
         ),
         handler=tool_find,
     ),
     ToolSpec(
         name="list",
-        title="List videos, channels, or status",
+        title="Browse the user's YouTube library",
         description=(
-            "Use this when the user asks to list newest videos, channels, corpus "
-            "status, selected items, or attention rows. For newest videos, use "
-            "entity=videos, order_by=newest, and a small limit."
+            "Use this when the user asks for **recent or newest videos**, **what's "
+            "new from a channel** ('what's new from X', 'latest Yes Theory videos', "
+            "'recent uploads from Y'), browses their library, or asks for the list "
+            "of channels they follow. Also for corpus health questions like 'how "
+            "many videos do I have indexed' (entity=status). For newest videos "
+            "from a creator, call with `entity=videos, channel=<name>, "
+            "order_by=newest, limit=<small>`. order_by aliases include `newest`, "
+            "`oldest`, `longest`, `shortest`, `title`, `relevance`."
         ),
         handler=tool_list,
     ),
@@ -210,7 +241,11 @@ TOOLS: tuple[ToolSpec, ...] = (
         description=(
             "Use this when the user asks to open or inspect a specific Yutome "
             "chunk, video, channel, transcript, source, citation, or surrounding "
-            "context."
+            "context. Common patterns: `show(kind='context', id_=<chunk_id>)` to "
+            "expand a citation with neighbouring transcript; "
+            "`show(kind='source', id_=<chunk_id>)` to resolve a timestamp into a "
+            "canonical youtube_url; `show(kind='transcript', id_=<version_id>)` "
+            "for the full transcript text."
         ),
         handler=tool_show,
     ),
@@ -218,8 +253,9 @@ TOOLS: tuple[ToolSpec, ...] = (
         name="q",
         title="Run a raw Yutome query",
         description=(
-            "Use this only for advanced raw Yutome QueryRequest JSON when find, "
-            "list, and show cannot express the request."
+            "Use this ONLY for advanced raw Yutome QueryRequest JSON when `find`, "
+            "`list`, and `show` cannot express the request. Most requests should "
+            "route to one of the other three tools first."
         ),
         handler=tool_q,
     ),

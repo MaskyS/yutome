@@ -406,9 +406,27 @@ def _status_predicate(status: str) -> StringPredicate:
     return StringPredicate(eq=status)
 
 
+_ORDER_BY_ALIASES: dict[str, tuple[str, str]] = {
+    # Aliases the model is told to use in tool descriptions. Map to real
+    # OrderBy fields so callers can keep using natural names.
+    "newest": ("published_at", "desc"),
+    "oldest": ("published_at", "asc"),
+    "longest": ("duration_seconds", "desc"),
+    "shortest": ("duration_seconds", "asc"),
+    "title_asc": ("title", "asc"),
+    "title_desc": ("title", "desc"),
+    "title": ("title", "asc"),
+    "updated": ("last_attempt_created_at", "desc"),
+    "relevance": ("score", "desc"),
+}
+
+
 def _order(order_by: str | None) -> list[OrderBy]:
     if not order_by:
         return []
+    if order_by in _ORDER_BY_ALIASES:
+        field, direction = _ORDER_BY_ALIASES[order_by]
+        return [OrderBy(field=field, direction=direction)]  # type: ignore[arg-type]
     if ":" in order_by:
         field, direction = order_by.split(":", 1)
         return [OrderBy(field=field, direction="asc" if direction == "asc" else "desc")]  # type: ignore[arg-type]

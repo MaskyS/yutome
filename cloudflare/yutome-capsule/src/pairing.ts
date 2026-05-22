@@ -73,6 +73,10 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
  * a bad pairing code.
  */
 export function renderForm(url: URL, error: string, authRequestJson?: string): Response {
+  // The pairing form ALWAYS posts to /pair regardless of which route rendered
+  // it. /authorize only handles GET; the POST step lives entirely in
+  // handlePairingRequest.
+  const action = `/pair${url.search}`;
   const hidden = authRequestJson
     ? `<input type="hidden" name="__auth_request" value="${escapeHtml(authRequestJson)}" />`
     : "";
@@ -98,7 +102,7 @@ export function renderForm(url: URL, error: string, authRequestJson?: string): R
   <p class="hint">Claude or ChatGPT wants permission to search this Yutome library while your computer is online.</p>
   <p class="hint">Enter the pairing code that <code>yutome connect</code> printed. No Yutome account is needed.</p>
   ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
-  <form method="post" action="${escapeHtml(url.pathname + url.search)}">
+  <form method="post" action="${escapeHtml(action)}">
     ${hidden}
     <label>Pairing code
       <input name="pairing_code" autocomplete="one-time-code" autofocus required />

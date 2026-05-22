@@ -44,28 +44,21 @@ interface ResourceTemplateEntry {
 
 interface ContractPayload {
   auth_scope: string;
+  server_name: string;
+  instructions: string;
   tools: ToolEntry[];
   resource_templates: ResourceTemplateEntry[];
 }
 
 const CONTRACT = contractData as ContractPayload;
 
-const SERVER_INSTRUCTIONS =
-  "yutome is a local-first YouTube channel knowledge base. Use `find` for ranked " +
-  "relevance, `list` for enumeration by filter, `show` for resource-by-id or " +
-  "citation/context expansion, and `q` for the raw QueryRequest primitive. " +
-  "Use show(kind='source') for citation URL/provenance only; use " +
-  "show(kind='context') for neighboring transcript text within a token budget. " +
-  "Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, " +
-  "and yutome://transcript/{id} expand citations without burning a tool call.";
-
 type DispatchResult = { result?: unknown; error?: { code?: number; message?: string; data?: unknown } };
 
 export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
   server = new Server(
-    { name: "yutome", version: "0.2.0" },
+    { name: CONTRACT.server_name, version: "0.2.0" },
     {
-      instructions: SERVER_INSTRUCTIONS,
+      instructions: CONTRACT.instructions,
       capabilities: {
         tools: {},
         resources: { listChanged: false, subscribe: false },
@@ -87,9 +80,8 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       const dispatch = (await this.relay().dispatch("tool", "tools/call", {
-        kind: "tool",
-        method: "tools/call",
-        params: { name, arguments: args ?? {} },
+        name,
+        arguments: args ?? {},
       })) as DispatchResult;
       return this.unwrapToolResult(dispatch);
     });
@@ -112,9 +104,7 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       const uri = request.params.uri;
       const dispatch = (await this.relay().dispatch("resource", "resources/read", {
-        kind: "resource",
-        method: "resources/read",
-        params: { uri },
+        uri,
       })) as DispatchResult;
       if (dispatch.error) {
         const err = dispatch.error;

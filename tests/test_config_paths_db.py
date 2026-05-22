@@ -491,7 +491,12 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
 
     monkeypatch.setattr(
         "yutome.cli._deploy_tracked_capsule",
-        lambda refresh_contract=True: ("https://example.workers.dev", "yutome-remote-mcp"),
+        lambda refresh_contract=True, relay_token=None, pairing_code=None: (
+            "https://example.workers.dev",
+            "yutome-remote-mcp",
+            "fake-relay-token",
+            "ABCD12",
+        ),
     )
 
     result = runner.invoke(app, ["connect", "--config", str(config_path), "--deploy"])
@@ -501,6 +506,12 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
     assert state["endpoint_url"] == "https://example.workers.dev"
     assert state["mcp_url"] == "https://example.workers.dev/mcp"
     assert state["cloud_resources"]["cloudflare_worker_name"] == "yutome-remote-mcp"
+    assert state["relay_token"] == "fake-relay-token"
+    assert state["pairing_code"] == "ABCD12"
+    # The "Pair this connector once" prose must now print the URL + code so
+    # the user knows where to paste it when Claude opens the OAuth browser.
+    assert f"{state['endpoint_url']}/pair" in result.output
+    assert "ABCD12" in result.output
 
 
 def test_status_reports_remote_unconfigured_and_configured(tmp_path: Path) -> None:
