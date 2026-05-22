@@ -26,6 +26,10 @@ def _is_tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def is_interactive() -> bool:
+    return _is_tty()
+
+
 def _style():
     global _STYLE
     if _STYLE is None:
@@ -111,6 +115,8 @@ def checkbox(
     choices: list[str],
     *,
     defaults: Iterable[str] = (),
+    instruction: str | None = None,
+    use_search_filter: bool = False,
 ) -> list[str]:
     if not _is_tty():
         default_set = set(defaults)
@@ -136,7 +142,15 @@ def checkbox(
 
     default_set = set(defaults)
     choice_objs = [{"name": c, "checked": c in default_set} for c in choices]
-    return _ask(questionary.checkbox(message, choices=choice_objs, style=_style()))
+    return _ask(
+        questionary.checkbox(
+            message,
+            choices=choice_objs,
+            instruction=instruction,
+            use_search_filter=use_search_filter,
+            style=_style(),
+        )
+    )
 
 
 def offer_to_open(

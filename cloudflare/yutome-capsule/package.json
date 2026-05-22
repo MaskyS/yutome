@@ -4,6 +4,9 @@
   "private": true,
   "description": "Cloudflare Worker for yutome's remote MCP endpoint. Tools and resources come from the Python contract registry via src/contract.json.",
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",

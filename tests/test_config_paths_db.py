@@ -4,11 +4,17 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from yutome.cli import (
     _active_oauth_kv_id,
+    _channel_picker_labels,
+    _cloudflare_deploy_runtime_problem,
     _ensure_oauth_kv_namespace,
+    _ensure_wrangler_authenticated,
+    _parse_node_version,
     _push_wrangler_secret,
     _strip_oauth_kv_binding,
     _tracked_capsule_path,
@@ -531,6 +537,41 @@ def test_channel_selection_parser_rejects_invalid_indexes() -> None:
         raise AssertionError("expected invalid selection")
 
 
+def test_channel_picker_labels_hide_ids_and_sources() -> None:
+    channels = [
+        channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+        channel_from_input("UC2222222222222222222222", title="Alpha", import_source="youtube-browser-cookies"),
+        channel_from_input("@beta", title="Beta", import_source="youtube-browser-cookies"),
+    ]
+
+    labels = _channel_picker_labels(channels)
+
+    assert labels[0] == "Alpha - duplicate 1"
+    assert labels[1] == "Alpha - duplicate 2"
+    assert labels[2] == "Beta"
+    rendered = " ".join(labels.values())
+    assert "UC1111111111111111111111" not in rendered
+    assert "youtube-browser-cookies" not in rendered
+
+
+def test_node_version_parser() -> None:
+    assert _parse_node_version("v22.12.0") == (22, 12, 0)
+    assert _parse_node_version("/opt/node (v20.19.5)") == (20, 19, 5)
+    assert _parse_node_version("not node") is None
+
+
+def test_cloudflare_deploy_runtime_rejects_node_below_wrangler_floor(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("shutil.which", lambda command: f"/bin/{command}")
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == ["/bin/node", "--version"]
+        return subprocess.CompletedProcess(command, 0, stdout="v20.19.5\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert "Node.js 22.0.0+ is required" in (_cloudflare_deploy_runtime_problem() or "")
+
+
 def test_import_youtube_uses_browser_cookie_source(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
@@ -899,6 +940,63 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 
     assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
     assert _active_oauth_kv_id(generated.read_text(encoding="utf-8")) == "33333333333333333333333333333333"
+
+
+def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    _ensure_wrangler_authenticated(capsule)
+
+    assert calls == []
+
+
+def test_wrangler_auth_runs_interactive_login_when_whoami_fails(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[-1] == "whoami" and calls.count(command) == 1:
+            return subprocess.CompletedProcess(command, 1, stdout="not logged in", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="logged in", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    _ensure_wrangler_authenticated(capsule)
+
+    assert calls == [
+        ["npx", "--yes", "wrangler", "whoami"],
+        ["npx", "--yes", "wrangler", "login"],
+        ["npx", "--yes", "wrangler", "whoami"],
+    ]
+
+
+def test_wrangler_auth_noninteractive_requires_api_token(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: False)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == ["npx", "--yes", "wrangler", "whoami"]
+        return subprocess.CompletedProcess(command, 1, stdout="needs token", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with pytest.raises(typer.Exit):
+        _ensure_wrangler_authenticated(capsule)
 
 
 def test_push_wrangler_secret_sends_newline_terminated_value(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

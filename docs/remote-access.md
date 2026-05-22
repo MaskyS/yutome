@@ -18,7 +18,7 @@ uv run yutome connect
 uv run yutome remote bridge
 ```
 
-`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the account-local `OAUTH_KV` namespace if missing, writes an ignored generated Wrangler config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing code. Node 18+ / npm / npx must be on PATH.
+`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the account-local `OAUTH_KV` namespace if missing, writes an ignored generated Wrangler config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing code. Node 22+ / npm / npx must be on PATH because current Wrangler requires Node 22 or newer.
 
 Each `--deploy` run refreshes the pairing code and bridge token. Use the newest printed code in the OAuth browser tab, and restart any old `uv run yutome remote bridge` process after redeploying.
 

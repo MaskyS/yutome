@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,8 @@ WEBSHARE_ENV_KEYS = (
 
 CLOUDFLARE_WORKERS_DASHBOARD_URL = "https://dash.cloudflare.com/?to=/:account/workers-and-pages"
 NODE_DOWNLOAD_URL = "https://nodejs.org/en/download"
+CLOUDFLARE_MIN_NODE_VERSION = (22, 0, 0)
+BACK_CHOICE = "Back"
 
 
 def _project_root(config_path: Path) -> Path:
@@ -647,12 +650,23 @@ def _add_setup_source(config: Path, target: str) -> LibrarySource | None:
     return source
 
 
-def _channel_picker_label(channel: LibraryChannel) -> str:
-    name = channel.title or channel.handle or channel.channel_id or channel.source_url
-    identity = channel.handle or channel.channel_id or channel.source_url
-    if identity == name:
-        return f"{name} [{channel.import_source or 'manual'}]"
-    return f"{name} ({identity}) [{channel.import_source or 'manual'}]"
+def _channel_picker_name(channel: LibraryChannel) -> str:
+    return channel.title or channel.handle or channel.source_url or "Untitled channel"
+
+
+def _channel_picker_labels(channels: list[LibraryChannel]) -> dict[int, str]:
+    base_names = [_channel_picker_name(channel) for channel in channels]
+    counts = Counter(base_names)
+    seen: Counter[str] = Counter()
+    labels: dict[int, str] = {}
+    for index, (channel, base_name) in enumerate(zip(channels, base_names, strict=True)):
+        if counts[base_name] == 1:
+            labels[index] = base_name
+            continue
+        seen[base_name] += 1
+        suffix = channel.handle if channel.handle and channel.handle != base_name else f"duplicate {seen[base_name]}"
+        labels[index] = f"{base_name} - {suffix}"
+    return labels
 
 
 def _sorted_picker_channels(channels: list[LibraryChannel]) -> list[LibraryChannel]:
@@ -692,17 +706,26 @@ def _parse_channel_selection(raw: str, channel_count: int) -> set[int]:
 
 def _display_channel_picker(channels: list[LibraryChannel], *, title: str, query: str | None = None) -> None:
     lowered_query = query.lower() if query else None
+    labels = _channel_picker_labels(channels)
     visible: list[tuple[int, LibraryChannel]] = []
     for index, channel in enumerate(channels):
-        label = _channel_picker_label(channel)
-        if lowered_query and lowered_query not in label.lower():
+        searchable = " ".join(
+            piece
+            for piece in (
+                labels[index],
+                channel.handle,
+                channel.source_url,
+            )
+            if piece
+        )
+        if lowered_query and lowered_query not in searchable.lower():
             continue
         visible.append((index, channel))
 
     typer.echo("")
     typer.echo(title)
     for index, channel in visible[:30]:
-        typer.echo(f"  {index + 1:>3}. {_channel_picker_label(channel)}")
+        typer.echo(f"  {index + 1:>3}. {labels[index]}")
     if len(visible) > 30:
         typer.echo(f"  ... {len(visible) - 30} more match; use /search text to narrow.")
     if query and not visible:
@@ -716,8 +739,39 @@ def _prompt_channels_to_select(
     title: str = "Choose channels:",
     prompt: str = "Select",
     default: str = "none",
-) -> list[LibraryChannel]:
+    allow_back: bool = False,
+) -> list[LibraryChannel] | None:
     ordered = _sorted_picker_channels(channels)
+    labels = _channel_picker_labels(ordered)
+    if setup_prompts.is_interactive():
+        default_indexes = _parse_channel_selection(default, len(ordered))
+        select_all_label = "All channels"
+        back_label = BACK_CHOICE
+        label_to_index = {label: index for index, label in labels.items()}
+        default_labels = (
+            [select_all_label]
+            if len(default_indexes) == len(ordered) and ordered
+            else [labels[index] for index in sorted(default_indexes)]
+        )
+        choices = [select_all_label, *labels.values()]
+        if allow_back:
+            choices.append(back_label)
+        selected_labels = setup_prompts.checkbox(
+            title,
+            choices=choices,
+            defaults=default_labels,
+            instruction=(
+                "Use arrows to move, space to select, type to search, enter to continue. "
+                "Choose 'All channels' to select everything."
+            ),
+            use_search_filter=True,
+        )
+        if allow_back and back_label in selected_labels:
+            return None
+        if select_all_label in selected_labels:
+            return ordered
+        return [ordered[label_to_index[label]] for label in selected_labels if label in label_to_index]
+
     query: str | None = None
     while True:
         _display_channel_picker(ordered, title=title, query=query)
@@ -804,18 +858,20 @@ def _setup_import_youtube_subscriptions(
     typer.echo("    when you have multiple Google accounts and want to be explicit, or when")
     typer.echo("    cookies don't work. One-time ~5-min Google Cloud Console setup.")
     typer.echo("")
-    method = setup_prompts.select(
-        "How do you want to import your subscriptions?",
-        choices=[
-            "Browser cookies (recommended)",
-            "Google OAuth (pick a specific account)",
-            "Skip — I'll add channels manually with `yutome add`",
-        ],
-        default="Browser cookies (recommended)",
-    )
-    if method.startswith("Skip"):
-        pass
-    else:
+    method_choices = [
+        "Browser cookies (recommended)",
+        "Google OAuth (pick a specific account)",
+        "Skip - I'll add channels manually with `yutome add`",
+    ]
+    while True:
+        method = setup_prompts.select(
+            "How do you want to import your subscriptions?",
+            choices=method_choices,
+            default="Browser cookies (recommended)",
+        )
+        imported = []
+        if method.startswith("Skip"):
+            break
         use_oauth = method.startswith("Google OAuth")
         if use_oauth:
             if _configured_oauth_client_secrets(app_config, project_root, env_path) is None:
@@ -868,6 +924,7 @@ def _setup_import_youtube_subscriptions(
                         )
                     except YouTubeImportError as oauth_exc:
                         typer.echo(f"[WARN] YouTube OAuth subscription import skipped: {oauth_exc}")
+        break
 
     if setup_prompts.confirm(
         "Import the public subscriptions of another channel (someone else's library)?",
@@ -893,14 +950,44 @@ def _setup_import_youtube_subscriptions(
         return []
     typer.echo(
         f"Found {len(imported)} subscription channel{'s' if len(imported) != 1 else ''}. "
-        "If this count or the channel names look like the wrong YouTube account, choose none and use OAuth instead."
+        "If this looks like the wrong YouTube account, choose Back and use OAuth instead."
     )
-    selected_channels = _prompt_channels_to_select(
-        imported,
-        title="Choose channels to add to the library:",
-        prompt="Add to library",
-        default="none",
-    )
+    while True:
+        selected_channels = _prompt_channels_to_select(
+            imported,
+            title="Choose channels to add to the library:",
+            prompt="Add to library",
+            default="none",
+            allow_back=True,
+        )
+        if selected_channels is not None:
+            break
+        method = setup_prompts.select(
+            "How do you want to import your subscriptions?",
+            choices=["Google OAuth (pick a specific account)", "Skip - I'll add channels manually with `yutome add`"],
+            default="Google OAuth (pick a specific account)",
+        )
+        if method.startswith("Skip"):
+            return []
+        if _configured_oauth_client_secrets(app_config, project_root, env_path) is None:
+            if _prompt_oauth_client_secrets(env_path):
+                app_config = apply_env_to_config(app_config)
+        if _configured_oauth_client_secrets(app_config, project_root, env_path) is None:
+            typer.echo("[WARN] OAuth subscription import skipped: no client secrets provided.")
+            return []
+        try:
+            imported = _fetch_youtube_import_channels(
+                target=None,
+                app_config=app_config,
+                paths=paths,
+                project_root=project_root,
+                env_path=env_path,
+                status_callback=typer.echo,
+            )
+        except YouTubeImportError as oauth_exc:
+            typer.echo(f"[WARN] OAuth subscription import skipped: {oauth_exc}")
+            return []
+        typer.echo(f"Found {len(imported)} subscription channel{'s' if len(imported) != 1 else ''}.")
     selected_count = _save_imported_channels(paths, selected_channels, selected=True)
     typer.echo(
         f"[OK] Added {selected_count} selected channel{'s' if selected_count != 1 else ''} "
@@ -1177,9 +1264,59 @@ def _cloudflare_deploy_tools() -> dict[str, str | None]:
     }
 
 
+def _parse_node_version(raw: str) -> tuple[int, int, int] | None:
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", raw)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _node_version() -> tuple[tuple[int, int, int] | None, str]:
+    node_path = shutil.which("node")
+    if node_path is None:
+        return None, "not found"
+    try:
+        result = subprocess.run(
+            [node_path, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"{node_path} failed: {exc}"
+    detail = (result.stdout or result.stderr or "").strip() or f"exit code {result.returncode}"
+    if result.returncode != 0:
+        return None, f"{node_path} failed: {detail}"
+    return _parse_node_version(detail), f"{node_path} ({detail})"
+
+
+def _cloudflare_deploy_runtime_problem() -> str | None:
+    missing = _missing_cloudflare_deploy_tools()
+    if missing:
+        return f"Missing: {', '.join(missing)}"
+    version, detail = _node_version()
+    required = ".".join(str(part) for part in CLOUDFLARE_MIN_NODE_VERSION)
+    if version is None:
+        return f"Could not determine Node.js version from {detail}."
+    if version < CLOUDFLARE_MIN_NODE_VERSION:
+        return f"Node.js {required}+ is required by Wrangler; found {detail}."
+    return None
+
+
+def _require_cloudflare_deploy_runtime() -> None:
+    problem = _cloudflare_deploy_runtime_problem()
+    if problem is None:
+        return
+    typer.echo("Cannot deploy the Cloudflare Worker from this computer yet.", err=True)
+    typer.echo(problem, err=True)
+    typer.echo(f"Install Node.js 22 LTS or newer from {NODE_DOWNLOAD_URL}, then rerun `yutome connect --deploy`.", err=True)
+    typer.echo("If you use Homebrew: `brew install node@22` and make sure that `node --version` prints v22+.", err=True)
+    raise typer.Exit(code=1)
+
+
 def _can_run_cloudflare_deploy() -> bool:
-    tools = _cloudflare_deploy_tools()
-    return all(tools[name] for name in ("node", "npm", "npx"))
+    return _cloudflare_deploy_runtime_problem() is None
 
 
 def _missing_cloudflare_deploy_tools() -> list[str]:
@@ -1253,18 +1390,23 @@ def _prompt_first_run_video_cap(default_cap: int) -> int | None:
         return value
 
 
-def _prompt_assistant_apps() -> str:
+def _prompt_assistant_apps(*, allow_back: bool = False) -> str | None:
     label_to_value = {
         "Claude (web, Desktop, mobile)": "claude",
         "ChatGPT": "chatgpt",
         "Both Claude and ChatGPT": "both",
         "Another remote MCP client": "other",
     }
+    choices = list(label_to_value.keys())
+    if allow_back:
+        choices.append(BACK_CHOICE)
     choice = setup_prompts.select(
         "Which assistant app do you want connector instructions for?",
-        choices=list(label_to_value.keys()),
+        choices=choices,
         default="Claude (web, Desktop, mobile)",
     )
+    if allow_back and choice == BACK_CHOICE:
+        return None
     return label_to_value[choice]
 
 
@@ -1559,6 +1701,56 @@ def _run_command_streamed(command: list[str], *, cwd: Path) -> tuple[int, str]:
     return process.wait(), "".join(output)
 
 
+def _run_wrangler_capture(capsule: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["npx", "--yes", "wrangler", *args],
+        cwd=capsule,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
+def _wrangler_auth_message() -> str:
+    return (
+        "Cloudflare authentication is required. Wrangler can open a browser sign-in from an "
+        "interactive terminal, or you can set CLOUDFLARE_API_TOKEN for scripted/non-interactive runs."
+    )
+
+
+def _ensure_wrangler_authenticated(capsule: Path) -> None:
+    if os.environ.get("CLOUDFLARE_API_TOKEN"):
+        return
+    completed = _run_wrangler_capture(capsule, ["whoami"])
+    if completed.returncode == 0:
+        return
+    if not setup_prompts.is_interactive():
+        typer.echo(_wrangler_auth_message(), err=True)
+        typer.echo(
+            "Create a token with Workers Scripts and Workers KV permissions, then rerun with "
+            "CLOUDFLARE_API_TOKEN set.",
+            err=True,
+        )
+        if completed.stdout:
+            typer.echo(completed.stdout.rstrip(), err=True)
+        raise typer.Exit(code=completed.returncode)
+
+    typer.echo("")
+    typer.echo(_wrangler_auth_message())
+    typer.echo("Starting Cloudflare browser sign-in with Wrangler...")
+    login = subprocess.run(["npx", "--yes", "wrangler", "login"], cwd=capsule, check=False)
+    if login.returncode != 0:
+        typer.echo("Cloudflare sign-in failed. Rerun `yutome connect --deploy` after signing in.", err=True)
+        raise typer.Exit(code=login.returncode)
+    verified = _run_wrangler_capture(capsule, ["whoami"])
+    if verified.returncode != 0:
+        typer.echo("Cloudflare sign-in did not complete successfully.", err=True)
+        if verified.stdout:
+            typer.echo(verified.stdout.rstrip(), err=True)
+        raise typer.Exit(code=verified.returncode)
+
+
 # ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
 
 CAPSULE_PROJECT_NAME = "yutome-remote-mcp"  # matches name in wrangler.toml
@@ -1581,15 +1773,7 @@ def _tracked_capsule_path() -> Path:
 def _ensure_capsule_node_modules(capsule: Path) -> None:
     if (capsule / "node_modules").exists():
         return
-    missing = _missing_cloudflare_deploy_tools()
-    if missing:
-        typer.echo(
-            "Cannot install TypeScript Worker dependencies because Node/npm are missing on this computer.",
-            err=True,
-        )
-        typer.echo(f"Missing: {', '.join(missing)}", err=True)
-        typer.echo(f"Install Node.js LTS from {NODE_DOWNLOAD_URL}, then rerun `yutome connect --deploy`.", err=True)
-        raise typer.Exit(code=1)
+    _require_cloudflare_deploy_runtime()
     typer.echo(f"Installing TypeScript Worker dependencies in {capsule}")
     returncode, _ = _run_command_streamed(["npm", "install"], cwd=capsule)
     if returncode != 0:
@@ -1660,14 +1844,7 @@ def _write_generated_wrangler_config(capsule: Path, paths: ProjectPaths, namespa
 
 
 def _existing_oauth_kv_namespace_id(capsule: Path) -> str | None:
-    completed = subprocess.run(
-        ["npx", "--yes", "wrangler", "kv", "namespace", "list"],
-        cwd=capsule,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    completed = _run_wrangler_capture(capsule, ["kv", "namespace", "list"])
     if completed.returncode != 0:
         return None
     try:
@@ -1705,14 +1882,7 @@ def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
         return generated_config
 
     typer.echo("Creating Cloudflare KV namespace OAUTH_KV (one-time setup)…")
-    completed = subprocess.run(
-        ["npx", "--yes", "wrangler", "kv", "namespace", "create", "OAUTH_KV"],
-        cwd=capsule,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+    completed = _run_wrangler_capture(capsule, ["kv", "namespace", "create", "OAUTH_KV"])
     if completed.returncode != 0:
         typer.echo("Failed to create OAUTH_KV namespace.", err=True)
         if completed.stdout:
@@ -1784,6 +1954,7 @@ def _deploy_tracked_capsule(
             err=True,
         )
         raise typer.Exit(code=1)
+    _require_cloudflare_deploy_runtime()
 
     effective_relay_token = relay_token or secrets.token_urlsafe(32)
     effective_pairing_code = pairing_code or secrets.token_hex(5).upper()
@@ -1796,6 +1967,7 @@ def _deploy_tracked_capsule(
         typer.echo(f"[OK] Refreshed contract: {contract_path}")
 
     _ensure_capsule_node_modules(capsule)
+    _ensure_wrangler_authenticated(capsule)
     wrangler_config = _ensure_oauth_kv_namespace(capsule, paths)
 
     typer.echo(f"Deploying Cloudflare Worker from {capsule}")
@@ -1819,8 +1991,9 @@ def _deploy_tracked_capsule(
 def _delete_tracked_capsule(worker_name: str) -> None:
     """Run `wrangler delete` from the tracked Worker project directory."""
     capsule = _tracked_capsule_path()
-    if shutil.which("npx") is None:
-        typer.echo("`npx` is not installed. Delete the Worker manually in the Cloudflare dashboard.", err=True)
+    problem = _cloudflare_deploy_runtime_problem()
+    if problem is not None:
+        typer.echo(f"{problem} Delete the Worker manually in the Cloudflare dashboard.", err=True)
         typer.echo(f"Cloudflare Workers dashboard: {CLOUDFLARE_WORKERS_DASHBOARD_URL}", err=True)
         raise typer.Exit(code=1)
     command = ["npx", "--yes", "wrangler", "delete", worker_name, "--force"]
@@ -2065,22 +2238,29 @@ def setup(
             "Web + mobile — works from claude.ai, ChatGPT, your phone "
             "(Cloudflare sign-in needed; free plan is fine)"
             if node_ready
-            else "Web + mobile — needs Node.js installed first; opens Cloudflare to get started"
+            else "Web + mobile — needs Node.js 22+ installed first; opens Cloudflare to get started"
         )
         paste_label = "Web + mobile — I already have a Yutome URL someone gave me"
         skip_label = "Skip for now — I'll run `yutome connect` later"
         choices = [local_label, deploy_label, paste_label, skip_label]
-        connect_choice = setup_prompts.select(
-            "How do you want to connect Yutome to your assistant?",
-            choices=choices,
-            default=local_label,
-        )
+        while True:
+            connect_choice = setup_prompts.select(
+                "How do you want to connect Yutome to your assistant?",
+                choices=choices,
+                default=local_label,
+            )
+            if connect_choice in {paste_label, deploy_label}:
+                assistant_apps = _prompt_assistant_apps(allow_back=True)
+                if assistant_apps is None:
+                    continue
+            else:
+                assistant_apps = None
+            break
         if connect_choice == skip_label:
             pass
         elif connect_choice == local_label:
             _setup_local_mcp(config)
         elif connect_choice == paste_label:
-            assistant_apps = _prompt_assistant_apps()
             typer.echo("")
             typer.echo(
                 "Paste the connector URL printed by whoever set up the Worker. The URL can be "
@@ -2113,11 +2293,10 @@ def setup(
                     typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
         else:
             # Deploy path
-            assistant_apps = _prompt_assistant_apps()
             if not node_ready:
                 typer.echo("")
                 typer.echo(
-                    "Deploying needs Node.js (free, https://nodejs.org). Yutome can open the "
+                    "Deploying needs Node.js 22+ (free, https://nodejs.org). Yutome can open the "
                     "Cloudflare dashboard so you can install Node alongside creating an account."
                 )
                 if setup_prompts.confirm(
@@ -2125,7 +2304,7 @@ def setup(
                 ):
                     webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
                     typer.echo("")
-                    typer.echo("Once Node.js LTS is installed, rerun:")
+                    typer.echo("Once Node.js 22 LTS or newer is installed, rerun:")
                     typer.echo("  yutome connect --deploy")
                 return
             typer.echo("")

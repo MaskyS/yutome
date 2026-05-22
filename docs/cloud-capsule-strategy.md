@@ -456,8 +456,8 @@ Advanced detail can map this to:
 1. User runs `yutome setup` and accepts the "Connect Claude/ChatGPT" step, or runs `yutome connect`.
 2. User chooses "Use while this computer is on."
 3. CLI deploys the tracked TypeScript Worker project at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures an account-local `OAUTH_KV` namespace exists (auto-creates it on first deploy), writes the real KV binding to ignored generated config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
-4. If Node/npm/npx are available, `yutome connect --deploy` is the default assisted path: Yutome uses `npx` to run Wrangler, downloading it if needed, runs the deploy, and lets Wrangler open Cloudflare sign-in if needed. The user does not need a global Wrangler install.
-5. If Node/npm/npx are not available, Yutome explains the missing runtime in plain language and asks the user to install Node.js LTS, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
+4. If Node 22+ / npm / npx are available, `yutome connect --deploy` is the default assisted path: Yutome uses `npx` to run Wrangler, downloading it if needed, runs the deploy, and lets Wrangler open Cloudflare sign-in if needed. The user does not need a global Wrangler install.
+5. If Node/npm/npx are missing or Node is older than 22, Yutome explains the runtime problem in plain language and asks the user to install Node.js 22 LTS or newer, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
 6. Future no-node best path should be a public Deploy-to-Cloudflare template. Cloudflare documents Deploy buttons as a way to let users deploy a Workers app into their own account, with resource provisioning from the app configuration. Source: [Cloudflare Deploy Buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 7. CLI stores the deployed endpoint and normalized `/mcp` URL in local remote state.
 8. User starts `yutome remote bridge` when they want the assistant to reach the laptop-backed corpus.
@@ -479,12 +479,12 @@ Transport decision:
 The setup command should treat local deploy capability as a convenience, not an assumption. My machine having Wrangler is not representative of noob machines. The CLI should detect the actual machine state:
 
 ```text
-Node/npm/npx present:
+Node 22+ / npm / npx present:
   "Yutome can deploy this from here. This may open Cloudflare sign-in."
 
-Node/npm/npx missing:
+Node/npm/npx missing or Node older than 22:
   "This computer cannot run Cloudflare's deploy tool yet."
-  "Install Node.js LTS, then rerun yutome connect --deploy."
+  "Install Node.js 22 LTS or newer, then rerun yutome connect --deploy."
 ```
 
 This keeps the beginner path honest. If local assisted deploy is possible, it is the default. If it is not possible, the CLI does not pretend a copied Wrangler command is noob-friendly.
