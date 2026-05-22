@@ -1,9 +1,35 @@
 [project]
 name = "yutome"
 version = "0.1.0"
-description = "Local-first YouTube channel knowledge base indexer"
-readme = "docs/plan.md"
+description = "Local-first YouTube source knowledge base indexer"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Kifah Meeran", email = "contact@maskys.com" },
+]
+keywords = [
+    "youtube",
+    "knowledge-base",
+    "transcripts",
+    "search",
+    "mcp",
+    "rag",
+    "local-first",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
 dependencies = [
     "pydantic>=2.8,<3",
     "rapidfuzz>=3.14.5",
@@ -11,6 +37,11 @@ dependencies = [
     "websockets>=13",
     "wordfreq>=3.1.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/MaskyS/yutome"
+Repository = "https://github.com/MaskyS/yutome"
+Issues = "https://github.com/MaskyS/yutome/issues"
 
 [project.optional-dependencies]
 ingest = [

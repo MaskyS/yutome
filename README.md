@@ -1,0 +1,109 @@
+# Yutome
+
+**Local-first YouTube source knowledge base.** Indexes the channels and videos you care about into a transcript corpus you can search by keyword or meaning, and exposes that corpus as a CLI, a local MCP server, and (optionally) a remote MCP endpoint that Claude.ai or ChatGPT can connect to.
+
+Nothing leaves your laptop unless you explicitly deploy the remote connector.
+
+## Three ways to use it
+
+- **CLI** — `yutome find "rabbit holes"` returns ranked transcript chunks with timestamps and source URLs.
+- **Local MCP server** — wire `yutome` into Claude Desktop, Claude Code, Codex, or any stdio MCP client. The corpus becomes a tool any local agent can call.
+- **Remote MCP via Cloudflare** — deploy a thin TypeScript Worker (`yutome connect --deploy`). Claude.ai and ChatGPT custom connectors can then query your corpus through OAuth, while the actual data stays on your laptop and is relayed over a WebSocket bridge.
+
+## Install
+
+Requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/). Python 3.12 is fetched automatically if you don't have it.
+
+```bash
+uv tool install --python 3.12 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+```
+
+This puts a single `yutome` command on your PATH. The `[all]` extra pulls in the full feature set (yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API). Without it you'll hit ImportErrors on first run.
+
+**Alternatives:**
+
+```bash
+# pipx — requires Python 3.12 already installed on your system
+pipx install --python python3.12 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+
+# For hacking on the code
+git clone https://github.com/MaskyS/yutome.git
+cd yutome
+uv sync --extra all
+uv run yutome --help
+```
+
+## Quickstart
+
+```bash
+yutome setup                                  # guided first-run: creates ./yutome.toml, ./data, etc.
+yutome add https://www.youtube.com/@LexClips  # add a YouTube channel or video as a source
+yutome sync                                   # discover videos, fetch transcripts, build indexes
+yutome find "first principles"                # ranked search across everything indexed
+```
+
+`yutome setup` is interactive by default; pass `-y` to skip prompts and just print what would happen. It prompts for any API keys it needs. To set keys ahead of time, copy `.env.example` to `.env`. The only commonly-needed key is `VOYAGE_API_KEY` (semantic search) — get one at [voyageai.com](https://www.voyageai.com/). Without it, `find` still works but falls back to keyword search only. Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
+
+The indexed corpus lives under `./data/` next to `yutome.toml` — SQLite catalog, LanceDB vector index, transcript artifacts. Back it up like any other project directory.
+
+Run `yutome --help` for the full surface. The most-used commands:
+
+| Goal | Command |
+|---|---|
+| First-run setup | `yutome setup` |
+| Add a channel/video | `yutome add <url>` |
+| Import a subscription list | `yutome import-youtube` or `yutome import <file>` |
+| Index everything new | `yutome sync` |
+| Search | `yutome find "<query>"` |
+| List or inspect indexed objects | `yutome list videos`, `yutome show video <id>`, … |
+| Local MCP server | `yutome mcp serve` (usually invoked via Claude config, not by hand) |
+| Deploy/manage remote connector | `yutome connect --deploy`, `yutome remote bridge`, `yutome status` |
+
+Commands like `list`, `show`, `remote`, `export`, `quality` are groups — append `--help` (e.g. `yutome list --help`) to see their subcommands.
+
+## Connect to Claude / ChatGPT
+
+### Local (recommended for daily use)
+
+For **Claude Code** or **Codex** opened against this repo, the bundled `.mcp.json` is picked up automatically — no extra config.
+
+For **Claude Desktop**, add this block to `~/Library/Application Support/Claude/claude_desktop_config.json`. Use an absolute path to `yutome.toml`, since Desktop won't launch from your project directory:
+
+```json
+{
+  "mcpServers": {
+    "yutome": {
+      "command": "uv",
+      "args": ["run", "yutome", "mcp", "serve", "--config", "/absolute/path/to/yutome.toml"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You'll see `yutome` in the connectors list with `find`, `list`, `show`, and `q` tools.
+
+### Remote (Claude.ai web, ChatGPT, phone)
+
+```bash
+yutome connect --deploy   # one-time: deploy the Worker, generate secrets, save state
+yutome remote bridge      # keep this running while you want queries to work
+```
+
+`connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, and prints a pairing code. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
+
+The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "desktop offline". Full setup walkthrough: [`docs/remote-access.md`](docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](cloudflare/yutome-capsule/README.md).
+
+## Docs
+
+See [`docs/README.md`](docs/README.md) for an index. The most useful starting points:
+
+- [`docs/remote-access.md`](docs/remote-access.md) — connecting Claude / ChatGPT / agents
+- [`docs/cloud-capsule-strategy.md`](docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
+- [`docs/query-api.md`](docs/query-api.md) — the query language `find` / `q` speak
+- [`docs/plan.md`](docs/plan.md) — internal architecture history (not a usage guide)
+
+## Status
+
+**v0.1.0 — private preview.** Released under the MIT license; the API and CLI surface may shift between point releases. Not on PyPI yet; install from git as shown above.
+
+Found a bug or a confusing doc? Open an issue: <https://github.com/MaskyS/yutome/issues>.
