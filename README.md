@@ -12,19 +12,21 @@ Nothing leaves your laptop unless you explicitly deploy the remote connector.
 
 ## Install
 
-Requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/). Python 3.12 is fetched automatically if you don't have it.
+Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-uv tool install --python 3.12 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+uv tool install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
 ```
 
 This puts a single `yutome` command on your PATH. The `[all]` extra pulls in the full feature set (yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API). Without it you'll hit ImportErrors on first run.
 
+If your default `python3` is older than 3.11, add `--python 3.11` to that command — uv will fetch a 3.11 for you.
+
 **Alternatives:**
 
 ```bash
-# pipx — requires Python 3.12 already installed on your system
-pipx install --python python3.12 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
+# pipx — uses whichever python3 is on your PATH; needs 3.11+
+pipx install 'yutome[all] @ git+https://github.com/MaskyS/yutome.git'
 
 # For hacking on the code
 git clone https://github.com/MaskyS/yutome.git
