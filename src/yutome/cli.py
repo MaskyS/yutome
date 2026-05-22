@@ -46,15 +46,11 @@ from yutome.maintenance import rebuild_active_chunks
 from yutome.quality_upgrade import upgrade_active_transcripts
 from yutome.query import QueryRequest
 from yutome.remote_connection import (
-    DEFAULT_WORKER_NAME,
-    CloudflareWorkerProject,
     RemoteMode,
     build_remote_state,
     build_sync_dry_run_manifest,
-    cloudflare_worker_project_path,
     load_remote_state,
     mark_desktop_seen,
-    prepare_cloudflare_worker_project,
     remote_status_payload,
     remote_state_path,
     save_remote_state,
@@ -1039,48 +1035,6 @@ def _missing_cloudflare_deploy_tools() -> list[str]:
     return [name for name in ("node", "npm", "npx") if not tools[name]]
 
 
-def _print_worker_project(project: CloudflareWorkerProject) -> None:
-    command = " ".join(project.deploy_command)
-    typer.echo(f"[OK] Prepared Cloudflare Worker project: {project.root}")
-    typer.echo("")
-    if _can_run_cloudflare_deploy():
-        typer.echo("Yutome can deploy this from here because Node/npm are available on this computer.")
-        typer.echo("The deploy step uses npx to run Cloudflare's Wrangler tool, downloading it if needed,")
-        typer.echo("then opens Cloudflare sign-in if this computer is not already connected.")
-        typer.echo("This may open Cloudflare sign-in. A basic connector should fit Cloudflare's free Workers plan.")
-        typer.echo("")
-        typer.echo("Run the assisted deploy with:")
-        typer.echo("  uv run yutome connect --deploy")
-    else:
-        missing = ", ".join(_missing_cloudflare_deploy_tools())
-        typer.echo("This computer cannot run Cloudflare's deploy tool yet.")
-        typer.echo(f"Missing: {missing}")
-        typer.echo("")
-        typer.echo("Easiest CLI path:")
-        typer.echo(f"  1. Install Node.js LTS from {NODE_DOWNLOAD_URL}")
-        typer.echo("  2. Run: uv run yutome connect --deploy")
-        typer.echo("")
-        typer.echo("No-CLI Cloudflare Workers dashboard path:")
-        typer.echo(f"  1. Open {CLOUDFLARE_WORKERS_DASHBOARD_URL}")
-        typer.echo("  2. Create a Worker")
-        typer.echo(f"  3. Paste this file into Cloudflare's code editor: {project.root / 'src/index.js'}")
-        typer.echo("  4. Deploy it and copy the workers.dev URL")
-        typer.echo("")
-        typer.echo("If Cloudflare asks about billing, skip paid/always-on features for now;")
-        typer.echo("choose the free Workers path for the basic connector.")
-    typer.echo("")
-    typer.echo("Manual deploy command:")
-    typer.echo(f"  cd {project.root}")
-    typer.echo(f"  {command}")
-    typer.echo("")
-    typer.echo("This Worker uses built-in OAuth/pairing for private Remote MCP access.")
-    typer.echo(f"Pairing code: {project.pairing_code}")
-    typer.echo("After deploy, open /pair on the Worker URL and approve Yutome once.")
-    typer.echo("")
-    typer.echo("After deployment, save the Worker URL with:")
-    typer.echo("  uv run yutome connect --endpoint https://your-worker.example.workers.dev")
-
-
 def _print_connector_next_steps(mcp_url: str) -> None:
     typer.echo("")
     typer.echo("Connect this MCP URL in each assistant account you use:")
@@ -1140,37 +1094,13 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("  ChatGPT also asks you to select the Yutome app in a chat with + > More before asking.")
     typer.echo("  In this first version, this computer and `yutome remote bridge` must be on.")
     typer.echo("  Setup needs a small public connector endpoint. If Yutome provides one, paste it; otherwise")
-    typer.echo("  yutome can prepare a Cloudflare Worker project for you or a helper to deploy.")
+    typer.echo("  yutome can deploy a Cloudflare Worker from the tracked TypeScript subproject for you.")
     typer.echo("  You may need to create or sign into a Cloudflare account during deploy.")
     typer.echo("  This step does not require Voyage, Webshare, Gemini, or proxy credentials.")
     typer.echo("  The basic laptop-backed connector is designed for Cloudflare's free Workers plan.")
     typer.echo("  Always-on/offline search is a later mode and may require enabling Cloudflare billing.")
     if yes:
         typer.echo("  Optional next step: uv run yutome connect")
-
-
-def _relay_token_from_worker_project(paths: ProjectPaths) -> str | None:
-    return _worker_project_var(paths, "YUTOME_RELAY_TOKEN")
-
-
-def _pairing_code_from_worker_project(paths: ProjectPaths) -> str | None:
-    return _worker_project_var(paths, "YUTOME_PAIRING_CODE")
-
-
-def _token_secret_from_worker_project(paths: ProjectPaths) -> str | None:
-    return _worker_project_var(paths, "YUTOME_TOKEN_SECRET")
-
-
-def _worker_project_var(paths: ProjectPaths, name: str) -> str | None:
-    wrangler_path = cloudflare_worker_project_path(paths) / "wrangler.toml"
-    if not wrangler_path.exists():
-        return None
-    match = re.search(
-        rf'^\s*{re.escape(name)}\s*=\s*"([^"]+)"\s*$',
-        wrangler_path.read_text(encoding="utf-8"),
-        flags=re.MULTILINE,
-    )
-    return match.group(1) if match else None
 
 
 def _pairing_url(endpoint_url: str, pairing_code: str | None = None) -> str:
@@ -1190,34 +1120,16 @@ def _save_remote_connection(
 ) -> Path:
     paths = _prepare_connect_project(config)
     existing = load_remote_state(paths)
-    effective_relay_token = relay_token or _relay_token_from_worker_project(paths)
-    effective_pairing_code = pairing_code or _pairing_code_from_worker_project(paths)
-    effective_token_secret = token_secret or _token_secret_from_worker_project(paths)
     state = build_remote_state(
         endpoint=endpoint,
         mode=mode,
         worker_name=worker_name,
-        relay_token=effective_relay_token,
-        pairing_code=effective_pairing_code,
-        token_secret=effective_token_secret,
-        existing=existing,
-    )
-    return save_remote_state(paths, state)
-
-
-def _prepare_worker_project(config: Path, *, worker_name: str) -> CloudflareWorkerProject:
-    paths = _prepare_connect_project(config)
-    existing = load_remote_state(paths)
-    relay_token = existing.relay_token if existing else _relay_token_from_worker_project(paths)
-    pairing_code = existing.pairing_code if existing else _pairing_code_from_worker_project(paths)
-    token_secret = existing.token_secret if existing else _token_secret_from_worker_project(paths)
-    return prepare_cloudflare_worker_project(
-        paths,
-        worker_name=worker_name,
         relay_token=relay_token,
         pairing_code=pairing_code,
         token_secret=token_secret,
+        existing=existing,
     )
+    return save_remote_state(paths, state)
 
 
 def _extract_worker_url(output: str) -> str | None:
@@ -1239,28 +1151,6 @@ def _run_command_streamed(command: list[str], *, cwd: Path) -> tuple[int, str]:
             output.append(line)
             typer.echo(line.rstrip())
     return process.wait(), "".join(output)
-
-
-def _ensure_cloudflare_deploy_tools(project: CloudflareWorkerProject) -> None:
-    missing = _missing_cloudflare_deploy_tools()
-    if missing:
-        typer.echo("Yutome cannot run Cloudflare's deploy tool on this computer yet.", err=True)
-        typer.echo(f"Missing: {', '.join(missing)}", err=True)
-        typer.echo(f"Install Node.js LTS from {NODE_DOWNLOAD_URL}, then rerun `uv run yutome connect --deploy`.", err=True)
-        typer.echo("Or deploy from the Cloudflare dashboard by pasting this Worker source:", err=True)
-        typer.echo(f"  {project.root / 'src/index.js'}", err=True)
-        raise typer.Exit(code=1)
-
-
-def _deploy_worker_project(project: CloudflareWorkerProject) -> str | None:
-    _ensure_cloudflare_deploy_tools(project)
-    typer.echo("Using npx to run Cloudflare Wrangler. If Wrangler is not already available, npx may download it.")
-    typer.echo(f"Running {' '.join(project.deploy_command)} in {project.root}")
-    returncode, output = _run_command_streamed(project.deploy_command, cwd=project.root)
-    if returncode != 0:
-        typer.echo("Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `uv run yutome connect --deploy`.", err=True)
-        raise typer.Exit(code=returncode)
-    return _extract_worker_url(output)
 
 
 # ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
@@ -1448,37 +1338,6 @@ def _delete_tracked_capsule(worker_name: str) -> None:
         typer.echo(completed.stderr.rstrip(), err=True)
     if completed.returncode != 0:
         typer.echo("Worker removal failed. Fix the error above and rerun.", err=True)
-        raise typer.Exit(code=completed.returncode)
-
-
-def _remove_worker_project(project: CloudflareWorkerProject) -> None:
-    executable = project.deploy_command[0]
-    if shutil.which(executable) is None:
-        typer.echo(f"Cannot run `{executable}` because it is not installed or not on PATH.", err=True)
-        typer.echo(
-            f"Remove it from Cloudflare manually in the Workers dashboard, or after installing Node.js/Wrangler run: "
-            f"cd {project.root} && npx wrangler delete {project.worker_name} --force",
-            err=True,
-        )
-        typer.echo(f"Cloudflare Workers dashboard: {CLOUDFLARE_WORKERS_DASHBOARD_URL}", err=True)
-        raise typer.Exit(code=1)
-
-    command = ["npx", "wrangler", "delete", project.worker_name, "--force"]
-    typer.echo(f"Removing Cloudflare Worker with Wrangler in {project.root}")
-    completed = subprocess.run(
-        command,
-        cwd=project.root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if completed.stdout:
-        typer.echo(completed.stdout.rstrip())
-    if completed.stderr:
-        typer.echo(completed.stderr.rstrip(), err=True)
-    if completed.returncode != 0:
-        typer.echo("Cloudflare Worker removal failed. Fix the Wrangler error above and rerun the command.", err=True)
         raise typer.Exit(code=completed.returncode)
 
 
@@ -1670,7 +1529,7 @@ def setup(
     _print_setup_mcp_section(yes=yes)
     if not yes and typer.confirm("Connect Yutome to Claude/ChatGPT now?", default=False):
         endpoint = typer.prompt(
-            "Remote connector URL if you already have one (blank to prepare deploy files)",
+            "Remote connector URL if you already have one (blank to deploy the tracked Worker)",
             default="",
             show_default=False,
         ).strip()
@@ -1680,7 +1539,7 @@ def setup(
                     config,
                     endpoint=endpoint,
                     mode="connector_only",
-                    worker_name=DEFAULT_WORKER_NAME,
+                    worker_name=CAPSULE_PROJECT_NAME,
                 )
             except ValueError as exc:
                 typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
@@ -1735,7 +1594,7 @@ def connect_command(
     deploy: bool = typer.Option(
         False,
         "--deploy",
-        help="Prepare and deploy the generated Cloudflare Worker with Cloudflare Wrangler through npx.",
+        help="Deploy the tracked Cloudflare Worker (cloudflare/yutome-capsule) with Wrangler through npx.",
     ),
     open_cloudflare: bool = typer.Option(
         False,
