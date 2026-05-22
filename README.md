@@ -1,14 +1,10 @@
 # Yutome
 
-**Local-first YouTube source knowledge base.** Indexes the channels and videos you care about into a transcript corpus you can search by keyword or meaning, and exposes that corpus as a CLI, a local MCP server, and (optionally) a remote MCP endpoint that Claude.ai or ChatGPT can connect to.
+Yutome ingests transcripts from the YouTube channels you point at, stores them on your machine, and connects to whichever AI app you already use — Claude, ChatGPT, Cursor, anything MCP-compatible.
 
-Nothing leaves your laptop unless you explicitly deploy the remote connector.
+The library is searchable from the command line, from any local MCP client, or remotely from claude.ai / ChatGPT through a small Cloudflare Worker you deploy yourself.
 
-## Three ways to use it
-
-- **CLI** — `yutome find "rabbit holes"` returns ranked transcript chunks with timestamps and source URLs.
-- **Local MCP server** — wire `yutome` into Claude Desktop, Claude Code, Codex, or any stdio MCP client. The corpus becomes a tool any local agent can call.
-- **Remote MCP via Cloudflare** — deploy a thin TypeScript Worker (`yutome connect --deploy`). Claude.ai and ChatGPT custom connectors can then query your corpus through OAuth, while the actual data stays on your laptop and is relayed over a WebSocket bridge.
+Yutome is a command-line tool. You set it up from the terminal; from there it handles sync, cleanup, and exports. A coding agent (Claude Code, Cursor) can drive any of it.
 
 ## Install
 
