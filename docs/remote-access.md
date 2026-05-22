@@ -18,9 +18,9 @@ uv run yutome connect
 uv run yutome remote bridge
 ```
 
-`yutome connect` prepares the Cloudflare Worker connector project when no endpoint is already known. If Node/npm/npx are available, Yutome can use `npx` to run Cloudflare Wrangler during `yutome connect --deploy`; otherwise it prints the Node.js and Cloudflare dashboard fallback.
+`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the `OAUTH_KV` namespace if missing, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing URL + code. Node 18+ / npm / npx must be on PATH.
 
-After deployment, save the Worker URL:
+If you already have an endpoint URL, save it without redeploying:
 
 ```bash
 uv run yutome connect --endpoint https://your-worker.example.workers.dev
@@ -28,26 +28,25 @@ uv run yutome connect --endpoint https://your-worker.example.workers.dev
 
 Then add the printed `/mcp` URL to each assistant account:
 
-- Claude: add one custom connector from Claude connector settings. The same Claude account should make it available across Claude web, mobile, Desktop, and Cowork where custom connectors are supported.
-- ChatGPT: create an App/connector in ChatGPT with the MCP Server URL. Choose the authenticated/OAuth option. In each chat, select Yutome from `+` > `More` before asking.
+- **Claude**: add one custom connector from Customize > Connectors. Same Claude account makes it available across web, mobile, Desktop, and Cowork. During the first browser OAuth tab, paste the pairing code printed by `yutome connect`. After connecting, expand the Yutome connector settings, find "Read-only tools," and switch the per-group permission from "Needs approval" to "Allowed always" — otherwise every tool call interrupts with a confirm prompt.
+- **ChatGPT**: create an App/connector in ChatGPT with the MCP Server URL. Choose the authenticated/OAuth option. In each chat, select Yutome from `+` > `More` before asking.
 
-This setup is account-level, not device-level. You should not need a new Yutome endpoint for every phone or laptop. ChatGPT still requires adding the app to a conversation before it considers Yutome tools.
+Setup is account-level, not device-level. You should not need a new Yutome endpoint for every phone or laptop. ChatGPT still requires adding the app to a conversation before it considers Yutome tools.
 
-Laptop on:
+Laptop on (bridge running):
 
 - Claude/ChatGPT can call `find`, `list`, `show`, and `q` through the Worker.
-- Results come from local SQLite, LanceDB, and artifacts.
+- Results come from local SQLite, LanceDB, and artifacts via a long-lived WebSocket from the bridge to the Worker's Durable Object (Cloudflare WebSocket Hibernation).
+- Resources (`yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`) are reachable via `resources/read` — host UIs can render citations inline without burning a tool call.
 
 Laptop off or bridge stopped:
 
 - The connector remains installed.
-- Tool calls return a clear Yutome Desktop offline response with last-seen information when available.
+- Tool calls return a clear "Yutome Desktop is offline" response with last-seen information when available; resource reads return a JSON-RPC `-32002` with the same metadata.
 
-The generated Worker includes a built-in OAuth/pairing flow. During setup, Yutome prints a pairing code and `/pair` URL. Approve once; Claude/ChatGPT store the connection through their normal OAuth linking flow. If you start connector setup from another device, the Yutome approval page can accept the same pairing code. This does not require a Yutome account, Auth0, Clerk, or Cloudflare Access.
+The Worker uses Cloudflare's `@cloudflare/workers-oauth-provider` for OAuth 2.1 (DCR, PKCE S256, refresh tokens) and the Agents SDK's `McpAgent` for the MCP protocol surface. Pairing is gated by the printed code; no Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.
 
-This remote MCP mode does not require Voyage, Webshare, Gemini, or proxy credentials. The basic laptop-backed connector is designed for Cloudflare's free Workers plan. Always-on/offline search is a later replica mode and may require enabling Cloudflare billing.
-
-No-auth is only a generated Worker development switch for debugging. Private Yutome remote MCP should use the default OAuth/pairing mode.
+Remote MCP mode does not require Voyage, Webshare, Gemini, or proxy credentials. The basic laptop-backed connector fits Cloudflare's free Workers plan (Workers + 1 KV namespace + 2 Durable Objects, all SQLite-backed). Always-on/offline search is a later replica mode and may require enabling Cloudflare billing.
 
 ## Current Supported Shape
 

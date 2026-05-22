@@ -1045,6 +1045,8 @@ def _print_connector_next_steps(mcp_url: str) -> None:
     typer.echo("")
     typer.echo("First, start the laptop bridge when you want Claude/ChatGPT to reach the local corpus:")
     typer.echo("  uv run yutome remote bridge")
+    typer.echo("  (The bridge holds a long-lived WebSocket to the Worker. If you're behind a")
+    typer.echo("  corporate proxy that blocks WS, requests fall back to the offline response.)")
     typer.echo("")
     typer.echo("Claude:")
     typer.echo("  Add one custom connector from Customize > Connectors.")

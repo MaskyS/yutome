@@ -40,7 +40,7 @@ Tested on 2026-05-21 with a user-owned Cloudflare Worker remote MCP endpoint and
 - Claude custom connector worked against the Worker `/mcp` endpoint and returned the two newest Yutome videos from the local corpus.
 - ChatGPT Apps developer mode worked after adding the app with the MCP Server URL, choosing no auth for the temporary test connector, and selecting the app in a chat from `+` > `More`.
 - Both Claude and ChatGPT returned the same result shape through remote tool calls: video titles and channels from `list`.
-- No-auth was used only as a temporary read-only developer proof. The generated Worker now defaults to OAuth/pairing for private remote MCP.
+- No-auth was used only as a temporary read-only developer proof. The deployed Worker now defaults to OAuth/pairing via `@cloudflare/workers-oauth-provider` for private remote MCP.
 
 Observed noob-facing implication: installing the ChatGPT app is not enough. The user also needs to opt the app into each ChatGPT conversation from the composer. The setup copy should say "Apps" first for ChatGPT and reserve "connector" as the protocol/setup bridge term.
 
@@ -154,7 +154,7 @@ Flow:
 Claude / ChatGPT
   -> https://<user-capsule>.workers.dev/mcp
   -> Cloudflare Worker + Durable Object session/router
-  -> outbound/polling bridge to Yutome Desktop
+  -> WebSocket bridge to Yutome Desktop (Cloudflare WebSocket Hibernation)
   -> local api.py find/list/show/q
   -> local SQLite + LanceDB + artifacts
 ```
@@ -174,7 +174,7 @@ Laptop off:
 
 This mode solves the "best app is no app" problem without making Yutome a hosted transcript provider.
 
-Implementation note: the current laptop-backed proof uses a Durable Object rendezvous queue. Claude/ChatGPT call `/mcp`; the Worker queues `tools/call`; `yutome remote bridge` polls `/bridge/next`, executes local `find/list/show/q`, and posts `/bridge/result`. A later bridge can upgrade the same architecture to WebSockets, but polling proves the product path without requiring the Worker to reach into the user's laptop.
+Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome remote bridge`; the bridge runs the local `find/list/show/q` or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
 
 ### Mode 2: Always-On Search Replica
 
@@ -219,7 +219,7 @@ Cloudflare's own MCP launch post is directly aligned with the problem Yutome has
 
 Cloudflare also maintains `workers-oauth-provider`, a Worker library that handles OAuth 2.1 provider mechanics, token management, DCR, protected-resource metadata, and optional CIMD support. Cloudflare's MCP security docs recommend it for OAuth-protected MCP servers. Sources: [Securing MCP servers](https://developers.cloudflare.com/agents/guides/securing-mcp-server/), [workers-oauth-provider](https://github.com/cloudflare/workers-oauth-provider).
 
-The first Yutome Worker implementation keeps this self-contained rather than adding a second runtime library: it exposes protected-resource metadata, authorization-server metadata, DCR registration, authorization-code + PKCE, refresh tokens, signed bearer tokens, and a local pairing code/page. That keeps the noob deployment simple while matching the major OAuth surfaces Claude/ChatGPT expect.
+The Worker uses Cloudflare's official MCP stack — `@cloudflare/workers-oauth-provider` for OAuth 2.1 (protected-resource metadata, authorization-server metadata, DCR registration, authorization-code + PKCE S256, refresh tokens, signed bearer tokens) and the Agents SDK's `McpAgent` for the MCP protocol (initialize, tools/*, resources/*). A small `pairing.ts` handler renders the local pairing-code consent page that the OAuth provider invokes during `/authorize`. That keeps the deployable Worker small and matches every major OAuth surface Claude/ChatGPT expect.
 
 ### 2. It supports the front-door role without owning the corpus
 
@@ -229,7 +229,7 @@ For Remote Connector Only mode, Cloudflare can act as:
 - OAuth/pairing endpoint;
 - MCP Streamable HTTP endpoint;
 - Durable Object-backed session/router;
-- polling or WebSocket bridge to Yutome Desktop.
+- WebSocket bridge (Cloudflare WebSocket Hibernation) to Yutome Desktop.
 
 Durable Objects are a good fit for long-lived session coordination. Cloudflare documents Durable Objects as WebSocket-capable endpoints, and the hibernation API reduces idle cost by allowing objects to sleep without disconnecting clients. Source: [Durable Objects WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
 
@@ -455,9 +455,9 @@ Advanced detail can map this to:
 
 1. User runs `yutome setup` and accepts the "Connect Claude/ChatGPT" step, or runs `yutome connect`.
 2. User chooses "Use while this computer is on."
-3. CLI prepares a Cloudflare Worker project under `data/remote/cloudflare-worker`.
+3. CLI deploys the tracked TypeScript Worker subproject at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures the `OAUTH_KV` namespace exists (auto-creates it on first deploy), runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
 4. If Node/npm/npx are available, `yutome connect --deploy` is the default assisted path: Yutome uses `npx` to run Wrangler, downloading it if needed, runs the deploy, and lets Wrangler open Cloudflare sign-in if needed. The user does not need a global Wrangler install.
-5. If Node/npm/npx are not available, Yutome explains the missing runtime in plain language and offers two fallbacks: install Node.js LTS and rerun `yutome connect --deploy`, or open the Cloudflare Workers dashboard and paste the generated single Worker source file.
+5. If Node/npm/npx are not available, Yutome explains the missing runtime in plain language and asks the user to install Node.js LTS, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
 6. Future no-node best path should be a public Deploy-to-Cloudflare template. Cloudflare documents Deploy buttons as a way to let users deploy a Workers app into their own account, with resource provisioning from the app configuration. Source: [Cloudflare Deploy Buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 7. CLI stores the deployed endpoint and normalized `/mcp` URL in local remote state.
 8. User starts `yutome remote bridge` when they want the assistant to reach the laptop-backed corpus.
@@ -476,7 +476,7 @@ Node/npm/npx present:
 
 Node/npm/npx missing:
   "This computer cannot run Cloudflare's deploy tool yet."
-  "Install Node.js LTS, or open Cloudflare Workers and paste the generated Worker source."
+  "Install Node.js LTS, then rerun yutome connect --deploy."
 ```
 
 This keeps the beginner path honest. If local assisted deploy is possible, it is the default. If it is not possible, the CLI does not pretend a copied Wrangler command is noob-friendly.
@@ -551,7 +551,7 @@ The local implementation should keep beginner verbs aligned with the existing CL
 - `yutome status` should include remote connector health when configured.
 - `yutome remote status` should provide detailed operational status.
 - `yutome remote sync` should handle replica export/upload when always-on search is enabled.
-- `yutome disconnect` should be the beginner cleanup command. It removes local remote connector state and, when Yutome knows the generated Cloudflare Worker name and Wrangler can run, removes that Worker from the user's Cloudflare account. `yutome remote disconnect` can remain as a detailed alias; destructive nouns like `delete` should not be part of the beginner-facing remote CLI.
+- `yutome disconnect` is the beginner cleanup command. It removes local remote connector state and, when Yutome knows the deployed Worker name and Wrangler can run, removes that Worker from the user's Cloudflare account. `yutome remote disconnect` remains as a detailed alias; destructive nouns like `delete` are not part of the beginner-facing remote CLI.
 - An internal or advanced `capsule` module/package can still hold implementation code and state helpers.
 
 Local state should live under `data/remote/` or another project data path, not in tracked config by default. It should include:
@@ -572,7 +572,7 @@ The Worker should be a deployable subproject, likely under a directory such as `
 - OAuth metadata, authorize, token, and registration endpoints;
 - pairing UI/API;
 - Durable Object session/router for Desktop-backed mode;
-- bridge endpoints for Desktop polling now, WebSockets later;
+- WebSocket bridge endpoint (`/relay/connect`) for the Desktop relay, authenticated by `YUTOME_RELAY_TOKEN`;
 - D1/R2/Vectorize access for replica-backed mode;
 - `/healthz` and `/readyz`;
 - administrative sync endpoints protected by a local pairing/admin token.
