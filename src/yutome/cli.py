@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -3176,6 +3177,86 @@ def _list_resources(params: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _bridge_ws_url(endpoint_url: str) -> str:
+    """Convert https://host[/...] to wss://host/relay/connect."""
+    parsed = urllib.parse.urlsplit(endpoint_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, "/relay/connect", "", ""))
+
+
+async def _bridge_ws_loop(
+    *,
+    app_config: AppConfig,
+    paths: ProjectPaths,
+    endpoint_url: str,
+    token: str,
+    once: bool,
+) -> None:
+    """Maintain a long-lived WebSocket to the Worker's relay DO. Each job
+    frame is dispatched through ``_execute_bridge_job``; the result frame
+    carries either ``result`` or ``error`` per the new envelope shape."""
+    import websockets
+
+    ws_url = _bridge_ws_url(endpoint_url)
+    typer.echo(f"Yutome bridge connecting to {ws_url}")
+    typer.echo("Keep this running while using Claude/ChatGPT remote MCP. Press Ctrl-C to stop.")
+
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(
+                ws_url,
+                additional_headers=[("Authorization", f"Bearer {token}")],
+                max_size=8 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                typer.echo("[OK] Bridge connected")
+                backoff = 1.0
+                mark_desktop_seen(paths)
+                processed = 0
+                async for message in ws:
+                    try:
+                        frame = json.loads(message)
+                    except json.JSONDecodeError:
+                        typer.echo("[WARN] Ignoring non-JSON frame", err=True)
+                        continue
+                    if not isinstance(frame, dict):
+                        continue
+                    if frame.get("type") != "job":
+                        # ping / control frames are handled by the lib
+                        continue
+                    job_id = str(frame.get("job_id") or "")
+                    if not job_id:
+                        continue
+                    kind = str(frame.get("kind") or "tool")
+                    method = str(frame.get("method") or "")
+                    params = {
+                        "kind": kind,
+                        "method": method,
+                        "params": frame.get("params") or {},
+                    }
+                    label = method or kind
+                    typer.echo(f"[OK] Remote {label} ({job_id})")
+                    envelope = _execute_bridge_job(
+                        app_config=app_config, paths=paths, params=params
+                    )
+                    response = {"type": "result", "job_id": job_id}
+                    response.update(envelope)  # adds "result" or "error"
+                    await ws.send(json.dumps(response))
+                    mark_desktop_seen(paths)
+                    processed += 1
+                    if once:
+                        await ws.send(json.dumps({"type": "bye"}))
+                        return
+        except (OSError, websockets.exceptions.WebSocketException) as exc:
+            typer.echo(f"[WARN] Bridge disconnected: {exc}", err=True)
+            if once:
+                raise typer.Exit(code=1) from exc
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
 @remote_app.command("bridge")
 def remote_bridge(
     config: Path = typer.Option(
@@ -3184,60 +3265,30 @@ def remote_bridge(
         "-c",
         help="Path to the yutome TOML config.",
     ),
-    once: bool = typer.Option(False, "--once", help="Process one pending remote tool call and exit."),
-    poll_interval: float = typer.Option(1.0, "--poll-interval", min=0.1, help="Seconds to wait between empty polls."),
-    timeout: float = typer.Option(35.0, "--timeout", min=1.0, help="HTTP timeout for Worker bridge calls."),
+    once: bool = typer.Option(False, "--once", help="Process one job and exit."),
 ) -> None:
-    """Connect this laptop to the Cloudflare remote MCP Worker."""
+    """Connect this laptop to the Cloudflare remote MCP Worker via WebSocket."""
     app_config, paths = _load_runtime(config)
     state = load_remote_state(paths)
     if state is None:
         typer.echo("Remote connector is not configured. Run: uv run yutome connect", err=True)
         raise typer.Exit(code=1)
     if not state.relay_token:
-        typer.echo("Remote connector has no bridge token. Redeploy with `uv run yutome connect --deploy`.", err=True)
+        typer.echo(
+            "Remote connector has no bridge token. Redeploy with `uv run yutome connect --deploy`.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
-    typer.echo(f"Yutome bridge connected to {state.endpoint_url}")
-    typer.echo("Keep this running while using Claude/ChatGPT remote MCP. Press Ctrl-C to stop.")
-
-    processed = 0
-    while True:
-        try:
-            job = _remote_bridge_get_job(state.endpoint_url, token=state.relay_token, timeout=timeout)
-            mark_desktop_seen(paths)
-        except RuntimeError as exc:
-            typer.echo(f"[WARN] {exc}", err=True)
-            if once:
-                raise typer.Exit(code=1) from exc
-            time.sleep(poll_interval)
-            continue
-
-        if job is None:
-            if once and processed:
-                return
-            time.sleep(poll_interval)
-            continue
-
-        job_id = str(job.get("job_id") or "")
-        params = job.get("params") or {}
-        if not job_id or not isinstance(params, dict):
-            typer.echo("[WARN] Ignoring malformed bridge job", err=True)
-            continue
-        tool = str(params.get("name") or "unknown")
-        typer.echo(f"[OK] Remote tool call: {tool} ({job_id})")
-        result = _execute_bridge_tool(app_config=app_config, paths=paths, params=params)
-        _remote_bridge_post_result(
-            state.endpoint_url,
+    asyncio.run(
+        _bridge_ws_loop(
+            app_config=app_config,
+            paths=paths,
+            endpoint_url=state.endpoint_url,
             token=state.relay_token,
-            job_id=job_id,
-            result=result,
-            timeout=timeout,
+            once=once,
         )
-        processed += 1
-        mark_desktop_seen(paths)
-        if once:
-            return
+    )
 
 
 @remote_app.command("status")
