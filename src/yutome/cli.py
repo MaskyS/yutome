@@ -1733,7 +1733,51 @@ def _extract_worker_url(output: str) -> str | None:
     return match.group(0).rstrip("/") if match else None
 
 
+def _should_use_interactive_command_stream() -> bool:
+    return os.name == "posix" and setup_prompts.is_interactive()
+
+
+def _command_exit_code(status: int) -> int:
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return status
+
+
+def _run_command_streamed_pty(command: list[str], *, cwd: Path) -> tuple[int, str]:
+    """Run an interactive subprocess through a PTY while capturing output.
+
+    Wrangler detects piped stdout as non-interactive and skips prompts such as
+    workers.dev subdomain registration. A PTY keeps those prompts available.
+    """
+    import pty
+
+    output: list[bytes] = []
+
+    def read_master(fd: int) -> bytes:
+        try:
+            chunk = os.read(fd, 1024)
+        except OSError:
+            return b""
+        output.append(chunk)
+        return chunk
+
+    previous_cwd = Path.cwd()
+    os.chdir(cwd)
+    try:
+        status = pty.spawn(command, master_read=read_master)
+    finally:
+        os.chdir(previous_cwd)
+    return _command_exit_code(status), b"".join(output).decode(errors="replace")
+
+
 def _run_command_streamed(command: list[str], *, cwd: Path) -> tuple[int, str]:
+    if _should_use_interactive_command_stream():
+        return _run_command_streamed_pty(command, cwd=cwd)
+
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -1747,6 +1791,35 @@ def _run_command_streamed(command: list[str], *, cwd: Path) -> tuple[int, str]:
             output.append(line)
             typer.echo(line.rstrip())
     return process.wait(), "".join(output)
+
+
+def _cloudflare_workers_onboarding_url(output: str) -> str:
+    match = re.search(r"/accounts/([0-9a-f]{32})/", output)
+    if match:
+        return f"https://dash.cloudflare.com/{match.group(1)}/workers/onboarding"
+    return "https://dash.cloudflare.com/?to=/:account/workers/onboarding"
+
+
+def _is_workers_dev_subdomain_error(output: str) -> bool:
+    lower = output.lower()
+    return "10063" in lower or "workers.dev subdomain" in lower
+
+
+def _print_workers_dev_subdomain_help(output: str) -> None:
+    onboarding_url = _cloudflare_workers_onboarding_url(output)
+    typer.echo("", err=True)
+    typer.echo("This Cloudflare account has not finished Workers setup yet.", err=True)
+    typer.echo(
+        "Create the account workers.dev subdomain, then rerun `yutome connect --deploy`.",
+        err=True,
+    )
+    typer.echo(f"Cloudflare Workers onboarding: {onboarding_url}", err=True)
+    if not _should_use_interactive_command_stream():
+        typer.echo(
+            "In an interactive terminal, Yutome runs Wrangler with a real TTY so Wrangler can prompt "
+            "for this during deploy.",
+            err=True,
+        )
 
 
 def _run_wrangler_capture(capsule: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -2029,6 +2102,8 @@ def _deploy_tracked_capsule(
     command = ["npx", "--yes", "wrangler", "deploy", "--config", str(wrangler_config)]
     returncode, output = _run_command_streamed(command, cwd=capsule)
     if returncode != 0:
+        if _is_workers_dev_subdomain_error(output):
+            _print_workers_dev_subdomain_help(output)
         typer.echo(
             "Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `yutome connect --deploy`.",
             err=True,

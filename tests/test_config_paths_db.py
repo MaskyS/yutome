@@ -14,12 +14,14 @@ from yutome.cli import (
     _active_oauth_kv_id,
     _channel_picker_labels,
     _cloudflare_deploy_runtime_problem,
+    _deploy_tracked_capsule,
     _ensure_oauth_kv_namespace,
     _ensure_wrangler_authenticated,
     _parse_node_version,
     _push_wrangler_secret,
     _prompt_channels_to_select,
     _prompt_public_subscription_target,
+    _run_command_streamed,
     _strip_oauth_kv_binding,
     _tracked_capsule_path,
     _wrangler_whoami_authenticated,
@@ -712,6 +714,20 @@ def test_cloudflare_deploy_runtime_rejects_node_below_wrangler_floor(monkeypatch
     assert "Node.js 22.0.0+ is required" in (_cloudflare_deploy_runtime_problem() or "")
 
 
+def test_streamed_command_uses_pty_for_interactive_terminal(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr("yutome.cli._should_use_interactive_command_stream", lambda: True)
+
+    def fake_pty(command: list[str], *, cwd: Path) -> tuple[int, str]:
+        calls.append((command, cwd))
+        return 0, "done\n"
+
+    monkeypatch.setattr("yutome.cli._run_command_streamed_pty", fake_pty)
+
+    assert _run_command_streamed(["wrangler", "deploy"], cwd=tmp_path) == (0, "done\n")
+    assert calls == [(["wrangler", "deploy"], tmp_path)]
+
+
 def test_import_youtube_uses_browser_cookie_source(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
@@ -1080,6 +1096,49 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 
     assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
     assert _active_oauth_kv_id(generated.read_text(encoding="utf-8")) == "33333333333333333333333333333333"
+
+
+def test_connect_deploy_explains_missing_workers_dev_subdomain(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:  # noqa: ANN001
+    account_id = "440c16ec06f5321075e4eadf38d4cc6d"
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    generated = tmp_path / "wrangler.generated.toml"
+
+    monkeypatch.setattr("yutome.cli._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._require_cloudflare_deploy_runtime", lambda: None)
+    monkeypatch.setattr("yutome.cli._ensure_capsule_node_modules", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_wrangler_authenticated", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+
+    def fake_stream(command: list[str], *, cwd: Path) -> tuple[int, str]:
+        assert command == ["npx", "--yes", "wrangler", "deploy", "--config", str(generated)]
+        assert cwd == capsule
+        return (
+            1,
+            "\n".join(
+                [
+                    f"A request to the Cloudflare API (/accounts/{account_id}/workers/scripts/yutome-remote-mcp) failed.",
+                    "You need a workers.dev subdomain in order to proceed. [code: 10063]",
+                ]
+            ),
+        )
+
+    monkeypatch.setattr("yutome.cli._run_command_streamed", fake_stream)
+
+    with pytest.raises(typer.Exit) as exc:
+        _deploy_tracked_capsule(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
+
+    assert exc.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "This Cloudflare account has not finished Workers setup yet." in captured.err
+    assert f"https://dash.cloudflare.com/{account_id}/workers/onboarding" in captured.err
+    assert "rerun `yutome connect --deploy`" in captured.err
 
 
 def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
