@@ -84,6 +84,24 @@ Do not just say "no results." Distinguish:
 
 Name the case you're in and suggest the next concrete move.
 
+## When yutome calls fail
+
+A failed yutome call is not a "no results" answer. Do not invent results, do not paraphrase what the videos "probably say." Tell the user what's wrong and what to do.
+
+The remote MCP transport returns JSON-RPC errors with structured `data`. Recognise these by `error.data.desktop_offline === true`:
+
+- **Desktop offline** — the user's laptop bridge isn't connected. Say so plainly. If `error.data.last_seen_at` is present, mention when it was last seen (e.g., "your laptop was last seen 2 hours ago"). Tell the user to open Yutome Desktop on their laptop. Do not retry — it won't change until the bridge is back.
+- **Timeout** — same `desktop_offline: true` data with a message containing "did not answer". The bridge is reachable but slow or stuck. Retry the call **once**. If it fails again, treat as offline and report.
+- **Bridge disconnected mid-call** — same shape; same handling as offline.
+
+For other failures:
+
+- **Pairing / auth (HTTP 401 from the relay)** — the connector token has been rejected. Tell the user to run `yutome connect --deploy` and re-pair the connector in their assistant client. Do not retry with the same token.
+- **Local HTTP unreachable** (`http://127.0.0.1:8765` connection refused, when not using MCP) — `yutome http` isn't running. Tell the user to start it or to fall back to the CLI.
+- **Empty corpus** — if `find` returns rows=[] and the result includes a note about no videos indexed, surface that note verbatim. Don't run more searches; suggest `yutome sync <channel>` instead.
+
+In every case, prefer one clear sentence ("Your laptop's Yutome bridge is offline — open Yutome Desktop and try again") over a generic apology. The user can't see the structured error; you're their translator.
+
 ## Stay Corpus-Grounded
 
 yutome answers are retrieval answers. State what the indexed videos say and cite the source timestamps. Do not introduce outside facts, corrections, or counterpoints unless the user asks for analysis beyond the corpus.

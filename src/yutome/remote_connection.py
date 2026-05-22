@@ -82,9 +82,18 @@ def load_remote_state(paths: ProjectPaths) -> RemoteConnectionState | None:
     path = remote_state_path(paths)
     if not path.exists():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"remote connector state at {path} is not valid JSON ({exc.msg}). "
+            "Run `yutome connect --deploy` to recreate it."
+        ) from exc
     if not isinstance(payload, dict):
-        raise ValueError(f"remote connection state must be a JSON object: {path}")
+        raise ValueError(
+            f"remote connector state at {path} is not a JSON object. "
+            "Run `yutome connect --deploy` to recreate it."
+        )
     return RemoteConnectionState.from_dict(payload)
 
 

@@ -144,14 +144,25 @@ def _project_root(config_path: Path) -> Path:
     return (Path.cwd() / config_path).parent
 
 
+def _load_config_or_exit(config_path: Path) -> AppConfig:
+    try:
+        return load_config(config_path)
+    except FileNotFoundError as exc:
+        typer.echo(
+            f"yutome config not found at {config_path}. Run: uv run yutome setup",
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
+
+
 def _load_paths(config_path: Path) -> ProjectPaths:
-    config = load_config(config_path)
+    config = _load_config_or_exit(config_path)
     return ProjectPaths.from_config(config, project_root=_project_root(config_path))
 
 
 def _load_runtime(config_path: Path) -> tuple[object, ProjectPaths]:
     load_dotenv(_project_root(config_path) / ".env")
-    app_config = apply_env_to_config(load_config(config_path))
+    app_config = apply_env_to_config(_load_config_or_exit(config_path))
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config_path))
     bootstrap_catalog(paths.catalog_db)
     return app_config, paths

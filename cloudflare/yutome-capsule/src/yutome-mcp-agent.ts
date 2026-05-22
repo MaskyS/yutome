@@ -109,7 +109,15 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
       if (dispatch.error) {
         const err = dispatch.error;
         const code = err.code === -32002 ? ErrorCode.InvalidParams : ErrorCode.InternalError;
-        throw new McpError(code, err.message ?? "Yutome resource unavailable.", err.data);
+        const isOffline =
+          err.code === -32002 ||
+          (typeof err.data === "object" &&
+            err.data !== null &&
+            (err.data as { desktop_offline?: unknown }).desktop_offline === true);
+        const fallback = isOffline
+          ? "Yutome Desktop bridge is offline."
+          : "Yutome resource unavailable.";
+        throw new McpError(code, err.message ?? fallback, err.data);
       }
       const wrapped = (dispatch.result ?? {}) as {
         contents?: Array<{ uri: string; mimeType: string; text: string }>;

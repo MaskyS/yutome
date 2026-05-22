@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from yutome.config import AppConfig
-from yutome.db import connect_catalog
+from yutome.db import catalog_is_initialized, connect_catalog
 from yutome.paths import ProjectPaths, resolve_under
 from yutome.query import (
     BoolPredicate,
@@ -90,7 +90,8 @@ def find(
             limit=limit,
             offset=offset,
         )
-    return q(config=config, paths=paths, request=query_request)
+    result = q(config=config, paths=paths, request=query_request)
+    return _annotate_empty_corpus(result, paths)
 
 
 def list_(
@@ -147,7 +148,8 @@ def list_(
         query_request = QueryRequest(project="status_breakdown")
     else:
         raise ValueError(f"unsupported list entity: {entity}")
-    return q(config=config, paths=paths, request=query_request)
+    result = q(config=config, paths=paths, request=query_request)
+    return _annotate_empty_corpus(result, paths)
 
 
 def show(
@@ -375,6 +377,29 @@ def _context_request(
         youtube_url = youtube_url or id_
         id_ = None
     return ContextRequest(chunk_id=id_, video_id=video_id, time_seconds=time_seconds, youtube_url=youtube_url)
+
+
+_EMPTY_CORPUS_NOTE = (
+    "No videos indexed yet — run `yutome sync <channel-url>` to index a channel before searching."
+)
+
+
+def _annotate_empty_corpus(result: QueryResult, paths: ProjectPaths) -> QueryResult:
+    if result.rows:
+        return result
+    if not catalog_is_initialized(paths.catalog_db):
+        if _EMPTY_CORPUS_NOTE not in result.notes:
+            result.notes.append(_EMPTY_CORPUS_NOTE)
+        return result
+    try:
+        with connect_catalog(paths.catalog_db) as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM videos").fetchone()
+            count = int(row["count"]) if row is not None else 0
+    except Exception:
+        return result
+    if count == 0 and _EMPTY_CORPUS_NOTE not in result.notes:
+        result.notes.append(_EMPTY_CORPUS_NOTE)
+    return result
 
 
 def _common_filter(
