@@ -309,7 +309,10 @@ def test_live_corpus_search_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     mcp_server._RUNTIME = None
     try:
         mcp_server.configure(Path("yutome.toml"))
-        hits = mcp_server.tool_find(text="Crohn probiotics", mode="lexical", limit=3)["rows"]
+        # Lexical search is phrase-based (v0.1.2+), so use a single-word
+        # query against the live corpus instead of a multi-word phrase
+        # that might not appear adjacent.
+        hits = mcp_server.tool_find(text="probiotics", mode="lexical", limit=3)["rows"]
         assert hits, "live lexical search returned no hits"
         for hit in hits:
             assert hit["chunk_id"]

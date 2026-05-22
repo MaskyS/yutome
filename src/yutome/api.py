@@ -62,10 +62,11 @@ def find(
     limit: int = 10,
     offset: int = 0,
     project: str | None = None,
+    raw: bool = False,
 ) -> QueryResult:
     filters = _common_filter(channel=channel, since=since, until=until, source=source, language=language)
     if in_ == "chunks":
-        search = Search(over="chunk_text", mode=mode or config.find.default_mode, text=text)
+        search = Search(over="chunk_text", mode=mode or config.find.default_mode, text=text, raw=raw)
         query_request = QueryRequest(
             entity="chunk",
             search=search,
@@ -82,6 +83,7 @@ def find(
             over="video_title" if in_ == "titles" else "video_description",
             mode=mode or "lexical",
             text=text,
+            raw=raw,
         )
         query_request = QueryRequest(
             entity="video",

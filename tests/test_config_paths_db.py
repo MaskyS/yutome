@@ -470,7 +470,7 @@ def test_setup_can_index_subset_of_added_channels(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         app,
         ["setup", "--config", str(config_path)],
-        input="n\nn\nn\ny\nn\nn\nall\ny\n1-2\nn\n",
+        input="n\nn\nn\ny\nn\nn\nall\ny\n1-2\n50\nn\n",
     )
 
     assert result.exit_code == 0
@@ -482,6 +482,7 @@ def test_setup_can_index_subset_of_added_channels(monkeypatch, tmp_path: Path) -
         ("https://www.youtube.com/channel/UC1111111111111111111111", "Alpha", "youtube_channel"),
         ("https://www.youtube.com/channel/UC2222222222222222222222", "Beta", "youtube_channel"),
     ]
+    assert captured["effective_max_process"] == 50
 
 
 def test_channel_selection_parser_supports_ranges_and_sentinels() -> None:

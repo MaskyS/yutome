@@ -101,6 +101,11 @@ class Search(BaseModel):
     over: SearchOver = "chunk_text"
     mode: SearchMode = "hybrid"
     text: str = ""
+    raw: bool = False
+    """When False (default), lexical search wraps `text` as an FTS5 phrase
+    so characters like `-`, `:`, `*`, `+` are treated literally. When True,
+    the text is passed through unmodified so power users can write raw
+    FTS5 query syntax (`AND`/`OR`/`NOT`, prefix `*`, column filters)."""
 
 
 class OrderBy(BaseModel):
@@ -265,6 +270,18 @@ def execute_query(compiled: CompiledQuery, config: AppConfig, paths: ProjectPath
     return QueryResult(rows=rows, notes=compiled.notes, total=len(rows))
 
 
+def _fts5_phrase(text: str) -> str:
+    """Wrap user input as an FTS5 phrase so characters like `-`, `:`, `*`,
+    `+`, `(`, `)`, `^` are treated as literal tokenizer input instead of
+    FTS5 operators. Per https://www.sqlite.org/fts5.html section 3.1,
+    embedded `"` characters inside a phrase escape by doubling."""
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _fts5_match_text(search: Search) -> str:
+    return search.text if search.raw else _fts5_phrase(search.text)
+
+
 def _present_filter_fields(filters: Filter) -> set[str]:
     return {name for name in type(filters).model_fields if getattr(filters, name) is not None}
 
@@ -272,8 +289,8 @@ def _present_filter_fields(filters: Filter) -> set[str]:
 def _execute_sql_chunk(connection: sqlite3.Connection, *, request: QueryRequest, lexical: bool) -> list[dict[str, Any]]:
     params: list[Any] = []
     if lexical:
-        search_text = request.search.text if request.search else ""
-        params.append(search_text)
+        match_text = _fts5_match_text(request.search) if request.search else '""'
+        params.append(match_text)
         from_sql = """
         FROM chunks_fts
         JOIN chunks c ON chunks_fts.rowid = c.rowid
@@ -337,7 +354,11 @@ def _execute_sql_video(connection: sqlite3.Connection, *, request: QueryRequest,
     if lexical:
         assert request.search is not None
         column = "title" if request.search.over == "video_title" else "description"
-        params.append(f"{column}:({request.search.text})")
+        # Wrap as an FTS5 phrase so special chars like `-` `:` `*` are literal,
+        # but keep the `column:` prefix so search stays scoped to that column.
+        # Power users pass --raw to inject their own FTS5 expression here.
+        inner = request.search.text if request.search.raw else _fts5_phrase(request.search.text)
+        params.append(f"{column}:({inner})")
         from_sql = """
         FROM videos_fts
         JOIN videos v ON videos_fts.rowid = v.rowid

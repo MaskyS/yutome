@@ -857,7 +857,7 @@ def _run_sync_targets(
     limit: int | None,
     effective_embed: bool,
     force: bool,
-    effective_max_process: int,
+    effective_max_process: int | None,
     retry_failed: bool,
     stop_on_rate_limit: bool,
     verbose_skips: bool,
@@ -875,7 +875,7 @@ def _run_sync_targets(
     target_types = sorted({target_type for _, _, target_type in sync_targets})
     typer.echo(f"  source types: {', '.join(target_types)}")
     typer.echo(f"  discovery: {'catalog cache' if use_catalog else 'source-specific'}")
-    typer.echo(f"  max-process: {effective_max_process}")
+    typer.echo(f"  max-process: {effective_max_process if effective_max_process is not None else 'unlimited'}")
     typer.echo(f"  workers: {effective_workers}")
     typer.echo(f"  staged fallback: transcript API first, yt-dlp retry second, metadata backfill third")
     typer.echo(f"  embeddings: {'enabled' if effective_embed else 'disabled'}")
@@ -1014,7 +1014,12 @@ def _first_run_default_selection(channels: list[LibraryChannel]) -> str:
     return "1-10"
 
 
-def _run_setup_first_sync(config: Path, *, channels: list[LibraryChannel] | None = None) -> None:
+def _run_setup_first_sync(
+    config: Path,
+    *,
+    channels: list[LibraryChannel] | None = None,
+    max_videos_per_channel: int | None,
+) -> None:
     load_dotenv(_project_root(config) / ".env")
     app_config = apply_env_to_config(load_config(config))
     if app_config.embeddings.enabled:
@@ -1032,12 +1037,18 @@ def _run_setup_first_sync(config: Path, *, channels: list[LibraryChannel] | None
         typer.echo("[WARN] No selected sources to index.")
         return
     effective_workers = app_config.backfill.workers
-    effective_max_process = app_config.backfill.max_videos_per_run
-    upper_bound = len(selected_channels) * effective_max_process
-    typer.echo(
-        f"First sync upper bound: {len(selected_channels)} channel(s) x "
-        f"{effective_max_process} videos = {upper_bound} videos; workers: {effective_workers}."
-    )
+    effective_max_process: int | None = max_videos_per_channel
+    if effective_max_process is None:
+        typer.echo(
+            f"First sync upper bound: {len(selected_channels)} channel(s) x "
+            f"all available videos; workers: {effective_workers}."
+        )
+    else:
+        upper_bound = len(selected_channels) * effective_max_process
+        typer.echo(
+            f"First sync upper bound: {len(selected_channels)} channel(s) x "
+            f"{effective_max_process} videos = {upper_bound} videos; workers: {effective_workers}."
+        )
     _run_sync_targets(
         app_config=app_config,
         paths=paths,
@@ -1157,6 +1168,28 @@ def _assistant_app_label(targets: set[str]) -> str:
     if "other" in targets:
         labels.append("other MCP clients")
     return ", ".join(labels)
+
+
+def _prompt_first_run_video_cap(default_cap: int) -> int | None:
+    typer.echo("")
+    typer.echo("How many recent videos per channel should Yutome index first?")
+    typer.echo("  10    quick try")
+    typer.echo(f"  {default_cap}    default")
+    typer.echo("  all   everything available (slow, large)")
+    typer.echo("  N     type any custom number")
+    while True:
+        raw = typer.prompt("Per channel", default=str(default_cap)).strip().lower()
+        if raw in {"all", "everything", "unlimited"}:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            typer.echo("[WARN] Enter a number, or 'all'.")
+            continue
+        if value < 1:
+            typer.echo("[WARN] Enter a positive number, or 'all'.")
+            continue
+        return value
 
 
 def _prompt_assistant_apps() -> str:
@@ -1776,7 +1809,23 @@ def setup(
             default=_first_run_default_selection(setup_library_channels),
         )
         if first_run_channels:
-            _run_setup_first_sync(config, channels=first_run_channels)
+            videos_per_channel = _prompt_first_run_video_cap(app_config.backfill.max_videos_per_run)
+            if videos_per_channel is None:
+                typer.echo(
+                    f"This first run will index all available videos across "
+                    f"{len(first_run_channels)} channel(s)."
+                )
+            else:
+                upper_bound = len(first_run_channels) * videos_per_channel
+                typer.echo(
+                    f"This first run may index up to {len(first_run_channels)} channel(s) "
+                    f"x {videos_per_channel} videos = {upper_bound} videos."
+                )
+            _run_setup_first_sync(
+                config,
+                channels=first_run_channels,
+                max_videos_per_channel=videos_per_channel,
+            )
             ran_sync = True
         else:
             typer.echo("[OK] No channels selected for immediate indexing.")
@@ -2645,6 +2694,13 @@ def find_command(
     limit: int = typer.Option(10, "--limit", min=1, max=200, help="Maximum rows to return."),
     offset: int = typer.Option(0, "--offset", min=0, help="Rows to skip."),
     project: str | None = typer.Option(None, "--project", help="Projection name."),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Pass the search text through to SQLite FTS5 verbatim. "
+        "Lets you use FTS5 operators (AND/OR/NOT, prefix `*`, column filters, "
+        "negation with `-`). Off by default: text is treated as a literal phrase.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the full QueryResult envelope."),
 ) -> None:
     """Rank transcript chunks or video metadata by relevance."""
@@ -2665,6 +2721,7 @@ def find_command(
             limit=limit,
             offset=offset,
             project=project,
+            raw=raw,
         )
     except (RuntimeError, ValueError) as exc:
         typer.echo(str(exc), err=True)
