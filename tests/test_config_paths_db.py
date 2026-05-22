@@ -360,11 +360,11 @@ def test_setup_command_creates_first_run_files_without_prompting(tmp_path: Path)
     assert catalog_is_initialized(tmp_path / "data/indexes/catalog.sqlite")
     assert "Next steps:" in result.output
     assert "Optional semantic search" in result.output
-    assert "Use Yutome from Claude/ChatGPT:" in result.output
-    assert "Remote MCP means Claude/ChatGPT call one public Yutome connector URL" in result.output
-    assert "this computer and `yutome remote bridge` must be on" in result.output
-    assert "+ > More" in result.output
-    assert "does not require Voyage, Webshare, Gemini, or proxy credentials" in result.output
+    assert "Use Yutome from your AI assistant:" in result.output
+    assert "Claude Desktop" in result.output
+    assert "Cursor" in result.output
+    assert "transcripts stay on this" in result.output
+    assert "Yutome Desktop offline" in result.output
     assert "Optional next step: yutome connect --app claude" in result.output
 
 
@@ -388,7 +388,7 @@ def test_setup_command_can_write_webshare_credentials_interactively(tmp_path: Pa
     result = runner.invoke(
         app,
         ["setup", "@YesTheory", "--config", str(config_path)],
-        input="y\nproxy-user\nproxy-pass\n\n\nn\nn\nn\nn\nn\nn\n",
+        input="y\nproxy-user\nproxy-pass\n\n\nn\nn\n3\nn\nn\n4\n",
     )
 
     assert result.exit_code == 0
@@ -407,7 +407,7 @@ def test_setup_command_can_enable_semantic_search_interactively(tmp_path: Path) 
     result = runner.invoke(
         app,
         ["setup", "--config", str(config_path)],
-        input="n\nn\ny\nvoyage-test-key\nn\nn\nn\nn\n",
+        input="n\nn\ny\nvoyage-test-key\n3\nn\nn\n4\n",
     )
 
     assert result.exit_code == 0
@@ -435,7 +435,7 @@ def test_setup_imports_subscriptions_then_selects_channels(monkeypatch, tmp_path
     result = runner.invoke(
         app,
         ["setup", "--config", str(config_path)],
-        input="n\nn\nn\ny\nn\nn\n1,3\nn\nn\n",
+        input="n\nn\nn\n1\nn\n1,3\nn\n4\n",
     )
 
     assert result.exit_code == 0
@@ -470,7 +470,7 @@ def test_setup_can_index_subset_of_added_channels(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         app,
         ["setup", "--config", str(config_path)],
-        input="n\nn\nn\ny\nn\nn\nall\ny\n1-2\n50\nn\n",
+        input="n\nn\nn\n1\nn\nall\ny\n1-2\n50\n4\n",
     )
 
     assert result.exit_code == 0
@@ -946,16 +946,12 @@ def test_setup_yes_skips_remote_prompt_and_points_to_connect(tmp_path: Path) -> 
     result = runner.invoke(app, ["setup", "--config", str(config_path), "--yes"])
 
     assert result.exit_code == 0
-    assert "Use Yutome from Claude/ChatGPT:" in result.output
-    assert "ask your normal assistant about your YouTube library" in result.output
-    assert "Remote MCP means Claude/ChatGPT call one public Yutome connector URL" in result.output
-    assert "+ > More" in result.output
-    assert "this computer and `yutome remote bridge` must be on" in result.output
-    assert "does not require Voyage, Webshare, Gemini, or proxy credentials" in result.output
-    assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
-    assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
+    assert "Use Yutome from your AI assistant:" in result.output
+    assert "Claude Desktop" in result.output
+    assert "Cloudflare" in result.output
+    assert "Yutome Desktop offline" in result.output
     assert "Optional next step: yutome connect --app claude" in result.output
-    assert "Connect Yutome to Claude/ChatGPT now?" not in result.output
+    assert "How do you want to connect Yutome to your assistant?" not in result.output
     assert not (tmp_path / "data/remote/connection.json").exists()
 
 
@@ -963,22 +959,22 @@ def test_setup_can_prepare_remote_mcp_worker_project_interactively(tmp_path: Pat
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
 
+    # Skip every step, pick "Web + mobile — deploy" at the connect select, then
+    # Claude as the assistant app, then decline the deploy/dashboard confirm.
+    # 1=webshare-no, 2=gemini-no, 3=voyage-no, 4=subs-skip,
+    # 5=public-subs-no, 6=add-channel-no, 7=connect-deploy,
+    # 8=assistant-claude, 9=continue-deploy-no
     result = runner.invoke(
         app,
         ["setup", "--config", str(config_path)],
-        input="n\nn\nn\nn\nn\nn\ny\nclaude\n\nn\n",
+        input="n\nn\nn\n3\nn\nn\n2\n1\nn\n",
     )
 
     assert result.exit_code == 0
-    assert "Use Yutome from Claude/ChatGPT:" in result.output
-    assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
-    assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
-    assert "Which assistant app do you want help connecting?" in result.output
-    assert "claude   Claude web/Desktop/mobile" in result.output
-    # The TS Worker subproject is tracked under cloudflare/yutome-capsule/.
-    # `setup` no longer generates JS source files into data/remote/.
-    assert "Tracked TypeScript Worker subproject lives at:" in result.output
-    assert "cloudflare/yutome-capsule" in result.output
+    assert "Use Yutome from your AI assistant:" in result.output
+    assert "Cloudflare" in result.output
+    assert "Which assistant app do you want connector instructions for?" in result.output
+    assert "Claude (web, Desktop, mobile)" in result.output
     assert not (tmp_path / "data/remote/cloudflare-worker").exists()
     assert not (tmp_path / "data/remote/connection.json").exists()
 

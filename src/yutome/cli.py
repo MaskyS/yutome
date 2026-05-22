@@ -41,6 +41,7 @@ from yutome.paths import ProjectPaths
 from yutome.maintenance import rebuild_active_chunks
 from yutome.quality_upgrade import upgrade_active_transcripts
 from yutome.query import QueryRequest
+from yutome import setup_prompts
 from yutome.remote_connection import (
     RemoteMode,
     build_remote_state,
@@ -87,7 +88,7 @@ export_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Expor
 list_app = typer.Typer(add_completion=False, no_args_is_help=True, help="List indexed corpus objects.")
 show_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Show indexed corpus objects.")
 quality_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Transcript quality tools.")
-mcp_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local MCP server for agent clients.")
+mcp_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local MCP server (for Claude Desktop, Cursor, Claude Code, and other MCP-aware apps on this machine).")
 http_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local HTTP API server.")
 eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run retrieval quality checks.")
 remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Prepare and serve authenticated remote access.")
@@ -493,19 +494,27 @@ def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> b
 
     typer.echo("")
     typer.echo(
-        "Semantic/hybrid search lets yutome find paraphrases and concepts, not just exact words. "
-        "It uses Voyage embeddings during sync; skip it if you only want keyword search for now."
+        "Semantic/hybrid search lets yutome find paraphrases and concepts, not just exact "
+        "words. It uses Voyage embeddings during sync. If you skip, lexical (keyword) "
+        "search still works fully — you can enable semantic later with `yutome setup`."
     )
-    typer.echo("  Sign up:  https://www.voyageai.com/  (free tier covers small/medium corpora; bring-your-own key)")
+    typer.echo("")
+    typer.echo("  Sign up:  https://www.voyageai.com/")
+    typer.echo("  Cost:     free tier covers small/medium libraries; pay-as-you-go past that")
     typer.echo("  Docs:     https://docs.voyageai.com/docs/embeddings")
+    typer.echo("")
     if not deps_ready:
         _status(False, "Semantic search dependencies", "run `uv sync --extra vectors --extra embeddings`")
-    if not typer.confirm("Enable semantic/hybrid search now?", default=False):
+    if not setup_prompts.confirm("Enable semantic/hybrid search now?", default=False):
         _status(False, "Semantic/hybrid search", "skipped; lexical search still works")
         return False
 
     if not has_voyage_key:
-        voyage_key = typer.prompt("Voyage API key", hide_input=True).strip()
+        setup_prompts.offer_to_open(
+            "https://www.voyageai.com/",
+            prompt="Open the Voyage signup page in your browser?",
+        )
+        voyage_key = setup_prompts.password("Voyage API key")
         if voyage_key:
             _merge_env_values(env_path, {"VOYAGE_API_KEY": voyage_key})
             has_voyage_key = True
@@ -531,23 +540,32 @@ def _setup_webshare(env_path: Path, *, yes: bool) -> None:
         return
     typer.echo("")
     typer.echo(
-        "Webshare helps large YouTube imports avoid local IP blocks. "
-        "Skip it for small tests; configure it before importing hundreds of videos."
+        "Webshare is a paid residential-proxy service that helps large YouTube imports "
+        "avoid local IP blocks. Skip it for small tests; configure it before importing "
+        "hundreds of videos. If you skip, yutome will ask again the first time YouTube "
+        "blocks a transcript fetch."
     )
-    typer.echo("  Sign up:  https://www.webshare.io/  (paid)")
-    typer.echo("  Plan:     'Residential Proxy' (rotating). ~$3.50/mo / ~1 GB is typically plenty;")
-    typer.echo("            do NOT use 'Proxy Server' (datacenter) — YouTube blocks those.")
+    typer.echo("")
+    typer.echo("  Sign up:  https://www.webshare.io/residential-proxy")
+    typer.echo("  Cost:     ~$3.50/month for ~1 GB residential traffic (usually plenty)")
+    typer.echo("  Plan:     'Residential Proxy' (rotating)")
+    typer.echo("            NOT the cheaper 'Proxy Server' (datacenter) — YouTube blocks those")
     typer.echo("  Why:      https://github.com/maskys/yutome/blob/main/docs/proxy-strategy.md")
-    if not typer.confirm("Configure Webshare residential proxy now?", default=False):
+    typer.echo("")
+    if not setup_prompts.confirm("Configure Webshare residential proxy now?", default=False):
         _status(False, "Webshare residential proxy", "skipped; yutome can ask again if YouTube blocks transcript fetching")
         return
 
-    username = typer.prompt("Webshare username").strip()
-    password = typer.prompt("Webshare password", hide_input=True).strip()
+    setup_prompts.offer_to_open(
+        "https://www.webshare.io/residential-proxy",
+        prompt="Open the Webshare signup page in your browser?",
+    )
+    username = setup_prompts.text("Webshare username")
+    password = setup_prompts.password("Webshare password")
     domain_default = values.get("YUTOME_WEBSHARE_DOMAIN") or "p.webshare.io"
     port_default = values.get("YUTOME_WEBSHARE_PORT") or "80"
-    domain = typer.prompt("Webshare domain", default=domain_default).strip()
-    port = typer.prompt("Webshare port", default=port_default).strip()
+    domain = setup_prompts.text("Webshare domain", default=domain_default)
+    port = setup_prompts.text("Webshare port", default=port_default)
     _merge_env_values(
         env_path,
         {
@@ -583,19 +601,28 @@ def _setup_gemini(config_path: Path, env_path: Path, *, yes: bool) -> None:
 
     typer.echo("")
     typer.echo(
-        "Gemini does two jobs for yutome: it repairs noisy auto-captions into clean readable "
-        "transcripts after each sync, and it transcribes videos directly when captions and ASR fail."
+        "Gemini does two jobs for yutome: it repairs noisy auto-captions into clean "
+        "readable transcripts after each sync, and it transcribes videos directly when "
+        "captions and ASR fail. If you skip, yutome still indexes raw auto-captions and "
+        "you can enable Gemini later with `yutome setup`."
     )
-    typer.echo("  Sign up:  https://aistudio.google.com/apikey  (free tier; bring-your-own key)")
+    typer.echo("")
+    typer.echo("  Sign up:  https://aistudio.google.com/apikey  (Google account required)")
+    typer.echo("  Cost:     free tier covers casual use; pay-as-you-go past the daily quota")
     typer.echo("  Docs:     https://ai.google.dev/gemini-api/docs")
+    typer.echo("")
     if not deps_ready:
         _status(False, "Gemini dependency", "run `uv sync --extra gemini`")
-    if not typer.confirm("Enable Gemini transcript repair and fallback now?", default=False):
+    if not setup_prompts.confirm("Enable Gemini transcript repair and fallback now?", default=False):
         _status(False, "Gemini (transcript repair + fallback)", "skipped; yutome can ask again before transcript repair/fallback")
         return
 
     if not has_key:
-        gemini_key = typer.prompt("Gemini API key", hide_input=True).strip()
+        setup_prompts.offer_to_open(
+            "https://aistudio.google.com/apikey",
+            prompt="Open AI Studio (Google) to create an API key?",
+        )
+        gemini_key = setup_prompts.password("Gemini API key")
         if gemini_key:
             _merge_env_values(env_path, {"GEMINI_API_KEY": gemini_key})
             has_key = True
@@ -712,7 +739,17 @@ def _prompt_oauth_client_secrets(env_path: Path) -> bool:
     Returns True when the YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS env value is set.
     """
     typer.echo("")
-    typer.echo("OAuth setup (one-time, ~3 minutes). Open each URL in your browser:")
+    typer.echo(
+        "You picked OAuth, so we need to register yutome as a Desktop OAuth client "
+        "inside your Google Cloud project. This is a one-time thing per Google account "
+        "— yutome reuses the client every time. Expect 5–10 minutes the first time you "
+        "use Google Cloud Console; faster if you've done it before."
+    )
+    typer.echo("")
+    typer.echo("Friendlier walk-through with screenshots:")
+    typer.echo("  https://github.com/MaskyS/yutome/blob/main/docs/oauth-testing.md")
+    typer.echo("")
+    typer.echo("The six steps (open each URL in your browser):")
     typer.echo("  1. Console:        https://console.cloud.google.com/")
     typer.echo("     Create a new project or pick an existing one.")
     typer.echo("  2. Enable the API: https://console.cloud.google.com/apis/library/youtube.googleapis.com")
@@ -725,7 +762,6 @@ def _prompt_oauth_client_secrets(env_path: Path) -> bool:
     typer.echo("     Create Credentials -> OAuth client ID -> Application type: Desktop app.")
     typer.echo("  5. Click DOWNLOAD JSON on the new client; save it somewhere private (e.g. ~/.yutome/).")
     typer.echo("  6. Paste the absolute path to that JSON below.")
-    typer.echo("  Full walkthrough: https://github.com/maskys/yutome/blob/main/docs/oauth-testing.md")
     client_secret_path = typer.prompt(
         "OAuth client secrets JSON path (blank to skip)",
         default="",
@@ -748,17 +784,39 @@ def _setup_import_youtube_subscriptions(
     imported: list[LibraryChannel] = []
     project_root = _project_root(config)
     typer.echo("")
-    typer.echo("YouTube subscription import. Two methods:")
-    typer.echo("  - Browser cookies (default): uses the YouTube account active in your browser.")
-    typer.echo("    Works with Chrome, Brave, Safari, Firefox, or Edge. macOS may prompt for")
-    typer.echo("    your login password or Touch ID to unlock the browser's cookie store.")
-    typer.echo("  - OAuth: target a specific Google account; one-time Google Cloud setup.")
-    typer.echo("    Recommended when you have multiple Google accounts or want repeatable results.")
-    if typer.confirm("Import your YouTube subscriptions now?", default=True):
-        use_oauth = typer.confirm(
-            "Use OAuth instead of browser cookies? (Recommended if you have multiple Google accounts.)",
-            default=False,
-        )
+    typer.echo(
+        "Yutome can pull your YouTube subscription list so you don't have to add channels "
+        "one by one. It only reads the list of channels you subscribe to — not your watch "
+        "history, not your private playlists, not any video data. The result is just a set "
+        "of channels added to your library; nothing is sent anywhere."
+    )
+    typer.echo("")
+    typer.echo("Two ways to get the list:")
+    typer.echo("")
+    typer.echo("  Browser cookies (recommended)")
+    typer.echo("    Reads the YouTube account already logged into Chrome / Brave / Safari /")
+    typer.echo("    Firefox / Edge on this computer. Zero setup. macOS may ask for your")
+    typer.echo("    login password or Touch ID once to unlock the cookie store. Whichever")
+    typer.echo("    Google account is signed into that browser is the one we read.")
+    typer.echo("")
+    typer.echo("  Google OAuth")
+    typer.echo("    You pick a specific Google account during a browser sign-in flow. Best")
+    typer.echo("    when you have multiple Google accounts and want to be explicit, or when")
+    typer.echo("    cookies don't work. One-time ~5-min Google Cloud Console setup.")
+    typer.echo("")
+    method = setup_prompts.select(
+        "How do you want to import your subscriptions?",
+        choices=[
+            "Browser cookies (recommended)",
+            "Google OAuth (pick a specific account)",
+            "Skip — I'll add channels manually with `yutome add`",
+        ],
+        default="Browser cookies (recommended)",
+    )
+    if method.startswith("Skip"):
+        pass
+    else:
+        use_oauth = method.startswith("Google OAuth")
         if use_oauth:
             if _configured_oauth_client_secrets(app_config, project_root, env_path) is None:
                 if _prompt_oauth_client_secrets(env_path):
@@ -811,8 +869,11 @@ def _setup_import_youtube_subscriptions(
                     except YouTubeImportError as oauth_exc:
                         typer.echo(f"[WARN] YouTube OAuth subscription import skipped: {oauth_exc}")
 
-    if typer.confirm("Import public subscriptions from another channel?", default=False):
-        public_target = typer.prompt("Public channel URL, handle, or channel id").strip()
+    if setup_prompts.confirm(
+        "Import the public subscriptions of another channel (someone else's library)?",
+        default=False,
+    ):
+        public_target = setup_prompts.text("Public channel URL, handle, or channel id")
         if public_target:
             try:
                 imported.extend(
@@ -1193,20 +1254,18 @@ def _prompt_first_run_video_cap(default_cap: int) -> int | None:
 
 
 def _prompt_assistant_apps() -> str:
-    typer.echo("")
-    typer.echo("Which assistant app do you want help connecting?")
-    typer.echo("  claude   Claude web/Desktop/mobile")
-    typer.echo("  chatgpt  ChatGPT Apps")
-    typer.echo("  both     Claude and ChatGPT")
-    typer.echo("  other    Another remote MCP client")
-    while True:
-        value = typer.prompt("Assistant app", default="claude").strip().lower()
-        try:
-            _assistant_app_targets(value)
-        except ValueError as exc:
-            typer.echo(f"[WARN] {exc}")
-            continue
-        return value or "claude"
+    label_to_value = {
+        "Claude (web, Desktop, mobile)": "claude",
+        "ChatGPT": "chatgpt",
+        "Both Claude and ChatGPT": "both",
+        "Another remote MCP client": "other",
+    }
+    choice = setup_prompts.select(
+        "Which assistant app do you want connector instructions for?",
+        choices=list(label_to_value.keys()),
+        default="Claude (web, Desktop, mobile)",
+    )
+    return label_to_value[choice]
 
 
 def _print_connector_next_steps(
@@ -1296,25 +1355,158 @@ def _print_pairing_next_steps(state: Any) -> None:
 
 def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("")
-    typer.echo("Use Yutome from Claude/ChatGPT:")
-    typer.echo("  This lets you ask your normal assistant about your YouTube library instead of opening yutome.")
-    typer.echo("  Remote MCP means Claude/ChatGPT call one public Yutome connector URL, then yutome")
-    typer.echo("  answers from the library and search index on this computer.")
-    typer.echo("  Add it once per assistant account; you should not need to repeat setup for every device.")
-    typer.echo("  When you connect, yutome asks whether you want Claude, ChatGPT, both, or another MCP client.")
-    typer.echo("  Claude/ChatGPT may still ask you to enable or select Yutome in each chat before asking.")
-    typer.echo("  For ChatGPT, select Yutome from + > More / composer tools before asking.")
-    typer.echo("  In this first version, this computer and `yutome remote bridge` must be on.")
-    typer.echo("  Rerunning `yutome connect --deploy` refreshes the pairing code and bridge token,")
-    typer.echo("  so use the newest printed code and restart any old `yutome remote bridge` process.")
-    typer.echo("  Setup needs a small public connector endpoint. If Yutome provides one, paste it; otherwise")
-    typer.echo("  yutome can deploy a Cloudflare Worker from the tracked TypeScript subproject for you.")
-    typer.echo("  You may need to create or sign into a Cloudflare account during deploy.")
-    typer.echo("  This step does not require Voyage, Webshare, Gemini, or proxy credentials.")
-    typer.echo("  The basic laptop-backed connector is designed for Cloudflare's free Workers plan.")
-    typer.echo("  Always-on/offline search is a later mode and may require enabling Cloudflare billing.")
+    typer.echo("Use Yutome from your AI assistant:")
+    typer.echo("")
+    typer.echo("  Right now, to search your library you run `yutome find \"topic\"`. After")
+    typer.echo("  this step, you can ask an AI assistant the same question and it searches")
+    typer.echo("  yutome for you, citing the videos. Works with any assistant that speaks")
+    typer.echo("  MCP — Claude (Desktop, Code, web, mobile), ChatGPT, Cursor, Cherry")
+    typer.echo("  Studio, LibreChat, Goose, and others. Your transcripts stay on this")
+    typer.echo("  computer either way.")
+    typer.echo("")
+    typer.echo("  Two ways to connect, depending on where you use the assistant:")
+    typer.echo("")
+    typer.echo("  [Local apps]   Assistants running on this Mac")
+    typer.echo("    - Examples: Claude Desktop, Cursor, Cherry Studio, LibreChat, Claude Code")
+    typer.echo("    - Yutome shows you a config snippet, copies it to your clipboard, and")
+    typer.echo("      can open the right folder so you can paste it in")
+    typer.echo("    - Free, no accounts to create, ready in ~30 seconds")
+    typer.echo("    - Only works while you're on THIS Mac — not your phone or another laptop")
+    typer.echo("")
+    typer.echo("  [Web + mobile]   Assistants you reach from anywhere")
+    typer.echo("    - Examples: claude.ai (web), ChatGPT, your phone, another laptop")
+    typer.echo("    - Yutome deploys a small piece to your free Cloudflare account (you'll")
+    typer.echo("      sign in to Cloudflare during setup; no card needed for the free tier)")
+    typer.echo("    - Add one URL to your assistant once; it works from every device after")
+    typer.echo("    - Catch: this computer has to be on (with `yutome remote bridge`")
+    typer.echo("      running) for the assistant to actually get answers. When it's off,")
+    typer.echo("      the assistant just says 'Yutome Desktop offline' and the rest of")
+    typer.echo("      the chat keeps working.")
+    typer.echo("")
+    typer.echo("  You can pick one, both, or skip and run `yutome connect` later.")
     if yes:
+        typer.echo("")
         typer.echo("  Optional next step: yutome connect --app claude")
+
+
+def _claude_desktop_config_path() -> Path:
+    """Where Claude Desktop reads its MCP server config. Path is conventional —
+    the file may not exist yet until the user creates it via Settings →
+    Developer → Edit Config or by editing manually."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/Claude/claude_desktop_config.json"
+    if sys.platform.startswith("win"):
+        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(appdata) / "Claude" / "claude_desktop_config.json"
+    return Path.home() / ".config" / "claude-desktop" / "claude_desktop_config.json"
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort clipboard copy. Returns True if the platform tool ran cleanly."""
+    if sys.platform == "darwin":
+        tool = ["pbcopy"]
+    elif sys.platform.startswith("win"):
+        tool = ["clip"]
+    elif shutil.which("wl-copy"):
+        tool = ["wl-copy"]
+    elif shutil.which("xclip"):
+        tool = ["xclip", "-selection", "clipboard"]
+    elif shutil.which("xsel"):
+        tool = ["xsel", "--clipboard", "--input"]
+    else:
+        return False
+    try:
+        subprocess.run(tool, input=text, text=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _reveal_in_file_manager(path: Path) -> bool:
+    """Open the path (or its parent if missing) in Finder / Explorer / xdg-open."""
+    target = path if path.exists() else path.parent
+    if not target.exists():
+        target = target.parent
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(target)], check=True)
+        elif sys.platform.startswith("win"):
+            subprocess.run(["explorer", str(target)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(target)], check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _setup_local_mcp(config_path: Path) -> None:
+    """Help a user wire yutome into Claude Desktop / Code / Cursor on this machine.
+
+    Doesn't modify any files. Claude Desktop's config is often touched by
+    hand or by other installers (Smithery, DXT/MCPB bundles, other MCP
+    servers), and JSON-merging into it from a CLI is a foot-gun: comments
+    don't round-trip, key ordering changes, and a botched write loses other
+    server entries. We show the snippet, offer to put it on the clipboard,
+    and offer to open the config file's location.
+    """
+    abs_config = config_path.resolve()
+    yutome_cmd = shutil.which("yutome") or "yutome"
+    snippet = json.dumps(
+        {
+            "mcpServers": {
+                "yutome": {
+                    "command": yutome_cmd,
+                    "args": ["mcp", "serve", "--config", str(abs_config)],
+                }
+            }
+        },
+        indent=2,
+    )
+    desktop_path = _claude_desktop_config_path()
+    typer.echo("")
+    typer.echo("Local MCP setup — for any AI assistant running on this Mac")
+    typer.echo("")
+    typer.echo("  Yutome's config snippet (same for every MCP-aware app):")
+    typer.echo("")
+    for line in snippet.splitlines():
+        typer.echo(f"    {line}")
+    typer.echo("")
+    typer.echo("  Where to paste it, by app:")
+    typer.echo("")
+    typer.echo("    Claude Desktop")
+    typer.echo(f"      Config file: {desktop_path}")
+    typer.echo("      (Inside Claude Desktop: Settings → Developer → Edit Config opens it.)")
+    typer.echo("      If `mcpServers` already exists, add the `\"yutome\": { ... }` entry")
+    typer.echo("      inside it — don't replace what's there. Restart Claude Desktop after.")
+    typer.echo("")
+    typer.echo("    Cursor")
+    typer.echo("      Paste into ~/.cursor/mcp.json (global) or .cursor/mcp.json (per-project).")
+    typer.echo("")
+    typer.echo("    Claude Code  (one-liner, no JSON editing)")
+    typer.echo(f"      claude mcp add yutome -- {yutome_cmd} mcp serve --config {abs_config}")
+    typer.echo("")
+    typer.echo("    Cherry Studio, LibreChat, Goose, others")
+    typer.echo("      Find each app's MCP server settings and paste the same snippet.")
+    typer.echo("      Search '<app> MCP config' if you're not sure where it lives.")
+    typer.echo("")
+    if setup_prompts.confirm("Copy the snippet to your clipboard?", default=True):
+        if _copy_to_clipboard(snippet):
+            typer.echo("[OK] Snippet copied to clipboard.")
+        else:
+            typer.echo("[WARN] No clipboard tool found; copy the snippet above by hand.")
+    if desktop_path.exists():
+        prompt = "Open the Claude Desktop config folder in Finder?"
+    else:
+        prompt = (
+            "Claude Desktop's config doesn't exist yet (you may not have Claude Desktop "
+            "installed). Open the folder anyway?"
+        )
+    if setup_prompts.confirm(prompt, default=False):
+        if not _reveal_in_file_manager(desktop_path):
+            typer.echo(f"[WARN] Couldn't open the folder automatically. Path: {desktop_path}")
+    typer.echo("")
+    typer.echo("  Local MCP only works while you're on this Mac. For phone, claude.ai web,")
+    typer.echo("  or another device, pick the 'Web + mobile' option instead.")
 
 
 def _pairing_url(endpoint_url: str, pairing_code: str | None = None) -> str:
@@ -1849,71 +2041,107 @@ def setup(
     if _env_has_webshare_credentials(env_path):
         typer.echo("  yutome proxy-info")
     _print_setup_mcp_section(yes=yes)
-    if not yes and typer.confirm("Connect Yutome to Claude/ChatGPT now?", default=False):
-        assistant_apps = _prompt_assistant_apps()
-        endpoint = typer.prompt(
-            "Remote connector URL if you already have one (blank to deploy the tracked Worker)",
-            default="",
-            show_default=False,
-        ).strip()
-        if endpoint:
-            relay_token = typer.prompt(
-                "YUTOME_RELAY_TOKEN for this Worker (blank if unknown)",
-                default="",
-                hide_input=True,
-                show_default=False,
-            ).strip()
-            pairing_code = typer.prompt(
-                "YUTOME_PAIRING_CODE for this Worker (blank if unknown)",
-                default="",
-                show_default=False,
-            ).strip()
-            try:
-                _save_deployed_worker_endpoint(
-                    config,
-                    endpoint=endpoint,
-                    mode="connector_only",
-                    worker_name=CAPSULE_PROJECT_NAME,
-                    relay_token=relay_token or None,
-                    pairing_code=pairing_code or None,
-                    assistant_apps=assistant_apps,
-                )
-            except ValueError as exc:
-                typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
-        else:
-            typer.echo("Tracked TypeScript Worker subproject lives at:")
-            typer.echo(f"  {_tracked_capsule_path()}")
-            if _can_run_cloudflare_deploy():
-                deploy_prompt = "Deploy this Cloudflare Worker now? This may open Cloudflare sign-in in your browser."
-                deploy_default = True
+    if not yes:
+        node_ready = _can_run_cloudflare_deploy()
+        local_label = (
+            "Local — Claude Desktop / Cursor / Cherry Studio on this Mac "
+            "(recommended: free, no signup, ~30 seconds)"
+        )
+        deploy_label = (
+            "Web + mobile — works from claude.ai, ChatGPT, your phone "
+            "(Cloudflare sign-in needed; free plan is fine)"
+            if node_ready
+            else "Web + mobile — needs Node.js installed first; opens Cloudflare to get started"
+        )
+        paste_label = "Web + mobile — I already have a Yutome URL someone gave me"
+        skip_label = "Skip for now — I'll run `yutome connect` later"
+        choices = [local_label, deploy_label, paste_label, skip_label]
+        connect_choice = setup_prompts.select(
+            "How do you want to connect Yutome to your assistant?",
+            choices=choices,
+            default=local_label,
+        )
+        if connect_choice == skip_label:
+            pass
+        elif connect_choice == local_label:
+            _setup_local_mcp(config)
+        elif connect_choice == paste_label:
+            assistant_apps = _prompt_assistant_apps()
+            typer.echo("")
+            typer.echo(
+                "Paste the connector URL printed by whoever set up the Worker. The URL can be "
+                "the base Worker URL or the full /mcp URL — yutome handles both."
+            )
+            endpoint = setup_prompts.text("Connector URL")
+            if not endpoint:
+                typer.echo("[WARN] No URL entered; skipping.")
             else:
-                deploy_prompt = "Open the Cloudflare Workers dashboard now?"
-                deploy_default = False
-            if typer.confirm(deploy_prompt, default=deploy_default):
-                if not _can_run_cloudflare_deploy():
-                    webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
-                    typer.echo("Opened Cloudflare Workers. Install Node.js LTS, then run:")
-                    typer.echo("  yutome connect --deploy")
-                    return
-                (
-                    deployed_url,
-                    deployed_worker_name,
-                    deployed_relay_token,
-                    deployed_pairing_code,
-                ) = _deploy_tracked_capsule(paths=paths)
-                if deployed_url:
+                typer.echo("")
+                typer.echo(
+                    "Two secrets pair this laptop to the Worker. Leave blank if you don't have "
+                    "them yet — you can save them later with `yutome connect --endpoint ...`."
+                )
+                typer.echo("  - RELAY_TOKEN   authenticates the laptop bridge to the Worker")
+                typer.echo("  - PAIRING_CODE  one-time code Claude/ChatGPT will ask for during OAuth")
+                relay_token = setup_prompts.password("Relay token (blank to skip)")
+                pairing_code = setup_prompts.text("Pairing code (blank to skip)")
+                try:
                     _save_deployed_worker_endpoint(
                         config,
-                        endpoint=deployed_url,
+                        endpoint=endpoint,
                         mode="connector_only",
-                        worker_name=deployed_worker_name,
-                        relay_token=deployed_relay_token,
-                        pairing_code=deployed_pairing_code,
+                        worker_name=CAPSULE_PROJECT_NAME,
+                        relay_token=relay_token or None,
+                        pairing_code=pairing_code or None,
                         assistant_apps=assistant_apps,
                     )
-                else:
-                    typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
-                    typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
+                except ValueError as exc:
+                    typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
+        else:
+            # Deploy path
+            assistant_apps = _prompt_assistant_apps()
+            if not node_ready:
+                typer.echo("")
+                typer.echo(
+                    "Deploying needs Node.js (free, https://nodejs.org). Yutome can open the "
+                    "Cloudflare dashboard so you can install Node alongside creating an account."
+                )
+                if setup_prompts.confirm(
+                    "Open the Cloudflare Workers dashboard in your browser?", default=True
+                ):
+                    webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
+                    typer.echo("")
+                    typer.echo("Once Node.js LTS is installed, rerun:")
+                    typer.echo("  yutome connect --deploy")
+                return
+            typer.echo("")
+            typer.echo(
+                "Yutome will deploy a small Worker to your own Cloudflare account (free plan). "
+                "If you're not signed in, Wrangler will open your browser to sign in or create "
+                "an account — no card required for the free tier."
+            )
+            if not setup_prompts.confirm("Continue with the Cloudflare deploy?", default=True):
+                typer.echo("Skipped. You can run `yutome connect --deploy` later.")
+                return
+            (
+                deployed_url,
+                deployed_worker_name,
+                deployed_relay_token,
+                deployed_pairing_code,
+            ) = _deploy_tracked_capsule(paths=paths)
+            if deployed_url:
+                _save_deployed_worker_endpoint(
+                    config,
+                    endpoint=deployed_url,
+                    mode="connector_only",
+                    worker_name=deployed_worker_name,
+                    relay_token=deployed_relay_token,
+                    pairing_code=deployed_pairing_code,
+                    assistant_apps=assistant_apps,
+                )
+            else:
+                typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
+                typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
 
 
 @app.command("connect")
@@ -1966,7 +2194,17 @@ def connect_command(
         help="Remote mode: connector-only for laptop-backed remote MCP, or replica for always-on search foundations.",
     ),
 ) -> None:
-    """Connect Claude/ChatGPT to yutome through one remote MCP endpoint."""
+    """Set up remote access so claude.ai, ChatGPT, or any MCP-aware app on your phone or another laptop can reach yutome.
+
+    Deploys a small Cloudflare Worker to your own free Cloudflare account
+    (or registers an existing endpoint URL via --endpoint), generates the
+    OAuth + pairing secrets needed for the assistant to authenticate, saves
+    everything locally, and prints per-assistant pairing instructions. Pick
+    the assistant with --app (claude, chatgpt, both, other, all). For
+    Claude Desktop / Cursor / other apps on this same machine, you don't
+    need this command — paste the local MCP snippet `yutome setup` shows
+    you instead.
+    """
     try:
         _assistant_app_targets(assistant_app)
     except ValueError as exc:

@@ -74,28 +74,35 @@ Run `yutome --help` for the full surface. The most-used commands:
 
 Commands like `list`, `show`, `remote`, `export`, `quality` are groups — append `--help` (e.g. `yutome list --help`) to see their subcommands.
 
-## Connect to Claude / ChatGPT
+## Connect to an AI assistant
+
+Yutome speaks [MCP](https://modelcontextprotocol.io/), so any MCP-aware assistant can call its `find`, `list`, `show`, and `q` tools. The fastest way is `yutome setup` — it walks you through both paths below.
 
 ### Local (recommended for daily use)
 
-For **Claude Code** or **Codex** opened against this repo, the bundled `.mcp.json` is picked up automatically — no extra config.
-
-For **Claude Desktop**, add this block to `~/Library/Application Support/Claude/claude_desktop_config.json`. Use an absolute path to `yutome.toml`, since Desktop won't launch from your project directory:
+For assistants running on the same Mac as yutome — **Claude Desktop, Cursor, Claude Code, Cherry Studio, LibreChat, Goose**, etc. Same config snippet, different config file per app:
 
 ```json
 {
   "mcpServers": {
     "yutome": {
-      "command": "uv",
-      "args": ["run", "yutome", "mcp", "serve", "--config", "/absolute/path/to/yutome.toml"]
+      "command": "yutome",
+      "args": ["mcp", "serve", "--config", "/absolute/path/to/yutome.toml"]
     }
   }
 }
 ```
 
-Restart Claude Desktop. You'll see `yutome` in the connectors list with `find`, `list`, `show`, and `q` tools.
+Where to paste it:
 
-### Remote (Claude.ai web, ChatGPT, phone)
+- **Claude Desktop** — [`~/Library/Application Support/Claude/claude_desktop_config.json`](https://modelcontextprotocol.io/quickstart/user). Inside Claude Desktop: *Settings → Developer → Edit Config*. Restart Claude Desktop after saving.
+- **Cursor** — `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in your project.
+- **Claude Code** — one-liner, no JSON editing: `claude mcp add yutome -- yutome mcp serve --config /absolute/path/to/yutome.toml`
+- **Cherry Studio / LibreChat / Goose / others** — each app has its own MCP server settings; paste the same snippet there.
+
+`yutome setup` does this interactively: shows the snippet, copies it to your clipboard, and opens the Claude Desktop config folder for you. If yutome's installed via `uv tool install`, the `yutome` binary on your PATH is what gets invoked — no `uv run` wrapper needed.
+
+### Remote (Claude.ai web, ChatGPT, phone, any device)
 
 ```bash
 yutome connect --deploy   # one-time: deploy the Worker, generate secrets, save state
@@ -104,7 +111,7 @@ yutome remote bridge      # keep this running while you want queries to work
 
 `connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, and prints a pairing code. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
 
-The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "desktop offline". Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
+The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
 
 ## Docs
 
