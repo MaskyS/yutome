@@ -16,6 +16,11 @@ import { DurableObject } from "cloudflare:workers";
 
 type PendingResolver = (payload: { result?: unknown; error?: unknown }) => void;
 
+interface PendingEntry {
+  resolve: PendingResolver;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
 interface JobFrame {
   type: "job";
   job_id: string;
@@ -37,7 +42,7 @@ export class YutomeRelay extends DurableObject<Env> {
   // In-memory pending dispatches. Hibernation evicts these on sleep — that's
   // fine because every dispatch awaits the result inline; we never have a
   // pending entry that outlives its caller.
-  private pending = new Map<string, PendingResolver>();
+  private pending = new Map<string, PendingEntry>();
   private lastSeenAt: number | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -53,23 +58,23 @@ export class YutomeRelay extends DurableObject<Env> {
       return this.acceptBridge(request);
     }
     if (url.pathname === "/relay/status") {
+      const unauthorized = this.authorizeRelayRequest(request);
+      if (unauthorized) {
+        return unauthorized;
+      }
+      const lastSeenAt = await this.getLastSeenAt();
       return Response.json({
         bridge_online: this.bridgeOnline(),
-        last_seen_at: this.lastSeenAt ? new Date(this.lastSeenAt).toISOString() : null,
+        last_seen_at: lastSeenAt ? new Date(lastSeenAt).toISOString() : null,
       });
     }
     return new Response("Not Found", { status: 404 });
   }
 
   private async acceptBridge(request: Request): Promise<Response> {
-    const expected = this.env.YUTOME_RELAY_TOKEN;
-    if (!expected) {
-      return Response.json({ error: "YUTOME_RELAY_TOKEN not configured" }, { status: 500 });
-    }
-    const header = request.headers.get("authorization") || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-    if (token !== expected) {
-      return new Response("Unauthorized", { status: 401 });
+    const unauthorized = this.authorizeRelayRequest(request);
+    if (unauthorized) {
+      return unauthorized;
     }
 
     const upgrade = request.headers.get("upgrade");
@@ -89,12 +94,25 @@ export class YutomeRelay extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server);
-    this.lastSeenAt = Date.now();
+    await this.recordBridgeSeen();
 
     return new Response(null, {
       status: 101,
       webSocket: client,
     });
+  }
+
+  private authorizeRelayRequest(request: Request): Response | null {
+    const expected = this.env.YUTOME_RELAY_TOKEN;
+    if (!expected) {
+      return Response.json({ error: "YUTOME_RELAY_TOKEN not configured" }, { status: 500 });
+    }
+    const header = request.headers.get("authorization") || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+    if (token !== expected) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    return null;
   }
 
   // ---------- WebSocket Hibernation event handlers ----------
@@ -107,12 +125,13 @@ export class YutomeRelay extends DurableObject<Env> {
     } catch {
       return;
     }
-    this.lastSeenAt = Date.now();
+    void this.recordBridgeSeen();
     if (frame.type === "result") {
-      const resolver = this.pending.get(frame.job_id);
-      if (resolver) {
+      const entry = this.pending.get(frame.job_id);
+      if (entry) {
         this.pending.delete(frame.job_id);
-        resolver({ result: frame.result, error: frame.error });
+        clearTimeout(entry.timeout);
+        entry.resolve({ result: frame.result, error: frame.error });
       }
     }
     // pong / bye fall through; bye does not require explicit handling because
@@ -122,8 +141,9 @@ export class YutomeRelay extends DurableObject<Env> {
   webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {
     // Reject every in-flight dispatch so callers get a prompt offline error
     // instead of waiting for the per-call timeout.
-    for (const [jobId, resolver] of this.pending.entries()) {
-      resolver({
+    for (const [jobId, entry] of this.pending.entries()) {
+      clearTimeout(entry.timeout);
+      entry.resolve({
         error: {
           code: -32002,
           message: "Yutome Desktop bridge disconnected.",
@@ -152,13 +172,14 @@ export class YutomeRelay extends DurableObject<Env> {
     params: Record<string, unknown>,
   ): Promise<{ result?: unknown; error?: unknown }> {
     if (!this.bridgeOnline()) {
+      const lastSeenAt = await this.getLastSeenAt();
       return {
         error: {
           code: -32002,
           message: "Yutome Desktop bridge is offline.",
           data: {
             desktop_offline: true,
-            last_seen_at: this.lastSeenAt ? new Date(this.lastSeenAt).toISOString() : null,
+            last_seen_at: lastSeenAt ? new Date(lastSeenAt).toISOString() : null,
           },
         },
       };
@@ -169,7 +190,20 @@ export class YutomeRelay extends DurableObject<Env> {
 
     const result = await new Promise<{ result?: unknown; error?: unknown }>((resolve) => {
       const resolver: PendingResolver = (payload) => resolve(payload);
-      this.pending.set(jobId, resolver);
+      const timeout = setTimeout(() => {
+        const entry = this.pending.get(jobId);
+        if (entry) {
+          this.pending.delete(jobId);
+          entry.resolve({
+            error: {
+              code: -32002,
+              message: "Yutome Desktop did not answer this call before the timeout.",
+              data: { desktop_offline: true, job_id: jobId },
+            },
+          });
+        }
+      }, DISPATCH_TIMEOUT_MS);
+      this.pending.set(jobId, { resolve: resolver, timeout });
 
       // Send the job. If sending fails (socket closed mid-flight), reject
       // immediately and clean up.
@@ -180,28 +214,17 @@ export class YutomeRelay extends DurableObject<Env> {
         }
       } catch (err) {
         this.pending.delete(jobId);
+        clearTimeout(timeout);
+        console.warn("yutome-relay: bridge send failed", (err as Error).message);
         resolve({
           error: {
-            code: -32603,
-            message: `Bridge send failed: ${(err as Error).message}`,
+            code: -32002,
+            message: "Yutome Desktop bridge is offline.",
+            data: { desktop_offline: true, job_id: jobId },
           },
         });
         return;
       }
-
-      // Per-dispatch timeout so a stuck bridge doesn't hold the request forever.
-      setTimeout(() => {
-        if (this.pending.has(jobId)) {
-          this.pending.delete(jobId);
-          resolve({
-            error: {
-              code: -32002,
-              message: "Yutome Desktop did not answer this call before the timeout.",
-              data: { desktop_offline: true, job_id: jobId },
-            },
-          });
-        }
-      }, DISPATCH_TIMEOUT_MS);
     });
 
     return result;
@@ -210,5 +233,19 @@ export class YutomeRelay extends DurableObject<Env> {
   /** Returns true while at least one accepted WebSocket is open. */
   private bridgeOnline(): boolean {
     return this.ctx.getWebSockets().length > 0;
+  }
+
+  private async recordBridgeSeen(): Promise<void> {
+    this.lastSeenAt = Date.now();
+    await this.ctx.storage.put("last_seen_at", this.lastSeenAt);
+  }
+
+  private async getLastSeenAt(): Promise<number | null> {
+    if (this.lastSeenAt !== null) {
+      return this.lastSeenAt;
+    }
+    const stored = await this.ctx.storage.get<number>("last_seen_at");
+    this.lastSeenAt = typeof stored === "number" ? stored : null;
+    return this.lastSeenAt;
   }
 }

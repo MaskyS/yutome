@@ -12,12 +12,13 @@ The interface should therefore behave like a musical instrument: a beginner shou
 
 ## First-Class Corpus Object
 
-The first-class user object is a channel library.
+The first-class user object is a source library. Channels are the main source type, but exact videos can be first-class sources when the user wants to save one specific episode or talk.
 
 The default flow should be:
 
 ```bash
 yutome setup https://www.youtube.com/@SomeChannel
+yutome add https://youtu.be/VIDEO_ID
 yutome sync
 yutome find "topic I remember"
 ```
@@ -28,9 +29,9 @@ The broader import flow should support:
 - Google Takeout `subscriptions.csv` import as a fallback when OAuth is undesirable or unavailable.
 - OPML import for users already managing YouTube via RSS tools.
 - Plain URL or handle lists for the lowest-friction manual path.
-- Direct paste of channel URLs, handles, or channel IDs for channels outside subscriptions.
+- Direct paste of channel URLs, handles, channel IDs, video URLs, or video IDs for sources outside subscriptions.
 
-Playlists and single videos are useful later, but they should not complicate the main library model. They can become additional source types under the same local corpus idea.
+Playlists are useful later, but they should not complicate the main library model until playlist ingest is explicit. Single videos are now the smallest useful source under the same local corpus idea.
 
 ## OAuth Position
 
@@ -99,7 +100,7 @@ The design principle is that transcript improvement should be incremental and in
 ## Open Questions
 
 - Should OAuth onboarding remain bring-your-own Google client credentials, or should a future hosted broker exist for less technical users?
-- Should `yutome sync` with no target always mean "sync selected channels," or should it require `--all` for safety once schedules exist?
-- Should LLM cleanup run automatically after ingest for selected channels, or should it remain an explicit/background upgrade?
+- Should `yutome sync` with no target always mean "sync selected sources," or should it require `--all` for safety once schedules exist?
+- Should LLM cleanup run automatically after ingest for selected sources, or should it remain an explicit/background upgrade?
 - ~~Should the first local agent connector be MCP, an OpenAI/ChatGPT app connector shape, a plain HTTP API, or all of these over the same service?~~ Decided: local MCP first, thin local HTTP underneath sharing the same core functions. Remote access is now a core architecture track rather than a distant integration. See the Agent And Multi-Device Connector section of `plan.md`.
 - How much should the beginner surface expose unresolved videos and transcript quality warnings before it becomes anxiety-inducing instead of helpful?

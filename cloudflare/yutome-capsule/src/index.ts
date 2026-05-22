@@ -16,14 +16,14 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "./env";
 import { YutomeMcpAgent } from "./yutome-mcp-agent";
 import { YutomeRelay } from "./yutome-relay";
-import { handlePairingRequest, renderForm } from "./pairing";
+import { handleAuthorizeRequest, handlePairingRequest } from "./pairing";
 
 interface DefaultHandlerEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
 }
 
 // Handler the OAuthProvider invokes for everything outside the protected
-// API surface — /authorize (consent form), /pair, /relay/connect, /healthz.
+// API surface — /authorize (consent form), /pair, /relay/*, /healthz.
 const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
   async fetch(request, env, _ctx) {
     const url = new URL(request.url);
@@ -32,7 +32,7 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
       return Response.json({ ok: true, service: "yutome-remote-mcp", mode: env.YUTOME_WORKER_MODE });
     }
 
-    if (url.pathname === "/relay/connect") {
+    if (url.pathname === "/relay/connect" || url.pathname === "/relay/status") {
       const id = env.RELAY.idFromName("default");
       const stub = env.RELAY.get(id);
       return stub.fetch(request);
@@ -59,13 +59,7 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
 };
 
 async function handleAuthorize(request: Request, env: DefaultHandlerEnv): Promise<Response> {
-  // The OAuth provider stashes the raw AuthRequest in the URL; parseAuthRequest
-  // validates client_id / redirect_uri / scope / PKCE method against the
-  // registered client. We render the pairing form with that AuthRequest
-  // serialized into a hidden field, so the POST handler can finalize the grant.
-  const url = new URL(request.url);
-  const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-  return renderForm(url, "", JSON.stringify(authRequest));
+  return handleAuthorizeRequest({ request, env, oauthHelpers: env.OAUTH_PROVIDER });
 }
 
 // OAuthProvider expects handlers whose `fetch` property is non-optional.
@@ -85,6 +79,7 @@ const provider = new OAuthProvider<DefaultHandlerEnv>({
   clientRegistrationEndpoint: "/register",
   scopesSupported: ["yutome.search.read"],
   allowPlainPKCE: false,
+  clientIdMetadataDocumentEnabled: true,
 });
 
 export default provider;

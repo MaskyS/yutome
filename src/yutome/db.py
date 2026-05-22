@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS library_channels (
     source TEXT NOT NULL,
     source_url TEXT NOT NULL,
     channel_id TEXT REFERENCES channels(channel_id) ON DELETE SET NULL,
+    handle TEXT,
+    title TEXT,
+    selected INTEGER NOT NULL DEFAULT 1,
+    import_source TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_url)
+);
+
+CREATE TABLE IF NOT EXISTS library_sources (
+    source_id TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    channel_id TEXT,
+    video_id TEXT,
     handle TEXT,
     title TEXT,
     selected INTEGER NOT NULL DEFAULT 1,
@@ -152,6 +168,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_videos_channel_id ON videos(channel_id);
 CREATE INDEX IF NOT EXISTS idx_library_channels_selected ON library_channels(selected, title);
 CREATE INDEX IF NOT EXISTS idx_library_channels_channel_id ON library_channels(channel_id);
+CREATE INDEX IF NOT EXISTS idx_library_sources_selected ON library_sources(selected, title);
+CREATE INDEX IF NOT EXISTS idx_library_sources_type_selected ON library_sources(source_type, selected);
+CREATE INDEX IF NOT EXISTS idx_library_sources_channel_id ON library_sources(channel_id);
+CREATE INDEX IF NOT EXISTS idx_library_sources_video_id ON library_sources(video_id);
 CREATE INDEX IF NOT EXISTS idx_transcript_versions_video_id ON transcript_versions(video_id);
 CREATE INDEX IF NOT EXISTS idx_transcript_versions_active ON transcript_versions(video_id, active);
 CREATE INDEX IF NOT EXISTS idx_chunks_video_time ON chunks(video_id, start_ms, end_ms);
@@ -173,6 +193,39 @@ SELECT
     'catalog'
 FROM channels
 WHERE channel_id IS NOT NULL;
+
+INSERT OR IGNORE INTO library_sources(
+    source_id, source_type, source, source_url, channel_id, handle, title, selected, import_source, created_at, updated_at
+)
+SELECT
+    library_channel_id,
+    'youtube_channel',
+    source,
+    source_url,
+    channel_id,
+    handle,
+    title,
+    selected,
+    import_source,
+    created_at,
+    updated_at
+FROM library_channels;
+
+UPDATE videos
+SET ingest_status = 'indexed',
+    updated_at = datetime('now')
+WHERE ingest_status = 'metadata'
+  AND EXISTS (
+      SELECT 1
+      FROM transcript_versions tv
+      WHERE tv.video_id = videos.video_id
+        AND tv.active = 1
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM chunks c
+      WHERE c.video_id = videos.video_id
+  );
 """
 
 
@@ -259,6 +312,7 @@ def catalog_is_initialized(db_path: Path) -> bool:
         "schema_migrations",
         "channels",
         "library_channels",
+        "library_sources",
         "videos",
         "videos_fts",
         "transcript_versions",

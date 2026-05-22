@@ -37,12 +37,15 @@ from yutome.youtube import (
     DiscoveredVideo,
     TranscriptFetchResult,
     describe_proxy,
+    discover_video,
     discover_videos,
     fetch_subtitle_transcript_with_ytdlp,
     fetch_transcript,
     fetch_video_metadata,
+    is_proxy_payment_error,
     is_youtube_block_error,
     non_preferred_generated_transcripts,
+    proxy_payment_required_message,
 )
 
 
@@ -112,6 +115,8 @@ class VideoProcessResult:
 
 def classify_transcript_error(error: Exception | str) -> tuple[str, bool]:
     text = str(error).lower()
+    if is_proxy_payment_error(error):
+        return "proxy_payment_required", True
     if is_rate_limit_error(error):
         return "rate_limited", True
     if "transcript disabled" in text or "subtitles are disabled" in text:
@@ -486,6 +491,10 @@ _DEFERRAL_FOR_ERROR_CLASS: dict[str, tuple[str, str]] = {
         "transient",
         "  deferred: transient transcript/provider error",
     ),
+    "proxy_payment_required": (
+        "proxy_payment_required",
+        "  deferred: proxy returned 402 Payment Required; check proxy plan/quota/credentials before retrying",
+    ),
 }
 
 
@@ -504,6 +513,12 @@ def _route_processing_error(
         progress("  deferred due to rate limiting")
         return 1, 0, True
     error_class, _ = classify_transcript_error(exc)
+    if error_class == "proxy_payment_required":
+        with connect_catalog(paths.catalog_db) as connection:
+            mark_video_deferred(connection, video_id=video.video_id, reason="proxy_payment_required")
+            connection.commit()
+        progress(f"  deferred: {proxy_payment_required_message(None, operation='transcript fetch')}")
+        return 1, 0, True
     deferral = _DEFERRAL_FOR_ERROR_CLASS.get(error_class)
     if deferral is not None:
         reason, message = deferral
@@ -633,6 +648,17 @@ def _process_metadata(
     return 1, 0
 
 
+def _channel_source_url(video: DiscoveredVideo, *, fallback: str) -> str:
+    raw_url = video.raw.get("channel_url") or video.raw.get("uploader_url")
+    if raw_url:
+        return str(raw_url).rstrip("/")
+    if video.channel_id:
+        return f"https://www.youtube.com/channel/{video.channel_id}"
+    if video.channel_handle:
+        return f"https://www.youtube.com/@{str(video.channel_handle).lstrip('@')}"
+    return fallback
+
+
 def sync_channel(
     *,
     target: str,
@@ -659,6 +685,7 @@ def sync_channel(
     ytdlp_fallback: bool = True,
     staged_fallback: bool = True,
     progress: Callable[[str], None] | None = None,
+    discovered_videos: list[DiscoveredVideo] | None = None,
 ) -> SyncStats:
     started_at = time.monotonic()
     paths.ensure_base_dirs()
@@ -672,7 +699,9 @@ def sync_channel(
     discovery_proxy = config.proxy if config.proxy.use_for_discovery else None
     metadata_proxy = config.proxy if config.proxy.use_for_metadata else None
 
-    if refresh_discovery:
+    if discovered_videos is not None:
+        discovered = discovered_videos
+    elif refresh_discovery:
         discovered = discover_videos(
             target=target,
             cwd=paths.root,
@@ -713,11 +742,15 @@ def sync_channel(
     staged_retry_video_ids: set[str] = set()
     rate_limit_stopped = False
 
-    if refresh_discovery:
+    if refresh_discovery or discovered_videos is not None:
         with connect_catalog(paths.catalog_db) as connection:
             channel_id = None
             for video in discovered:
-                channel_id = upsert_channel_from_discovery(connection, video, source_url=target)
+                channel_id = upsert_channel_from_discovery(
+                    connection,
+                    video,
+                    source_url=_channel_source_url(video, fallback=target),
+                )
                 upsert_discovered_video(connection, video, channel_id=channel_id)
                 write_json(paths.video_metadata_dir(video.video_id) / "discovered.json", video.raw)
             connection.commit()
@@ -1092,3 +1125,63 @@ def sync_channel(
 
     stats["elapsed_seconds"] = time.monotonic() - started_at
     return SyncStats(**stats)
+
+
+def sync_video(
+    *,
+    target: str,
+    config: AppConfig,
+    paths: ProjectPaths,
+    embed: bool = False,
+    sleep_seconds: float = 0.0,
+    force: bool = False,
+    asr_fallback: bool = False,
+    gemini_fallback: bool = False,
+    retry_failed: bool = False,
+    stop_on_rate_limit: bool = False,
+    verbose_skips: bool = False,
+    workers: int = 1,
+    status_filters: list[str] | None = None,
+    source_filters: list[str] | None = None,
+    max_duration_seconds: int | None = None,
+    fallback_only: bool = False,
+    ytdlp_fallback: bool = True,
+    staged_fallback: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> SyncStats:
+    paths.ensure_base_dirs()
+    bootstrap_catalog(paths.catalog_db)
+    metadata_proxy = config.proxy if config.proxy.use_for_metadata else None
+    video = discover_video(
+        target=target,
+        cwd=paths.root,
+        proxy=metadata_proxy,
+        ytdlp_config=config.yt_dlp,
+    )
+    return sync_channel(
+        target=video.video_id,
+        config=config,
+        paths=paths,
+        limit=None,
+        embed=embed,
+        sleep_seconds=sleep_seconds,
+        force=force,
+        asr_fallback=asr_fallback,
+        gemini_fallback=gemini_fallback,
+        max_process=1,
+        retry_failed=retry_failed,
+        stop_on_rate_limit=stop_on_rate_limit,
+        refresh_discovery=True,
+        verbose_skips=verbose_skips,
+        workers=workers,
+        fetch_metadata=True,
+        status_filters=status_filters,
+        source_filters=source_filters,
+        max_duration_seconds=max_duration_seconds,
+        shortest_first=False,
+        fallback_only=fallback_only,
+        ytdlp_fallback=ytdlp_fallback,
+        staged_fallback=staged_fallback,
+        progress=progress,
+        discovered_videos=[video],
+    )

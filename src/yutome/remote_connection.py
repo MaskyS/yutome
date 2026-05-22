@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
 from yutome.db import catalog_is_initialized, connect_catalog
@@ -174,7 +176,7 @@ def normalize_endpoint(endpoint: str) -> tuple[str, str]:
     return endpoint_url.rstrip("/"), mcp_url
 
 
-def remote_status_payload(paths: ProjectPaths) -> dict[str, Any]:
+def remote_status_payload(paths: ProjectPaths, *, live: bool = True, timeout: float = 2.0) -> dict[str, Any]:
     state = load_remote_state(paths)
     if state is None:
         return {
@@ -184,13 +186,25 @@ def remote_status_payload(paths: ProjectPaths) -> dict[str, Any]:
             "endpoint_url": None,
             "mcp_url": None,
             "pairing_status": None,
+            "assistant_oauth_status": None,
             "desktop_connection": "not configured",
+            "desktop_connection_source": "not_configured",
             "offline_search": "disabled",
         }
-    if state.last_desktop_seen_at:
-        desktop_connection = "online" if _recent_iso_timestamp(state.last_desktop_seen_at, seconds=60) else "offline"
-    else:
-        desktop_connection = "not seen yet"
+    desktop_connection = _local_desktop_connection(state)
+    desktop_connection_source = "local"
+    last_worker_seen_at: str | None = None
+    relay_status_error: str | None = None
+
+    if live and state.relay_token:
+        live_status = _fetch_relay_status(state, timeout=timeout)
+        if "error" in live_status:
+            relay_status_error = str(live_status["error"])
+        else:
+            desktop_connection_source = "worker"
+            last_worker_seen_at = live_status.get("last_seen_at")
+            desktop_connection = "online (live)" if live_status.get("bridge_online") else "offline (live)"
+
     return {
         "configured": True,
         "mode": state.mode,
@@ -198,16 +212,51 @@ def remote_status_payload(paths: ProjectPaths) -> dict[str, Any]:
         "endpoint_url": state.endpoint_url,
         "mcp_url": state.mcp_url,
         "pairing_status": state.pairing_status,
+        "assistant_oauth_status": "client-managed",
         "desktop_connection": desktop_connection,
+        "desktop_connection_source": desktop_connection_source,
         "last_desktop_seen_at": state.last_desktop_seen_at,
+        "last_worker_seen_at": last_worker_seen_at,
+        "relay_status_error": relay_status_error,
         "relay_token_configured": bool(state.relay_token),
         "pairing_code_configured": bool(state.pairing_code),
         "token_secret_configured": bool(state.token_secret),
+        "oauth_storage": "worker OAUTH_KV",
         "replica_enabled": state.replica_enabled,
         "offline_search": "enabled" if state.replica_enabled else "disabled",
         "last_sync_at": state.last_sync_at,
         "semantic_replica": state.semantic_replica,
     }
+
+
+def _local_desktop_connection(state: RemoteConnectionState) -> str:
+    if state.last_desktop_seen_at:
+        return "online (local)" if _recent_iso_timestamp(state.last_desktop_seen_at, seconds=60) else "offline (local)"
+    return "not seen yet"
+
+
+def _fetch_relay_status(state: RemoteConnectionState, *, timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{state.endpoint_url.rstrip('/')}/relay/status",
+        headers={
+            "accept": "application/json",
+            "authorization": f"Bearer {state.relay_token}",
+            "user-agent": "Mozilla/5.0 (Macintosh; yutome-status) urllib/3.12",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        suffix = f" {detail}" if detail else ""
+        return {"error": f"HTTP {exc.code}{suffix}"}
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {"error": str(exc)}
+    if not isinstance(payload, dict):
+        return {"error": "relay status returned non-object JSON"}
+    return payload
 
 
 def build_sync_dry_run_manifest(paths: ProjectPaths) -> dict[str, Any]:

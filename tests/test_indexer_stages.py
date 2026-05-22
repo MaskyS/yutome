@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from yutome.config import default_config
-from yutome.indexer import VideoProcessResult, sync_channel
+from yutome.indexer import VideoProcessResult, sync_channel, sync_video
 import yutome.indexer as indexer_module
 from yutome.paths import ProjectPaths
 from yutome.youtube import DiscoveredVideo
@@ -108,3 +108,32 @@ def test_sync_runs_heuristic_cleanup_for_touched_videos_when_gemini_configured(m
     assert stats.cleanup_upgraded == 1
     assert stats.cleanup_chunks_saved == 3
     assert any("Stage 4/heuristic transcript cleanup: scanning 1 touched video" in message for message in logs)
+
+
+def test_sync_video_reuses_staged_channel_pipeline(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    paths = ProjectPaths.from_config(default_config(), project_root=tmp_path)
+    logs: list[str] = []
+    calls: list[str] = []
+
+    monkeypatch.setattr(indexer_module, "discover_video", lambda **kwargs: _video("exact-video"))
+
+    def fake_process_video(**kwargs):  # noqa: ANN003
+        calls.append(kwargs["video"].video_id)
+        return VideoProcessResult(video_id=kwargs["video"].video_id, transcripts_saved=1, chunks_saved=4)
+
+    monkeypatch.setattr(indexer_module, "_process_video", fake_process_video)
+
+    stats = sync_video(
+        target="https://www.youtube.com/watch?v=exact-video",
+        config=default_config(),
+        paths=paths,
+        workers=1,
+        embed=False,
+        progress=logs.append,
+    )
+
+    assert calls == ["exact-video"]
+    assert stats.discovered == 1
+    assert stats.transcripts_saved == 1
+    assert stats.chunks_saved == 4
+    assert any("Candidate videos: 1" in message for message in logs)

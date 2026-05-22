@@ -125,6 +125,15 @@ retry_sleep = "exp=5:120"
 remote_components = false
 impersonate = "chrome"
 subprocess_timeout_seconds = 300.0
+
+[find]
+# Default search mode when `yutome find` is invoked without --mode.
+# "hybrid" combines lexical (SQLite FTS) and semantic (LanceDB + Voyage)
+# recall and is the most powerful — but needs VOYAGE_API_KEY and a
+# populated vector index. "lexical" uses FTS only and works without any
+# embedding setup. `yutome setup` rewrites this to "lexical" when no
+# VOYAGE_API_KEY is configured. "semantic" forces vectors only.
+default_mode = "hybrid"
 """
 
 
@@ -235,6 +244,10 @@ class YtDlpConfig(BaseModel):
     subprocess_timeout_seconds: float = Field(default=300.0, gt=0)
 
 
+class FindConfig(BaseModel):
+    default_mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
+
+
 class GeminiConfig(BaseModel):
     enabled: bool = False
     model: str = "gemini-3.1-flash-lite"
@@ -264,6 +277,7 @@ class AppConfig(BaseModel):
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     yt_dlp: YtDlpConfig = Field(default_factory=YtDlpConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
+    find: FindConfig = Field(default_factory=FindConfig)
 
 
 def default_config() -> AppConfig:

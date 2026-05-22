@@ -30,6 +30,7 @@ from yutome.retrieval import (
     _youtube_url,
     parse_youtube_location,
 )
+from yutome.transcripts import format_timestamp, read_normalized_segments
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,7 @@ def find(
 ) -> QueryResult:
     filters = _common_filter(channel=channel, since=since, until=until, source=source, language=language)
     if in_ == "chunks":
-        search = Search(over="chunk_text", mode=mode or "hybrid", text=text)
+        search = Search(over="chunk_text", mode=mode or config.find.default_mode, text=text)
         query_request = QueryRequest(
             entity="chunk",
             search=search,
@@ -91,7 +92,9 @@ def find(
             offset=offset,
         )
     result = q(config=config, paths=paths, request=query_request)
-    return _annotate_empty_corpus(result, paths)
+    result = _annotate_empty_corpus(result, paths)
+    result = _annotate_no_match(result, paths)
+    return result
 
 
 def list_(
@@ -162,6 +165,8 @@ def show(
     video_id: str | None = None,
     time_seconds: int | None = None,
     youtube_url: str | None = None,
+    transcript_offset: int = 0,
+    transcript_limit: int | None = None,
 ) -> dict[str, Any]:
     if kind == "chunk":
         if not id_:
@@ -178,7 +183,13 @@ def show(
     if kind == "transcript":
         if not id_:
             raise ValueError("transcript id is required")
-        return resource_transcript(config=config, paths=paths, transcript_version_id=id_)
+        return resource_transcript(
+            config=config,
+            paths=paths,
+            transcript_version_id=id_,
+            offset=transcript_offset,
+            limit=transcript_limit,
+        )
     if kind == "context":
         return context_expand(
             paths=paths,
@@ -297,8 +308,18 @@ def resource_channel(*, config: AppConfig, paths: ProjectPaths, selector: str) -
 _TRANSCRIPT_TEXT_CAP = 200_000
 
 
-def resource_transcript(*, config: AppConfig, paths: ProjectPaths, transcript_version_id: str) -> dict[str, Any]:
+def resource_transcript(
+    *,
+    config: AppConfig,
+    paths: ProjectPaths,
+    transcript_version_id: str,
+    offset: int = 0,
+    limit: int | None = None,
+) -> dict[str, Any]:
     del config
+    offset = max(0, offset)
+    if limit is not None:
+        limit = max(1, min(limit, 5000))
     with connect_catalog(paths.catalog_db) as connection:
         row = connection.execute(
             """
@@ -306,11 +327,14 @@ def resource_transcript(*, config: AppConfig, paths: ProjectPaths, transcript_ve
                    raw_path, normalized_path, segment_count, active, created_at
             FROM transcript_versions
             WHERE transcript_version_id = ?
+               OR (video_id = ? AND active = 1)
+            ORDER BY active DESC, created_at DESC
+            LIMIT 1
             """,
-            (transcript_version_id,),
+            (transcript_version_id, transcript_version_id),
         ).fetchone()
     if row is None:
-        raise ValueError(f"transcript_version_id not found: {transcript_version_id}")
+        raise ValueError(f"transcript or active video transcript not found: {transcript_version_id}")
 
     normalized_path = resolve_under(paths.root, Path(row["normalized_path"])) if row["normalized_path"] else None
     text = ""
@@ -326,6 +350,19 @@ def resource_transcript(*, config: AppConfig, paths: ProjectPaths, transcript_ve
                 text_truncated = True
             else:
                 text = raw
+        if limit is not None or offset:
+            segments = read_normalized_segments(normalized_path)
+            selected = segments[offset : offset + limit if limit is not None else None]
+            text = "\n".join(
+                f"[{format_timestamp(segment.start_ms)}] {segment.text}" for segment in selected
+            )
+            text_truncated = offset > 0 or offset + len(selected) < len(segments)
+        else:
+            segments = []
+            selected = []
+    else:
+        segments = []
+        selected = []
 
     return {
         "resource_uri": f"yutome://transcript/{row['transcript_version_id']}",
@@ -341,6 +378,14 @@ def resource_transcript(*, config: AppConfig, paths: ProjectPaths, transcript_ve
         "text_path": text_path,
         "text_truncated": text_truncated,
         "text_char_limit": _TRANSCRIPT_TEXT_CAP,
+        "offset": offset,
+        "limit": limit,
+        "returned_segments": len(selected),
+        "next_offset": (
+            offset + len(selected)
+            if (limit is not None or offset) and offset + len(selected) < int(row["segment_count"])
+            else None
+        ),
         "text": text,
     }
 
@@ -383,22 +428,38 @@ _EMPTY_CORPUS_NOTE = (
     "No videos indexed yet — run `yutome sync <channel-url>` to index a channel before searching."
 )
 
+_NO_MATCH_NOTE = (
+    "No matches for this query. Try different phrasing, `--mode lexical` for exact terms, "
+    "or `yutome list videos --limit 5` to see what's indexed."
+)
+
+
+def _video_count(paths: ProjectPaths) -> int | None:
+    if not catalog_is_initialized(paths.catalog_db):
+        return None
+    try:
+        with connect_catalog(paths.catalog_db) as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM videos").fetchone()
+            return int(row["count"]) if row is not None else 0
+    except Exception:
+        return None
+
 
 def _annotate_empty_corpus(result: QueryResult, paths: ProjectPaths) -> QueryResult:
     if result.rows:
         return result
-    if not catalog_is_initialized(paths.catalog_db):
-        if _EMPTY_CORPUS_NOTE not in result.notes:
-            result.notes.append(_EMPTY_CORPUS_NOTE)
-        return result
-    try:
-        with connect_catalog(paths.catalog_db) as connection:
-            row = connection.execute("SELECT COUNT(*) AS count FROM videos").fetchone()
-            count = int(row["count"]) if row is not None else 0
-    except Exception:
-        return result
-    if count == 0 and _EMPTY_CORPUS_NOTE not in result.notes:
+    count = _video_count(paths)
+    if (count is None or count == 0) and _EMPTY_CORPUS_NOTE not in result.notes:
         result.notes.append(_EMPTY_CORPUS_NOTE)
+    return result
+
+
+def _annotate_no_match(result: QueryResult, paths: ProjectPaths) -> QueryResult:
+    if result.rows:
+        return result
+    count = _video_count(paths)
+    if count and count > 0 and _NO_MATCH_NOTE not in result.notes:
+        result.notes.append(_NO_MATCH_NOTE)
     return result
 
 

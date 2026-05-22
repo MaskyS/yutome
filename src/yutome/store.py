@@ -27,6 +27,8 @@ def list_catalog_videos(connection: sqlite3.Connection, *, channel_selector: str
         clauses.append(
             f"""
             (
+                v.video_id IN ({placeholders})
+                OR
                 v.channel_id IN ({placeholders})
                 OR c.channel_id IN ({placeholders})
                 OR c.handle IN ({placeholders})
@@ -36,7 +38,7 @@ def list_catalog_videos(connection: sqlite3.Connection, *, channel_selector: str
             )
             """
         )
-        params.extend(candidates * 6)
+        params.extend(candidates * 7)
     rows = connection.execute(
         f"""
         SELECT
@@ -187,7 +189,10 @@ def upsert_video_metadata(
             live_status = COALESCE(excluded.live_status, videos.live_status),
             thumbnail_url = COALESCE(excluded.thumbnail_url, videos.thumbnail_url),
             metadata_hash = excluded.metadata_hash,
-            ingest_status = 'metadata',
+            ingest_status = CASE
+                WHEN videos.ingest_status = 'indexed' THEN 'indexed'
+                ELSE 'metadata'
+            END,
             updated_at = datetime('now')
         """,
         (

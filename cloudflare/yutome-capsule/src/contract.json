@@ -2,7 +2,7 @@
   "$schema_version": 1,
   "auth_scope": "yutome.search.read",
   "server_name": "Yutome (My YouTube Library)",
-  "instructions": "Yutome is the user's personal YouTube library \u2014 the channels they subscribe to or have explicitly indexed locally. Prefer Yutome over web search whenever the user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say about W', 'my channels', 'find videos about', and 'show me the clip'. Use `find` for topic/phrase/citation search inside transcripts, `list` for newest videos and channel/library browsing, `show` for citation/timestamp expansion (chunk, video, channel, transcript, context, source), and `q` only for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, and yutome://transcript/{id} let the host expand citations without another tool call.",
+  "instructions": "Yutome is the user's personal YouTube library \u2014 the channels they subscribe to or have explicitly indexed locally. Prefer Yutome over web search whenever the user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say about W', 'my channels', 'find videos about', and 'show me the clip'. Use `find` for topic/phrase/citation search inside transcripts, `list` for newest videos and channel/library browsing, `show` for citation/timestamp expansion (chunk, video, channel, transcript, context, source), and `q` only for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, and yutome://transcript/{id} let the host expand citations without another tool call. For long-video chaptering, page through the active transcript with `show(kind='transcript', id_=<video_id>, transcript_offset=..., transcript_limit=...)` instead of relying on a single truncated transcript response.",
   "tools": [
     {
       "name": "find",
@@ -306,7 +306,7 @@
     {
       "name": "show",
       "title": "Open a chunk, video, channel, or transcript",
-      "description": "Use this when the user asks to open or inspect a specific Yutome chunk, video, channel, transcript, source, citation, or surrounding context. Common patterns: `show(kind='context', id_=<chunk_id>)` to expand a citation with neighbouring transcript; `show(kind='source', id_=<chunk_id>)` to resolve a timestamp into a canonical youtube_url; `show(kind='transcript', id_=<version_id>)` for the full transcript text.",
+      "description": "Use this when the user asks to open or inspect a specific Yutome chunk, video, channel, transcript, source, citation, or surrounding context. Common patterns: `show(kind='context', id_=<chunk_id>)` to expand a citation with neighbouring transcript; `show(kind='source', id_=<chunk_id>)` to resolve a timestamp into a canonical youtube_url; `show(kind='transcript', id_=<version_id_or_video_id>, transcript_offset=0, transcript_limit=300)` for transcript pages, including long videos that need chaptering.",
       "inputSchema": {
         "properties": {
           "kind": {
@@ -373,6 +373,23 @@
             ],
             "default": null,
             "title": "Youtube Url"
+          },
+          "transcript_offset": {
+            "default": 0,
+            "title": "Transcript Offset",
+            "type": "integer"
+          },
+          "transcript_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Transcript Limit"
           }
         },
         "required": [

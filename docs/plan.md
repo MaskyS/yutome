@@ -148,21 +148,21 @@ Implemented commands:
 
 | Command | Purpose |
 | --- | --- |
-| `yutome setup [CHANNEL]` | Guided first-run setup: config, `.env`, Webshare proxy secrets, semantic search, YouTube subscription import, channel picker, and optional first sync. |
+| `yutome setup [SOURCE]` | Guided first-run setup: config, `.env`, Webshare proxy secrets, semantic search, YouTube subscription import, source picker, and optional first sync. |
 | `yutome init` | Create `yutome.toml`, base directories, and SQLite catalog. |
 | `yutome doctor` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
-| `yutome channels add URL_OR_HANDLE` | Add a channel URL, handle, or id to the local channel library. |
-| `yutome channels import FILE` | Import channel library entries from CSV, OPML/XML, or a plain URL list. |
-| `yutome channels import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
-| `yutome channels select/unselect` | Include or exclude channel library entries from default library syncs. |
-| `yutome sync TARGET` | Discover and index a channel. |
-| `yutome sync --all` | Sync every selected channel in the local channel library. |
+| `yutome add SOURCE` | Add a YouTube channel or video source to the local library. |
+| `yutome import FILE` | Import source entries from CSV, OPML/XML, or a plain URL list. |
+| `yutome import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
+| `yutome select/unselect SOURCE` | Include or exclude source entries from default library syncs. |
+| `yutome sync [SOURCE]` | Discover and index a channel source, exact video source, or selected sources when omitted. |
+| `yutome sync --all` | Sync every selected source in the local library. |
 | `yutome find QUERY` | Ranked retrieval over chunks, titles, or descriptions with lexical/semantic/hybrid modes. |
 | `yutome list videos` | Enumerate videos by status, channel, source, language, and date filters. |
-| `yutome list channels` | Show selected and unselected local channel library entries. |
+| `yutome list channels` | Show channel entries from the local source library and catalog. |
 | `yutome list attention` | Show failed/deferred videos with latest provider-attempt details. |
 | `yutome list status` | Show catalog counts, index percentages, statuses, and job breakdowns. |
-| `yutome show chunk/video/channel/transcript` | Fetch one resource by id or selector. |
+| `yutome show chunk/video/channel/transcript` | Fetch one resource by id or selector; transcripts can be addressed by transcript id or active video id. |
 | `yutome show source` | Resolve a citation anchor to a YouTube timestamp and provenance. |
 | `yutome show context` | Expand a selected hit into bounded neighboring transcript context. |
 | `yutome q` | Execute a raw QueryRequest JSON object. |
@@ -186,7 +186,6 @@ Target command surface not yet implemented:
 | --- | --- |
 | `yutome sync --channel ID` | Sync one registered channel by local/channel id. |
 | `yutome backfill --channel ID --limit N --workers N` | Controlled historical ingest for an existing channel. Current `sync --use-catalog --max-process --workers` covers part of this need. |
-| `yutome transcribe VIDEO_ID` | Force transcript acquisition or fallback processing for one video. Current implementation uses `sync` filters instead. |
 | `yutome index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `rebuild-chunks` and `rebuild-vectors`. |
 | `yutome scheduler install` | Install a cron/launchd schedule for bounded recurring syncs. |
 | `yutome inspect video VIDEO_ID` | Inspect one video, active transcript version, artifacts, chunks, and status. |
@@ -1664,8 +1663,7 @@ Later slices:
 - Built-in `yutome answer`.
 - Hosted API / remote MCP for multi-device access.
 - Web UI or local browser transcript navigator.
-- `yutome channel add`, `yutome sync --all`, and scheduler install/run commands.
-- `yutome transcribe VIDEO_ID` for forced one-video processing.
+- `yutome add`, `yutome sync --all`, and scheduler install/run commands.
 - `yutome index --lexical --vectors` as a unified rebuild command.
 - Incremental scheduler for new channel videos.
 - Topic/entity extraction.

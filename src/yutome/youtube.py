@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -9,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 from requests import Session
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -70,10 +72,25 @@ YOUTUBE_BLOCK_MARKERS = (
     "temporarily blocked",
 )
 
+PROXY_PAYMENT_MARKERS = (
+    "402 payment required",
+    "connect tunnel failed, response 402",
+    "tunnel connection failed: 402",
+    "response 402",
+)
+
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
+YOUTUBE_VIDEO_ID_RE = r"[A-Za-z0-9_-]{11}"
+
 
 def is_youtube_block_error(error: Exception | str) -> bool:
     text = str(error).lower()
     return any(marker in text for marker in YOUTUBE_BLOCK_MARKERS)
+
+
+def is_proxy_payment_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in PROXY_PAYMENT_MARKERS)
 
 
 _is_ytdlp_block_error = is_youtube_block_error
@@ -84,6 +101,32 @@ def canonical_channel_tabs(target: str) -> list[tuple[str, str]]:
     if cleaned.endswith("/videos") or cleaned.endswith("/streams"):
         return [(cleaned.rsplit("/", 1)[-1], cleaned)]
     return [("videos", f"{cleaned}/videos"), ("streams", f"{cleaned}/streams")]
+
+
+def canonical_video_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def extract_video_id(value: str) -> str | None:
+    stripped = value.strip()
+    if re.fullmatch(YOUTUBE_VIDEO_ID_RE, stripped):
+        return stripped
+    parsed = urlsplit(stripped if "://" in stripped else f"https://www.youtube.com/{stripped.lstrip('/')}")
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "youtu.be":
+        candidate = parsed.path.strip("/").split("/", 1)[0]
+        return candidate if re.fullmatch(YOUTUBE_VIDEO_ID_RE, candidate) else None
+    if host not in YOUTUBE_HOSTS and not host.endswith(".youtube.com"):
+        return None
+    query = parse_qs(parsed.query)
+    if video_id := query.get("v", [None])[0]:
+        return video_id if re.fullmatch(YOUTUBE_VIDEO_ID_RE, video_id) else None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
+        return parts[1] if re.fullmatch(YOUTUBE_VIDEO_ID_RE, parts[1]) else None
+    return None
 
 
 def _yt_dlp_base_command() -> list[str]:
@@ -145,6 +188,21 @@ def describe_proxy(proxy: ProxyConfig | None) -> str:
     return "webshare (missing credentials)"
 
 
+def proxy_payment_required_message(
+    proxy: ProxyConfig | None,
+    *,
+    operation: str = "request",
+) -> str:
+    provider = "Configured proxy"
+    if proxy and proxy.kind == "webshare":
+        provider = "Webshare proxy"
+    return (
+        f"{provider} returned 402 Payment Required during {operation}. "
+        "Check the proxy account plan, traffic quota, target-site entitlement, and credentials; "
+        "then retry or disable proxy use for this path."
+    )
+
+
 def redact_proxy_secrets(proxy: ProxyConfig | None, text: str, *, key: str | None = None) -> str:
     redacted = text
     if not proxy:
@@ -157,6 +215,44 @@ def redact_proxy_secrets(proxy: ProxyConfig | None, text: str, *, key: str | Non
         if secret:
             redacted = redacted.replace(secret, "***")
     return redacted
+
+
+def _format_negative_returncode(returncode: int) -> str:
+    signal_number = abs(returncode)
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        signal_name = f"signal {signal_number}"
+    return f"{signal_name} (return code {returncode})"
+
+
+def format_ytdlp_failure(
+    result: subprocess.CompletedProcess[str],
+    *,
+    operation: str,
+    proxy: ProxyConfig | None = None,
+    proxy_key: str | None = None,
+) -> str:
+    detail = (result.stderr or "").strip() or (result.stdout or "").strip()
+    redacted_detail = redact_proxy_secrets(proxy, detail, key=proxy_key) if detail else ""
+    if is_proxy_payment_error(detail):
+        message = proxy_payment_required_message(proxy, operation=f"yt-dlp {operation}")
+        if result.returncode < 0:
+            message = f"{message} yt-dlp also aborted with {_format_negative_returncode(result.returncode)}."
+        return message
+    if result.returncode < 0:
+        message = f"yt-dlp subprocess aborted with {_format_negative_returncode(result.returncode)} during {operation}."
+        if proxy_url_for_ytdlp(proxy, key=proxy_key):
+            message = (
+                f"{message} A proxy was configured for this yt-dlp request; run `yutome proxy-test` "
+                "and check proxy quota/credentials before retrying."
+            )
+        if redacted_detail:
+            message = f"{message} Last output: {redacted_detail}"
+        return message
+    if redacted_detail:
+        return redacted_detail
+    return f"exit code {result.returncode} with no stderr/stdout"
 
 
 def _run_ytdlp(
@@ -254,7 +350,14 @@ def discover_videos(
         if result.returncode != 0:
             if tab_name == "streams":
                 continue
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            raise RuntimeError(
+                format_ytdlp_failure(
+                    result,
+                    operation=f"discovery for {tab_url}",
+                    proxy=proxy,
+                    proxy_key=tab_url,
+                )
+            )
         for raw in _parse_json_lines(result.stdout):
             video_id = raw.get("id")
             if not video_id or video_id in discovered:
@@ -329,9 +432,12 @@ def fetch_video_metadata(
         proxy_key=video_id,
     )
     if result.returncode != 0:
-        detail = (result.stderr or "").strip() or (result.stdout or "").strip()
-        if not detail:
-            detail = f"exit code {result.returncode} with no stderr/stdout"
+        detail = format_ytdlp_failure(
+            result,
+            operation=f"metadata fetch for {video_id}",
+            proxy=proxy,
+            proxy_key=video_id,
+        )
         raise RuntimeError(f"yt-dlp metadata fetch failed for {video_id}: {detail}")
     rows = _parse_json_lines(result.stdout)
     if not rows:
@@ -339,6 +445,38 @@ def fetch_video_metadata(
     row = rows[0]
     _validate_video_metadata_row(row, video_id=video_id)
     return row
+
+
+def discover_video(
+    *,
+    target: str,
+    cwd: Path,
+    proxy: ProxyConfig | None = None,
+    ytdlp_config: YtDlpConfig | None = None,
+) -> DiscoveredVideo:
+    video_id = extract_video_id(target)
+    if video_id is None:
+        raise ValueError(f"not a YouTube video URL or id: {target}")
+    metadata = fetch_video_metadata(
+        video_id=video_id,
+        cwd=cwd,
+        proxy=proxy,
+        ytdlp_config=ytdlp_config,
+    )
+    channel_handle = metadata.get("uploader_id") or metadata.get("channel")
+    if isinstance(channel_handle, str) and channel_handle.startswith("@"):
+        channel_handle = channel_handle
+    return DiscoveredVideo(
+        video_id=video_id,
+        title=metadata.get("title"),
+        url=metadata.get("webpage_url") or canonical_video_url(video_id),
+        channel_id=metadata.get("channel_id"),
+        channel_title=metadata.get("channel") or metadata.get("uploader"),
+        channel_handle=channel_handle,
+        duration_seconds=int(metadata["duration"]) if metadata.get("duration") is not None else None,
+        playlist_tab="video",
+        raw=metadata,
+    )
 
 
 def fetch_transcript(
@@ -507,7 +645,14 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
             proxy_key=video_id,
         )
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            raise RuntimeError(
+                format_ytdlp_failure(
+                    result,
+                    operation=f"subtitle fetch for {video_id}",
+                    proxy=proxy,
+                    proxy_key=video_id,
+                )
+            )
         files = sorted(Path(temp_dir).glob(f"{video_id}*.json3"))
         if not files:
             raise RuntimeError(f"yt-dlp did not write json3 subtitles for {video_id}")

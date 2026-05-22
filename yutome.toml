@@ -43,7 +43,7 @@ device = "cpu"
 compute_type = "int8"
 
 [embeddings]
-enabled = false
+enabled = true
 provider = "voyage"
 model = "voyage-4-lite"
 dimension = 1024
@@ -74,7 +74,7 @@ remote_components = false
 impersonate = "chrome"
 
 [gemini]
-enabled = false
+enabled = true
 model = "gemini-3.1-flash-lite"
 fallback_enabled = false
 max_output_tokens = 65536

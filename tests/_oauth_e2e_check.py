@@ -10,8 +10,8 @@ The script simulates a Claude-style custom connector:
 
 1. Dynamic Client Registration (DCR) at /register.
 2. PKCE S256 challenge.
-3. GET /authorize → parse the hidden ``__auth_request`` from the pairing form.
-4. POST /pair with the pairing code + the carried AuthRequest. Capture the
+3. GET /authorize → parse the hidden auth-request id + CSRF token from the pairing form.
+4. POST /pair with the pairing code + hidden auth state. Capture the
    redirect to the registered redirect_uri with the auth code.
 5. POST /token with the code + verifier → access_token.
 6. POST /mcp with the access_token: initialize, tools/list,
@@ -35,6 +35,16 @@ import urllib.request
 
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _add_cookie(jar: dict[str, str], set_cookie: str) -> dict[str, str]:
+    updated = dict(jar)
+    cookie_pair = set_cookie.split(";", 1)[0]
+    if "=" not in cookie_pair:
+        return updated
+    name, value = cookie_pair.split("=", 1)
+    updated[name] = value
+    return updated
 
 
 _DEFAULT_UA = "Mozilla/5.0 (Macintosh; yutome-smoke) urllib/3.12"
@@ -114,26 +124,57 @@ def main() -> int:
     )
 
     # ---- 3. GET /authorize → pairing form ----
-    status, _, body = _http("GET", auth_url)
+    status, auth_headers, body = _http("GET", auth_url)
     if status != 200:
         print(f"authorize GET failed: HTTP {status}\n{body.decode(errors='replace')}", file=sys.stderr)
         return 1
     html = body.decode("utf-8", errors="replace")
-    match = re.search(r'name="__auth_request"\s+value="([^"]+)"', html)
-    if not match:
-        print("could not find __auth_request hidden field on /authorize page", file=sys.stderr)
+    auth_id_match = re.search(r'name="auth_request_id"\s+value="([^"]+)"', html)
+    csrf_match = re.search(r'name="csrf_token"\s+value="([^"]+)"', html)
+    cookie = auth_headers.get("Set-Cookie") or auth_headers.get("set-cookie") or ""
+    if not auth_id_match or not csrf_match:
+        print("could not find auth_request_id/csrf pairing state on /authorize page", file=sys.stderr)
         return 1
-    auth_req_payload = match.group(1).replace("&quot;", '"').replace("&amp;", "&")
+    auth_request_id = auth_id_match.group(1)
+    csrf_token = csrf_match.group(1)
+    expected_cookie_name = f"__Host-yutome_pairing_{auth_request_id}"
+    cookie_jar = _add_cookie({}, cookie)
+    if expected_cookie_name not in cookie_jar:
+        print("could not find auth-request-specific CSRF cookie on /authorize page", file=sys.stderr)
+        return 1
     print("[OK] GET /authorize rendered pairing form")
+
+    # Simulate a noob clicking Connect more than once. Browsers keep all
+    # auth-request-specific cookies, but a single global cookie would be
+    # overwritten here and make the first visible tab fail.
+    status, second_headers, second_body = _http("GET", auth_url)
+    if status != 200:
+        print(
+            f"second authorize GET failed: HTTP {status}\n{second_body.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+    second_html = second_body.decode("utf-8", errors="replace")
+    second_auth_id_match = re.search(r'name="auth_request_id"\s+value="([^"]+)"', second_html)
+    if not second_auth_id_match:
+        print("could not find second auth_request_id on /authorize page", file=sys.stderr)
+        return 1
+    second_cookie = second_headers.get("Set-Cookie") or second_headers.get("set-cookie") or ""
+    cookie_jar = _add_cookie(cookie_jar, second_cookie)
+    if f"__Host-yutome_pairing_{second_auth_id_match.group(1)}" not in cookie_jar:
+        print("could not find second auth-request-specific CSRF cookie on /authorize page", file=sys.stderr)
+        return 1
+    cookie_header = "; ".join(f"{key}={value}" for key, value in cookie_jar.items())
+    print("[OK] overlapping /authorize tabs preserved independent pairing state")
 
     # ---- 4. POST /pair ----
     form_body = urllib.parse.urlencode(
-        {"pairing_code": pairing_code, "__auth_request": auth_req_payload}
+        {"pairing_code": pairing_code, "auth_request_id": auth_request_id, "csrf_token": csrf_token}
     ).encode()
     status, headers, body = _http(
         "POST",
         f"{base}/pair",
-        headers={"content-type": "application/x-www-form-urlencoded"},
+        headers={"content-type": "application/x-www-form-urlencoded", "cookie": cookie_header},
         body=form_body,
     )
     if status != 302:
@@ -143,6 +184,24 @@ def main() -> int:
         )
         return 1
     location = headers.get("Location") or headers.get("location") or ""
+    status, retry_headers, retry_body = _http(
+        "POST",
+        f"{base}/pair",
+        headers={"content-type": "application/x-www-form-urlencoded", "cookie": cookie_header},
+        body=form_body,
+    )
+    if status != 302:
+        print(
+            f"pair POST retry did not redirect: HTTP {status}\n{retry_body.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+    retry_location = retry_headers.get("Location") or retry_headers.get("location") or ""
+    if retry_location != location:
+        print("pair POST retry redirected to a different callback URL", file=sys.stderr)
+        return 1
+    print("[OK] /pair retry reused completed authorization redirect")
+
     parsed = urllib.parse.urlsplit(location)
     code = urllib.parse.parse_qs(parsed.query).get("code", [None])[0]
     if not code:

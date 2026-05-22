@@ -80,6 +80,7 @@ uv run yutome list status
 uv run yutome show chunk CHUNK_ID
 uv run yutome show video VIDEO_ID
 uv run yutome show transcript TRANSCRIPT_VERSION_ID
+uv run yutome show transcript VIDEO_ID --offset 0 --limit 300
 uv run yutome show source CHUNK_ID
 uv run yutome show context CHUNK_ID --token-budget 3000
 uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s"

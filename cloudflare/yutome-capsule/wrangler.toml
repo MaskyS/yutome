@@ -1,7 +1,7 @@
 name = "yutome-remote-mcp"
 main = "src/index.ts"
 compatibility_date = "2025-06-18"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 workers_dev = true
 
 # Vars are non-secret. Real tokens live in `wrangler secret put`:
@@ -26,7 +26,5 @@ tag = "v1"
 new_sqlite_classes = ["YutomeRelay", "YutomeMcpAgent"]
 
 # KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).
-# Created with `wrangler kv namespace create OAUTH_KV`.
-[[kv_namespaces]]
-binding = "OAUTH_KV"
-id = "785d8e1a702f4815b99c807a805a4e10"
+# `yutome connect --deploy` creates a per-account namespace and writes an
+# ignored generated Wrangler config under data/remote/cloudflare/.

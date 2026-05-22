@@ -1,6 +1,6 @@
 # OAuth Testing
 
-`yutome channels import-youtube` imports YouTube subscriptions. With no channel argument it tries local browser cookies first and falls back to a local OAuth desktop flow for the YouTube Data API read-only subscription scope when `YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS` is configured.
+`yutome import-youtube` imports YouTube subscriptions. With no channel argument it tries local browser cookies first and falls back to a local OAuth desktop flow for the YouTube Data API read-only subscription scope when `YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS` is configured.
 
 The browser-cookie path uses the active YouTube account in the browser profile it can read. On macOS, yt-dlp may trigger a password or Touch ID prompt to decrypt Chrome cookie storage. If the returned subscription count looks wrong, use OAuth to target a specific Google account.
 
@@ -32,7 +32,7 @@ YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS=/path/to/client_secret.json
 5. Run:
 
 ```bash
-uv run yutome channels import-youtube \
+uv run yutome import-youtube \
   --config yutome.toml
 ```
 
@@ -47,7 +47,7 @@ Expected result:
 For terminal-only environments:
 
 ```bash
-uv run yutome channels import-youtube \
+uv run yutome import-youtube \
   --print-url \
   --config yutome.toml
 ```

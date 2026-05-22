@@ -224,6 +224,21 @@ def test_transcript_resource_returns_text(configured: ProjectPaths) -> None:
     assert payload["text_truncated"] is False
 
 
+def test_show_transcript_accepts_video_id_and_pages_segments(configured: ProjectPaths) -> None:
+    payload = mcp_server.tool_show(
+        kind="transcript",
+        id_="vid123",
+        transcript_offset=1,
+        transcript_limit=1,
+    )
+    assert payload["transcript_version_id"] == "tx123"
+    assert payload["video_id"] == "vid123"
+    assert payload["returned_segments"] == 1
+    assert payload["next_offset"] is None
+    assert "lentils and salads context" in payload["text"]
+    assert "Crohn probiotics intro" not in payload["text"]
+
+
 def test_build_server_registers_tools_and_resources(configured: ProjectPaths) -> None:
     server = mcp_server.build_server()
     # FastMCP exposes registered tools/resources via these methods (sync wrappers

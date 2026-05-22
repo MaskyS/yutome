@@ -68,7 +68,7 @@ The capsule should use built-in Worker OAuth/pairing rather than Cloudflare Acce
 
 ### Claude
 
-Claude custom connectors using remote MCP are available through Claude's connector UI. Current Claude help says remote MCP custom connectors are available across Free, Pro, Max, Team, and Enterprise plans, with Free limited to one custom connector. Claude connects to the remote MCP server from Anthropic cloud infrastructure rather than from the user's local device. Sources: [Claude remote MCP custom connectors](https://support.claude.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [Claude remote MCP docs](https://claude.com/docs/connectors/custom/remote-mcp).
+Claude custom connectors using remote MCP are available through Claude's connector UI. Current Claude help says remote MCP custom connectors are available across Free, Pro, Max, Team, and Enterprise plans, with Free limited to one custom connector. Claude connects to the remote MCP server from Anthropic cloud infrastructure rather than from the user's local device. Sources: [Claude remote MCP custom connectors](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp), [Claude remote MCP docs](https://claude.com/docs/connectors/custom/remote-mcp).
 
 That means:
 
@@ -81,9 +81,9 @@ Claude's connector auth docs support OAuth-style remote connector auth, includin
 
 ### ChatGPT
 
-ChatGPT exposes remote MCP servers as Apps. Current OpenAI Apps SDK docs describe enabling developer mode from Settings > Apps & Connectors > Advanced settings, creating a connector from Settings > Connectors > Create, and using the public `/mcp` endpoint. After creation, the user tries the app in a new chat by clicking `+`, choosing More, and selecting the app so it is added to that conversation context. The docs also say that after a connector is linked on ChatGPT web, it is available on ChatGPT mobile apps. Sources: [Connect from ChatGPT](https://developers.openai.com/apps-sdk/deploy/connect-chatgpt), [Building MCP servers for ChatGPT Apps and API integrations](https://developers.openai.com/api/docs/mcp).
+ChatGPT exposes remote MCP servers as Apps. Current OpenAI developer-mode docs describe enabling developer mode from Settings > Apps > Advanced settings, creating an app from Settings > Apps with the public `/mcp` endpoint, and selecting the app from the composer tools/More menu in each chat. OpenAI's MCP docs recommend OAuth for private remote MCP servers and describe ChatGPT support for Client ID Metadata Documents and Dynamic Client Registration. Sources: [ChatGPT Developer mode](https://developers.openai.com/api/docs/guides/developer-mode), [Building MCP servers for ChatGPT Apps and API integrations](https://developers.openai.com/api/docs/mcp).
 
-There is plan/workspace gating to be careful about. OpenAI's help-center page says full MCP support and developer mode are in beta for Business, Enterprise, and Edu customers on ChatGPT web, while the developer docs also say ChatGPT Apps are supported on all plans and developer mode appears only if the organization allows it. Product copy should therefore say "where developer mode is available" rather than promise every user can add a custom ChatGPT MCP app today. Sources: [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461), [Connect from ChatGPT](https://developers.openai.com/apps-sdk/deploy/connect-chatgpt).
+There is plan/workspace gating to be careful about. Product copy should therefore say "where developer mode is available" rather than promise every user can add a custom ChatGPT MCP app today. Sources: [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461), [ChatGPT Developer mode](https://developers.openai.com/api/docs/guides/developer-mode).
 
 Current product implication:
 
@@ -432,7 +432,7 @@ Noob-facing copy should avoid implementation words like Worker, Durable Object, 
 
 The user-facing verb should be **connect**, not **capsule**. "Cloud Capsule" is the architecture/product name for the user-owned remote environment, but a normal user should not need to understand or type it. Remote setup should appear as a guided step inside `yutome setup`, plus a direct `yutome connect` command for users who already have a local corpus.
 
-`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after the local corpus steps. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, ChatGPT also requires selecting the Yutome app in each chat from `+` > `More`, the laptop-backed V1 needs this computer and `yutome remote bridge` online, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Voyage, Webshare, Gemini, or proxy credentials.
+`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after the local corpus steps. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, the user chooses which assistant they want help with (Claude, ChatGPT, both, or another MCP client), ChatGPT also requires selecting the Yutome app in each chat from `+` > `More` / composer tools, the laptop-backed V1 needs this computer and `yutome remote bridge` online, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Voyage, Webshare, Gemini, or proxy credentials.
 
 Primary choice:
 
@@ -455,18 +455,26 @@ Advanced detail can map this to:
 
 1. User runs `yutome setup` and accepts the "Connect Claude/ChatGPT" step, or runs `yutome connect`.
 2. User chooses "Use while this computer is on."
-3. CLI deploys the tracked TypeScript Worker subproject at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures the `OAUTH_KV` namespace exists (auto-creates it on first deploy), runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
+3. CLI deploys the tracked TypeScript Worker subproject at `cloudflare/yutome-capsule/`. It emits `contract.json` from the Python registry, ensures an account-local `OAUTH_KV` namespace exists (auto-creates it on first deploy), writes the real KV binding to ignored generated config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE`, pushes both as Wrangler secrets, and saves them to `data/remote/connection.json`.
 4. If Node/npm/npx are available, `yutome connect --deploy` is the default assisted path: Yutome uses `npx` to run Wrangler, downloading it if needed, runs the deploy, and lets Wrangler open Cloudflare sign-in if needed. The user does not need a global Wrangler install.
 5. If Node/npm/npx are not available, Yutome explains the missing runtime in plain language and asks the user to install Node.js LTS, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
 6. Future no-node best path should be a public Deploy-to-Cloudflare template. Cloudflare documents Deploy buttons as a way to let users deploy a Workers app into their own account, with resource provisioning from the app configuration. Source: [Cloudflare Deploy Buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 7. CLI stores the deployed endpoint and normalized `/mcp` URL in local remote state.
 8. User starts `yutome remote bridge` when they want the assistant to reach the laptop-backed corpus.
 9. User adds the MCP URL to Claude/ChatGPT.
-   - Claude: add one custom connector for the Claude account.
-   - ChatGPT: create the app/connector with the MCP Server URL, choose the authenticated/OAuth option, then select Yutome from `+` > `More` in each chat.
-10. Desktop polls the Worker bridge, executes local tool calls, and posts results back.
+   - Claude: add one custom connector for the Claude account from Customize > Connectors, leaving advanced OAuth fields blank.
+   - ChatGPT: turn on Developer mode where available, create the app with the MCP Server URL from Settings > Apps, choose OAuth/authenticated, then select Yutome from `+` > `More` / composer tools in each chat.
+   - Other clients: use the same `/mcp` URL with Streamable HTTP; OAuth/DCR is handled by the Worker, and the latest printed pairing code is the only user-facing secret.
+10. Desktop holds the Worker bridge WebSocket, executes local tool calls, and posts results back.
 11. Claude/ChatGPT can query local Yutome while Desktop is online.
 12. Connector OAuth/pairing protects `/mcp`; no-auth is only an explicit development/debug switch.
+
+Transport decision:
+
+- `/mcp` is the canonical public connector URL. It uses MCP Streamable HTTP, which the current MCP spec defines as the standard remote transport and which Cloudflare, ChatGPT Apps, and Codex document as the production path.
+- `/sse` is legacy compatibility only. It is not part of the default Yutome setup unless a specific target client cannot use `/mcp`; adding it means testing and protecting a second transport path.
+- Remote Claude custom connectors still need a public URL because calls originate from Anthropic infrastructure, including for Claude Desktop and Cowork. Local Desktop MCP configuration is a separate product path.
+- Claude API examples still show SSE in places, but the API connector documentation says publicly exposed HTTP servers support both Streamable HTTP and SSE. For Yutome's Claude/ChatGPT/Codex noob path, the instruction remains: paste the exact `/mcp` URL.
 
 The setup command should treat local deploy capability as a convenience, not an assumption. My machine having Wrangler is not representative of noob machines. The CLI should detect the actual machine state:
 
@@ -506,11 +514,17 @@ Status should show:
 - endpoint URL;
 - Claude/ChatGPT connector URL;
 - Desktop connection: online/offline/last seen;
+- Desktop connection source: live Worker status when `/relay/status` is reachable, otherwise local last-seen fallback;
 - local corpus health: videos, chunks, embeddings, attention rows;
 - cloud readiness: Worker reachable, auth configured, replica available;
 - last sync time;
 - offline search: enabled/disabled;
 - semantic replica: enabled/disabled and model/dimension.
+
+`/relay/status` should route to the same Durable Object as `/relay/connect`,
+require the same `YUTOME_RELAY_TOKEN`, and return only `bridge_online` plus
+`last_seen_at`. The normal CLI should not guess based only on local state when
+the Worker can answer live status.
 
 ### Connector setup across apps
 
@@ -573,9 +587,17 @@ The Worker should be a deployable subproject, likely under a directory such as `
 - pairing UI/API;
 - Durable Object session/router for Desktop-backed mode;
 - WebSocket bridge endpoint (`/relay/connect`) for the Desktop relay, authenticated by `YUTOME_RELAY_TOKEN`;
+- live bridge status endpoint (`/relay/status`), authenticated with the same relay token;
 - D1/R2/Vectorize access for replica-backed mode;
 - `/healthz` and `/readyz`;
 - administrative sync endpoints protected by a local pairing/admin token.
+
+Worker auth and pairing constraints:
+
+- `@cloudflare/workers-oauth-provider` owns OAuth token storage, DCR, PKCE validation, protected-resource metadata, and access-token validation for `/mcp`.
+- Yutome's pairing form is the consent gate for a single-owner connector. It should preserve OAuth request state in `OAUTH_KV`, use an auth-request-specific CSRF cookie, and make duplicate/retried authorization tabs safe.
+- The pairing code and relay token are Worker secrets. Assisted deploy rotates both, persists the same values locally, and prints only the pairing code as the user-facing secret.
+- Manual secret writes should send newline-terminated values to Wrangler; the saved local state and deployed Worker secret must match exactly or the Desktop bridge will get `401`.
 
 ### Sync/export format
 

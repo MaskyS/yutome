@@ -28,11 +28,7 @@ from yutome.api import q as api_q
 from yutome.api import show as api_show
 from yutome.channels import (
     LibraryChannel,
-    channel_from_input,
-    import_channels_from_file,
     list_library_channels,
-    set_library_channel_selected,
-    upsert_library_channel,
 )
 from yutome.db import bootstrap_catalog, catalog_is_initialized, connect_catalog, fts5_available
 from yutome.embeddings import embed_pending_chunks, rebuild_lancedb_chunks
@@ -40,7 +36,7 @@ from yutome.env import apply_env_to_config, load_dotenv
 from yutome.evals import load_eval_suite, run_eval_suite
 from yutome.exports import export_markdown
 from yutome.gemini import transcribe_youtube_url_with_gemini
-from yutome.indexer import sync_channel
+from yutome.indexer import sync_channel, sync_video
 from yutome.paths import ProjectPaths
 from yutome.maintenance import rebuild_active_chunks
 from yutome.quality_upgrade import upgrade_active_transcripts
@@ -55,6 +51,15 @@ from yutome.remote_connection import (
     remote_state_path,
     save_remote_state,
 )
+from yutome.sources import (
+    LibrarySource,
+    import_sources_from_file,
+    list_library_sources,
+    set_library_source_selected,
+    source_from_channel,
+    source_from_input,
+    upsert_library_source,
+)
 from yutome.youtube_oauth import fetch_subscription_channels, load_oauth_client, load_or_authorize_token
 from yutome.youtube_import import (
     YouTubeImportError,
@@ -66,6 +71,8 @@ from yutome.youtube import (
     describe_proxy,
     fetch_subtitle_transcript_with_ytdlp,
     fetch_transcript,
+    is_proxy_payment_error,
+    proxy_payment_required_message,
     proxy_url_for_ytdlp,
     redact_proxy_secrets,
     redact_proxy_url,
@@ -74,10 +81,9 @@ from yutome.youtube import (
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Local-first YouTube channel knowledge base indexer.",
+    help="Local-first YouTube source knowledge base indexer.",
 )
 export_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Export indexed artifacts.")
-channels_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Manage the local channel library.")
 list_app = typer.Typer(add_completion=False, no_args_is_help=True, help="List indexed corpus objects.")
 show_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Show indexed corpus objects.")
 quality_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Transcript quality tools.")
@@ -87,7 +93,6 @@ eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run ret
 remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Prepare and serve authenticated remote access.")
 contract_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Inspect and export the MCP contract.")
 app.add_typer(export_app, name="export")
-app.add_typer(channels_app, name="channels")
 app.add_typer(list_app, name="list")
 app.add_typer(show_app, name="show")
 app.add_typer(quality_app, name="quality")
@@ -96,6 +101,30 @@ app.add_typer(http_app, name="http")
 app.add_typer(eval_app, name="eval")
 app.add_typer(remote_app, name="remote")
 app.add_typer(contract_app, name="contract")
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    from yutome import __version__
+
+    typer.echo(f"yutome {__version__}")
+    raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        is_eager=True,
+        callback=_version_callback,
+        help="Print the installed yutome version and exit.",
+    ),
+) -> None:
+    """Local-first YouTube source knowledge base indexer."""
+    del version  # handled by callback
 
 
 ENV_TEMPLATE = """# Local secrets and proxy configuration. This file is ignored by git.
@@ -149,7 +178,7 @@ def _load_config_or_exit(config_path: Path) -> AppConfig:
         return load_config(config_path)
     except FileNotFoundError as exc:
         typer.echo(
-            f"yutome config not found at {config_path}. Run: uv run yutome setup",
+            f"yutome config not found at {config_path}. Run: yutome setup",
             err=True,
         )
         raise typer.Exit(code=2) from exc
@@ -214,6 +243,13 @@ def _status(ok: bool, label: str, detail: str = "") -> None:
     marker = "OK" if ok else "WARN"
     suffix = f" - {detail}" if detail else ""
     typer.echo(f"[{marker}] {label}{suffix}")
+
+
+def _proxy_diagnostic_detail(app_config, exc: Exception, *, video_id: str) -> str:  # noqa: ANN001
+    detail = redact_proxy_secrets(app_config.proxy, str(exc), key=video_id)
+    if is_proxy_payment_error(detail):
+        return proxy_payment_required_message(app_config.proxy, operation="proxy test")
+    return detail[:500]
 
 
 def _module_available(module_name: str) -> bool:
@@ -376,7 +412,7 @@ def _save_imported_channels(
 ) -> int:
     with connect_catalog(paths.catalog_db) as connection:
         for channel in channels:
-            upsert_library_channel(connection, channel, selected=selected)
+            upsert_library_source(connection, source_from_channel(channel), selected=selected)
         connection.commit()
     return len(channels)
 
@@ -392,9 +428,17 @@ def _header_token(token: str | None) -> dict[str, str]:
 
 
 def _set_toml_bool(config_path: Path, section: str, key: str, value: bool) -> None:
+    _set_toml_value(config_path, section, key, "true" if value else "false")
+
+
+def _set_toml_string(config_path: Path, section: str, key: str, value: str) -> None:
+    escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
+    _set_toml_value(config_path, section, key, f'"{escaped}"')
+
+
+def _set_toml_value(config_path: Path, section: str, key: str, rendered_value: str) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     lines = config_path.read_text(encoding="utf-8").splitlines() if config_path.exists() else []
-    rendered_value = "true" if value else "false"
     target_header = f"[{section}]"
     rendered_key = f"{key} = {rendered_value}"
     output: list[str] = []
@@ -443,7 +487,7 @@ def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> b
         _status(
             False,
             "Semantic/hybrid search",
-            "not configured; add VOYAGE_API_KEY to .env, then run `uv run yutome setup`",
+            "not configured; add VOYAGE_API_KEY to .env, then run `yutome setup`",
         )
         return False
 
@@ -533,7 +577,7 @@ def _setup_gemini(config_path: Path, env_path: Path, *, yes: bool) -> None:
         _status(
             False,
             "Gemini (transcript repair + fallback)",
-            "not configured; add GEMINI_API_KEY to .env, then run `uv run yutome setup`",
+            "not configured; add GEMINI_API_KEY to .env, then run `yutome setup`",
         )
         return
 
@@ -563,17 +607,17 @@ def _setup_gemini(config_path: Path, env_path: Path, *, yes: bool) -> None:
         _status(False, "Gemini (transcript repair + fallback)", "enabled in config but missing GEMINI_API_KEY")
 
 
-def _add_setup_channel(config: Path, target: str) -> LibraryChannel | None:
+def _add_setup_source(config: Path, target: str) -> LibrarySource | None:
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
     bootstrap_catalog(paths.catalog_db)
-    channel = channel_from_input(target, import_source="setup")
-    if channel is None:
+    source = source_from_input(target, import_source="setup")
+    if source is None:
         return None
     with connect_catalog(paths.catalog_db) as connection:
-        upsert_library_channel(connection, channel, selected=True)
+        upsert_library_source(connection, source, selected=True)
         connection.commit()
-    return channel
+    return source
 
 
 def _channel_picker_label(channel: LibraryChannel) -> str:
@@ -808,7 +852,7 @@ def _run_sync_targets(
     *,
     app_config: AppConfig,
     paths: ProjectPaths,
-    sync_targets: list[tuple[str, str | None]],
+    sync_targets: list[tuple[str, str | None, str]],
     use_catalog: bool,
     limit: int | None,
     effective_embed: bool,
@@ -828,7 +872,9 @@ def _run_sync_targets(
 ) -> None:
     typer.echo("Import plan:")
     typer.echo(f"  targets: {len(sync_targets)}")
-    typer.echo(f"  discovery: {'catalog cache' if use_catalog else 'youtube channel tabs'}")
+    target_types = sorted({target_type for _, _, target_type in sync_targets})
+    typer.echo(f"  source types: {', '.join(target_types)}")
+    typer.echo(f"  discovery: {'catalog cache' if use_catalog else 'source-specific'}")
     typer.echo(f"  max-process: {effective_max_process}")
     typer.echo(f"  workers: {effective_workers}")
     typer.echo(f"  staged fallback: transcript API first, yt-dlp retry second, metadata backfill third")
@@ -859,32 +905,55 @@ def _run_sync_targets(
         "stopped_early": False,
         "embedding_messages": [],
     }
-    for sync_target, label in sync_targets:
+    for sync_target, label, target_type in sync_targets:
         if len(sync_targets) > 1:
             typer.echo("")
             typer.echo(f"Syncing {label or sync_target}")
-        stats = sync_channel(
-            target=sync_target,
-            config=app_config,
-            paths=paths,
-            limit=limit,
-            embed=effective_embed,
-            sleep_seconds=sleep_seconds,
-            force=force,
-            asr_fallback=asr_fallback,
-            gemini_fallback=gemini_fallback,
-            max_process=effective_max_process,
-            retry_failed=retry_failed,
-            stop_on_rate_limit=stop_on_rate_limit,
-            refresh_discovery=not use_catalog,
-            verbose_skips=verbose_skips,
-            workers=effective_workers,
-            status_filters=status_filter,
-            source_filters=source_filter,
-            max_duration_seconds=max_duration_seconds,
-            shortest_first=shortest_first,
-            progress=typer.echo,
-        )
+        if target_type == "youtube_playlist":
+            typer.echo(f"Skipping playlist source; playlist sync is not supported yet: {sync_target}")
+            continue
+        if target_type == "youtube_video":
+            stats = sync_video(
+                target=sync_target,
+                config=app_config,
+                paths=paths,
+                embed=effective_embed,
+                sleep_seconds=sleep_seconds,
+                force=force,
+                asr_fallback=asr_fallback,
+                gemini_fallback=gemini_fallback,
+                retry_failed=retry_failed,
+                stop_on_rate_limit=stop_on_rate_limit,
+                verbose_skips=verbose_skips,
+                workers=effective_workers,
+                status_filters=status_filter,
+                source_filters=source_filter,
+                max_duration_seconds=max_duration_seconds,
+                progress=typer.echo,
+            )
+        else:
+            stats = sync_channel(
+                target=sync_target,
+                config=app_config,
+                paths=paths,
+                limit=limit,
+                embed=effective_embed,
+                sleep_seconds=sleep_seconds,
+                force=force,
+                asr_fallback=asr_fallback,
+                gemini_fallback=gemini_fallback,
+                max_process=effective_max_process,
+                retry_failed=retry_failed,
+                stop_on_rate_limit=stop_on_rate_limit,
+                refresh_discovery=not use_catalog,
+                verbose_skips=verbose_skips,
+                workers=effective_workers,
+                status_filters=status_filter,
+                source_filters=source_filter,
+                max_duration_seconds=max_duration_seconds,
+                shortest_first=shortest_first,
+                progress=typer.echo,
+            )
         for field in (
             "discovered",
             "processed",
@@ -960,7 +1029,7 @@ def _run_setup_first_sync(config: Path, *, channels: list[LibraryChannel] | None
     else:
         selected_channels = channels
     if not selected_channels:
-        typer.echo("[WARN] No selected channels to index.")
+        typer.echo("[WARN] No selected sources to index.")
         return
     effective_workers = app_config.backfill.workers
     effective_max_process = app_config.backfill.max_videos_per_run
@@ -973,7 +1042,7 @@ def _run_setup_first_sync(config: Path, *, channels: list[LibraryChannel] | None
         app_config=app_config,
         paths=paths,
         sync_targets=[
-            (channel.source_url, channel.title or channel.handle or channel.channel_id)
+            (channel.source_url, channel.title or channel.handle or channel.channel_id, "youtube_channel")
             for channel in selected_channels
         ],
         use_catalog=False,
@@ -1017,8 +1086,8 @@ def _print_cloudflare_connect_instructions() -> None:
     typer.echo("")
     typer.echo("For now this uses a small Cloudflare Worker as the public connector endpoint.")
     typer.echo("Claude and ChatGPT call this URL; Yutome answers from this computer while the bridge is running.")
-    typer.echo("If Yutome or your team already provides that endpoint, paste it with:")
-    typer.echo("  uv run yutome connect --endpoint https://your-worker.example.workers.dev")
+    typer.echo("If Yutome or your team already provides that endpoint, save it with:")
+    typer.echo("  yutome connect --endpoint https://your-worker.example.workers.dev --relay-token <token> --pairing-code <code>")
     typer.echo("If not, yutome can prepare the Cloudflare Worker and try to deploy it from this computer.")
     typer.echo("You may need to create or sign into a Cloudflare account during deploy.")
     typer.echo("")
@@ -1046,31 +1115,126 @@ def _missing_cloudflare_deploy_tools() -> list[str]:
     return [name for name in ("node", "npm", "npx") if not tools[name]]
 
 
-def _print_connector_next_steps(mcp_url: str) -> None:
+def _assistant_app_targets(value: str | None = None) -> set[str]:
+    raw = (value or "all").strip().lower()
+    pieces = [piece.strip() for piece in re.split(r"[,/ ]+", raw) if piece.strip()]
+    if not pieces:
+        return {"claude", "chatgpt", "other"}
+    targets: set[str] = set()
+    aliases = {
+        "c": "claude",
+        "claude": "claude",
+        "anthropic": "claude",
+        "g": "chatgpt",
+        "gpt": "chatgpt",
+        "chat": "chatgpt",
+        "chatgpt": "chatgpt",
+        "openai": "chatgpt",
+        "oai": "chatgpt",
+        "other": "other",
+        "mcp": "other",
+    }
+    for piece in pieces:
+        if piece in {"all", "any"}:
+            targets.update({"claude", "chatgpt", "other"})
+            continue
+        if piece in {"both", "claude+chatgpt", "claude-chatgpt"}:
+            targets.update({"claude", "chatgpt"})
+            continue
+        target = aliases.get(piece)
+        if target is None:
+            raise ValueError("assistant app must be one of: claude, chatgpt, both, other, all")
+        targets.add(target)
+    return targets or {"claude", "chatgpt", "other"}
+
+
+def _assistant_app_label(targets: set[str]) -> str:
+    labels = []
+    if "claude" in targets:
+        labels.append("Claude")
+    if "chatgpt" in targets:
+        labels.append("ChatGPT")
+    if "other" in targets:
+        labels.append("other MCP clients")
+    return ", ".join(labels)
+
+
+def _prompt_assistant_apps() -> str:
     typer.echo("")
-    typer.echo("Connect this MCP URL in each assistant account you use:")
+    typer.echo("Which assistant app do you want help connecting?")
+    typer.echo("  claude   Claude web/Desktop/mobile")
+    typer.echo("  chatgpt  ChatGPT Apps")
+    typer.echo("  both     Claude and ChatGPT")
+    typer.echo("  other    Another remote MCP client")
+    while True:
+        value = typer.prompt("Assistant app", default="claude").strip().lower()
+        try:
+            _assistant_app_targets(value)
+        except ValueError as exc:
+            typer.echo(f"[WARN] {exc}")
+            continue
+        return value or "claude"
+
+
+def _print_connector_next_steps(
+    mcp_url: str,
+    *,
+    bridge_configured: bool = True,
+    assistant_apps: str | None = None,
+) -> None:
+    targets = _assistant_app_targets(assistant_apps)
+    typer.echo("")
+    typer.echo(f"Connect this MCP URL in {_assistant_app_label(targets)}:")
     typer.echo(f"  {mcp_url}")
     typer.echo("")
     typer.echo("Use this one URL for Claude/ChatGPT across your devices. You do not need")
     typer.echo("a new Yutome endpoint for every phone, laptop, or tablet.")
+    typer.echo("Paste this exact /mcp URL into the assistant. Do not paste /authorize or /pair;")
+    typer.echo("the assistant opens those OAuth pages itself.")
+    typer.echo("If an old Yutome connector already exists with a different URL, remove it first")
+    typer.echo("and add this one again.")
     typer.echo("")
-    typer.echo("First, start the laptop bridge when you want Claude/ChatGPT to reach the local corpus:")
-    typer.echo("  uv run yutome remote bridge")
-    typer.echo("  (The bridge holds a long-lived WebSocket to the Worker. If you're behind a")
-    typer.echo("  corporate proxy that blocks WS, requests fall back to the offline response.)")
+    if bridge_configured:
+        typer.echo("Start or restart the laptop bridge when you want Claude/ChatGPT to reach the local corpus:")
+        typer.echo("  yutome remote bridge")
+        typer.echo("  If you just reran `yutome connect --deploy`, restart any old bridge process")
+        typer.echo("  because deploy refreshes the Worker's bridge token.")
+        typer.echo("  (The bridge holds a long-lived WebSocket to the Worker. If you're behind a")
+        typer.echo("  corporate proxy that blocks WS, requests fall back to the offline response.)")
+    else:
+        typer.echo("This endpoint is saved, but the local bridge token is not. This computer")
+        typer.echo("cannot answer assistant requests until you save the Worker secrets locally:")
+        typer.echo("  yutome connect --endpoint <url> --relay-token <token> --pairing-code <code>")
     typer.echo("")
-    typer.echo("Claude:")
-    typer.echo("  Add one custom connector from Customize > Connectors.")
-    typer.echo("  Claude may route Settings > Connectors there. The same Claude account should")
-    typer.echo("  make it available across Claude web, mobile, Desktop, and Cowork.")
-    typer.echo("ChatGPT:")
-    typer.echo("  ChatGPT calls these Apps. Where developer mode is available, create an")
-    typer.echo("  app/connector from Settings > Apps & Connectors > Advanced settings, then")
-    typer.echo("  Settings > Connectors > Create using this MCP Server URL.")
-    typer.echo("  Choose the authenticated/OAuth option when ChatGPT asks.")
-    typer.echo("  In each chat, click + > More and select Yutome before asking.")
-    typer.echo("Other MCP clients:")
-    typer.echo("  Reuse the same URL; configure each app/account once, not every physical device.")
+    if "claude" in targets:
+        typer.echo("Claude:")
+        typer.echo("  Docs: https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp")
+        typer.echo("  1. Open Claude Customize > Connectors.")
+        typer.echo("  2. Click +, choose Add custom connector, then Custom > Web if Claude asks.")
+        typer.echo("  3. Paste the /mcp URL above. Leave advanced OAuth fields blank.")
+        typer.echo("  4. Click Add, then Connect. Claude opens the Yutome pairing tab.")
+        typer.echo("  5. Paste the latest pairing code printed above, then approve.")
+        typer.echo("  6. Back in Claude, expand Read-only tools and choose Allowed always if you")
+        typer.echo("     trust this read-only connector; otherwise Claude will prompt every tool call.")
+        typer.echo("  Claude may route Settings > Connectors to Customize > Connectors.")
+        typer.echo("  The same Claude account should make it available across web, mobile, Desktop, and Cowork.")
+        typer.echo("  Enable/select Yutome in each chat if Claude shows a per-chat connector picker.")
+    if "chatgpt" in targets:
+        typer.echo("ChatGPT:")
+        typer.echo("  Docs: https://developers.openai.com/api/docs/guides/developer-mode")
+        typer.echo("  MCP auth notes: https://developers.openai.com/api/docs/mcp")
+        typer.echo("  1. Turn on Developer mode from Settings > Apps > Advanced settings.")
+        typer.echo("  2. Open Settings > Apps, click Create app, and paste the /mcp URL above.")
+        typer.echo("  3. Choose OAuth/authenticated when ChatGPT asks.")
+        typer.echo("  4. During OAuth, paste the latest pairing code printed above.")
+        typer.echo("  5. In each chat, select Yutome from + > More / composer tools before asking.")
+    if "other" in targets:
+        typer.echo("Other MCP clients:")
+        typer.echo("  MCP transport docs: https://modelcontextprotocol.io/docs/concepts/transports")
+        typer.echo("  Remote test guide: https://developers.cloudflare.com/agents/guides/test-remote-mcp-server/")
+        typer.echo("  Reuse the same /mcp URL; configure each app/account once, not every physical device.")
+        typer.echo("  Pick Streamable HTTP if the client asks for a transport. OAuth/DCR is handled")
+        typer.echo("  by the Worker; the only user-facing secret is the latest pairing code.")
     typer.echo("")
     typer.echo("If this computer or bridge is off, the connector stays installed but reports Yutome Desktop offline.")
     typer.echo("No Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.")
@@ -1082,15 +1246,15 @@ def _print_pairing_next_steps(state: Any) -> None:
     if not endpoint:
         return
     typer.echo("")
-    typer.echo("Pair this connector once:")
+    typer.echo("Pair this connector during assistant setup:")
     if pairing_code:
-        typer.echo(f"  Open: {endpoint}/pair")
         typer.echo(f"  Code: {pairing_code}")
-        typer.echo("  (Claude/ChatGPT will prompt you in a browser tab during OAuth setup.")
-        typer.echo("  Paste the code there.)")
+        typer.echo("  Use the latest code printed by `yutome connect`; rerunning deploy refreshes it.")
+        typer.echo("  Claude/ChatGPT will open the Yutome browser tab during OAuth setup.")
+        typer.echo("  Do not open /pair manually. Paste the code in the assistant-opened tab.")
+        typer.echo("  If several Yutome tabs are open, use the newest tab/newest code and close the rest after success.")
     else:
-        typer.echo(f"  Open {endpoint}/pair after adding the connector to your assistant.")
-        typer.echo("  You will need the YUTOME_PAIRING_CODE secret you set on the Worker.")
+        typer.echo("  You will need the YUTOME_PAIRING_CODE secret set on the Worker.")
     typer.echo("")
     typer.echo("Tip: in Claude Desktop, after pairing succeeds, open the connector settings,")
     typer.echo("expand 'Read-only tools', and switch the per-group permission from")
@@ -1104,8 +1268,12 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("  Remote MCP means Claude/ChatGPT call one public Yutome connector URL, then yutome")
     typer.echo("  answers from the library and search index on this computer.")
     typer.echo("  Add it once per assistant account; you should not need to repeat setup for every device.")
-    typer.echo("  ChatGPT also asks you to select the Yutome app in a chat with + > More before asking.")
+    typer.echo("  When you connect, yutome asks whether you want Claude, ChatGPT, both, or another MCP client.")
+    typer.echo("  Claude/ChatGPT may still ask you to enable or select Yutome in each chat before asking.")
+    typer.echo("  For ChatGPT, select Yutome from + > More / composer tools before asking.")
     typer.echo("  In this first version, this computer and `yutome remote bridge` must be on.")
+    typer.echo("  Rerunning `yutome connect --deploy` refreshes the pairing code and bridge token,")
+    typer.echo("  so use the newest printed code and restart any old `yutome remote bridge` process.")
     typer.echo("  Setup needs a small public connector endpoint. If Yutome provides one, paste it; otherwise")
     typer.echo("  yutome can deploy a Cloudflare Worker from the tracked TypeScript subproject for you.")
     typer.echo("  You may need to create or sign into a Cloudflare account during deploy.")
@@ -1113,7 +1281,7 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("  The basic laptop-backed connector is designed for Cloudflare's free Workers plan.")
     typer.echo("  Always-on/offline search is a later mode and may require enabling Cloudflare billing.")
     if yes:
-        typer.echo("  Optional next step: uv run yutome connect")
+        typer.echo("  Optional next step: yutome connect --app claude")
 
 
 def _pairing_url(endpoint_url: str, pairing_code: str | None = None) -> str:
@@ -1169,6 +1337,7 @@ def _run_command_streamed(command: list[str], *, cwd: Path) -> tuple[int, str]:
 # ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
 
 CAPSULE_PROJECT_NAME = "yutome-remote-mcp"  # matches name in wrangler.toml
+GENERATED_WRANGLER_FILENAME = "wrangler.generated.toml"
 
 
 def _tracked_capsule_path() -> Path:
@@ -1187,33 +1356,121 @@ def _ensure_capsule_node_modules(capsule: Path) -> None:
             err=True,
         )
         typer.echo(f"Missing: {', '.join(missing)}", err=True)
-        typer.echo(f"Install Node.js LTS from {NODE_DOWNLOAD_URL}, then rerun `uv run yutome connect --deploy`.", err=True)
+        typer.echo(f"Install Node.js LTS from {NODE_DOWNLOAD_URL}, then rerun `yutome connect --deploy`.", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"Installing TypeScript Worker dependencies in {capsule}")
     returncode, _ = _run_command_streamed(["npm", "install"], cwd=capsule)
     if returncode != 0:
-        typer.echo("npm install failed. Fix the error above and rerun `uv run yutome connect --deploy`.", err=True)
+        typer.echo("npm install failed. Fix the error above and rerun `yutome connect --deploy`.", err=True)
         raise typer.Exit(code=returncode)
 
 
 _OAUTH_KV_ID_RE = re.compile(r'id\s*=\s*"([0-9a-f]{8,})"')
 
 
-def _ensure_oauth_kv_namespace(capsule: Path) -> None:
-    """If wrangler.toml has no active OAUTH_KV binding, create the namespace
-    and write the resulting id into the config. Idempotent — re-runs are
-    cheap because we check for an existing uncommented binding first."""
-    wrangler_path = capsule / "wrangler.toml"
-    content = wrangler_path.read_text(encoding="utf-8")
+def _generated_cloudflare_dir(paths: ProjectPaths) -> Path:
+    return paths.data_dir / "remote" / "cloudflare"
 
-    # Strip comment-only lines to test whether OAUTH_KV is actually bound.
-    active = "\n".join(
-        line for line in content.splitlines() if not line.lstrip().startswith("#")
+
+def _generated_wrangler_config_path(paths: ProjectPaths) -> Path:
+    return _generated_cloudflare_dir(paths) / GENERATED_WRANGLER_FILENAME
+
+
+def _active_oauth_kv_id(content: str) -> str | None:
+    active = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("#"))
+    if 'binding = "OAUTH_KV"' not in active:
+        return None
+    match = _OAUTH_KV_ID_RE.search(active.split('binding = "OAUTH_KV"', 1)[1])
+    return match.group(1) if match else None
+
+
+def _strip_oauth_kv_binding(content: str) -> str:
+    lines = content.splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "[[kv_namespaces]]":
+            block = [line]
+            index += 1
+            while index < len(lines) and not lines[index].lstrip().startswith("["):
+                block.append(lines[index])
+                index += 1
+            if any('binding = "OAUTH_KV"' in block_line for block_line in block):
+                continue
+            output.extend(block)
+            continue
+        output.append(line)
+        index += 1
+    return "\n".join(output).rstrip() + "\n"
+
+
+def _write_generated_wrangler_config(capsule: Path, paths: ProjectPaths, namespace_id: str) -> Path:
+    source_config = capsule / "wrangler.toml"
+    content = _strip_oauth_kv_binding(source_config.read_text(encoding="utf-8"))
+    absolute_main = str((capsule / "src" / "index.ts").resolve()).replace("\\", "\\\\")
+    content = re.sub(r'^main\s*=\s*"[^"]+"', f'main = "{absolute_main}"', content, count=1, flags=re.MULTILINE)
+    content = (
+        content.rstrip()
+        + "\n\n# Generated by `yutome connect --deploy`; account-specific and ignored by git.\n"
+        + "[[kv_namespaces]]\n"
+        + 'binding = "OAUTH_KV"\n'
+        + f'id = "{namespace_id}"\n'
     )
-    if 'binding = "OAUTH_KV"' in active and _OAUTH_KV_ID_RE.search(
-        active.split('binding = "OAUTH_KV"', 1)[1]
-    ):
-        return  # already configured
+    generated_path = _generated_wrangler_config_path(paths)
+    generated_path.parent.mkdir(parents=True, exist_ok=True)
+    generated_path.write_text(content, encoding="utf-8")
+    try:
+        generated_path.chmod(0o600)
+    except OSError:
+        pass
+    return generated_path
+
+
+def _existing_oauth_kv_namespace_id(capsule: Path) -> str | None:
+    completed = subprocess.run(
+        ["npx", "--yes", "wrangler", "kv", "namespace", "list"],
+        cwd=capsule,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    try:
+        namespaces = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(namespaces, list):
+        return None
+    for namespace in namespaces:
+        if not isinstance(namespace, dict):
+            continue
+        if namespace.get("title") == "OAUTH_KV" and isinstance(namespace.get("id"), str):
+            return namespace["id"]
+    return None
+
+
+def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
+    """Create or reuse an account-local OAUTH_KV binding in ignored state.
+
+    The tracked Worker config deliberately does not contain a real KV id because
+    Cloudflare namespace ids are account-specific. Assisted deploy writes the
+    actual binding to data/remote/cloudflare/wrangler.generated.toml instead.
+    """
+    generated_config = _generated_wrangler_config_path(paths)
+    if generated_config.exists():
+        existing_id = _active_oauth_kv_id(generated_config.read_text(encoding="utf-8"))
+        if existing_id:
+            return generated_config
+
+    existing_namespace_id = _existing_oauth_kv_namespace_id(capsule)
+    if existing_namespace_id:
+        typer.echo(f"[OK] Reusing existing OAUTH_KV namespace id={existing_namespace_id}")
+        generated_config = _write_generated_wrangler_config(capsule, paths, existing_namespace_id)
+        typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
+        return generated_config
 
     typer.echo("Creating Cloudflare KV namespace OAUTH_KV (one-time setup)…")
     completed = subprocess.run(
@@ -1242,36 +1499,21 @@ def _ensure_oauth_kv_namespace(capsule: Path) -> None:
         raise typer.Exit(code=1)
     namespace_id = match.group(1)
     typer.echo(f"[OK] Created OAUTH_KV namespace id={namespace_id}")
-
-    new_block = (
-        "\n# KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).\n"
-        "# Auto-created by `yutome connect --deploy`.\n"
-        '[[kv_namespaces]]\n'
-        'binding = "OAUTH_KV"\n'
-        f'id = "{namespace_id}"\n'
-    )
-    if "binding = \"OAUTH_KV\"" in content:
-        # Replace any commented-out template block with the real one.
-        content = re.sub(
-            r"(?:^#[^\n]*\n)*#?\s*\[\[kv_namespaces\]\][^\n]*\n(?:#?[^\n]*\n)*",
-            new_block.lstrip("\n"),
-            content,
-            count=1,
-            flags=re.MULTILINE,
-        )
-    else:
-        content = content.rstrip() + "\n" + new_block
-    wrangler_path.write_text(content, encoding="utf-8")
-    typer.echo(f"[OK] Wrote OAUTH_KV binding to {wrangler_path}")
+    generated_config = _write_generated_wrangler_config(capsule, paths, namespace_id)
+    typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
+    return generated_config
 
 
-def _push_wrangler_secret(capsule: Path, name: str, value: str) -> None:
+def _push_wrangler_secret(capsule: Path, name: str, value: str, *, wrangler_config: Path | None = None) -> None:
     """Push a secret to the deployed Worker via `wrangler secret put`."""
     typer.echo(f"Setting Cloudflare secret {name}")
+    command = ["npx", "--yes", "wrangler", "secret", "put", name]
+    if wrangler_config is not None:
+        command.extend(["--config", str(wrangler_config)])
     completed = subprocess.run(
-        ["npx", "--yes", "wrangler", "secret", "put", name],
+        command,
         cwd=capsule,
-        input=value,
+        input=f"{value}\n",
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1286,6 +1528,7 @@ def _push_wrangler_secret(capsule: Path, name: str, value: str) -> None:
 
 def _deploy_tracked_capsule(
     *,
+    paths: ProjectPaths,
     refresh_contract: bool = True,
     relay_token: str | None = None,
     pairing_code: str | None = None,
@@ -1313,21 +1556,21 @@ def _deploy_tracked_capsule(
         typer.echo(f"[OK] Refreshed contract: {contract_path}")
 
     _ensure_capsule_node_modules(capsule)
-    _ensure_oauth_kv_namespace(capsule)
+    wrangler_config = _ensure_oauth_kv_namespace(capsule, paths)
 
     typer.echo(f"Deploying Cloudflare Worker from {capsule}")
-    command = ["npx", "--yes", "wrangler", "deploy"]
+    command = ["npx", "--yes", "wrangler", "deploy", "--config", str(wrangler_config)]
     returncode, output = _run_command_streamed(command, cwd=capsule)
     if returncode != 0:
         typer.echo(
-            "Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `uv run yutome connect --deploy`.",
+            "Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `yutome connect --deploy`.",
             err=True,
         )
         raise typer.Exit(code=returncode)
 
     # Worker is up. Push secrets so OAuth pairing + bridge auth work.
-    _push_wrangler_secret(capsule, "YUTOME_RELAY_TOKEN", effective_relay_token)
-    _push_wrangler_secret(capsule, "YUTOME_PAIRING_CODE", effective_pairing_code)
+    _push_wrangler_secret(capsule, "YUTOME_RELAY_TOKEN", effective_relay_token, wrangler_config=wrangler_config)
+    _push_wrangler_secret(capsule, "YUTOME_PAIRING_CODE", effective_pairing_code, wrangler_config=wrangler_config)
 
     deployed_url = _extract_worker_url(output)
     return deployed_url, CAPSULE_PROJECT_NAME, effective_relay_token, effective_pairing_code
@@ -1363,6 +1606,7 @@ def _save_deployed_worker_endpoint(
     relay_token: str | None = None,
     pairing_code: str | None = None,
     token_secret: str | None = None,
+    assistant_apps: str | None = None,
 ) -> None:
     state_path = _save_remote_connection(
         config,
@@ -1379,7 +1623,11 @@ def _save_deployed_worker_endpoint(
     if state is not None:
         typer.echo(f"[OK] MCP URL: {state.mcp_url}")
         _print_pairing_next_steps(state)
-        _print_connector_next_steps(state.mcp_url)
+        _print_connector_next_steps(
+            state.mcp_url,
+            bridge_configured=bool(state.relay_token),
+            assistant_apps=assistant_apps,
+        )
 
 
 def _disconnect_remote(
@@ -1435,7 +1683,7 @@ def _disconnect_remote(
 def setup(
     channel: str | None = typer.Argument(
         None,
-        help="Optional channel URL, handle, or channel id to add during setup.",
+        help="Optional channel or video URL/id to add during setup.",
     ),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -1481,6 +1729,7 @@ def setup(
     _setup_webshare(env_path, yes=yes)
     _setup_gemini(config, env_path, yes=yes)
     semantic_enabled = _setup_semantic_search(config, env_path, yes=yes)
+    _set_toml_string(config, "find", "default_mode", "hybrid" if semantic_enabled else "lexical")
     load_dotenv(env_path)
     app_config = apply_env_to_config(load_config(config))
 
@@ -1496,14 +1745,25 @@ def setup(
         )
     selected_channel = channel
     if selected_channel is None and not yes and not setup_library_channels:
-        if typer.confirm("Add a YouTube channel now?", default=True):
-            selected_channel = typer.prompt("Channel URL, handle, or channel id").strip()
+        if typer.confirm("Add a YouTube source now?", default=True):
+            selected_channel = typer.prompt("Channel or video URL, handle, or id").strip()
     if selected_channel:
-        added_channel = _add_setup_channel(config, selected_channel)
-        if added_channel is not None:
-            setup_library_channels.append(added_channel)
-        added = 1 if added_channel is not None else 0
-        typer.echo(f"[OK] Added {added} selected channel{'s' if added != 1 else ''}.")
+        added_source = _add_setup_source(config, selected_channel)
+        if added_source is not None and added_source.source_type == "youtube_channel":
+            setup_library_channels.append(
+                LibraryChannel(
+                    library_channel_id=added_source.source_id,
+                    source=added_source.source,
+                    source_url=added_source.source_url,
+                    channel_id=added_source.channel_id,
+                    handle=added_source.handle,
+                    title=added_source.title,
+                    selected=added_source.selected,
+                    import_source=added_source.import_source,
+                )
+            )
+        added = 1 if added_source is not None else 0
+        typer.echo(f"[OK] Added {added} selected source{'s' if added != 1 else ''}.")
     elif not setup_library_channels:
         typer.echo("[OK] No channel added yet.")
 
@@ -1524,35 +1784,50 @@ def setup(
     typer.echo("")
     typer.echo("Next steps:" if not ran_sync else "After this run:")
     if setup_library_channels:
-        typer.echo("  uv run yutome sync")
+        typer.echo("  yutome sync")
     else:
-        typer.echo("  uv run yutome channels add https://www.youtube.com/@SomeChannel")
-        typer.echo("  uv run yutome sync")
+        typer.echo("  yutome add https://www.youtube.com/@SomeChannel")
+        typer.echo("  yutome sync")
     if semantic_enabled:
-        typer.echo("  uv run yutome find \"topic I remember\" --mode hybrid")
+        typer.echo("  yutome find \"topic I remember\" --mode hybrid")
     else:
         typer.echo("  # Optional semantic search:")
         typer.echo("  #   add VOYAGE_API_KEY to .env")
         typer.echo("  #   uv sync --extra vectors --extra embeddings")
-        typer.echo("  #   uv run yutome setup")
-    typer.echo("  uv run yutome status")
-    typer.echo('  uv run yutome find "topic I remember"')
+        typer.echo("  #   yutome setup")
+    typer.echo("  yutome status")
+    typer.echo('  yutome find "topic I remember"')
     if _env_has_webshare_credentials(env_path):
-        typer.echo("  uv run yutome proxy-info")
+        typer.echo("  yutome proxy-info")
     _print_setup_mcp_section(yes=yes)
     if not yes and typer.confirm("Connect Yutome to Claude/ChatGPT now?", default=False):
+        assistant_apps = _prompt_assistant_apps()
         endpoint = typer.prompt(
             "Remote connector URL if you already have one (blank to deploy the tracked Worker)",
             default="",
             show_default=False,
         ).strip()
         if endpoint:
+            relay_token = typer.prompt(
+                "YUTOME_RELAY_TOKEN for this Worker (blank if unknown)",
+                default="",
+                hide_input=True,
+                show_default=False,
+            ).strip()
+            pairing_code = typer.prompt(
+                "YUTOME_PAIRING_CODE for this Worker (blank if unknown)",
+                default="",
+                show_default=False,
+            ).strip()
             try:
                 _save_deployed_worker_endpoint(
                     config,
                     endpoint=endpoint,
                     mode="connector_only",
                     worker_name=CAPSULE_PROJECT_NAME,
+                    relay_token=relay_token or None,
+                    pairing_code=pairing_code or None,
+                    assistant_apps=assistant_apps,
                 )
             except ValueError as exc:
                 typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
@@ -1569,14 +1844,14 @@ def setup(
                 if not _can_run_cloudflare_deploy():
                     webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
                     typer.echo("Opened Cloudflare Workers. Install Node.js LTS, then run:")
-                    typer.echo("  uv run yutome connect --deploy")
+                    typer.echo("  yutome connect --deploy")
                     return
                 (
                     deployed_url,
                     deployed_worker_name,
                     deployed_relay_token,
                     deployed_pairing_code,
-                ) = _deploy_tracked_capsule()
+                ) = _deploy_tracked_capsule(paths=paths)
                 if deployed_url:
                     _save_deployed_worker_endpoint(
                         config,
@@ -1585,10 +1860,11 @@ def setup(
                         worker_name=deployed_worker_name,
                         relay_token=deployed_relay_token,
                         pairing_code=deployed_pairing_code,
+                        assistant_apps=assistant_apps,
                     )
                 else:
                     typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
-                    typer.echo("Save the endpoint manually with `uv run yutome connect --endpoint <url>`.")
+                    typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
 
 
 @app.command("connect")
@@ -1619,6 +1895,22 @@ def connect_command(
         "--worker-name",
         help="Cloudflare Worker name for generated deployments or for later cleanup of a pasted endpoint.",
     ),
+    relay_token: str | None = typer.Option(
+        None,
+        "--relay-token",
+        help="Bridge bearer token for an already-deployed Worker endpoint.",
+    ),
+    pairing_code: str | None = typer.Option(
+        None,
+        "--pairing-code",
+        help="Pairing code secret for an already-deployed Worker endpoint.",
+    ),
+    assistant_app: str = typer.Option(
+        "all",
+        "--app",
+        "--assistant",
+        help="Assistant instructions to print: claude, chatgpt, both, other, or all.",
+    ),
     mode: str = typer.Option(
         "connector-only",
         "--mode",
@@ -1626,9 +1918,17 @@ def connect_command(
     ),
 ) -> None:
     """Connect Claude/ChatGPT to yutome through one remote MCP endpoint."""
+    try:
+        _assistant_app_targets(assistant_app)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     remote_mode = _remote_mode_from_option(mode)
     paths = _prepare_connect_project(config)
     if endpoint is None:
+        if relay_token or pairing_code:
+            typer.echo("--relay-token and --pairing-code are only used with --endpoint.", err=True)
+            raise typer.Exit(code=1)
         _print_cloudflare_connect_instructions()
         typer.echo(f"Remote state will be saved at: {remote_state_path(paths)}")
         if open_cloudflare:
@@ -1641,15 +1941,15 @@ def connect_command(
             typer.echo(f"  {_tracked_capsule_path()}")
             typer.echo("")
             typer.echo("Run the assisted deploy with:")
-            typer.echo("  uv run yutome connect --deploy")
+            typer.echo("  yutome connect --deploy")
             return
 
         deployed_url, deployed_worker_name, deployed_relay_token, deployed_pairing_code = (
-            _deploy_tracked_capsule()
+            _deploy_tracked_capsule(paths=paths)
         )
         if deployed_url is None:
             typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
-            typer.echo("Save the endpoint manually with `uv run yutome connect --endpoint <url>`.")
+            typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
             return
         _save_deployed_worker_endpoint(
             config,
@@ -1658,10 +1958,18 @@ def connect_command(
             worker_name=deployed_worker_name,
             relay_token=deployed_relay_token,
             pairing_code=deployed_pairing_code,
+            assistant_apps=assistant_app,
         )
         return
     try:
-        state_path = _save_remote_connection(config, endpoint=endpoint, mode=remote_mode, worker_name=worker_name)
+        state_path = _save_remote_connection(
+            config,
+            endpoint=endpoint,
+            mode=remote_mode,
+            worker_name=worker_name,
+            relay_token=relay_token,
+            pairing_code=pairing_code,
+        )
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -1672,7 +1980,11 @@ def connect_command(
         typer.echo(f"[OK] Provider: {state.provider}")
         typer.echo(f"[OK] MCP URL: {state.mcp_url}")
         _print_pairing_next_steps(state)
-        _print_connector_next_steps(state.mcp_url)
+        _print_connector_next_steps(
+            state.mcp_url,
+            bridge_configured=bool(state.relay_token),
+            assistant_apps=assistant_app,
+        )
 
 
 @app.command("disconnect")
@@ -1770,15 +2082,17 @@ def status_command(
     if remote["configured"]:
         typer.echo(f"  provider={remote['provider']} mode={remote['mode']}")
         typer.echo(f"  mcp_url={remote['mcp_url']}")
-        typer.echo(f"  pairing={remote['pairing_status']} desktop={remote['desktop_connection']}")
+        typer.echo(f"  assistant_oauth={remote.get('assistant_oauth_status')}")
+        typer.echo(f"  desktop={remote['desktop_connection']}")
+        if remote.get("relay_status_error"):
+            typer.echo(f"  live_status=unavailable ({remote['relay_status_error']})")
         typer.echo(f"  bridge_token={'configured' if remote.get('relay_token_configured') else 'missing'}")
-        typer.echo(
-            f"  oauth_secrets={'configured' if remote.get('pairing_code_configured') and remote.get('token_secret_configured') else 'missing'}"
-        )
+        typer.echo(f"  pairing_code={'configured' if remote.get('pairing_code_configured') else 'missing'}")
+        typer.echo("  oauth_storage=worker OAUTH_KV")
         typer.echo(f"  offline_search={remote['offline_search']}")
     else:
         typer.echo("  not configured")
-        typer.echo("  run: uv run yutome connect")
+        typer.echo("  run: yutome connect")
 
 
 @app.command()
@@ -1866,36 +2180,36 @@ def doctor(
         raise typer.Exit(code=1)
 
 
-@channels_app.command("add")
-def channels_add(
-    targets: list[str] = typer.Argument(..., help="YouTube channel URL, handle, or channel id."),
+@app.command("add")
+def add_sources(
+    targets: list[str] = typer.Argument(..., help="YouTube channel or video URL, handle, or id."),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
         "--config",
         "-c",
         help="Path to the yutome TOML config.",
     ),
-    title: str | None = typer.Option(None, "--title", help="Optional display title for one channel."),
-    selected: bool = typer.Option(True, "--selected/--unselected", help="Include channel in default sync runs."),
+    title: str | None = typer.Option(None, "--title", help="Optional display title for one source."),
+    selected: bool = typer.Option(True, "--selected/--unselected", help="Include source in default sync runs."),
 ) -> None:
-    """Add channel URLs, handles, or ids to the local channel library."""
+    """Add YouTube sources to the local library."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
     bootstrap_catalog(paths.catalog_db)
     imported = 0
     with connect_catalog(paths.catalog_db) as connection:
         for target in targets:
-            channel = channel_from_input(target, title=title if len(targets) == 1 else None, import_source="manual")
-            if channel is None:
+            source = source_from_input(target, title=title if len(targets) == 1 else None, import_source="manual")
+            if source is None:
                 continue
-            upsert_library_channel(connection, channel, selected=selected)
+            upsert_library_source(connection, source, selected=selected)
             imported += 1
         connection.commit()
-    typer.echo(f"Added {imported} channel{'s' if imported != 1 else ''}.")
+    typer.echo(f"Added {imported} source{'s' if imported != 1 else ''}.")
 
 
-@channels_app.command("import")
-def channels_import(
+@app.command("import")
+def import_command(
     path: Path = typer.Argument(..., exists=True, readable=True, help="CSV, OPML/XML, or plain URL list."),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -1903,22 +2217,22 @@ def channels_import(
         "-c",
         help="Path to the yutome TOML config.",
     ),
-    selected: bool = typer.Option(True, "--selected/--unselected", help="Include imported channels in default sync runs."),
+    selected: bool = typer.Option(True, "--selected/--unselected", help="Include imported sources in default sync runs."),
 ) -> None:
-    """Import channels from Google Takeout CSV, OPML/XML, or a plain list."""
+    """Import sources from CSV, OPML/XML, or a plain list."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
     bootstrap_catalog(paths.catalog_db)
-    channels = import_channels_from_file(path, selected=selected)
+    sources = import_sources_from_file(path, selected=selected)
     with connect_catalog(paths.catalog_db) as connection:
-        for channel in channels:
-            upsert_library_channel(connection, channel, selected=selected)
+        for source in sources:
+            upsert_library_source(connection, source, selected=selected)
         connection.commit()
-    typer.echo(f"Imported {len(channels)} channel{'s' if len(channels) != 1 else ''}.")
+    typer.echo(f"Imported {len(sources)} source{'s' if len(sources) != 1 else ''}.")
 
 
-@channels_app.command("import-youtube")
-def channels_import_youtube(
+@app.command("import-youtube")
+def import_youtube(
     target: str | None = typer.Argument(
         None,
         help=(
@@ -1965,9 +2279,9 @@ def channels_import_youtube(
     )
 
 
-@channels_app.command("select")
-def channels_select(
-    selector: str = typer.Argument(..., help="Channel id, URL, handle, title, or 'all'."),
+@app.command("select")
+def select_source(
+    selector: str = typer.Argument(..., help="Source id, URL, handle, title, or 'all'."),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
         "--config",
@@ -1975,19 +2289,19 @@ def channels_select(
         help="Path to the yutome TOML config.",
     ),
 ) -> None:
-    """Include matching channel library entries in default sync runs."""
+    """Include matching sources in default sync runs."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
     bootstrap_catalog(paths.catalog_db)
     with connect_catalog(paths.catalog_db) as connection:
-        count = set_library_channel_selected(connection, selector=selector, selected=True)
+        count = set_library_source_selected(connection, selector=selector, selected=True)
         connection.commit()
-    typer.echo(f"Selected {count} channel{'s' if count != 1 else ''}.")
+    typer.echo(f"Selected {count} source{'s' if count != 1 else ''}.")
 
 
-@channels_app.command("unselect")
-def channels_unselect(
-    selector: str = typer.Argument(..., help="Channel id, URL, handle, title, or 'all'."),
+@app.command("unselect")
+def unselect_source(
+    selector: str = typer.Argument(..., help="Source id, URL, handle, title, or 'all'."),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
         "--config",
@@ -1995,14 +2309,14 @@ def channels_unselect(
         help="Path to the yutome TOML config.",
     ),
 ) -> None:
-    """Exclude matching channel library entries from default sync runs."""
+    """Exclude matching sources from default sync runs."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
     bootstrap_catalog(paths.catalog_db)
     with connect_catalog(paths.catalog_db) as connection:
-        count = set_library_channel_selected(connection, selector=selector, selected=False)
+        count = set_library_source_selected(connection, selector=selector, selected=False)
         connection.commit()
-    typer.echo(f"Unselected {count} channel{'s' if count != 1 else ''}.")
+    typer.echo(f"Unselected {count} source{'s' if count != 1 else ''}.")
 
 
 @quality_app.command("upgrade")
@@ -2113,8 +2427,7 @@ def sync(
     target: str | None = typer.Argument(
         None,
         help=(
-            "YouTube channel URL or handle URL. Omit to sync selected channels "
-            "from `yutome list channels`."
+            "YouTube channel or video URL/id. Omit to sync selected sources."
         ),
     ),
     config: Path = typer.Option(
@@ -2126,7 +2439,7 @@ def sync(
     all_channels: bool = typer.Option(
         False,
         "--all",
-        help="Sync every selected channel in the local channel library.",
+        help="Sync every selected source in the local library.",
     ),
     limit: int | None = typer.Option(
         None,
@@ -2226,7 +2539,7 @@ def sync(
         help="Override Webshare transcript retries for this run.",
     ),
 ) -> None:
-    """Discover and index a YouTube channel."""
+    """Discover and index YouTube sources."""
     load_dotenv(_project_root(config) / ".env")
     app_config = apply_env_to_config(load_config(config))
     if proxy_retries_when_blocked is not None:
@@ -2254,19 +2567,37 @@ def sync(
     if target and all_channels:
         raise typer.BadParameter("Pass either TARGET or --all, not both.")
     if use_catalog:
-        sync_targets = [(target or "catalog", None)]
+        sync_targets = [(target or "catalog", None, "catalog")]
     elif target:
-        sync_targets = [(target, None)]
+        source = source_from_input(target)
+        if source is None:
+            typer.echo(f"Unsupported source: {target}", err=True)
+            raise typer.Exit(code=1)
+        bootstrap_catalog(paths.catalog_db)
+        with connect_catalog(paths.catalog_db) as connection:
+            upsert_library_source(connection, source, selected=True)
+            connection.commit()
+        sync_targets = [
+            (
+                source.source_url,
+                source.title or source.handle or source.video_id or source.channel_id,
+                source.source_type,
+            )
+        ]
     else:
         bootstrap_catalog(paths.catalog_db)
         with connect_catalog(paths.catalog_db) as connection:
-            selected_channels = list_library_channels(connection, selected_only=True)
-        if not selected_channels:
-            typer.echo("No selected channels. Add one with `yutome channels add URL` or import subscriptions.", err=True)
+            selected_sources = list_library_sources(connection, selected_only=True)
+        if not selected_sources:
+            typer.echo("No selected sources. Add one with `yutome add URL` or import subscriptions.", err=True)
             raise typer.Exit(code=1)
         sync_targets = [
-            (channel.source_url, channel.title or channel.handle or channel.channel_id)
-            for channel in selected_channels
+            (
+                source.source_url,
+                source.title or source.handle or source.video_id or source.channel_id,
+                source.source_type,
+            )
+            for source in selected_sources
         ]
 
     effective_workers = workers if workers is not None else app_config.backfill.workers
@@ -2516,18 +2847,29 @@ def show_channel(
 
 @show_app.command("transcript")
 def show_transcript(
-    transcript_version_id: str = typer.Argument(..., help="Transcript version id."),
+    transcript_id_or_video_id: str = typer.Argument(..., help="Transcript version id or video id."),
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
         "--config",
         "-c",
         help="Path to the yutome TOML config.",
     ),
+    offset: int = typer.Option(0, "--offset", min=0, help="Segment offset for long transcript paging."),
+    limit: int | None = typer.Option(None, "--limit", min=1, max=5000, help="Maximum transcript segments to return."),
 ) -> None:
-    """Fetch one transcript by id."""
+    """Fetch one transcript by transcript id or active video id."""
     app_config, paths = _load_runtime(config)
     try:
-        _echo_json(api_show(config=app_config, paths=paths, kind="transcript", id_=transcript_version_id))
+        _echo_json(
+            api_show(
+                config=app_config,
+                paths=paths,
+                kind="transcript",
+                id_=transcript_id_or_video_id,
+                transcript_offset=offset,
+                transcript_limit=limit,
+            )
+        )
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -2542,12 +2884,16 @@ def show_context(
         "-c",
         help="Path to the yutome TOML config.",
     ),
+    id_: str | None = typer.Option(None, "--id", help="Chunk id; equivalent to positional ANCHOR."),
     video_id: str | None = typer.Option(None, "--video-id", help="Video id for timestamp lookup."),
     time_seconds: int | None = typer.Option(None, "--time", min=0, help="Timestamp in seconds for video lookup."),
     youtube_url: str | None = typer.Option(None, "--youtube-url", help="Timestamped YouTube URL."),
     token_budget: int = typer.Option(3000, "--token-budget", min=200, max=8000, help="Context token budget."),
 ) -> None:
     """Expand neighboring transcript text around a citation anchor."""
+    if anchor and id_ and anchor != id_:
+        raise typer.BadParameter("Pass either positional ANCHOR or --id, not both.")
+    anchor_id = anchor or id_
     app_config, paths = _load_runtime(config)
     try:
         _echo_json(
@@ -2555,7 +2901,7 @@ def show_context(
                 config=app_config,
                 paths=paths,
                 kind="context",
-                id_=anchor,
+                id_=anchor_id,
                 video_id=video_id,
                 time_seconds=time_seconds,
                 youtube_url=youtube_url,
@@ -2576,11 +2922,15 @@ def show_source(
         "-c",
         help="Path to the yutome TOML config.",
     ),
+    id_: str | None = typer.Option(None, "--id", help="Chunk id; equivalent to positional ANCHOR."),
     video_id: str | None = typer.Option(None, "--video-id", help="Video id for timestamp lookup."),
     time_seconds: int | None = typer.Option(None, "--time", min=0, help="Timestamp in seconds for video lookup."),
     youtube_url: str | None = typer.Option(None, "--youtube-url", help="Timestamped YouTube URL."),
 ) -> None:
     """Resolve a citation anchor to the canonical source URL and provenance."""
+    if anchor and id_ and anchor != id_:
+        raise typer.BadParameter("Pass either positional ANCHOR or --id, not both.")
+    anchor_id = anchor or id_
     app_config, paths = _load_runtime(config)
     try:
         _echo_json(
@@ -2588,7 +2938,7 @@ def show_source(
                 config=app_config,
                 paths=paths,
                 kind="source",
-                id_=anchor,
+                id_=anchor_id,
                 video_id=video_id,
                 time_seconds=time_seconds,
                 youtube_url=youtube_url,
@@ -2814,7 +3164,7 @@ def proxy_test(
             _status(
                 False,
                 "youtube-transcript-api",
-                redact_proxy_secrets(app_config.proxy, str(exc), key=video_id)[:500],
+                _proxy_diagnostic_detail(app_config, exc, video_id=video_id),
             )
 
     if ytdlp_subtitles:
@@ -2833,7 +3183,7 @@ def proxy_test(
             _status(
                 False,
                 "yt-dlp subtitles",
-                redact_proxy_secrets(app_config.proxy, str(exc), key=video_id)[:500],
+                _proxy_diagnostic_detail(app_config, exc, video_id=video_id),
             )
 
     if failures:
@@ -2963,11 +3313,11 @@ def remote_prepare(
         typer.echo("Token not printed. Re-run with --show-token if you need to copy it to a client.")
     typer.echo("")
     typer.echo("Serve locally for a reverse proxy:")
-    typer.echo("  uv run yutome remote serve --host 127.0.0.1 --port 8765")
+    typer.echo("  yutome remote serve --host 127.0.0.1 --port 8765")
     typer.echo("Serve on a private network/VPN interface:")
-    typer.echo("  uv run yutome remote serve --host 0.0.0.0 --port 8765")
+    typer.echo("  yutome remote serve --host 0.0.0.0 --port 8765")
     typer.echo("Serve remote MCP for agent clients:")
-    typer.echo("  uv run yutome remote mcp --host 0.0.0.0 --port 8766")
+    typer.echo("  yutome remote mcp --host 0.0.0.0 --port 8766")
 
 
 def _remote_bridge_headers(token: str) -> dict[str, str]:
@@ -3354,11 +3704,12 @@ def remote_bridge(
     app_config, paths = _load_runtime(config)
     state = load_remote_state(paths)
     if state is None:
-        typer.echo("Remote connector is not configured. Run: uv run yutome connect", err=True)
+        typer.echo("Remote connector is not configured. Run: yutome connect", err=True)
         raise typer.Exit(code=1)
     if not state.relay_token:
         typer.echo(
-            "Remote connector has no bridge token. Redeploy with `uv run yutome connect --deploy`.",
+            "Remote connector has no bridge token. Redeploy with `yutome connect --deploy`, "
+            "or save the existing Worker with `yutome connect --endpoint <url> --relay-token <token> --pairing-code <code>`.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -3392,17 +3743,20 @@ def remote_status(
         return
     if not payload["configured"]:
         typer.echo("Remote connector is not configured.")
-        typer.echo("Run: uv run yutome connect")
+        typer.echo("Run: yutome connect")
         return
     typer.echo("Remote connector:")
     typer.echo(f"  provider: {payload['provider']}")
     typer.echo(f"  mode: {payload['mode']}")
     typer.echo(f"  endpoint: {payload['endpoint_url']}")
     typer.echo(f"  mcp url: {payload['mcp_url']}")
-    typer.echo(f"  pairing: {payload['pairing_status']}")
+    typer.echo(f"  assistant oauth: {payload.get('assistant_oauth_status')}")
     typer.echo(f"  desktop: {payload['desktop_connection']}")
+    if payload.get("relay_status_error"):
+        typer.echo(f"  live status: unavailable ({payload['relay_status_error']})")
     typer.echo(f"  bridge token: {'configured' if payload.get('relay_token_configured') else 'missing'}")
-    typer.echo(f"  oauth secrets: {'configured' if payload.get('pairing_code_configured') and payload.get('token_secret_configured') else 'missing'}")
+    typer.echo(f"  pairing code: {'configured' if payload.get('pairing_code_configured') else 'missing'}")
+    typer.echo("  oauth storage: worker OAUTH_KV")
     typer.echo(f"  offline search: {payload['offline_search']}")
     typer.echo(f"  last sync: {payload.get('last_sync_at') or 'never'}")
 

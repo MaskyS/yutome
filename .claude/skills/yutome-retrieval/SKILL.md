@@ -7,6 +7,20 @@ description: Use whenever the user asks a question that should be answered from 
 
 `yutome` is a local-first YouTube knowledge base over channels the user chose to index. The corpus is whatever they have indexed — never assume topics or specific channels. Call `list(entity="channels")` and `list(entity="status")` first when scope is unclear.
 
+## Local Claude Code indexing
+
+If the user gives a YouTube channel/video URL and asks to add it, index it, or answer from it in a local Claude Code repo session, use the CLI. The MCP server is read-only and exposes retrieval tools only.
+
+1. Register the source: `uv run yutome add SOURCE`.
+2. Ingest/index it: `uv run yutome sync SOURCE`.
+3. Query with `uv run yutome find "question terms" --limit 10 --json`.
+4. Expand only the promising hits with `uv run yutome show context CHUNK_ID --token-budget 2000`.
+5. Answer with timestamped `youtube_url` citations.
+
+Use exact-video sync for old or specific episodes. `SOURCE` may be a YouTube channel URL, handle, channel id, video URL, Shorts URL, or raw video id. Playlist URLs are detected but may not be supported yet; report that clearly instead of guessing.
+
+If `sync` fails because a global `yt-dlp` executable is broken, stay inside the uv environment. Prefer `uv run yutome sync SOURCE`; if diagnosing, check `uv run python -m yt_dlp --version` before relying on `yt-dlp` from the shell `PATH`.
+
 ## Two-stage retrieval is mandatory
 
 `find` returns thin hits without full chunk text. This is deliberate to keep your context small. The flow:
@@ -23,8 +37,9 @@ Do not call `show context` for every hit. Each context expansion is typically 20
 If one chunk is clearly relevant and the question depends on the whole video, fetch the full video/transcript path:
 
 1. `show(kind="video", id_=video_id)` or read `yutome://video/{video_id}` to get metadata and the active `transcript_version_id`.
-2. Read `yutome://transcript/{transcript_version_id}` for the full active transcript text, capped at 200k characters.
-3. Use `show(kind="context", id_=chunk_id)` only for the timestamp neighbourhood you need to cite tightly.
+2. Page through the active transcript with `show(kind="transcript", id_=video_id, transcript_offset=0, transcript_limit=300)` and then increment `transcript_offset` until `has_more` is false or the task has enough coverage. You can pass either the video id or transcript version id.
+3. Read `yutome://transcript/{transcript_version_id}` only when a single capped resource is enough; long videos need the paged `show` path.
+4. Use `show(kind="context", id_=chunk_id)` only for the timestamp neighbourhood you need to cite tightly.
 
 ## Mode selection
 
@@ -124,7 +139,7 @@ yutome answers are retrieval answers. State what the indexed videos say and cite
 `show(kind="context", youtube_url=..., token_budget=1200)`. A tight budget keeps focus on the timestamp neighbourhood.
 
 **"This hit seems important; read the whole video."**
-Use `show(kind="video", id_=video_id)` to get the active transcript id, then read `yutome://transcript/{transcript_version_id}`. Use the full transcript for understanding, and cite the specific timestamp URLs from chunks/context in the final answer.
+Use `show(kind="video", id_=video_id)` to get the active transcript id, then page with `show(kind="transcript", id_=video_id, transcript_offset=0, transcript_limit=300)`. Continue with later offsets as needed, especially for chapter indexes and 2-3 hour interviews. Use the transcript for understanding, and cite the specific timestamp URLs from chunks/context in the final answer.
 
 ## Token budgets for `show context`
 

@@ -21,7 +21,7 @@ from yutome.quality_llm import (
 import yutome.quality_upgrade as quality_upgrade_module
 from yutome.quality_upgrade import upgrade_active_transcripts
 from yutome.api import ContextRequest, context_expand, find as api_find
-from yutome.store import rebuild_fts
+from yutome.store import rebuild_fts, upsert_video_metadata
 from yutome.transcripts import TranscriptSegment, normalize_transcript
 
 
@@ -204,6 +204,29 @@ def test_exports_write_frontmatter_and_timestamp_links(tmp_path: Path) -> None:
     assert "[00:00:04](https://youtu.be/vid123?t=4)" in portable_text
     assert "^chunk-" in obsidian_text
     assert "## Timestamps" in obsidian_text
+
+
+def test_metadata_backfill_does_not_remove_indexed_video_from_exports(tmp_path: Path) -> None:
+    paths = _sample_project(tmp_path)
+    with connect_catalog(paths.catalog_db) as connection:
+        upsert_video_metadata(
+            connection,
+            video_id="vid123",
+            channel_id="chan123",
+            metadata={
+                "title": "How I Overcame Crohn's Disease",
+                "description": "Backfilled description",
+                "duration": 120,
+                "upload_date": "20200101",
+            },
+        )
+        status = connection.execute(
+            "SELECT ingest_status FROM videos WHERE video_id = 'vid123'"
+        ).fetchone()["ingest_status"]
+        connection.commit()
+
+    assert status == "indexed"
+    assert export_markdown(paths=paths, mode="obsidian").exported == 1
 
 
 def test_oversized_segments_are_split_under_hard_cap() -> None:

@@ -236,6 +236,22 @@ def execute_query(compiled: CompiledQuery, config: AppConfig, paths: ProjectPath
         elif compiled.kind == "sql_channel":
             rows = _execute_sql_channel(connection, request=request)
         elif compiled.kind in {"lance_chunk", "two_stage"}:
+            if not _vectors_available_for_chunks(config, paths):
+                # Fall back to lexical FTS so a noob without VOYAGE_API_KEY
+                # or a populated vector index still gets results instead of
+                # a setup error.
+                lexical_request = request.model_copy(deep=True)
+                if lexical_request.search is not None:
+                    lexical_request.search = lexical_request.search.model_copy(update={"mode": "lexical"})
+                lexical_compiled = compile_query(lexical_request)
+                fallback_result = execute_query(lexical_compiled, config, paths)
+                fallback_result.notes = [
+                    *compiled.notes,
+                    "Vector search unavailable — ran lexical search instead. "
+                    "Configure VOYAGE_API_KEY and run `yutome rebuild-vectors` to enable hybrid/semantic recall.",
+                    *fallback_result.notes,
+                ]
+                return fallback_result
             rows, lance_notes = _execute_lance_chunk(
                 connection,
                 config=config,
@@ -397,6 +413,27 @@ def _execute_sql_channel(connection: sqlite3.Connection, *, request: QueryReques
     """
     params.extend([request.limit, request.offset])
     return [_project_channel_row(dict(row)) for row in connection.execute(sql, params)]
+
+
+def _vectors_available_for_chunks(config: AppConfig, paths: ProjectPaths) -> bool:
+    """Return True only when a vector search over the chunks table can succeed
+    end-to-end. Used by `execute_query` to fall back to lexical FTS when the
+    user hasn't set up embeddings yet, instead of raising a setup error."""
+    if config.vectors.backend != "lancedb" or not config.vectors.enabled:
+        return False
+    if config.embeddings.provider != "voyage":
+        return False
+    try:
+        import lancedb
+    except ImportError:
+        return False
+    try:
+        db = lancedb.connect(paths.lancedb_dir)
+    except Exception:
+        return False
+    if not _lancedb_has_table(db, LANCEDB_CHUNKS_TABLE):
+        return False
+    return True
 
 
 def _execute_lance_chunk(

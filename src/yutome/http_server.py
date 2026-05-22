@@ -59,6 +59,8 @@ class ShowRequest(BaseModel):
     video_id: str | None = None
     time_seconds: int | None = None
     youtube_url: str | None = None
+    transcript_offset: int = Field(0, ge=0)
+    transcript_limit: int | None = Field(None, ge=1, le=5000)
 
 
 def _verify_token_dependency():  # noqa: ANN202 - factory returns a FastAPI Depends value.
@@ -195,6 +197,8 @@ def build_app() -> Any:
                 video_id=req.video_id,
                 time_seconds=req.time_seconds,
                 youtube_url=req.youtube_url,
+                transcript_offset=req.transcript_offset,
+                transcript_limit=req.transcript_limit,
             )
         except ValueError as exc:
             status_code = 400 if str(exc).startswith("Provide ") else 404

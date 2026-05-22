@@ -51,12 +51,19 @@ interface ContractPayload {
 }
 
 const CONTRACT = contractData as ContractPayload;
+const TEST_VIDEO_ICON =
+  "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjgiIGhlaWdodD0iMTI4IiB2aWV3Qm94PSIwIDAgMTI4IDEyOCI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIHJ4PSIyNCIgZmlsbD0iIzExMTExMSIvPjx0ZXh0IHg9IjY0IiB5PSI4MyIgZm9udC1zaXplPSI2NCIgdGV4dC1hbmNob3I9Im1pZGRsZSI+8J+OpTwvdGV4dD48L3N2Zz4=";
 
 type DispatchResult = { result?: unknown; error?: { code?: number; message?: string; data?: unknown } };
 
 export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
   server = new Server(
-    { name: CONTRACT.server_name, version: "0.2.0" },
+    {
+      name: CONTRACT.server_name,
+      title: "🎥 Yutome",
+      version: "0.2.0",
+      icons: [{ src: TEST_VIDEO_ICON, mimeType: "image/svg+xml", sizes: ["128x128"] }],
+    },
     {
       instructions: CONTRACT.instructions,
       capabilities: {

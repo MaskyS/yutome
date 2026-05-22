@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from yutome.store import _published_at_from_flat_discovery
-from yutome.youtube import _validate_video_metadata_row
+from yutome.youtube import extract_video_id, _validate_video_metadata_row
 
 
 def test_rejects_url_stub() -> None:
@@ -50,6 +50,13 @@ def test_error_message_includes_video_id() -> None:
     stub = {"_type": "url", "title": "X"}
     with pytest.raises(RuntimeError, match="ZZZ"):
         _validate_video_metadata_row(stub, video_id="ZZZ")
+
+
+def test_extract_video_id_accepts_watch_short_and_raw_ids() -> None:
+    assert extract_video_id("UTuuTTnjxMQ") == "UTuuTTnjxMQ"
+    assert extract_video_id("https://www.youtube.com/watch?v=UTuuTTnjxMQ") == "UTuuTTnjxMQ"
+    assert extract_video_id("https://youtu.be/UTuuTTnjxMQ?t=12") == "UTuuTTnjxMQ"
+    assert extract_video_id("https://www.youtube.com/shorts/abcdefghijk") == "abcdefghijk"
 
 
 def test_flat_discovery_published_at_prefers_upload_date() -> None:

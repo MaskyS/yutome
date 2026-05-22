@@ -1,5 +1,5 @@
 /**
- * /pair — pairing-code consent flow used by the OAuthProvider's defaultHandler.
+ * /authorize + /pair — pairing-code consent flow used by the OAuthProvider's defaultHandler.
  *
  * When Claude/ChatGPT redirects the browser to /authorize, the OAuth provider
  * routes the unauthenticated request here. We render an HTML form asking for
@@ -8,12 +8,49 @@
  * redirects the browser back to the MCP client with the auth code.
  */
 import type { Env, YutomeAuthProps } from "./env";
-import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import type { AuthRequest, ClientInfo, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 interface PairingContext {
   request: Request;
   env: Env;
   oauthHelpers: OAuthHelpers;
+}
+
+interface StoredAuthorizationRequest {
+  authRequest: AuthRequest;
+  clientName?: string;
+  clientUri?: string;
+  logoUri?: string;
+  redirectUri: string;
+  scope: string[];
+  csrfToken: string;
+  expiresAt: number;
+  completedRedirectTo?: string;
+}
+
+interface RenderAuthorizationState {
+  authRequestId: string;
+  csrfToken: string;
+  clientName?: string;
+  clientUri?: string;
+  logoUri?: string;
+  redirectUri: string;
+  scope: string[];
+}
+
+const AUTH_STATE_TTL_SECONDS = 10 * 60;
+const COMPLETED_AUTH_STATE_TTL_SECONDS = 60;
+const AUTH_STATE_PREFIX = "yutome:pairing:auth:";
+const CSRF_COOKIE_PREFIX = "__Host-yutome_pairing_";
+const AUTH_REQUEST_ID_PATTERN = /^[0-9a-f-]{36}$/;
+
+export async function handleAuthorizeRequest(ctx: PairingContext): Promise<Response> {
+  const { request, env, oauthHelpers } = ctx;
+  const url = new URL(request.url);
+  const authRequest = await oauthHelpers.parseAuthRequest(request);
+  const client = await oauthHelpers.lookupClient(authRequest.clientId);
+  const renderState = await createAuthorizationState(env, authRequest, client);
+  return renderForm(url, "", renderState);
 }
 
 export async function handlePairingRequest(ctx: PairingContext): Promise<Response> {
@@ -28,27 +65,30 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
   }
 
   const form = await request.formData();
+  const authRequestId = String(form.get("auth_request_id") || "").trim();
+  const csrfToken = String(form.get("csrf_token") || "").trim();
+  const cookieName = csrfCookieName(authRequestId);
+  const cookieToken = cookieName ? readCookie(request.headers.get("cookie") || "", cookieName) : null;
+  const state = cookieName ? await loadAuthorizationState(env, authRequestId) : null;
+  if (!authRequestId || !csrfToken || !cookieToken || !state || cookieToken !== csrfToken || state.csrfToken !== csrfToken) {
+    return errorResponse("Missing or expired authorization context. Restart connector setup from your assistant.", authRequestId);
+  }
+  if (state.completedRedirectTo) {
+    return redirectResponse(state.completedRedirectTo);
+  }
+  const renderState = toRenderState(authRequestId, state);
+
   const supplied = String(form.get("pairing_code") || "").trim().toUpperCase();
   const expected = String(env.YUTOME_PAIRING_CODE || "").trim().toUpperCase();
   if (!expected) {
     return errorResponse("Yutome pairing is not configured. Run `yutome connect --deploy` again.");
   }
   if (!supplied || supplied !== expected) {
-    return renderForm(url, "That pairing code was not accepted. Check `yutome status` or rerun `yutome connect`.");
-  }
-
-  // Reconstruct the original AuthRequest from the hidden form fields the
-  // GET handler stamped in. We trust them because the OAuthProvider verifies
-  // the redirect_uri/client_id against the registered client metadata.
-  const authReqPayload = String(form.get("__auth_request") || "");
-  if (!authReqPayload) {
-    return errorResponse("Missing authorization request context. Restart from your assistant.");
-  }
-  let authRequest: Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
-  try {
-    authRequest = JSON.parse(authReqPayload);
-  } catch {
-    return errorResponse("Invalid authorization request payload.");
+    return renderForm(
+      url,
+      "That pairing code was not accepted. Check `yutome status` or rerun `yutome connect`.",
+      renderState,
+    );
   }
 
   const props: YutomeAuthProps = {
@@ -57,29 +97,50 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
   };
 
   const { redirectTo } = await oauthHelpers.completeAuthorization({
-    request: authRequest,
+    request: state.authRequest,
     userId: "yutome-owner",
     metadata: { paired_at: props.paired_at },
-    scope: authRequest.scope,
+    scope: state.authRequest.scope,
     props,
   });
 
-  return Response.redirect(redirectTo, 302);
+  await env.OAUTH_KV.put(
+    authStateKey(authRequestId),
+    JSON.stringify({
+      ...state,
+      completedRedirectTo: redirectTo,
+      expiresAt: Date.now() + COMPLETED_AUTH_STATE_TTL_SECONDS * 1000,
+    }),
+    { expirationTtl: COMPLETED_AUTH_STATE_TTL_SECONDS },
+  );
+
+  return redirectResponse(redirectTo);
 }
 
 /**
- * Renders the pairing form. Called from both the `/authorize` GET path (where
- * we serialize the AuthRequest into a hidden field) and from POST retries on
- * a bad pairing code.
+ * Renders the pairing form. /authorize provides a short-lived server-side
+ * authorization state id plus a CSRF token. Direct /pair visits are still
+ * allowed so the URL has a useful explanation, but they cannot approve until
+ * an MCP client starts a real OAuth flow.
  */
-export function renderForm(url: URL, error: string, authRequestJson?: string): Response {
+export function renderForm(url: URL, error: string, authState?: RenderAuthorizationState): Response {
   // The pairing form ALWAYS posts to /pair regardless of which route rendered
   // it. /authorize only handles GET; the POST step lives entirely in
   // handlePairingRequest.
   const action = `/pair${url.search}`;
-  const hidden = authRequestJson
-    ? `<input type="hidden" name="__auth_request" value="${escapeHtml(authRequestJson)}" />`
+  const hidden = authState
+    ? [
+        `<input type="hidden" name="auth_request_id" value="${escapeHtml(authState.authRequestId)}" />`,
+        `<input type="hidden" name="csrf_token" value="${escapeHtml(authState.csrfToken)}" />`,
+      ].join("\n    ")
     : "";
+  const target = authState
+    ? `<dl class="target">
+        <div><dt>Assistant app</dt><dd>${escapeHtml(authState.clientName || "Unnamed MCP client")}</dd></div>
+        <div><dt>Redirect</dt><dd><code>${escapeHtml(authState.redirectUri)}</code></dd></div>
+        <div><dt>Scope</dt><dd>${escapeHtml(authState.scope.join(" ") || "none")}</dd></div>
+      </dl>`
+    : `<p class="hint">Start connector setup from Claude, ChatGPT, or another MCP client. The assistant will open this page during OAuth setup.</p>`;
   const body = `<!doctype html>
 <html lang="en">
 <head>
@@ -93,6 +154,10 @@ export function renderForm(url: URL, error: string, authRequestJson?: string): R
     input { padding: 0.7rem; border: 1px solid #999; border-radius: 8px; font: inherit; }
     button { padding: 0.8rem 1.1rem; border: 0; border-radius: 8px; background: #111; color: white; font-weight: 600; font-size: 1rem; }
     code { background: #f3f3f3; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    dl { border: 1px solid #ddd; border-radius: 8px; padding: 0.85rem; }
+    dl div + div { margin-top: 0.65rem; }
+    dt { color: #555; font-size: 0.82rem; }
+    dd { margin: 0.1rem 0 0; overflow-wrap: anywhere; }
     .error { color: #9f1239; font-weight: 500; }
     .hint { color: #555; font-size: 0.95rem; }
   </style>
@@ -100,9 +165,11 @@ export function renderForm(url: URL, error: string, authRequestJson?: string): R
 <body>
   <h1>Pair Yutome with this assistant</h1>
   <p class="hint">Claude or ChatGPT wants permission to search this Yutome library while your computer is online.</p>
-  <p class="hint">Enter the pairing code that <code>yutome connect</code> printed. No Yutome account is needed.</p>
+  <p class="hint">Enter the latest pairing code printed by <code>uv run yutome connect --deploy</code> or saved with <code>uv run yutome connect --endpoint ... --pairing-code ...</code>. No Yutome account is needed.</p>
+  <p class="hint">If you reran <code>yutome connect</code> or have several Yutome tabs open, use the newest tab and the newest code.</p>
+  ${target}
   ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
-  <form method="post" action="${escapeHtml(action)}">
+  <form method="post" action="${escapeHtml(action)}" ${authState ? "" : "hidden"}>
     ${hidden}
     <label>Pairing code
       <input name="pairing_code" autocomplete="one-time-code" autofocus required />
@@ -111,18 +178,128 @@ export function renderForm(url: URL, error: string, authRequestJson?: string): R
   </form>
 </body>
 </html>
-`;
+	`;
+  const headers = new Headers(securityHeaders());
+  if (authState) {
+    const cookieName = csrfCookieName(authState.authRequestId);
+    if (cookieName) {
+      headers.append(
+        "set-cookie",
+        `${cookieName}=${authState.csrfToken}; Path=/; Max-Age=${AUTH_STATE_TTL_SECONDS}; Secure; HttpOnly; SameSite=Lax`,
+      );
+    }
+  }
   return new Response(body, {
     status: error ? 401 : 200,
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    headers,
   });
 }
 
-function errorResponse(message: string): Response {
-  return new Response(message, {
+function errorResponse(message: string, authRequestId?: string): Response {
+  const response = new Response(message, {
     status: 400,
-    headers: { "content-type": "text/plain; charset=utf-8" },
+    headers: securityHeaders("text/plain; charset=utf-8"),
   });
+  if (authRequestId) {
+    appendClearCsrfCookie(response.headers, authRequestId);
+  }
+  return response;
+}
+
+function redirectResponse(location: string): Response {
+  return new Response(null, {
+    status: 302,
+    headers: { location },
+  });
+}
+
+async function createAuthorizationState(
+  env: Env,
+  authRequest: AuthRequest,
+  client: ClientInfo | null,
+): Promise<RenderAuthorizationState> {
+  const authRequestId = crypto.randomUUID();
+  const csrfToken = crypto.randomUUID() + crypto.randomUUID();
+  const now = Date.now();
+  const stored: StoredAuthorizationRequest = {
+    authRequest,
+    clientName: client?.clientName,
+    clientUri: client?.clientUri,
+    logoUri: client?.logoUri,
+    redirectUri: authRequest.redirectUri,
+    scope: authRequest.scope,
+    csrfToken,
+    expiresAt: now + AUTH_STATE_TTL_SECONDS * 1000,
+  };
+  await env.OAUTH_KV.put(authStateKey(authRequestId), JSON.stringify(stored), {
+    expirationTtl: AUTH_STATE_TTL_SECONDS,
+  });
+  return toRenderState(authRequestId, stored);
+}
+
+async function loadAuthorizationState(env: Env, authRequestId: string): Promise<StoredAuthorizationRequest | null> {
+  const raw = await env.OAUTH_KV.get(authStateKey(authRequestId));
+  if (!raw) {
+    return null;
+  }
+  const parsed = JSON.parse(raw) as StoredAuthorizationRequest;
+  if (!parsed.expiresAt || parsed.expiresAt < Date.now()) {
+    await env.OAUTH_KV.delete(authStateKey(authRequestId));
+    return null;
+  }
+  return parsed;
+}
+
+function toRenderState(authRequestId: string, state: StoredAuthorizationRequest): RenderAuthorizationState {
+  return {
+    authRequestId,
+    csrfToken: state.csrfToken,
+    clientName: state.clientName,
+    clientUri: state.clientUri,
+    logoUri: state.logoUri,
+    redirectUri: state.redirectUri,
+    scope: state.scope,
+  };
+}
+
+function authStateKey(authRequestId: string): string {
+  return `${AUTH_STATE_PREFIX}${authRequestId}`;
+}
+
+function csrfCookieName(authRequestId: string): string | null {
+  if (!AUTH_REQUEST_ID_PATTERN.test(authRequestId)) {
+    return null;
+  }
+  return `${CSRF_COOKIE_PREFIX}${authRequestId}`;
+}
+
+function appendClearCsrfCookie(headers: Headers, authRequestId: string): void {
+  const cookieName = csrfCookieName(authRequestId);
+  if (!cookieName) {
+    return;
+  }
+  headers.append("set-cookie", `${cookieName}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax`);
+}
+
+function readCookie(cookieHeader: string, name: string): string | null {
+  for (const part of cookieHeader.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (rawKey === name) {
+      return rawValue.join("=");
+    }
+  }
+  return null;
+}
+
+function securityHeaders(contentType = "text/html; charset=utf-8"): HeadersInit {
+  return {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+  };
 }
 
 function escapeHtml(value: string): string {

@@ -18,18 +18,24 @@ uv run yutome connect
 uv run yutome remote bridge
 ```
 
-`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the `OAUTH_KV` namespace if missing, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing URL + code. Node 18+ / npm / npx must be on PATH.
+`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the account-local `OAUTH_KV` namespace if missing, writes an ignored generated Wrangler config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing code. Node 18+ / npm / npx must be on PATH.
 
-If you already have an endpoint URL, save it without redeploying:
+Each `--deploy` run refreshes the pairing code and bridge token. Use the newest printed code in the OAuth browser tab, and restart any old `uv run yutome remote bridge` process after redeploying.
+
+If you already have an endpoint URL, save it without redeploying. Include the Worker secrets if this computer should run the laptop bridge:
 
 ```bash
-uv run yutome connect --endpoint https://your-worker.example.workers.dev
+uv run yutome connect \
+  --endpoint https://your-worker.example.workers.dev \
+  --relay-token <YUTOME_RELAY_TOKEN> \
+  --pairing-code <YUTOME_PAIRING_CODE>
 ```
 
 Then add the printed `/mcp` URL to each assistant account:
 
-- **Claude**: add one custom connector from Customize > Connectors. Same Claude account makes it available across web, mobile, Desktop, and Cowork. During the first browser OAuth tab, paste the pairing code printed by `yutome connect`. After connecting, expand the Yutome connector settings, find "Read-only tools," and switch the per-group permission from "Needs approval" to "Allowed always" — otherwise every tool call interrupts with a confirm prompt.
-- **ChatGPT**: create an App/connector in ChatGPT with the MCP Server URL. Choose the authenticated/OAuth option. In each chat, select Yutome from `+` > `More` before asking.
+- **Claude**: add one custom connector from Customize > Connectors. Same Claude account makes it available across web, mobile, Desktop, and Cowork. During OAuth, Claude opens the Yutome pairing page in a browser tab; verify the assistant app/redirect shown on the page, then paste the latest pairing code printed by `yutome connect`. If multiple Yutome tabs opened during retries, use the newest tab/newest code and close the extras after success. After connecting, expand the Yutome connector settings, find "Read-only tools," and switch the per-group permission from "Needs approval" to "Allowed always" if you trust this read-only server — otherwise every tool call interrupts with a confirm prompt. Claude's custom connector docs are at <https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp>.
+- **ChatGPT**: create an App/connector in ChatGPT with the MCP Server URL. Choose the authenticated/OAuth option. In each chat, select Yutome from `+` > `More` / composer tools before asking. If you rerun deploy while testing, use the newest pairing code and refresh/reconnect the app if ChatGPT keeps using an old OAuth tab. OpenAI's current ChatGPT developer-mode docs are at <https://developers.openai.com/api/docs/guides/developer-mode>, and MCP auth notes are at <https://developers.openai.com/api/docs/mcp>.
+- **Other MCP clients**: use the same `/mcp` URL with Streamable HTTP. The MCP transport docs are at <https://modelcontextprotocol.io/docs/concepts/transports>. For manual smoke testing, the Cloudflare guide for MCP Inspector is at <https://developers.cloudflare.com/agents/guides/test-remote-mcp-server/>.
 
 Setup is account-level, not device-level. You should not need a new Yutome endpoint for every phone or laptop. ChatGPT still requires adding the app to a conversation before it considers Yutome tools.
 
@@ -44,7 +50,7 @@ Laptop off or bridge stopped:
 - The connector remains installed.
 - Tool calls return a clear "Yutome Desktop is offline" response with last-seen information when available; resource reads return a JSON-RPC `-32002` with the same metadata.
 
-The Worker uses Cloudflare's `@cloudflare/workers-oauth-provider` for OAuth 2.1 (DCR, PKCE S256, refresh tokens) and the Agents SDK's `McpAgent` for the MCP protocol surface. Pairing is gated by the printed code; no Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.
+The Worker uses Cloudflare's `@cloudflare/workers-oauth-provider` for OAuth 2.1 (DCR, optional CIMD, PKCE S256, refresh tokens) and the Agents SDK's `McpAgent` for the MCP protocol surface. Pairing is gated by the printed code plus short-lived OAuth state and CSRF validation; no Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.
 
 Remote MCP mode does not require Voyage, Webshare, Gemini, or proxy credentials. The basic laptop-backed connector fits Cloudflare's free Workers plan (Workers + 1 KV namespace + 2 Durable Objects, all SQLite-backed). Always-on/offline search is a later replica mode and may require enabling Cloudflare billing.
 
@@ -179,7 +185,14 @@ For local Claude-style clients that read an MCP config, this repo includes `.mcp
 
 Use it from the repo root, or convert `yutome.toml` to an absolute path if the client launches from a different working directory. The local MCP server is stdio and does not need `YUTOME_HTTP_TOKEN`.
 
-The yutome retrieval skill lives at `.claude/skills/yutome-retrieval/SKILL.md`. It teaches agents to use `find`, `list`, `show`, and `q` with timestamped citations and full-transcript escalation.
+The yutome retrieval skill lives at `.claude/skills/yutome-retrieval/SKILL.md`. It teaches agents to use `find`, `list`, `show`, and `q` with timestamped citations and full-transcript escalation. In Claude Code/local repo sessions it also teaches the noob indexing workflow: `uv run yutome add SOURCE`, `uv run yutome sync SOURCE`, then retrieve and cite.
+
+Keep the split clear:
+
+- MCP exposes capabilities. Yutome's current MCP surface is read-only retrieval.
+- The CLI owns local mutation and indexing until remote job queues exist.
+- Skills teach Claude Code workflow and failure recovery.
+- A Claude Code plugin can bundle both a skill and MCP config for distribution. Remote Claude.ai custom connectors only receive the remote MCP surface and its tool/server instructions; they do not automatically receive this project skill.
 
 Before public hosted remote MCP:
 

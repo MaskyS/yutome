@@ -41,7 +41,10 @@ SERVER_INSTRUCTIONS = (
     "for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each "
     "hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, "
     "yutome://channel/{id}, and yutome://transcript/{id} let the host expand "
-    "citations without another tool call."
+    "citations without another tool call. For long-video chaptering, page through "
+    "the active transcript with `show(kind='transcript', id_=<video_id>, "
+    "transcript_offset=..., transcript_limit=...)` instead of relying on a single "
+    "truncated transcript response."
 )
 
 
@@ -150,6 +153,8 @@ def tool_show(
     video_id: str | None = None,
     time_seconds: int | None = None,
     youtube_url: str | None = None,
+    transcript_offset: int = 0,
+    transcript_limit: int | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks to open or inspect a specific Yutome chunk,
     video, channel, transcript, source, citation, or surrounding context."""
@@ -163,6 +168,8 @@ def tool_show(
         video_id=video_id,
         time_seconds=time_seconds,
         youtube_url=youtube_url,
+        transcript_offset=max(0, transcript_offset),
+        transcript_limit=transcript_limit,
     )
 
 
@@ -244,8 +251,9 @@ TOOLS: tuple[ToolSpec, ...] = (
             "context. Common patterns: `show(kind='context', id_=<chunk_id>)` to "
             "expand a citation with neighbouring transcript; "
             "`show(kind='source', id_=<chunk_id>)` to resolve a timestamp into a "
-            "canonical youtube_url; `show(kind='transcript', id_=<version_id>)` "
-            "for the full transcript text."
+            "canonical youtube_url; `show(kind='transcript', id_=<version_id_or_video_id>, "
+            "transcript_offset=0, transcript_limit=300)` for transcript pages, "
+            "including long videos that need chaptering."
         ),
         handler=tool_show,
     ),
