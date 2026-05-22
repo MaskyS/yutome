@@ -8,7 +8,9 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from yutome import setup_prompts
 from yutome.cli import (
+    BACK_CHOICE,
     _active_oauth_kv_id,
     _channel_picker_labels,
     _cloudflare_deploy_runtime_problem,
@@ -16,8 +18,11 @@ from yutome.cli import (
     _ensure_wrangler_authenticated,
     _parse_node_version,
     _push_wrangler_secret,
+    _prompt_channels_to_select,
+    _prompt_public_subscription_target,
     _strip_oauth_kv_binding,
     _tracked_capsule_path,
+    _wrangler_whoami_authenticated,
     _write_generated_wrangler_config,
     app,
     _parse_channel_selection,
@@ -554,6 +559,73 @@ def test_channel_picker_labels_hide_ids_and_sources() -> None:
     assert "youtube-browser-cookies" not in rendered
 
 
+def test_interactive_channel_picker_uses_searchable_checkbox(monkeypatch) -> None:  # noqa: ANN001
+    channels = [
+        channel_from_input("UC2222222222222222222222", title="Beta", import_source="youtube-browser-cookies"),
+        channel_from_input("UC1111111111111111111111", title="Alpha", import_source="youtube-browser-cookies"),
+    ]
+    captured: dict[str, object] = {}
+
+    def fake_checkbox(message: str, choices: list[str], **kwargs):  # noqa: ANN003
+        captured.update({"message": message, "choices": choices, **kwargs})
+        return ["All channels"]
+
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr("yutome.setup_prompts.checkbox", fake_checkbox)
+
+    selected = _prompt_channels_to_select(channels, title="Choose channels", allow_back=True)
+
+    assert [channel.title for channel in selected or []] == ["Alpha", "Beta"]
+    assert captured["message"] == "Choose channels"
+    assert captured["use_search_filter"] is True
+    assert BACK_CHOICE in captured["choices"]
+    rendered = " ".join(captured["choices"])
+    assert "UC1111111111111111111111" not in rendered
+    assert "youtube-browser-cookies" not in rendered
+
+
+def test_searchable_checkbox_disables_jk_navigation(monkeypatch) -> None:  # noqa: ANN001
+    captured: dict[str, object] = {}
+
+    class FakeQuestion:
+        def ask(self) -> list[str]:
+            return ["Alpha"]
+
+    def fake_checkbox(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return FakeQuestion()
+
+    monkeypatch.setattr("yutome.setup_prompts._is_tty", lambda: True)
+    monkeypatch.setattr("questionary.checkbox", fake_checkbox)
+
+    selected = setup_prompts.checkbox("Choose", ["Alpha"], use_search_filter=True)
+
+    assert selected == ["Alpha"]
+    assert captured["use_search_filter"] is True
+    assert captured["use_jk_keys"] is False
+
+
+def test_public_subscription_prompt_can_go_back_from_choice(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr(
+        "yutome.setup_prompts.select",
+        lambda message, choices, default=None: "Back - choose a different subscription import method",
+    )
+
+    assert _prompt_public_subscription_target() == BACK_CHOICE
+
+
+def test_public_subscription_prompt_can_go_back_from_target(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr(
+        "yutome.setup_prompts.select",
+        lambda message, choices, default=None: "Yes - add another channel's public subscriptions",
+    )
+    monkeypatch.setattr("yutome.setup_prompts.text", lambda message: "b")
+
+    assert _prompt_public_subscription_target() == BACK_CHOICE
+
+
 def test_node_version_parser() -> None:
     assert _parse_node_version("v22.12.0") == (22, 12, 0)
     assert _parse_node_version("/opt/node (v20.19.5)") == (20, 19, 5)
@@ -997,6 +1069,17 @@ def test_wrangler_auth_noninteractive_requires_api_token(monkeypatch, tmp_path: 
 
     with pytest.raises(typer.Exit):
         _ensure_wrangler_authenticated(capsule)
+
+
+def test_wrangler_whoami_zero_exit_can_still_be_unauthenticated() -> None:
+    completed = subprocess.CompletedProcess(
+        ["npx", "--yes", "wrangler", "whoami"],
+        0,
+        stdout="You are not authenticated. Please run `wrangler login`.\n",
+        stderr="",
+    )
+
+    assert _wrangler_whoami_authenticated(completed) is False
 
 
 def test_push_wrangler_secret_sends_newline_terminated_value(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

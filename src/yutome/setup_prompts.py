@@ -142,14 +142,17 @@ def checkbox(
 
     default_set = set(defaults)
     choice_objs = [{"name": c, "checked": c in default_set} for c in choices]
+    checkbox_kwargs = {
+        "message": message,
+        "choices": choice_objs,
+        "instruction": instruction,
+        "use_search_filter": use_search_filter,
+        "style": _style(),
+    }
+    if use_search_filter:
+        checkbox_kwargs["use_jk_keys"] = False
     return _ask(
-        questionary.checkbox(
-            message,
-            choices=choice_objs,
-            instruction=instruction,
-            use_search_filter=use_search_filter,
-            style=_style(),
-        )
+        questionary.checkbox(**checkbox_kwargs)
     )
 
 

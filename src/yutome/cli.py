@@ -828,6 +828,36 @@ def _prompt_oauth_client_secrets(env_path: Path) -> bool:
     return True
 
 
+def _prompt_public_subscription_target() -> str | None:
+    back_values = {"b", "back"}
+    if setup_prompts.is_interactive():
+        add_choice = "Yes - add another channel's public subscriptions"
+        skip_choice = "No - continue with this subscription list"
+        back_choice = "Back - choose a different subscription import method"
+        choice = setup_prompts.select(
+            "Import the public subscriptions of another channel (someone else's library)?",
+            choices=[skip_choice, add_choice, back_choice],
+            default=skip_choice,
+        )
+        if choice == back_choice:
+            return BACK_CHOICE
+        if choice == skip_choice:
+            return None
+        raw = setup_prompts.text("Public channel URL, handle, or channel id (blank to skip, b to go back)")
+    else:
+        if not setup_prompts.confirm(
+            "Import the public subscriptions of another channel (someone else's library)?",
+            default=False,
+        ):
+            return None
+        raw = setup_prompts.text("Public channel URL, handle, or channel id")
+
+    target = raw.strip()
+    if target.lower() in back_values:
+        return BACK_CHOICE
+    return target or None
+
+
 def _setup_import_youtube_subscriptions(
     *,
     config: Path,
@@ -849,9 +879,16 @@ def _setup_import_youtube_subscriptions(
     typer.echo("")
     typer.echo("  Browser cookies (recommended)")
     typer.echo("    Reads the YouTube account already logged into Chrome / Brave / Safari /")
-    typer.echo("    Firefox / Edge on this computer. Zero setup. macOS may ask for your")
-    typer.echo("    login password or Touch ID once to unlock the cookie store. Whichever")
-    typer.echo("    Google account is signed into that browser is the one we read.")
+    typer.echo("    Firefox / Edge on this computer. Zero setup. Whichever Google account")
+    typer.echo("    is signed into that browser is the one we read.")
+    typer.secho(
+        "    Heads up: macOS will ask for your login password or Touch ID once to unlock",
+        bold=True,
+    )
+    typer.secho(
+        "    the cookie store — that prompt comes from macOS, not Yutome.",
+        bold=True,
+    )
     typer.echo("")
     typer.echo("  Google OAuth")
     typer.echo("    You pick a specific Google account during a browser sign-in flow. Best")
@@ -924,13 +961,10 @@ def _setup_import_youtube_subscriptions(
                         )
                     except YouTubeImportError as oauth_exc:
                         typer.echo(f"[WARN] YouTube OAuth subscription import skipped: {oauth_exc}")
-        break
 
-    if setup_prompts.confirm(
-        "Import the public subscriptions of another channel (someone else's library)?",
-        default=False,
-    ):
-        public_target = setup_prompts.text("Public channel URL, handle, or channel id")
+        public_target = _prompt_public_subscription_target()
+        if public_target == BACK_CHOICE:
+            continue
         if public_target:
             try:
                 imported.extend(
@@ -945,6 +979,7 @@ def _setup_import_youtube_subscriptions(
                 )
             except YouTubeImportError as exc:
                 typer.echo(f"[WARN] Public subscription import skipped: {exc}")
+        break
 
     if not imported:
         return []
@@ -1719,11 +1754,18 @@ def _wrangler_auth_message() -> str:
     )
 
 
+def _wrangler_whoami_authenticated(completed: subprocess.CompletedProcess[str]) -> bool:
+    output = (completed.stdout or "").lower()
+    if "not authenticated" in output or "not logged in" in output:
+        return False
+    return completed.returncode == 0
+
+
 def _ensure_wrangler_authenticated(capsule: Path) -> None:
     if os.environ.get("CLOUDFLARE_API_TOKEN"):
         return
     completed = _run_wrangler_capture(capsule, ["whoami"])
-    if completed.returncode == 0:
+    if _wrangler_whoami_authenticated(completed):
         return
     if not setup_prompts.is_interactive():
         typer.echo(_wrangler_auth_message(), err=True)
@@ -1734,7 +1776,7 @@ def _ensure_wrangler_authenticated(capsule: Path) -> None:
         )
         if completed.stdout:
             typer.echo(completed.stdout.rstrip(), err=True)
-        raise typer.Exit(code=completed.returncode)
+        raise typer.Exit(code=completed.returncode or 1)
 
     typer.echo("")
     typer.echo(_wrangler_auth_message())
@@ -1744,11 +1786,11 @@ def _ensure_wrangler_authenticated(capsule: Path) -> None:
         typer.echo("Cloudflare sign-in failed. Rerun `yutome connect --deploy` after signing in.", err=True)
         raise typer.Exit(code=login.returncode)
     verified = _run_wrangler_capture(capsule, ["whoami"])
-    if verified.returncode != 0:
+    if not _wrangler_whoami_authenticated(verified):
         typer.echo("Cloudflare sign-in did not complete successfully.", err=True)
         if verified.stdout:
             typer.echo(verified.stdout.rstrip(), err=True)
-        raise typer.Exit(code=verified.returncode)
+        raise typer.Exit(code=verified.returncode or 1)
 
 
 # ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
