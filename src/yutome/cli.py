@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any
 import typer
 
 from yutome.config import DEFAULT_CONFIG_FILENAME, AppConfig, load_config, write_default_config
+from yutome import contract, runtime
 from yutome.api import find as api_find
 from yutome.api import list_ as api_list
 from yutome.api import q as api_q
@@ -2953,74 +2955,223 @@ def _bridge_tool_error(tool: str, message: str) -> dict[str, Any]:
     }
 
 
+def _bridge_resource_result(uri: str, payload: dict[str, Any], mime_type: str) -> dict[str, Any]:
+    return {
+        "contents": [
+            {
+                "uri": uri,
+                "mimeType": mime_type,
+                "text": json.dumps(payload, ensure_ascii=False),
+            }
+        ]
+    }
+
+
+# JSON-RPC error codes used in bridge envelopes. The Worker converts these
+# into MCP-shaped errors on the wire.
+_RPC_INVALID_PARAMS = -32602
+_RPC_RESOURCE_NOT_FOUND = -32002
+_RPC_INTERNAL_ERROR = -32603
+
+
+def _bridge_rpc_error(code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return error
+
+
+def _parse_yutome_uri(uri: str) -> tuple[str, dict[str, str]]:
+    """Parse ``yutome://<host>/<path>`` into ``(host, {param: value})``.
+
+    Raises ValueError for malformed URIs or unknown hosts.
+    """
+    parsed = urllib.parse.urlsplit(uri)
+    if parsed.scheme != "yutome":
+        raise ValueError(f"unsupported resource URI scheme: {parsed.scheme!r}")
+    host = parsed.hostname or ""
+    spec = contract.resource_by_host(host)
+    if spec is None:
+        raise ValueError(f"unknown resource host: {host!r}")
+    # Extract the placeholder name from the URI template (e.g. {chunk_id}).
+    placeholder_match = re.search(r"\{([^}]+)\}", spec.uri_template)
+    if placeholder_match is None:
+        return host, {}
+    placeholder = placeholder_match.group(1)
+    raw_path = parsed.path.lstrip("/")
+    if not raw_path:
+        raise ValueError(f"resource URI {uri!r} is missing the {placeholder} segment")
+    value = urllib.parse.unquote(raw_path)
+    return host, {placeholder: value}
+
+
+def _install_bridge_runtime(app_config: AppConfig, paths: ProjectPaths) -> None:
+    runtime.set_current(
+        runtime.Runtime(config_path=Path("yutome.toml"), config=app_config, paths=paths)
+    )
+
+
 def _execute_bridge_tool(
     *,
     app_config: AppConfig,
     paths: ProjectPaths,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    tool = str(params.get("name") or "")
-    arguments = params.get("arguments") or {}
+    """Legacy polling-bridge entry point. Accepts tool-call params
+    (``{name, arguments}``) and returns a tool-result-shaped dict directly.
+    Kept stable so the current Worker (which expects tool-result shape on
+    /bridge/result) continues to work until the WebSocket migration."""
+    _install_bridge_runtime(app_config, paths)
+    return _dispatch_tool(params)
+
+
+def _execute_bridge_job(
+    *,
+    app_config: AppConfig,
+    paths: ProjectPaths,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """WebSocket-bridge entry point. Accepts the generalized
+    ``{kind, method, params}`` envelope and returns ``{result|error}``.
+    The new TS Worker will speak this shape over the bridge WebSocket."""
+    _install_bridge_runtime(app_config, paths)
+
+    kind = str(params.get("kind") or "tool")
+
+    if kind == "tool":
+        inner = params.get("params") if isinstance(params.get("params"), dict) else params
+        return {"result": _dispatch_tool(inner)}
+
+    if kind == "resource":
+        return _dispatch_resource(params.get("params") or {})
+
+    if kind == "resource_templates":
+        return {"result": _list_resource_templates()}
+
+    if kind == "resource_list":
+        return {"result": _list_resources(params.get("params") or {})}
+
+    return {
+        "error": _bridge_rpc_error(
+            _RPC_INVALID_PARAMS, f"unsupported bridge job kind: {kind!r}"
+        )
+    }
+
+
+def _dispatch_tool(inner: dict[str, Any]) -> dict[str, Any]:
+    tool = str(inner.get("name") or "")
+    arguments = inner.get("arguments") or {}
     if not isinstance(arguments, dict):
         return _bridge_tool_error(tool or "unknown", "tool arguments must be a JSON object")
-
+    spec = contract.tool_by_name(tool)
+    if spec is None:
+        return _bridge_tool_error(tool or "unknown", f"unsupported tool: {tool!r}")
     try:
-        if tool == "find":
-            payload = api_find(
-                config=app_config,
-                paths=paths,
-                text=str(arguments.get("text") or ""),
-                in_=str(arguments.get("in_") or arguments.get("in") or "chunks"),  # type: ignore[arg-type]
-                mode=arguments.get("mode"),
-                channel=arguments.get("channel"),
-                since=arguments.get("since"),
-                until=arguments.get("until"),
-                source=arguments.get("source"),
-                language=arguments.get("language"),
-                group_by=arguments.get("group_by"),
-                limit=int(arguments.get("limit") or 10),
-                offset=int(arguments.get("offset") or 0),
-                project=arguments.get("project"),
-            ).model_dump()
-        elif tool == "list":
-            payload = api_list(
-                config=app_config,
-                paths=paths,
-                entity=str(arguments.get("entity") or "videos"),  # type: ignore[arg-type]
-                channel=arguments.get("channel"),
-                since=arguments.get("since"),
-                until=arguments.get("until"),
-                status=arguments.get("status"),
-                source=arguments.get("source"),
-                language=arguments.get("language"),
-                selected=arguments.get("selected"),
-                order_by=arguments.get("order_by"),
-                limit=int(arguments.get("limit") or 20),
-                offset=int(arguments.get("offset") or 0),
-                project=arguments.get("project"),
-            ).model_dump()
-        elif tool == "show":
-            payload = api_show(
-                config=app_config,
-                paths=paths,
-                kind=str(arguments.get("kind") or ""),  # type: ignore[arg-type]
-                id_=arguments.get("id"),
-                token_budget=int(arguments.get("token_budget") or 3000),
-                video_id=arguments.get("video_id"),
-                time_seconds=arguments.get("time_seconds"),
-                youtube_url=arguments.get("youtube_url"),
-            )
-        elif tool == "q":
-            request_payload = arguments.get("request") if "request" in arguments else arguments
-            if not isinstance(request_payload, dict):
-                return _bridge_tool_error(tool, "q request must be a JSON object")
-            payload = api_q(config=app_config, paths=paths, request=request_payload).model_dump()
-        else:
-            return _bridge_tool_error(tool or "unknown", f"unsupported tool: {tool!r}")
+        # ``in_`` arrives as ``in`` over the wire from some clients; normalize.
+        if "in" in arguments and "in_" not in arguments:
+            arguments = {**arguments, "in_": arguments.pop("in")}
+        # ``id`` arrives as itself for show(kind="..."); the handler signature
+        # uses ``id_`` to avoid the Python builtin shadow. Same normalization.
+        if "id" in arguments and "id_" not in arguments and tool == "show":
+            arguments = {**arguments, "id_": arguments.pop("id")}
+        payload = spec.handler(**arguments)
     except Exception as exc:  # noqa: BLE001 - remote bridge should report tool errors cleanly.
         return _bridge_tool_error(tool or "unknown", str(exc))
-
     return _bridge_tool_result(tool, payload)
+
+
+def _dispatch_resource(inner: dict[str, Any]) -> dict[str, Any]:
+    uri = str(inner.get("uri") or "")
+    if not uri:
+        return {
+            "error": _bridge_rpc_error(_RPC_INVALID_PARAMS, "resources/read requires uri")
+        }
+    try:
+        host, kwargs = _parse_yutome_uri(uri)
+    except ValueError as exc:
+        return {"error": _bridge_rpc_error(_RPC_INVALID_PARAMS, str(exc))}
+    spec = contract.resource_by_host(host)
+    if spec is None:
+        return {
+            "error": _bridge_rpc_error(_RPC_RESOURCE_NOT_FOUND, f"unknown resource host: {host!r}")
+        }
+    try:
+        payload = spec.handler(**kwargs)
+    except ValueError as exc:
+        return {"error": _bridge_rpc_error(_RPC_RESOURCE_NOT_FOUND, str(exc))}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": _bridge_rpc_error(_RPC_INTERNAL_ERROR, str(exc))}
+    return {"result": _bridge_resource_result(uri, payload, spec.mime_type)}
+
+
+def _list_resource_templates() -> dict[str, Any]:
+    return {
+        "resourceTemplates": [
+            {
+                "uriTemplate": spec.uri_template,
+                "name": spec.name,
+                "description": spec.description,
+                "mimeType": spec.mime_type,
+            }
+            for spec in contract.RESOURCES
+        ]
+    }
+
+
+def _list_resources(params: dict[str, Any]) -> dict[str, Any]:
+    """Enumerate concrete resource instances. Chunks are template-only by
+    decision (millions of them); channels and recent videos are paginated."""
+    host = str(params.get("host") or "")
+    limit = max(1, min(int(params.get("limit") or 50), 200))
+    offset = max(0, int(params.get("offset") or 0))
+
+    if host in ("", "chunk"):
+        return {"resources": []}
+
+    if host == "channel":
+        rows = api_list(
+            config=runtime.current().config,
+            paths=runtime.current().paths,
+            entity="channels",
+            limit=limit,
+            offset=offset,
+        ).model_dump()
+        return {
+            "resources": [
+                {
+                    "uri": f"yutome://channel/{row['channel_id']}",
+                    "name": row.get("title") or row.get("handle") or row["channel_id"],
+                    "mimeType": "application/json",
+                }
+                for row in rows.get("rows", [])
+                if "channel_id" in row
+            ]
+        }
+
+    if host == "video":
+        rows = api_list(
+            config=runtime.current().config,
+            paths=runtime.current().paths,
+            entity="videos",
+            order_by="newest",
+            limit=limit,
+            offset=offset,
+        ).model_dump()
+        return {
+            "resources": [
+                {
+                    "uri": f"yutome://video/{row['video_id']}",
+                    "name": row.get("title") or row["video_id"],
+                    "mimeType": "application/json",
+                }
+                for row in rows.get("rows", [])
+                if "video_id" in row
+            ]
+        }
+
+    return {"resources": []}
+
+
 
 
 @remote_app.command("bridge")

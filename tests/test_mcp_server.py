@@ -255,7 +255,7 @@ def test_build_server_can_enable_remote_bearer_auth(configured: ProjectPaths) ->
     access = anyio.run(server._token_verifier.verify_token, "secret-abc123")
     rejected = anyio.run(server._token_verifier.verify_token, "wrong")
     assert access is not None
-    assert access.scopes == ["yutome:read"]
+    assert access.scopes == ["yutome.search.read"]
     assert rejected is None
 
 
