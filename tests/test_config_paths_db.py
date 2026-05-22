@@ -473,84 +473,34 @@ def test_connect_without_endpoint_prints_deploy_instructions_without_provider_ke
     result = runner.invoke(app, ["connect", "--config", str(config_path)])
 
     assert result.exit_code == 0
-    assert "Prepared Cloudflare Worker project" in result.output
-    assert "yutome connect --endpoint" in result.output
+    assert "yutome connect --deploy" in result.output
     assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
     assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
-    assert "create or sign into a Cloudflare account" in result.output
-    assert (tmp_path / "data/remote/cloudflare-worker/wrangler.toml").exists()
-    assert (tmp_path / "data/remote/cloudflare-worker/src/index.js").exists()
-    wrangler = (tmp_path / "data/remote/cloudflare-worker/wrangler.toml").read_text(encoding="utf-8")
-    assert "YUTOME_RELAY_TOKEN" in wrangler
-    assert "YUTOME_PAIRING_CODE" in wrangler
-    assert "YUTOME_TOKEN_SECRET" in wrangler
-    assert 'YUTOME_DEV_NO_AUTH = "false"' in wrangler
-    assert "new_sqlite_classes" in wrangler
-    assert "YutomeRelay" in wrangler
+    assert "Tracked TypeScript Worker subproject lives at:" in result.output
+    # The new connect flow does NOT generate files under data/remote — the
+    # tracked TypeScript project at cloudflare/yutome-capsule/ is the source.
+    assert not (tmp_path / "data/remote/cloudflare-worker").exists()
     assert not (tmp_path / "data/remote/connection.json").exists()
     assert "VOYAGE_API_KEY" not in result.output
     assert "YUTOME_WEBSHARE" not in result.output
 
 
-def test_connect_without_endpoint_prefers_assisted_deploy_when_node_is_available(
-    monkeypatch, tmp_path: Path
-) -> None:  # noqa: ANN001
+def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
 
     monkeypatch.setattr(
-        "yutome.cli.shutil.which",
-        lambda name: f"/usr/local/bin/{name}" if name in {"node", "npm", "npx"} else None,
+        "yutome.cli._deploy_tracked_capsule",
+        lambda refresh_contract=True: ("https://example.workers.dev", "yutome-remote-mcp"),
     )
-
-    result = runner.invoke(app, ["connect", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert "Yutome can deploy this from here" in result.output
-    assert "Cloudflare sign-in" in result.output
-    assert "basic connector should fit Cloudflare's free Workers plan" in result.output
-    assert "uv run yutome connect --deploy" in result.output
-
-
-def test_connect_deploy_saves_oauth_pairing_state(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    runner = CliRunner()
-    config_path = tmp_path / "yutome.toml"
-
-    monkeypatch.setattr(
-        "yutome.cli.shutil.which",
-        lambda name: f"/usr/local/bin/{name}" if name in {"node", "npm", "npx"} else None,
-    )
-    monkeypatch.setattr("yutome.cli._deploy_worker_project", lambda project: "https://example.workers.dev")
 
     result = runner.invoke(app, ["connect", "--config", str(config_path), "--deploy"])
 
     assert result.exit_code == 0
     state = json.loads((tmp_path / "data/remote/connection.json").read_text(encoding="utf-8"))
-    assert state["relay_token"]
-    assert state["pairing_code"]
-    assert state["token_secret"]
-    assert "Pair this connector once" in result.output
-    assert "https://example.workers.dev/pair?code=" in result.output
-    assert "authenticated/OAuth option" in result.output
-
-
-def test_connect_without_endpoint_explains_dashboard_fallback_when_node_is_missing(
-    monkeypatch, tmp_path: Path
-) -> None:  # noqa: ANN001
-    runner = CliRunner()
-    config_path = tmp_path / "yutome.toml"
-
-    monkeypatch.setattr("yutome.cli.shutil.which", lambda _name: None)
-
-    result = runner.invoke(app, ["connect", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert "This computer cannot run Cloudflare's deploy tool yet" in result.output
-    assert "Install Node.js LTS" in result.output
-    assert "Cloudflare Workers dashboard" in result.output
-    assert "skip paid/always-on features" in result.output
-    assert "free Workers path for the basic connector" in result.output
-    assert "src/index.js" in result.output
+    assert state["endpoint_url"] == "https://example.workers.dev"
+    assert state["mcp_url"] == "https://example.workers.dev/mcp"
+    assert state["cloud_resources"]["cloudflare_worker_name"] == "yutome-remote-mcp"
 
 
 def test_status_reports_remote_unconfigured_and_configured(tmp_path: Path) -> None:
@@ -616,10 +566,7 @@ def test_disconnect_can_remove_local_state_after_cloud_delete(monkeypatch, tmp_p
     config_path = tmp_path / "yutome.toml"
     deleted: list[str] = []
 
-    def fake_delete(project):  # noqa: ANN001
-        deleted.append(project.worker_name)
-
-    monkeypatch.setattr("yutome.cli._remove_worker_project", fake_delete)
+    monkeypatch.setattr("yutome.cli._delete_tracked_capsule", lambda name: deleted.append(name))
     connect_result = runner.invoke(
         app,
         ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
@@ -637,7 +584,7 @@ def test_remote_disconnect_alias_uses_disconnect_language(monkeypatch, tmp_path:
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
 
-    monkeypatch.setattr("yutome.cli._remove_worker_project", lambda project: None)
+    monkeypatch.setattr("yutome.cli._delete_tracked_capsule", lambda _name: None)
     connect_result = runner.invoke(
         app,
         ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
@@ -685,31 +632,11 @@ def test_setup_can_prepare_remote_mcp_worker_project_interactively(tmp_path: Pat
     assert "basic laptop-backed connector is designed for Cloudflare's free Workers plan" in result.output
     assert "Always-on/offline search is a later mode and may require enabling Cloudflare billing" in result.output
     assert "ChatGPT also asks you to select the Yutome app" in result.output
-    assert "Prepared Cloudflare Worker project" in result.output
-    assert (tmp_path / "data/remote/cloudflare-worker/package.json").exists()
-    worker = (tmp_path / "data/remote/cloudflare-worker/src/index.js").read_text(encoding="utf-8")
-    assert 'case "initialize"' in worker
-    assert 'case "tools/list"' in worker
-    assert 'case "tools/call"' in worker
-    assert "instructions: SERVER_INSTRUCTIONS" in worker
-    assert "Use find when the user asks a topic or semantic search question" in worker
-    assert "Use this when the user asks to list newest videos" in worker
-    assert "readOnlyHint: true" in worker
-    assert 'type: "oauth2"' in worker
-    assert 'type: "noauth"' in worker
-    assert "/.well-known/oauth-protected-resource" in worker
-    assert "/.well-known/oauth-authorization-server" in worker
-    assert 'url.pathname === "/authorize"' in worker
-    assert 'url.pathname === "/token"' in worker
-    assert "YUTOME_PAIRING_CODE" in worker
-    assert "YUTOME_TOKEN_SECRET" in worker
-    assert "export class YutomeRelay" in worker
-    assert "/bridge/next" in worker
-    assert "/bridge/result" in worker
-    assert 'if (request.method === "GET")' in worker
-    assert "status: 405" in worker
-    assert '"allow": "POST"' in worker
-    assert "Yutome Desktop is not connected" in worker
+    # The TS Worker subproject is tracked under cloudflare/yutome-capsule/.
+    # `setup` no longer generates JS source files into data/remote/.
+    assert "Tracked TypeScript Worker subproject lives at:" in result.output
+    assert "cloudflare/yutome-capsule" in result.output
+    assert not (tmp_path / "data/remote/cloudflare-worker").exists()
     assert not (tmp_path / "data/remote/connection.json").exists()
 
 

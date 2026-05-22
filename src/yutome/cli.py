@@ -1251,6 +1251,89 @@ def _deploy_worker_project(project: CloudflareWorkerProject) -> str | None:
     return _extract_worker_url(output)
 
 
+# ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
+
+CAPSULE_PROJECT_NAME = "yutome-remote-mcp"  # matches name in wrangler.toml
+
+
+def _tracked_capsule_path() -> Path:
+    """Repo path to the tracked TypeScript Worker subproject."""
+    here = Path(__file__).resolve()
+    return here.parents[2] / "cloudflare" / "yutome-capsule"
+
+
+def _ensure_capsule_node_modules(capsule: Path) -> None:
+    if (capsule / "node_modules").exists():
+        return
+    missing = _missing_cloudflare_deploy_tools()
+    if missing:
+        typer.echo(
+            "Cannot install TypeScript Worker dependencies because Node/npm are missing on this computer.",
+            err=True,
+        )
+        typer.echo(f"Missing: {', '.join(missing)}", err=True)
+        typer.echo(f"Install Node.js LTS from {NODE_DOWNLOAD_URL}, then rerun `uv run yutome connect --deploy`.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"Installing TypeScript Worker dependencies in {capsule}")
+    returncode, _ = _run_command_streamed(["npm", "install"], cwd=capsule)
+    if returncode != 0:
+        typer.echo("npm install failed. Fix the error above and rerun `uv run yutome connect --deploy`.", err=True)
+        raise typer.Exit(code=returncode)
+
+
+def _deploy_tracked_capsule(*, refresh_contract: bool = True) -> tuple[str | None, str]:
+    """Deploy the tracked TypeScript Worker from cloudflare/yutome-capsule.
+
+    Returns ``(deployed_url, worker_name)``. The worker_name comes from
+    wrangler.toml (currently the fixed CAPSULE_PROJECT_NAME)."""
+    capsule = _tracked_capsule_path()
+    if not capsule.exists():
+        typer.echo(f"Expected TypeScript Worker subproject at {capsule}, but it is missing.", err=True)
+        raise typer.Exit(code=1)
+
+    if refresh_contract:
+        from yutome.contract_export import emit_contract_json
+
+        contract_path = capsule / "src" / "contract.json"
+        emit_contract_json(contract_path)
+        typer.echo(f"[OK] Refreshed contract: {contract_path}")
+
+    _ensure_capsule_node_modules(capsule)
+
+    typer.echo(f"Deploying Cloudflare Worker from {capsule}")
+    command = ["npx", "--yes", "wrangler", "deploy"]
+    returncode, output = _run_command_streamed(command, cwd=capsule)
+    if returncode != 0:
+        typer.echo(
+            "Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `uv run yutome connect --deploy`.",
+            err=True,
+        )
+        raise typer.Exit(code=returncode)
+
+    return _extract_worker_url(output), CAPSULE_PROJECT_NAME
+
+
+def _delete_tracked_capsule(worker_name: str) -> None:
+    """Run `wrangler delete` from the tracked subproject directory."""
+    capsule = _tracked_capsule_path()
+    if shutil.which("npx") is None:
+        typer.echo("`npx` is not installed. Delete the Worker manually in the Cloudflare dashboard.", err=True)
+        typer.echo(f"Cloudflare Workers dashboard: {CLOUDFLARE_WORKERS_DASHBOARD_URL}", err=True)
+        raise typer.Exit(code=1)
+    command = ["npx", "--yes", "wrangler", "delete", worker_name, "--force"]
+    typer.echo(f"Removing Cloudflare Worker {worker_name!r} via wrangler in {capsule}")
+    completed = subprocess.run(
+        command, cwd=capsule, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+    )
+    if completed.stdout:
+        typer.echo(completed.stdout.rstrip())
+    if completed.stderr:
+        typer.echo(completed.stderr.rstrip(), err=True)
+    if completed.returncode != 0:
+        typer.echo("Worker removal failed. Fix the error above and rerun.", err=True)
+        raise typer.Exit(code=completed.returncode)
+
+
 def _remove_worker_project(project: CloudflareWorkerProject) -> None:
     executable = project.deploy_command[0]
     if shutil.which(executable) is None:
@@ -1347,8 +1430,7 @@ def _disconnect_remote(
         if not yes and not typer.confirm("Remove the Yutome Cloudflare Worker from your Cloudflare account too?", default=True):
             remove_cloudflare = False
         if remove_cloudflare:
-            project = prepare_cloudflare_worker_project(paths, worker_name=effective_worker)
-            _remove_worker_project(project)
+            _delete_tracked_capsule(effective_worker)
 
     if state_path.exists() and not keep_state:
         state_path.unlink()
@@ -1486,8 +1568,8 @@ def setup(
             except ValueError as exc:
                 typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
         else:
-            project = _prepare_worker_project(config, worker_name=DEFAULT_WORKER_NAME)
-            _print_worker_project(project)
+            typer.echo("Tracked TypeScript Worker subproject lives at:")
+            typer.echo(f"  {_tracked_capsule_path()}")
             if _can_run_cloudflare_deploy():
                 deploy_prompt = "Deploy this Cloudflare Worker now? This may open Cloudflare sign-in in your browser."
                 deploy_default = True
@@ -1497,19 +1579,16 @@ def setup(
             if typer.confirm(deploy_prompt, default=deploy_default):
                 if not _can_run_cloudflare_deploy():
                     webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
-                    typer.echo("Opened Cloudflare Workers. Create a Worker, paste the generated source, deploy it, then save the URL with:")
-                    typer.echo("  uv run yutome connect --endpoint https://your-worker.example.workers.dev")
+                    typer.echo("Opened Cloudflare Workers. Install Node.js LTS, then run:")
+                    typer.echo("  uv run yutome connect --deploy")
                     return
-                deployed_url = _deploy_worker_project(project)
+                deployed_url, deployed_worker_name = _deploy_tracked_capsule()
                 if deployed_url:
                     _save_deployed_worker_endpoint(
                         config,
                         endpoint=deployed_url,
                         mode="connector_only",
-                        worker_name=project.worker_name,
-                        relay_token=project.relay_token,
-                        pairing_code=project.pairing_code,
-                        token_secret=project.token_secret,
+                        worker_name=deployed_worker_name,
                     )
                 else:
                     typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
@@ -1555,27 +1634,31 @@ def connect_command(
     paths = _prepare_connect_project(config)
     if endpoint is None:
         _print_cloudflare_connect_instructions()
-        project = _prepare_worker_project(config, worker_name=worker_name or DEFAULT_WORKER_NAME)
-        _print_worker_project(project)
         typer.echo(f"Remote state will be saved at: {remote_state_path(paths)}")
         if open_cloudflare:
             webbrowser.open(CLOUDFLARE_WORKERS_DASHBOARD_URL)
             typer.echo(f"[OK] Opened Cloudflare Workers dashboard: {CLOUDFLARE_WORKERS_DASHBOARD_URL}")
-        if deploy:
-            deployed_url = _deploy_worker_project(project)
-            if deployed_url is None:
-                typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
-                typer.echo("Save the endpoint manually with `uv run yutome connect --endpoint <url>`.")
-                return
-            _save_deployed_worker_endpoint(
-                config,
-                endpoint=deployed_url,
-                mode=remote_mode,
-                worker_name=project.worker_name,
-                relay_token=project.relay_token,
-                pairing_code=project.pairing_code,
-                token_secret=project.token_secret,
-            )
+
+        if not deploy:
+            typer.echo("")
+            typer.echo("Tracked TypeScript Worker subproject lives at:")
+            typer.echo(f"  {_tracked_capsule_path()}")
+            typer.echo("")
+            typer.echo("Run the assisted deploy with:")
+            typer.echo("  uv run yutome connect --deploy")
+            return
+
+        deployed_url, deployed_worker_name = _deploy_tracked_capsule()
+        if deployed_url is None:
+            typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
+            typer.echo("Save the endpoint manually with `uv run yutome connect --endpoint <url>`.")
+            return
+        _save_deployed_worker_endpoint(
+            config,
+            endpoint=deployed_url,
+            mode=remote_mode,
+            worker_name=deployed_worker_name,
+        )
         return
     try:
         state_path = _save_remote_connection(config, endpoint=endpoint, mode=remote_mode, worker_name=worker_name)
