@@ -87,26 +87,100 @@ def password(message: str) -> str:
     return _ask(questionary.password(message, style=_style())).strip()
 
 
-def select(message: str, choices: list[str], *, default: str | None = None) -> str:
+def select(message: str, choices: list, *, default=None):
+    """Single-pick prompt.
+
+    Each item in ``choices`` may be:
+
+    - a plain ``str`` — legacy. Returned as-is when selected.
+    - a ``(label,)`` 1-tuple — a TTY visual separator (e.g. a section header
+      like ``"─── On this Mac ───"``). In non-TTY it's printed but not
+      numbered.
+    - a ``(label, value)`` 2-tuple — a choice that displays ``label`` and
+      returns ``value`` when picked.
+    - a ``(label, value, disabled_reason)`` 3-tuple — a choice that is shown
+      greyed-out in TTY (cannot be picked). In non-TTY it's numbered but
+      decorated with the disabled reason, and selecting it returns the value
+      anyway so existing late-check fallbacks (e.g. "Node missing") still
+      run.
+
+    ``default`` matches a choice's ``value`` (or its label for plain strings).
+    """
+
+    def label_of(item) -> str:
+        if isinstance(item, tuple):
+            return item[0]
+        return item
+
+    def value_of(item):
+        if isinstance(item, tuple):
+            return item[1] if len(item) >= 2 else item[0]
+        return item
+
+    def is_separator(item) -> bool:
+        return isinstance(item, tuple) and len(item) == 1
+
+    def disabled_of(item) -> str | None:
+        if isinstance(item, tuple) and len(item) >= 3:
+            return item[2]
+        return None
+
     if not _is_tty():
-        # Render as a numbered list and accept a number or exact label.
         typer.echo(message)
-        for index, choice in enumerate(choices, 1):
-            typer.echo(f"  {index}. {choice}")
-        default_index = (choices.index(default) + 1) if default in choices else 1
+        selectable: list = []
+        for item in choices:
+            if is_separator(item):
+                typer.echo(f"  {label_of(item)}")
+                continue
+            selectable.append(item)
+            label = label_of(item)
+            disabled_reason = disabled_of(item)
+            suffix = f"  ({disabled_reason})" if disabled_reason else ""
+            typer.echo(f"  {len(selectable)}. {label}{suffix}")
+        labels = [label_of(item) for item in selectable]
+        values = [value_of(item) for item in selectable]
+        default_index = 1
+        for index, item in enumerate(selectable, 1):
+            if default is not None and (value_of(item) == default or label_of(item) == default):
+                default_index = index
+                break
         while True:
-            raw = typer.prompt(
-                "Choose by number or label", default=str(default_index)
-            ).strip()
-            if raw.isdigit() and 1 <= int(raw) <= len(choices):
-                return choices[int(raw) - 1]
-            if raw in choices:
-                return raw
+            raw = typer.prompt("Choose by number or label", default=str(default_index)).strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(selectable):
+                return values[int(raw) - 1]
+            if raw in labels:
+                return values[labels.index(raw)]
             typer.echo("[WARN] Invalid choice; try again.")
+
     import questionary
 
+    pretty: list = []
+    default_value = None
+    for item in choices:
+        if is_separator(item):
+            pretty.append(questionary.Separator(label_of(item)))
+            continue
+        disabled_reason = disabled_of(item)
+        if isinstance(item, tuple):
+            pretty.append(
+                questionary.Choice(
+                    title=label_of(item),
+                    value=value_of(item),
+                    disabled=disabled_reason,
+                )
+            )
+            if default is not None and value_of(item) == default:
+                default_value = label_of(item)
+        else:
+            pretty.append(item)
+            if default is not None and item == default:
+                default_value = item
+
+    if default_value is None and default is not None:
+        default_value = default
+
     return _ask(
-        questionary.select(message, choices=choices, default=default, style=_style())
+        questionary.select(message, choices=pretty, default=default_value, style=_style())
     )
 
 
@@ -159,6 +233,34 @@ def checkbox(
     return _ask(
         questionary.checkbox(**checkbox_kwargs)
     )
+
+
+def press_any_key(message: str = "Press Enter to continue …") -> None:
+    """Block until the user presses a key. No-op when stdin isn't a TTY.
+
+    Used to gate multi-step walkthroughs (the Google Cloud Console OAuth
+    setup) so a first-timer can complete one step before being shown the
+    next. CliRunner tests get the no-op behavior so they don't hang waiting
+    for input that isn't there.
+
+    Ctrl-C / Ctrl-D raise typer.Abort just like every other wrapper in this
+    module — questionary returns None on interrupt, and we must NOT silently
+    advance to the next step (the original bug: Ctrl-C between OAuth
+    walkthrough steps was eaten, marching the user forward instead of
+    aborting).
+    """
+    if not _is_tty():
+        return
+    import questionary
+
+    try:
+        prompt = questionary.press_any_key_to_continue(message, style=_style())
+    except AttributeError:
+        # Defensive: older questionary versions ship the helper under a
+        # different name; fall back to a plain confirm.
+        prompt = questionary.confirm(message, default=True, style=_style())
+    if prompt.ask() is None:
+        raise typer.Abort()
 
 
 def offer_to_open(

@@ -51,6 +51,7 @@ from yutome.remote_connection import (
     build_sync_dry_run_manifest,
     load_remote_state,
     mark_desktop_seen,
+    normalize_endpoint,
     remote_status_payload,
     remote_state_path,
     save_remote_state,
@@ -174,6 +175,102 @@ NODE_DOWNLOAD_URL = "https://nodejs.org/en/download"
 CLOUDFLARE_MIN_NODE_VERSION = (22, 0, 0)
 BACK_CHOICE = "Back"
 
+# Sentinel returned by service-setup helpers when the user picks Back from a
+# prompt that supports it. setup() loops on these so the user can re-decide
+# without restarting the whole wizard.
+BACK = object()
+
+SETUP_TOTAL_STEPS = 6
+
+
+def _step_header(step: int, total: int, title: str) -> None:
+    """Print a brand-coloured "Step N of M · title" divider.
+
+    Color is stripped automatically by click when stdout is not a TTY, so
+    CliRunner tests see plain text and existing substring assertions still
+    match.
+    """
+    typer.echo("")
+    line = f"━━ Step {step} of {total} · {title} "
+    width = 72
+    pad = max(2, width - len(line))
+    typer.secho(line + ("━" * pad), fg="magenta", bold=True)
+    typer.echo("")
+
+
+def _status_skip(label: str, detail: str = "") -> None:
+    """Dimmed [SKIP] line — for choices the user explicitly skipped.
+
+    Visually distinct from [WARN] so a deliberate skip doesn't read as a
+    problem to a first-time user.
+    """
+    suffix = f" - {detail}" if detail else ""
+    typer.secho(f"[SKIP] {label}{suffix}", dim=True)
+
+
+def _styled_url(url: str) -> str:
+    """Return a click-styled URL string (blue + underline on TTY)."""
+    return typer.style(url, fg="blue", underline=True)
+
+
+class _SpinnerContext:
+    """Context manager that shows a spinner in interactive terminals and is
+    a no-op everywhere else. Falls back gracefully when Rich isn't usable.
+    """
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+        self._status = None
+
+    def __enter__(self):
+        if not (sys.stdout.isatty() and setup_prompts.is_interactive()):
+            return self
+        try:
+            from rich.console import Console
+            from rich.status import Status
+
+            self._console = Console(file=sys.stdout)
+            self._status = Status(self._message, console=self._console, spinner="dots")
+            self._status.__enter__()
+        except Exception:
+            # If rich isn't usable for any reason, fall back to a single
+            # heartbeat line so the user still knows something started.
+            self._status = None
+            typer.echo(f"… {self._message}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._status is not None:
+            try:
+                self._status.__exit__(exc_type, exc, tb)
+            except Exception:
+                pass
+        return False
+
+    def update(self, message: str) -> None:
+        if self._status is not None:
+            try:
+                self._status.update(message)
+            except Exception:
+                pass
+
+
+def _spinner(message: str) -> _SpinnerContext:
+    """Return a spinner context manager. See `_SpinnerContext`."""
+    return _SpinnerContext(message)
+
+
+def _callout(text: str, *, kind: str = "info") -> None:
+    """Print a one-line callout that draws the eye to a decision sentence.
+
+    kind='info'    bright but neutral
+    kind='warn'    yellow — for plan/option choices that bite if missed
+    """
+    if kind == "warn":
+        typer.secho(text, fg="yellow", bold=True)
+    else:
+        typer.secho(text, bold=True)
+
 
 def _project_root(config_path: Path) -> Path:
     if config_path.is_absolute():
@@ -248,9 +345,10 @@ def _read_query_request(request: str | None, file: Path | None) -> dict[str, obj
 
 
 def _status(ok: bool, label: str, detail: str = "") -> None:
+    """Print a single-line status. Color is stripped by click on non-TTY."""
     marker = "OK" if ok else "WARN"
     suffix = f" - {detail}" if detail else ""
-    typer.echo(f"[{marker}] {label}{suffix}")
+    typer.secho(f"[{marker}] {label}{suffix}", fg="green" if ok else "yellow", bold=True)
 
 
 def _proxy_diagnostic_detail(app_config, exc: Exception, *, video_id: str) -> str:  # noqa: ANN001
@@ -499,21 +597,23 @@ def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> b
         )
         return False
 
-    typer.echo("")
     typer.echo(
-        "Semantic/hybrid search lets yutome find paraphrases and concepts, not just exact "
-        "words. It uses Voyage embeddings during sync. If you skip, lexical (keyword) "
-        "search still works fully — you can enable semantic later with `yutome setup`."
+        "Semantic/hybrid search lets yutome find paraphrases and concepts, not just "
+        "exact words. It uses Voyage embeddings during sync."
+    )
+    _callout(
+        "If you skip, lexical (keyword) search still works fully — you can enable "
+        "semantic later with `yutome setup`."
     )
     typer.echo("")
-    typer.echo("  Sign up:  https://www.voyageai.com/")
+    typer.echo(f"  Sign up:  {_styled_url('https://www.voyageai.com/')}")
     typer.echo("  Cost:     free tier covers small/medium libraries; pay-as-you-go past that")
-    typer.echo("  Docs:     https://docs.voyageai.com/docs/embeddings")
+    typer.echo(f"  Docs:     {_styled_url('https://docs.voyageai.com/docs/embeddings')}")
     typer.echo("")
     if not deps_ready:
         _status(False, "Semantic search dependencies", "run `uv sync` or reinstall yutome")
     if not setup_prompts.confirm("Enable semantic/hybrid search now?", default=False):
-        _status(False, "Semantic/hybrid search", "skipped; lexical search still works")
+        _status_skip("Semantic/hybrid search", "lexical search still works")
         return False
 
     if not has_voyage_key:
@@ -545,22 +645,26 @@ def _setup_webshare(env_path: Path, *, yes: bool) -> None:
             "not configured; add YUTOME_WEBSHARE_USERNAME and YUTOME_WEBSHARE_PASSWORD to .env",
         )
         return
-    typer.echo("")
     typer.echo(
         "Webshare is a paid residential-proxy service that helps large YouTube imports "
-        "avoid local IP blocks. Skip it for small tests; configure it before importing "
-        "hundreds of videos. If you skip, yutome will ask again the first time YouTube "
-        "blocks a transcript fetch."
+        "avoid local IP blocks."
+    )
+    _callout(
+        "Skip it for small tests; configure it before importing hundreds of videos. "
+        "If you skip, yutome will ask again the first time YouTube blocks a fetch."
     )
     typer.echo("")
-    typer.echo("  Sign up:  https://www.webshare.io/residential-proxy")
+    typer.echo(f"  Sign up:  {_styled_url('https://www.webshare.io/residential-proxy')}")
     typer.echo("  Cost:     ~$3.50/month for ~1 GB residential traffic (usually plenty)")
     typer.echo("  Plan:     'Residential Proxy' (rotating)")
-    typer.echo("            NOT the cheaper 'Proxy Server' (datacenter) — YouTube blocks those")
-    typer.echo("  Why:      https://github.com/maskys/yutome/blob/main/docs/proxy-strategy.md")
+    _callout(
+        "            NOT the cheaper 'Proxy Server' (datacenter) — YouTube blocks those",
+        kind="warn",
+    )
+    typer.echo(f"  Why:      {_styled_url('https://github.com/maskys/yutome/blob/main/docs/proxy-strategy.md')}")
     typer.echo("")
     if not setup_prompts.confirm("Configure Webshare residential proxy now?", default=False):
-        _status(False, "Webshare residential proxy", "skipped; yutome can ask again if YouTube blocks transcript fetching")
+        _status_skip("Webshare residential proxy", "yutome can ask again if YouTube blocks a fetch")
         return
 
     setup_prompts.offer_to_open(
@@ -606,22 +710,27 @@ def _setup_gemini(config_path: Path, env_path: Path, *, yes: bool) -> None:
         )
         return
 
-    typer.echo("")
     typer.echo(
         "Gemini does two jobs for yutome: it repairs noisy auto-captions into clean "
         "readable transcripts after each sync, and it transcribes videos directly when "
-        "captions and ASR fail. If you skip, yutome still indexes raw auto-captions and "
-        "you can enable Gemini later with `yutome setup`."
+        "captions and ASR fail."
+    )
+    _callout(
+        "If you skip, raw auto-captions are still fully searchable — just messier. "
+        "You can enable Gemini later with `yutome setup`."
     )
     typer.echo("")
-    typer.echo("  Sign up:  https://aistudio.google.com/apikey  (Google account required)")
+    typer.echo(f"  Sign up:  {_styled_url('https://aistudio.google.com/apikey')}  (Google account required)")
     typer.echo("  Cost:     free tier covers casual use; pay-as-you-go past the daily quota")
-    typer.echo("  Docs:     https://ai.google.dev/gemini-api/docs")
+    typer.echo(f"  Docs:     {_styled_url('https://ai.google.dev/gemini-api/docs')}")
     typer.echo("")
     if not deps_ready:
         _status(False, "Gemini dependency", "run `uv sync` or reinstall yutome")
     if not setup_prompts.confirm("Enable Gemini transcript repair and fallback now?", default=False):
-        _status(False, "Gemini (transcript repair + fallback)", "skipped; yutome can ask again before transcript repair/fallback")
+        _status_skip(
+            "Gemini (transcript repair + fallback)",
+            "yutome can ask again before repair/fallback runs",
+        )
         return
 
     if not has_key:
@@ -804,35 +913,88 @@ def _prompt_channels_to_select(
         return [ordered[index] for index in sorted(indexes)]
 
 
+_OAUTH_CONSOLE_STEPS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
+    (
+        "Google Cloud project",
+        "https://console.cloud.google.com/",
+        ("Create a new project or pick an existing one.",),
+    ),
+    (
+        "Enable the YouTube Data API",
+        "https://console.cloud.google.com/apis/library/youtube.googleapis.com",
+        ("Click ENABLE on the YouTube Data API v3 page.",),
+    ),
+    (
+        "OAuth consent screen",
+        "https://console.cloud.google.com/apis/credentials/consent",
+        (
+            "User type: External",
+            "Add the scope: .../auth/youtube.readonly",
+            "Add your own Gmail under 'Test users'.",
+            "⚠ This last one is required while the app is in 'Testing' — easy to miss.",
+        ),
+    ),
+    (
+        "Credentials → OAuth client ID",
+        "https://console.cloud.google.com/apis/credentials",
+        ("Create Credentials → OAuth client ID → Application type: Desktop app.",),
+    ),
+    (
+        "Download the JSON",
+        None,
+        ("Click DOWNLOAD JSON on the new client. Save it somewhere private (e.g. ~/.yutome/).",),
+    ),
+)
+
+
 def _prompt_oauth_client_secrets(env_path: Path) -> bool:
     """Walk the user through creating a Google OAuth Desktop client and storing its JSON path.
 
+    Interactive callers see the six steps one at a time, gated on press-Enter
+    so they can complete each step before reading the next. Non-interactive
+    callers (scripted setup, CI) get the legacy dump-everything-at-once
+    behaviour so test inputs don't have to step through gates.
+
     Returns True when the YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS env value is set.
     """
-    typer.echo("")
-    typer.echo(
-        "You picked OAuth, so we need to register yutome as a Desktop OAuth client "
-        "inside your Google Cloud project. This is a one-time thing per Google account "
-        "— yutome reuses the client every time. Expect 5–10 minutes the first time you "
-        "use Google Cloud Console; faster if you've done it before."
-    )
-    typer.echo("")
-    typer.echo("Friendlier walk-through with screenshots:")
-    typer.echo("  https://github.com/MaskyS/yutome/blob/main/docs/oauth-testing.md")
-    typer.echo("")
-    typer.echo("The six steps (open each URL in your browser):")
-    typer.echo("  1. Console:        https://console.cloud.google.com/")
-    typer.echo("     Create a new project or pick an existing one.")
-    typer.echo("  2. Enable the API: https://console.cloud.google.com/apis/library/youtube.googleapis.com")
-    typer.echo("     Click ENABLE on the YouTube Data API v3 page.")
-    typer.echo("  3. Consent screen: https://console.cloud.google.com/apis/credentials/consent")
-    typer.echo("     - User type: External")
-    typer.echo("     - Add the scope: .../auth/youtube.readonly")
-    typer.echo("     - Add your own Gmail under 'Test users' (required while the app is in Testing).")
-    typer.echo("  4. Credentials:    https://console.cloud.google.com/apis/credentials")
-    typer.echo("     Create Credentials -> OAuth client ID -> Application type: Desktop app.")
-    typer.echo("  5. Click DOWNLOAD JSON on the new client; save it somewhere private (e.g. ~/.yutome/).")
-    typer.echo("  6. Paste the absolute path to that JSON below.")
+    walkthrough = "https://github.com/MaskyS/yutome/blob/main/docs/oauth-testing.md"
+    if setup_prompts.is_interactive():
+        typer.echo("")
+        typer.echo(
+            "You picked OAuth, so we need to register yutome as a Desktop OAuth "
+            "client inside your Google Cloud project. One-time per Google account; "
+            "expect 5–10 minutes the first time."
+        )
+        typer.echo(f"Screenshots walkthrough: {_styled_url(walkthrough)}")
+        typer.echo("")
+        for index, (title, url, lines) in enumerate(_OAUTH_CONSOLE_STEPS, 1):
+            typer.secho(f"  Step {index} of 6 · {title}", fg="cyan", bold=True)
+            if url:
+                typer.echo(f"    Open: {_styled_url(url)}")
+            for line in lines:
+                typer.echo(f"    {line}")
+            setup_prompts.press_any_key("    Press Enter when this step is done …")
+            typer.echo("")
+        typer.secho("  Step 6 of 6 · Paste the absolute path to the downloaded JSON", fg="cyan", bold=True)
+    else:
+        typer.echo("")
+        typer.echo(
+            "You picked OAuth, so we need to register yutome as a Desktop OAuth client "
+            "inside your Google Cloud project. This is a one-time thing per Google account "
+            "— yutome reuses the client every time. Expect 5–10 minutes the first time you "
+            "use Google Cloud Console; faster if you've done it before."
+        )
+        typer.echo("")
+        typer.echo("Friendlier walk-through with screenshots:")
+        typer.echo(f"  {walkthrough}")
+        typer.echo("")
+        typer.echo("The six steps (open each URL in your browser):")
+        for index, (title, url, lines) in enumerate(_OAUTH_CONSOLE_STEPS, 1):
+            url_part = f"   {url}" if url else ""
+            typer.echo(f"  {index}. {title}{url_part}")
+            for line in lines:
+                typer.echo(f"     {line}")
+        typer.echo("  6. Paste the absolute path to that JSON below.")
     client_secret_path = typer.prompt(
         "OAuth client secrets JSON path (blank to skip)",
         default="",
@@ -950,16 +1112,20 @@ def _setup_import_youtube_subscriptions(
                     typer.echo(f"[WARN] OAuth subscription import skipped: {oauth_exc}")
         else:
             try:
-                imported.extend(
-                    _fetch_youtube_import_channels(
-                        target=None,
-                        app_config=app_config,
-                        paths=paths,
-                        project_root=project_root,
-                        env_path=env_path,
-                        status_callback=None,
+                with _spinner(
+                    "Reading your YouTube subscriptions from the browser cookie store… "
+                    "macOS may ask for your password or Touch ID once."
+                ):
+                    imported.extend(
+                        _fetch_youtube_import_channels(
+                            target=None,
+                            app_config=app_config,
+                            paths=paths,
+                            project_root=project_root,
+                            env_path=env_path,
+                            status_callback=None,
+                        )
                     )
-                )
             except YouTubeImportError as exc:
                 typer.echo(f"[WARN] Browser-cookie subscription import did not work: {exc}")
                 if _configured_oauth_client_secrets(app_config, project_root, env_path) is None:
@@ -990,16 +1156,17 @@ def _setup_import_youtube_subscriptions(
             continue
         if public_target:
             try:
-                imported.extend(
-                    _fetch_youtube_import_channels(
-                        target=public_target,
-                        app_config=app_config,
-                        paths=paths,
-                        project_root=project_root,
-                        env_path=env_path,
-                        status_callback=typer.echo,
+                with _spinner(f"Fetching public subscriptions for {public_target}…"):
+                    imported.extend(
+                        _fetch_youtube_import_channels(
+                            target=public_target,
+                            app_config=app_config,
+                            paths=paths,
+                            project_root=project_root,
+                            env_path=env_path,
+                            status_callback=typer.echo,
+                        )
                     )
-                )
             except YouTubeImportError as exc:
                 typer.echo(f"[WARN] Public subscription import skipped: {exc}")
         break
@@ -1427,9 +1594,49 @@ def _assistant_app_label(targets: set[str]) -> str:
 
 
 def _prompt_first_run_video_cap(default_cap: int) -> int | None:
+    """Ask how many recent videos per channel to index on the first sync.
+
+    Interactive callers get a four-choice questionary picker ("Custom number"
+    falls through to a number prompt). Non-TTY callers (CliRunner, scripted
+    setup) keep the legacy free-text typer.prompt so the existing tests'
+    numeric input (``"50\\n"``, ``"all\\n"``) still works untouched.
+    """
     typer.echo("")
     typer.echo("How many recent videos per channel should Yutome index first?")
-    typer.echo("  10    quick try")
+    if setup_prompts.is_interactive():
+        quick_value = 10
+        all_value = "all"
+        custom_value = "custom"
+        choices = [
+            (f"Quick try · {quick_value} videos per channel", quick_value),
+            (f"Default · {default_cap} videos per channel", default_cap),
+            (f"All available · slow, large library", all_value),
+            ("Custom number…", custom_value),
+        ]
+        chosen = setup_prompts.select(
+            "Per channel",
+            choices=choices,
+            default=default_cap,
+        )
+        if chosen == all_value:
+            return None
+        if chosen == custom_value:
+            while True:
+                raw = setup_prompts.text("Videos per channel", default=str(default_cap)).strip().lower()
+                if raw in {"all", "everything", "unlimited"}:
+                    return None
+                try:
+                    value = int(raw)
+                except ValueError:
+                    typer.echo("[WARN] Enter a number, or 'all'.")
+                    continue
+                if value < 1:
+                    typer.echo("[WARN] Enter a positive number, or 'all'.")
+                    continue
+                return value
+        return chosen  # int
+    # Non-TTY: legacy free-text prompt — kept verbatim so existing tests pass.
+    typer.echo(f"  10    quick try")
     typer.echo(f"  {default_cap}    default")
     typer.echo("  all   everything available (slow, large)")
     typer.echo("  N     type any custom number")
@@ -1533,6 +1740,55 @@ def _print_connector_next_steps(
     typer.echo("")
     typer.echo("If this computer or bridge is off, the connector stays installed but reports Yutome Desktop offline.")
     typer.echo("No Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.")
+
+
+def _print_deploy_secrets_card(mcp_url: str, pairing_code: str | None) -> None:
+    """Visually-distinct success card printed after a successful Cloudflare deploy.
+
+    Renders MCP URL + pairing code in a magenta-bordered Rich panel and
+    auto-copies the MCP URL to the clipboard. Falls back to a plain framed
+    block if Rich somehow isn't available (it's a transitive of typer, so
+    this is defensive only).
+    """
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+    except ImportError:  # pragma: no cover — Rich ships with typer.
+        typer.echo("")
+        typer.echo("✓ Yutome Worker is live")
+        typer.echo(f"  Paste this URL into your assistant: {mcp_url}")
+        if pairing_code:
+            typer.echo(f"  Pairing code (one-time during OAuth): {pairing_code}")
+        return
+
+    console = Console(file=sys.stdout, soft_wrap=False)
+    body = Text()
+    body.append("Paste this URL into your assistant:\n", style="dim")
+    body.append(f"  {mcp_url}\n", style="bold cyan")
+    if pairing_code:
+        body.append("\nPairing code (asked once, during the assistant's OAuth step):\n", style="dim")
+        body.append(f"  {pairing_code}\n", style="bold yellow")
+    console.print("")
+    console.print(
+        Panel(
+            body,
+            title="[bold green]✓ Yutome Worker is live[/bold green]",
+            title_align="left",
+            border_style="magenta",
+            padding=(1, 2),
+        )
+    )
+    # Only mutate the system clipboard for interactive runs. Non-TTY
+    # callers (CI tests, `yutome connect --deploy > log.txt`, automation)
+    # must not have their clipboard silently overwritten — the sibling
+    # `_setup_local_mcp` snippet path gates the same operation behind a
+    # confirm; we mirror that intent here.
+    if setup_prompts.is_interactive():
+        if _copy_to_clipboard(mcp_url):
+            typer.secho("[OK] MCP URL copied to your clipboard.", fg="green")
+        else:
+            typer.echo("(Couldn't auto-copy. Select the URL above to copy by hand.)")
 
 
 def _print_pairing_next_steps(state: Any) -> None:
@@ -1717,8 +1973,18 @@ def _offer_claude_desktop_bundle(config_path: Path) -> bool:
     typer.echo(f"[OK] Built {bundle}")
     if _open_with_default_app(bundle):
         typer.echo("Claude Desktop should pop the install dialog. Click 'Install' to add Yutome.")
+        _callout(
+            "After clicking Install: restart Claude Desktop, then look for Yutome under "
+            "Settings → Connectors. If it's not there, quit Claude fully (⌘Q) and reopen."
+        )
     else:
-        typer.echo(f"[WARN] Couldn't open it automatically. Double-click {bundle} to install.")
+        # Don't print the "After installing…" hint here: the install never
+        # started (otherwise `open` wouldn't have failed). Pairing it with
+        # the WARN above misleads the user into thinking restart is the
+        # next step when the next step is actually to double-click the
+        # bundle themselves.
+        typer.echo(f"[WARN] Couldn't open it automatically. Double-click {bundle} to install,")
+        typer.echo("       then restart Claude Desktop and look under Settings → Connectors.")
     return True
 
 
@@ -1796,6 +2062,47 @@ def _setup_local_mcp(config_path: Path) -> None:
     typer.echo("")
     typer.echo("  Local MCP only works while you're on this Mac. For phone, claude.ai web,")
     typer.echo("  or another device, pick the 'Web + mobile' option instead.")
+
+
+def _normalize_pasted_connector_url(raw: str) -> str:
+    """Clean up a connector URL pasted by a user.
+
+    Common foot-guns we forgive silently:
+
+    * Stray ``/mcp`` / ``/authorize`` / ``/pair`` paths copied from the
+      assistant pairing flow (we want the *base* worker URL or ``/mcp`` —
+      both are accepted by ``_save_deployed_worker_endpoint``, but
+      ``/authorize`` and ``/pair`` are not, so strip those).
+    * Trailing slashes and whitespace.
+    * Query strings (notably the ``?code=...`` fragment pairing URLs carry).
+
+    If the result doesn't look like a Cloudflare workers.dev URL we warn,
+    but we still return it — users can host the connector on their own
+    domain. The save call will reject genuinely-invalid URLs.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parsed = urllib.parse.urlsplit(value)
+    if not parsed.scheme:
+        parsed = urllib.parse.urlsplit("https://" + value)
+    path = parsed.path or ""
+    for suffix in ("/authorize", "/pair"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    path = path.rstrip("/")
+    cleaned = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    if cleaned != value:
+        typer.echo(f"[OK] Normalized URL to: {cleaned}")
+    host = parsed.netloc.lower()
+    if host and not (host.endswith(".workers.dev") or "." in host):
+        typer.secho(
+            f"[WARN] {host!r} doesn't look like a Cloudflare workers.dev host. "
+            "Continuing — yutome will reject it later if it's not reachable.",
+            fg="yellow",
+        )
+    return cleaned
 
 
 def _pairing_url(endpoint_url: str, pairing_code: str | None = None) -> str:
@@ -2507,9 +2814,15 @@ def setup(
     ),
 ) -> None:
     """Guided first-run setup for a local yutome project."""
-    typer.echo("yutome guided setup")
-    typer.echo("")
+    typer.secho("yutome · guided setup", fg="magenta", bold=True)
+    typer.secho("─" * 21, fg="magenta")
+    if not yes and setup_prompts.is_interactive():
+        typer.echo(
+            "Six short steps. Picked the wrong answer? Ctrl-C and rerun "
+            "`yutome setup` — choices already saved are detected and skipped."
+        )
 
+    _step_header(1, SETUP_TOTAL_STEPS, "Project setup")
     config_written = write_default_config(config)
     if config_written:
         typer.echo(f"[OK] Wrote config: {config}")
@@ -2534,8 +2847,14 @@ def setup(
     _status(ingest_ok, "Ingest dependencies", "uv sync" if not ingest_ok else "ready")
     _status(vectors_ok, "Vector database dependency", "uv sync" if not vectors_ok else "ready")
     _status(embeddings_ok, "Embedding client", "uv sync" if not embeddings_ok else "ready")
+
+    _step_header(2, SETUP_TOTAL_STEPS, "Webshare residential proxy")
     _setup_webshare(env_path, yes=yes)
+
+    _step_header(3, SETUP_TOTAL_STEPS, "Gemini (transcript repair + fallback)")
     _setup_gemini(config, env_path, yes=yes)
+
+    _step_header(4, SETUP_TOTAL_STEPS, "Semantic search (Voyage)")
     semantic_enabled = _setup_semantic_search(config, env_path, yes=yes)
     _set_toml_string(config, "find", "default_mode", "hybrid" if semantic_enabled else "lexical")
     load_dotenv(env_path)
@@ -2543,6 +2862,7 @@ def setup(
 
     setup_library_channels: list[LibraryChannel] = []
     if not yes:
+        _step_header(5, SETUP_TOTAL_STEPS, "YouTube subscriptions & first sync")
         setup_library_channels.extend(
             _setup_import_youtube_subscriptions(
                 config=config,
@@ -2622,46 +2942,75 @@ def setup(
     typer.echo('  yutome find "topic I remember"')
     if _env_has_webshare_credentials(env_path):
         typer.echo("  yutome proxy-info")
+    if not yes:
+        _step_header(6, SETUP_TOTAL_STEPS, "Connect Yutome to your assistant")
     _print_setup_mcp_section(yes=yes)
     if not yes:
         node_ready = _can_run_cloudflare_deploy()
+        # Stable identity tokens — the *value* returned by the prompt is one
+        # of these short strings, not the user-facing label. That way we can
+        # restyle the label freely while keeping the dispatch branches simple.
+        local_value = "local"
+        deploy_value = "deploy"
+        paste_value = "paste"
+        skip_value = "skip"
+
         local_label = (
-            "Local — Claude Desktop / Cursor / Cherry Studio on this Mac "
-            "(recommended: free, no signup, ~30 seconds)"
+            "Local apps on this Mac · Claude Desktop, Cursor, Cherry Studio "
+            "(recommended · free · ~30 sec)"
         )
         deploy_label = (
-            "Web + mobile — works from claude.ai, ChatGPT, your phone "
-            "(Cloudflare sign-in needed; free plan is fine)"
-            if node_ready
-            else "Web + mobile — needs Node.js 22+ installed first; opens Cloudflare to get started"
+            "Deploy to Cloudflare · works from claude.ai, ChatGPT, phone "
+            "(free plan; sign-in needed)"
         )
-        paste_label = "Web + mobile — I already have a Yutome URL someone gave me"
-        skip_label = "Skip for now — I'll run `yutome connect` later"
-        choices = [local_label, deploy_label, paste_label, skip_label]
+        # When Node 22+ isn't installed we leave the choice *selectable* —
+        # picking it falls into the late `if not node_ready:` check at
+        # cli.py:3019 which opens the Cloudflare dashboard and tells the
+        # user how to install Node. Using questionary's `disabled=` here
+        # would grey the row out and trap the user behind a hint they
+        # can't act on.
+        if not node_ready:
+            deploy_label = (
+                deploy_label
+                + " — needs Node.js 22+; yutome will help"
+            )
+        paste_label = "I already have a Yutome URL · paste it"
+        skip_label = "Skip · run `yutome connect` later"
+
+        choices = [
+            ("─── On this Mac ─────────────────────────────────────",),
+            (local_label, local_value),
+            ("─── From anywhere (web, phone, other devices) ───────",),
+            (deploy_label, deploy_value),
+            (paste_label, paste_value),
+            ("─────────────────────────────────────────────────────",),
+            (skip_label, skip_value),
+        ]
         while True:
             connect_choice = setup_prompts.select(
                 "How do you want to connect Yutome to your assistant?",
                 choices=choices,
-                default=local_label,
+                default=local_value,
             )
-            if connect_choice in {paste_label, deploy_label}:
+            if connect_choice in {paste_value, deploy_value}:
                 assistant_apps = _prompt_assistant_apps(allow_back=True)
                 if assistant_apps is None:
                     continue
             else:
                 assistant_apps = None
             break
-        if connect_choice == skip_label:
+        if connect_choice == skip_value:
             pass
-        elif connect_choice == local_label:
+        elif connect_choice == local_value:
             _setup_local_mcp(config)
-        elif connect_choice == paste_label:
+        elif connect_choice == paste_value:
             typer.echo("")
             typer.echo(
                 "Paste the connector URL printed by whoever set up the Worker. The URL can be "
                 "the base Worker URL or the full /mcp URL — yutome handles both."
             )
             endpoint = setup_prompts.text("Connector URL")
+            endpoint = _normalize_pasted_connector_url(endpoint)
             if not endpoint:
                 typer.echo("[WARN] No URL entered; skipping.")
             else:
@@ -2728,6 +3077,15 @@ def setup(
                     assistant_apps=assistant_apps,
                 )
                 _restart_bridge_after_deploy(config_path=config, paths=paths)
+                # Card is the last thing printed — only shown when save +
+                # restart have actually succeeded. Otherwise the user
+                # would see a green "live" panel for a deploy whose state
+                # never persisted locally.
+                try:
+                    _, _deploy_mcp_url = normalize_endpoint(deployed_url)
+                except ValueError:
+                    _deploy_mcp_url = deployed_url
+                _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
             else:
                 typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
                 typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
@@ -2837,6 +3195,12 @@ def connect_command(
             assistant_apps=assistant_app,
         )
         _restart_bridge_after_deploy(config_path=config, paths=paths)
+        # Card last — only shown when save + restart actually succeeded.
+        try:
+            _, _deploy_mcp_url = normalize_endpoint(deployed_url)
+        except ValueError:
+            _deploy_mcp_url = deployed_url
+        _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
         return
     try:
         state_path = _save_remote_connection(
