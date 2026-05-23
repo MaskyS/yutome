@@ -193,9 +193,9 @@ def test_select_tty_passes_questionary_choice_and_separator(monkeypatch):
     deploy_choice = captured["choices"][2]
     assert deploy_choice.value == "deploy"
     assert deploy_choice.disabled == "needs Node"
-    # The default-value passed to questionary is the LABEL string matched
-    # by the value, not the value itself.
-    assert captured["default"] == "Deploy"
+    # The default-value passed to questionary must be the stored value;
+    # questionary validates defaults against Choice.value, not title.
+    assert captured["default"] == "deploy"
 
 
 # --------------------------------------------------------------------------- #
@@ -410,7 +410,7 @@ def test_bridge_start_with_launchd_running_does_not_spawn_detached(monkeypatch, 
     assert "PID 5555" in result.output
 
 
-def test_bridge_start_with_launchd_installed_but_not_running_kickstarts(monkeypatch, tmp_path):
+def test_bridge_start_with_launchd_installed_but_not_running_starts_service(monkeypatch, tmp_path):
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
@@ -435,7 +435,7 @@ def test_bridge_start_with_launchd_installed_but_not_running_kickstarts(monkeypa
     result = CliRunner().invoke(app, ["bridge", "start", "--config", str(config_path)])
     assert result.exit_code == 0
     assert spawned["hit"] is False
-    assert any("kickstart" in cmd for cmd in invocations), invocations
+    assert any(cmd[:2] == ["launchctl", "load"] for cmd in invocations), invocations
     assert "PID 7777" in result.output
 
 

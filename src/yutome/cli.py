@@ -4,9 +4,11 @@ import asyncio
 import importlib.util
 import json
 import os
+import plistlib
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -5069,6 +5071,17 @@ def _bridge_binary_args() -> list[str]:
     return [sys.executable, "-m", "yutome"]
 
 
+def _bridge_foreground_command(binary_args: list[str], config_path: Path) -> list[str]:
+    return [
+        *binary_args,
+        "bridge",
+        "start",
+        "--config",
+        str(config_path),
+        "--foreground",
+    ]
+
+
 def _bridge_start_detached(config_path: Path, paths: ProjectPaths) -> tuple[int, Path]:
     """Spawn the bridge as a detached background process. Returns (pid, log_path)."""
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -5083,7 +5096,7 @@ def _bridge_start_detached(config_path: Path, paths: ProjectPaths) -> tuple[int,
     log_handle = log_path.open("ab")
     try:
         binary_args = _bridge_binary_args()
-        command = [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
+        command = _bridge_foreground_command(binary_args, config_path)
         proc = subprocess.Popen(
             command,
             stdout=log_handle,
@@ -5130,40 +5143,39 @@ def _launchd_plist_path() -> Path:
 def _launchd_plist_content(
     binary_args: list[str], config_path: Path, project_root: Path, log_path: Path
 ) -> str:
-    args_xml = "\n".join(
-        f"        <string>{a}</string>"
-        for a in [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n'
-        '<dict>\n'
-        f'    <key>Label</key><string>{LAUNCHD_BRIDGE_LABEL}</string>\n'
-        '    <key>ProgramArguments</key>\n'
-        '    <array>\n'
-        f'{args_xml}\n'
-        '    </array>\n'
-        f'    <key>WorkingDirectory</key><string>{project_root}</string>\n'
-        '    <key>RunAtLoad</key><true/>\n'
-        '    <key>KeepAlive</key><true/>\n'
-        f'    <key>StandardOutPath</key><string>{log_path}</string>\n'
-        f'    <key>StandardErrorPath</key><string>{log_path}</string>\n'
-        '    <key>ProcessType</key><string>Background</string>\n'
-        '</dict>\n'
-        '</plist>\n'
-    )
+    payload = {
+        "Label": LAUNCHD_BRIDGE_LABEL,
+        "ProgramArguments": _bridge_foreground_command(binary_args, config_path),
+        "WorkingDirectory": str(project_root),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+        "ProcessType": "Background",
+    }
+    return plistlib.dumps(payload, sort_keys=False).decode("utf-8")
 
 
 def _systemd_unit_path() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_BRIDGE_UNIT
 
 
+def _systemd_quote(value: str | Path) -> str:
+    text = str(value)
+    escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+        .replace("$", "$$")
+    )
+    return f'"{escaped}"'
+
+
 def _systemd_unit_content(
     binary_args: list[str], config_path: Path, project_root: Path, log_path: Path
 ) -> str:
     exec_start = " ".join(
-        [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
+        _systemd_quote(arg) for arg in _bridge_foreground_command(binary_args, config_path)
     )
     return (
         "[Unit]\n"
@@ -5174,11 +5186,11 @@ def _systemd_unit_content(
         "[Service]\n"
         "Type=simple\n"
         f"ExecStart={exec_start}\n"
-        f"WorkingDirectory={project_root}\n"
+        f"WorkingDirectory={_systemd_quote(project_root)}\n"
         "Restart=on-failure\n"
         "RestartSec=10\n"
-        f"StandardOutput=append:{log_path}\n"
-        f"StandardError=append:{log_path}\n"
+        f"StandardOutput=append:{_systemd_quote(log_path)}\n"
+        f"StandardError=append:{_systemd_quote(log_path)}\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
@@ -5191,6 +5203,69 @@ def _launchd_installed() -> bool:
 
 def _systemd_installed() -> bool:
     return sys.platform.startswith("linux") and _systemd_unit_path().exists()
+
+
+def _config_arg_from_argv(argv: list[str]) -> Path | None:
+    try:
+        index = argv.index("--config")
+    except ValueError:
+        return None
+    if index + 1 >= len(argv):
+        return None
+    return Path(argv[index + 1])
+
+
+def _installed_bridge_config_path() -> Path | None:
+    """Best-effort config path encoded in the installed service file."""
+    if _launchd_installed():
+        try:
+            payload = plistlib.loads(_launchd_plist_path().read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return None
+        argv = payload.get("ProgramArguments") if isinstance(payload, dict) else None
+        if isinstance(argv, list) and all(isinstance(arg, str) for arg in argv):
+            return _config_arg_from_argv(argv)
+        return None
+    if _systemd_installed():
+        try:
+            content = _systemd_unit_path().read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in content.splitlines():
+            if not line.startswith("ExecStart="):
+                continue
+            try:
+                argv = shlex.split(line.removeprefix("ExecStart="))
+            except ValueError:
+                return None
+            return _config_arg_from_argv(argv)
+    return None
+
+
+def _same_config_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left.absolute() == right.absolute()
+
+
+def _installed_service_matches_config(config_path: Path) -> bool:
+    installed_config = _installed_bridge_config_path()
+    if installed_config is None:
+        # Unknown/legacy service files are treated as matching so existing
+        # installs stay controllable.
+        return True
+    return _same_config_path(installed_config, config_path)
+
+
+def _installed_service_mismatch_message(config_path: Path) -> str:
+    installed_config = _installed_bridge_config_path()
+    if installed_config is None:
+        return "Bridge auto-start is installed, but yutome could not read its config path."
+    return (
+        "Bridge auto-start is installed for another config: "
+        f"{installed_config}. Current config: {config_path.resolve()}."
+    )
 
 
 def _launchd_bridge_pid() -> int | None:
@@ -5270,6 +5345,33 @@ def _service_bridge_pid() -> int | None:
     return None
 
 
+def _start_launchd_bridge_service() -> subprocess.CompletedProcess[str]:
+    plist_path = _launchd_plist_path()
+    result = subprocess.run(
+        ["launchctl", "load", str(plist_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0 or _launchd_bridge_pid() is not None:
+        return result
+    return subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _stop_launchd_bridge_service() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["launchctl", "unload", str(_launchd_plist_path())],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None:
     """Called after connect/disconnect state changes. Restart any auto-managed bridge so it
     picks up the new relay token; or auto-start a detached bridge if no service is installed."""
@@ -5277,19 +5379,25 @@ def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None
     if state is None or not state.relay_token:
         return
     if _launchd_installed():
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
-            capture_output=True, check=False,
-        )
-        typer.echo("Bridge: restarted via launchd to pick up the new token.")
-        return
+        if _installed_service_matches_config(config_path):
+            subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
+                capture_output=True, check=False,
+            )
+            typer.echo("Bridge: restarted via launchd to pick up the new token.")
+            return
+        typer.secho(f"[WARN] {_installed_service_mismatch_message(config_path)}", fg="yellow")
+        typer.echo("Bridge: starting a project-local background bridge instead.")
     if _systemd_installed():
-        subprocess.run(
-            ["systemctl", "--user", "restart", SYSTEMD_BRIDGE_UNIT],
-            capture_output=True, check=False,
-        )
-        typer.echo("Bridge: restarted via systemd to pick up the new token.")
-        return
+        if _installed_service_matches_config(config_path):
+            subprocess.run(
+                ["systemctl", "--user", "restart", SYSTEMD_BRIDGE_UNIT],
+                capture_output=True, check=False,
+            )
+            typer.echo("Bridge: restarted via systemd to pick up the new token.")
+            return
+        typer.secho(f"[WARN] {_installed_service_mismatch_message(config_path)}", fg="yellow")
+        typer.echo("Bridge: starting a project-local background bridge instead.")
     pid, log_path = _bridge_start_detached(config_path, paths)
     typer.echo(f"Bridge: started in background (PID {pid}, logs at {log_path}).")
     typer.echo("Survives this terminal session but not reboots. For persistence: yutome bridge install")
@@ -5316,49 +5424,58 @@ def bridge_start_command(
     # service manager can't see, both processes connect to the worker, and
     # `bridge stop` only kills the manual one — leaving a ghost bridge.
     if _launchd_installed():
-        existing_pid = _launchd_bridge_pid()
-        if existing_pid:
-            typer.secho(
-                f"[OK] Bridge is already running under launchd (PID {existing_pid}).",
-                fg="green",
-            )
-            typer.echo(
-                f"     Restart it: launchctl kickstart -k gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"
-            )
-            typer.echo("     Remove auto-start: yutome bridge uninstall")
-            return
-        typer.echo("Bridge auto-start is installed but the service isn't running. Kickstarting via launchd…")
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
-            capture_output=True, check=False,
-        )
-        new_pid = _launchd_bridge_pid()
-        if new_pid:
-            typer.secho(f"[OK] Bridge running under launchd (PID {new_pid}).", fg="green")
+        if not _installed_service_matches_config(config):
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            typer.echo("Starting a project-local background bridge instead.")
         else:
-            typer.echo("[WARN] launchctl kickstart returned but no PID was reported. Check `yutome bridge status`.")
-        return
+            existing_pid = _launchd_bridge_pid()
+            if existing_pid:
+                typer.secho(
+                    f"[OK] Bridge is already running under launchd (PID {existing_pid}).",
+                    fg="green",
+                )
+                typer.echo(
+                    f"     Restart it: launchctl kickstart -k gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"
+                )
+                typer.echo("     Remove auto-start: yutome bridge uninstall")
+                return
+            typer.echo("Bridge auto-start is installed but the service isn't running. Starting via launchd…")
+            result = _start_launchd_bridge_service()
+            new_pid = _launchd_bridge_pid()
+            if new_pid:
+                typer.secho(f"[OK] Bridge running under launchd (PID {new_pid}).", fg="green")
+            else:
+                detail = (result.stderr or result.stdout or "").strip()
+                typer.echo(
+                    "[WARN] launchctl returned but no PID was reported. Check `yutome bridge status`."
+                    + (f" Details: {detail}" if detail else "")
+                )
+            return
     if _systemd_installed():
-        existing_pid = _systemd_bridge_pid()
-        if existing_pid:
-            typer.secho(
-                f"[OK] Bridge is already running under systemd (PID {existing_pid}).",
-                fg="green",
-            )
-            typer.echo(f"     Restart it: systemctl --user restart {SYSTEMD_BRIDGE_UNIT}")
-            typer.echo("     Remove auto-start: yutome bridge uninstall")
-            return
-        typer.echo("Bridge auto-start is installed but the service isn't running. Starting via systemd…")
-        subprocess.run(
-            ["systemctl", "--user", "start", SYSTEMD_BRIDGE_UNIT],
-            capture_output=True, check=False,
-        )
-        new_pid = _systemd_bridge_pid()
-        if new_pid:
-            typer.secho(f"[OK] Bridge running under systemd (PID {new_pid}).", fg="green")
+        if not _installed_service_matches_config(config):
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            typer.echo("Starting a project-local background bridge instead.")
         else:
-            typer.echo("[WARN] systemctl start returned but no MainPID was reported. Check `yutome bridge status`.")
-        return
+            existing_pid = _systemd_bridge_pid()
+            if existing_pid:
+                typer.secho(
+                    f"[OK] Bridge is already running under systemd (PID {existing_pid}).",
+                    fg="green",
+                )
+                typer.echo(f"     Restart it: systemctl --user restart {SYSTEMD_BRIDGE_UNIT}")
+                typer.echo("     Remove auto-start: yutome bridge uninstall")
+                return
+            typer.echo("Bridge auto-start is installed but the service isn't running. Starting via systemd…")
+            subprocess.run(
+                ["systemctl", "--user", "start", SYSTEMD_BRIDGE_UNIT],
+                capture_output=True, check=False,
+            )
+            new_pid = _systemd_bridge_pid()
+            if new_pid:
+                typer.secho(f"[OK] Bridge running under systemd (PID {new_pid}).", fg="green")
+            else:
+                typer.echo("[WARN] systemctl start returned but no MainPID was reported. Check `yutome bridge status`.")
+            return
     _, paths = _load_runtime(config)
     pid, log_path = _bridge_start_detached(config, paths)
     typer.echo(f"[OK] Bridge started (PID {pid}).")
@@ -5375,9 +5492,47 @@ def bridge_stop_command(
 ) -> None:
     """Stop the background bridge process."""
     _, paths = _load_runtime(config)
+    service_handled = False
+    if _launchd_installed():
+        if _installed_service_matches_config(config):
+            result = _stop_launchd_bridge_service()
+            service_handled = True
+            if result.returncode == 0 or _launchd_bridge_pid() is None:
+                typer.echo("[OK] Stopped launchd bridge service. Start it again with: yutome bridge start")
+            else:
+                detail = (result.stderr or result.stdout or "").strip()
+                typer.echo(
+                    "[WARN] launchd bridge service did not stop cleanly."
+                    + (f" Details: {detail}" if detail else "")
+                )
+        else:
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            typer.echo("Not stopping that service; checking for a project-local manual bridge.")
+    elif _systemd_installed():
+        if _installed_service_matches_config(config):
+            result = subprocess.run(
+                ["systemctl", "--user", "stop", SYSTEMD_BRIDGE_UNIT],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            service_handled = True
+            if result.returncode == 0 or _systemd_bridge_pid() is None:
+                typer.echo("[OK] Stopped systemd bridge service. Start it again with: yutome bridge start")
+            else:
+                detail = (result.stderr or result.stdout or "").strip()
+                typer.echo(
+                    "[WARN] systemd bridge service did not stop cleanly."
+                    + (f" Details: {detail}" if detail else "")
+                )
+        else:
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            typer.echo("Not stopping that service; checking for a project-local manual bridge.")
+
     pid = _read_bridge_pid(paths)
     if pid is None:
-        typer.echo("No bridge PID recorded; nothing to stop.")
+        if not service_handled:
+            typer.echo("No bridge PID recorded; nothing to stop.")
         return
     if not _pid_is_alive(pid):
         typer.echo(f"PID {pid} is not running. Clearing stale PID file.")
@@ -5399,9 +5554,33 @@ def bridge_status_command(
     if _launchd_installed():
         typer.echo("Bridge auto-start: launchd")
         typer.echo(f"  plist: {_launchd_plist_path()}")
+        if not _installed_service_matches_config(config):
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            manual_pid = _read_bridge_pid(paths)
+            if manual_pid is None:
+                typer.echo("Bridge process: not started for this config (no PID file).")
+                return
+            if _pid_is_alive(manual_pid):
+                typer.echo(f"Bridge process: running for this config (manual PID {manual_pid}).")
+                typer.echo(f"  logs: {_bridge_log_path(paths)}")
+            else:
+                typer.echo(f"Bridge process: PID {manual_pid} recorded but process is not alive.")
+            return
     elif _systemd_installed():
         typer.echo("Bridge auto-start: systemd")
         typer.echo(f"  unit: {_systemd_unit_path()}")
+        if not _installed_service_matches_config(config):
+            typer.secho(f"[WARN] {_installed_service_mismatch_message(config)}", fg="yellow")
+            manual_pid = _read_bridge_pid(paths)
+            if manual_pid is None:
+                typer.echo("Bridge process: not started for this config (no PID file).")
+                return
+            if _pid_is_alive(manual_pid):
+                typer.echo(f"Bridge process: running for this config (manual PID {manual_pid}).")
+                typer.echo(f"  logs: {_bridge_log_path(paths)}")
+            else:
+                typer.echo(f"Bridge process: PID {manual_pid} recorded but process is not alive.")
+            return
     else:
         typer.echo("Bridge auto-start: not installed (run `yutome bridge install` to persist across reboots)")
     # When auto-start is installed, the *service manager's* PID is the
@@ -5436,7 +5615,6 @@ def bridge_status_command(
         typer.echo("  Run `yutome bridge start` to restart it.")
 
 
-@bridge_app.command("install")
 def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str | None]:
     """Install the bridge as a launchd / systemd user service.
 
@@ -5529,20 +5707,31 @@ def _offer_bridge_persistence(config_path: Path) -> None:
     if not _bridge_persistence_supported():
         return
     if _launchd_installed() or _systemd_installed():
-        typer.secho(
-            "[OK] Bridge auto-start service is already installed — survives reboots.",
-            fg="green",
-        )
-        return
+        if _installed_service_matches_config(config_path):
+            typer.secho(
+                "[OK] Bridge auto-start service is already installed — survives reboots.",
+                fg="green",
+            )
+            return
+        typer.secho(f"[WARN] {_installed_service_mismatch_message(config_path)}", fg="yellow")
+        if not setup_prompts.is_interactive():
+            typer.echo("Run `yutome bridge install --config <this yutome.toml>` to repoint auto-start.")
+            return
     if not setup_prompts.is_interactive():
         return
     typer.echo("")
-    typer.echo(
-        "The bridge is running in the background, but it'll stop the next time this "
-        "computer reboots. Install it as a "
-        + ("launchd agent (macOS)" if sys.platform == "darwin" else "systemd user service")
-        + " so your assistant can still reach yutome after a restart?"
-    )
+    if _launchd_installed() or _systemd_installed():
+        typer.echo(
+            "Install bridge auto-start for this project, replacing the existing "
+            "Yutome auto-start service?"
+        )
+    else:
+        typer.echo(
+            "The bridge is running in the background, but it'll stop the next time this "
+            "computer reboots. Install it as a "
+            + ("launchd agent (macOS)" if sys.platform == "darwin" else "systemd user service")
+            + " so your assistant can still reach yutome after a restart?"
+        )
     if not setup_prompts.confirm(
         "Install bridge auto-start so it survives reboots?",
         default=True,
@@ -5561,6 +5750,7 @@ def _offer_bridge_persistence(config_path: Path) -> None:
         typer.echo("       You can retry later with: yutome bridge install")
 
 
+@bridge_app.command("install")
 def bridge_install_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."

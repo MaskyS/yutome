@@ -1,4 +1,6 @@
 import json
+import plistlib
+import shlex
 import subprocess
 import time
 import urllib.parse
@@ -24,6 +26,7 @@ from yutome.cli import (
     _ensure_workers_dev_subdomain,
     _ensure_wrangler_authenticated,
     _launchd_plist_content,
+    _installed_bridge_config_path,
     _read_bridge_pid,
     _restart_bridge_after_deploy,
     _stop_bridge_pid,
@@ -885,9 +888,16 @@ def test_connect_with_endpoint_writes_remote_state(tmp_path: Path) -> None:
     assert "YUTOME_WEBSHARE" not in result.output
 
 
-def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(tmp_path: Path) -> None:
+def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
+    starts: list[Path] = []
+    monkeypatch.setattr(
+        "yutome.cli._bridge_start_detached",
+        lambda cfg, paths: (starts.append(cfg) or (1234, paths.logs_dir / "bridge.log")),
+    )
 
     result = runner.invoke(
         app,
@@ -910,6 +920,7 @@ def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(tmp_path: P
     assert state["pairing_code"] == "PAIR12"
     assert "Code: PAIR12" in result.output
     assert "yutome bridge" in result.output
+    assert starts == [config_path]
 
 
 def test_connect_without_endpoint_prints_deploy_instructions_without_provider_keys(tmp_path: Path) -> None:
@@ -948,6 +959,7 @@ def test_tracked_capsule_path_uses_packaged_bundle_when_repo_sibling_missing(
 def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
+    starts: list[Path] = []
 
     monkeypatch.setattr(
         "yutome.cli._deploy_tracked_capsule",
@@ -957,6 +969,10 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
             "fake-relay-token",
             "ABCD12",
         ),
+    )
+    monkeypatch.setattr(
+        "yutome.cli._bridge_start_detached",
+        lambda cfg, paths: (starts.append(cfg) or (1234, paths.logs_dir / "bridge.log")),
     )
 
     result = runner.invoke(app, ["connect", "--config", str(config_path), "--deploy"])
@@ -971,6 +987,7 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
     # The pairing prose must print the code so the user knows what to paste
     # when Claude/ChatGPT opens the OAuth browser.
     assert "ABCD12" in result.output
+    assert starts == [config_path]
 
 
 def test_status_reports_remote_unconfigured_and_configured(tmp_path: Path) -> None:
@@ -1023,6 +1040,10 @@ def test_remote_status_uses_live_worker_relay_status(monkeypatch, tmp_path: Path
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
+    monkeypatch.setattr(
+        "yutome.cli._bridge_start_detached",
+        lambda _cfg, paths: (1234, paths.logs_dir / "bridge.log"),
+    )
     connect_result = runner.invoke(
         app,
         [
@@ -1455,12 +1476,19 @@ def test_launchd_plist_content_has_expected_keys(tmp_path: Path) -> None:
         tmp_path,
         tmp_path / "bridge.log",
     )
-    assert "<key>Label</key><string>ai.yutome.bridge</string>" in plist
-    assert "<key>RunAtLoad</key><true/>" in plist
-    assert "<key>KeepAlive</key><true/>" in plist
-    assert "/usr/local/bin/yutome" in plist
-    assert "bridge" in plist and "start" in plist and "--foreground" in plist
-    assert str(tmp_path / "bridge.log") in plist
+    parsed = plistlib.loads(plist.encode("utf-8"))
+    assert parsed["Label"] == "ai.yutome.bridge"
+    assert parsed["RunAtLoad"] is True
+    assert parsed["KeepAlive"] is True
+    assert parsed["ProgramArguments"] == [
+        "/usr/local/bin/yutome",
+        "bridge",
+        "start",
+        "--config",
+        str(tmp_path / "yutome.toml"),
+        "--foreground",
+    ]
+    assert parsed["StandardOutPath"] == str(tmp_path / "bridge.log")
 
 
 def test_systemd_unit_content_has_expected_directives(tmp_path: Path) -> None:
@@ -1470,10 +1498,161 @@ def test_systemd_unit_content_has_expected_directives(tmp_path: Path) -> None:
         tmp_path,
         tmp_path / "bridge.log",
     )
-    assert "ExecStart=/usr/local/bin/yutome" in unit
+    exec_start = next(line.removeprefix("ExecStart=") for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert shlex.split(exec_start) == [
+        "/usr/local/bin/yutome",
+        "bridge",
+        "start",
+        "--config",
+        str(tmp_path / "yutome.toml"),
+        "--foreground",
+    ]
     assert "Restart=on-failure" in unit
     assert "WantedBy=default.target" in unit
-    assert f"StandardOutput=append:{tmp_path / 'bridge.log'}" in unit
+    assert f'StandardOutput=append:"{tmp_path / "bridge.log"}"' in unit
+
+
+def test_service_files_preserve_paths_with_spaces_and_xml_chars(tmp_path: Path) -> None:
+    root = tmp_path / "Yutome & Project"
+    config_path = root / "yutome.toml"
+    log_path = root / "logs" / "bridge.log"
+    binary = str(root / "bin" / "yutome")
+
+    plist = _launchd_plist_content([binary], config_path, root, log_path)
+    parsed = plistlib.loads(plist.encode("utf-8"))
+    assert parsed["ProgramArguments"] == [
+        binary,
+        "bridge",
+        "start",
+        "--config",
+        str(config_path),
+        "--foreground",
+    ]
+    assert parsed["WorkingDirectory"] == str(root)
+
+    unit = _systemd_unit_content([binary], config_path, root, log_path)
+    exec_start = next(line.removeprefix("ExecStart=") for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert shlex.split(exec_start) == [
+        binary,
+        "bridge",
+        "start",
+        "--config",
+        str(config_path),
+        "--foreground",
+    ]
+    assert f'WorkingDirectory="{root}"' in unit
+
+
+def test_bridge_start_detached_uses_bridge_command_config_order(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakePopen:
+        pid = 12345
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("yutome.cli._bridge_binary_args", lambda: ["/usr/local/bin/yutome"])
+    monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: None)
+    monkeypatch.setattr("yutome.cli.subprocess.Popen", FakePopen)
+
+    pid, _log_path = _bridge_start_detached(config_path, paths)
+
+    assert pid == 12345
+    assert captured["command"] == [
+        "/usr/local/bin/yutome",
+        "bridge",
+        "start",
+        "--config",
+        str(config_path),
+        "--foreground",
+    ]
+
+
+def test_installed_bridge_config_path_reads_launchd_plist(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    config_path = tmp_path / "current project" / "yutome.toml"
+    plist_path = tmp_path / "ai.yutome.bridge.plist"
+    plist_path.write_text(
+        _launchd_plist_content(["/usr/local/bin/yutome"], config_path, config_path.parent, tmp_path / "bridge.log"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._launchd_plist_path", lambda: plist_path)
+
+    assert _installed_bridge_config_path() == config_path
+
+
+def test_bridge_install_cli_accepts_config_option(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    service_path = tmp_path / "ai.yutome.bridge.plist"
+    monkeypatch.setattr(
+        "yutome.cli._install_bridge_service",
+        lambda cfg: (cfg == config_path, service_path, None),
+    )
+
+    result = runner.invoke(app, ["bridge", "install", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert str(service_path) in result.output
+
+
+def test_bridge_stop_stops_launchd_service_for_matching_config(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    calls: list[str] = []
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
+    monkeypatch.setattr("yutome.cli._launchd_bridge_pid", lambda: None)
+    monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: None)
+
+    def fake_stop() -> subprocess.CompletedProcess[str]:
+        calls.append("stop")
+        return subprocess.CompletedProcess(["launchctl", "unload"], 0, stdout="", stderr="")
+
+    monkeypatch.setattr("yutome.cli._stop_launchd_bridge_service", fake_stop)
+
+    result = runner.invoke(app, ["bridge", "stop", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert calls == ["stop"]
+    assert "Stopped launchd bridge service" in result.output
+
+
+def test_bridge_stop_does_not_stop_service_for_different_config(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: False)
+    monkeypatch.setattr("yutome.cli._installed_bridge_config_path", lambda: tmp_path / "other.toml")
+    monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: None)
+
+    def fail_stop() -> subprocess.CompletedProcess[str]:
+        raise AssertionError("must not stop another config's service")
+
+    monkeypatch.setattr("yutome.cli._stop_launchd_bridge_service", fail_stop)
+
+    result = runner.invoke(app, ["bridge", "stop", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "another config" in result.output
+    assert "No bridge PID recorded" in result.output
 
 
 def test_restart_bridge_after_deploy_spawns_detached_when_no_service(

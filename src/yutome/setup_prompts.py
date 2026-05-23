@@ -169,8 +169,8 @@ def select(message: str, choices: list, *, default=None):
                     disabled=disabled_reason,
                 )
             )
-            if default is not None and value_of(item) == default:
-                default_value = label_of(item)
+            if default is not None and (value_of(item) == default or label_of(item) == default):
+                default_value = value_of(item)
         else:
             pretty.append(item)
             if default is not None and item == default:
