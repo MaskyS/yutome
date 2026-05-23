@@ -2590,6 +2590,66 @@ def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
     return generated_config
 
 
+def _wait_for_worker_online(
+    url: str,
+    *,
+    timeout: float = 60.0,
+    interval: float = 1.5,
+    request_timeout: float = 3.0,
+) -> bool:
+    """Poll ``{url}/healthz`` until it responds 200, or ``timeout`` elapses.
+
+    ``wrangler deploy`` returns as soon as Cloudflare's control plane has
+    accepted the bundle, but the URL can take several more seconds to
+    actually serve requests from the edge (and the secret pushes that
+    follow take their own propagation time). Without this wait, the
+    deploy-success card and the per-assistant pairing prose are printed
+    while the user's first paste into Claude / ChatGPT still 502s.
+
+    Returns True if the worker started responding within the window, False
+    if we timed out. A False return is non-fatal — callers print a soft
+    warning and proceed; the worker almost always comes up in another
+    minute or two.
+    """
+    health_url = url.rstrip("/") + "/healthz"
+    deadline = time.monotonic() + timeout
+    last_error: str | None = None
+    with _spinner(
+        f"Waiting for Cloudflare edge to start serving {url} (up to {int(timeout)}s)…"
+    ):
+        while time.monotonic() < deadline:
+            try:
+                req = urllib.request.Request(
+                    health_url,
+                    headers={
+                        "accept": "application/json",
+                        "user-agent": "yutome-setup/healthz-probe",
+                    },
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                    if 200 <= response.status < 300:
+                        return True
+                    last_error = f"HTTP {response.status}"
+            except urllib.error.HTTPError as exc:
+                # A 4xx from /healthz means the route is registered (worker
+                # is up) but the response wasn't successful — still counts
+                # as "reachable enough" since the URL is serving traffic.
+                if 400 <= exc.code < 500:
+                    return True
+                last_error = f"HTTP {exc.code}"
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = str(exc)
+            time.sleep(interval)
+    typer.secho(
+        f"[WARN] Worker not yet reachable at {url} after {int(timeout)}s"
+        + (f" (last error: {last_error})" if last_error else "")
+        + ". It usually comes up within another minute — try pairing in your assistant in ~60s.",
+        fg="yellow",
+    )
+    return False
+
+
 def _push_wrangler_secret(capsule: Path, name: str, value: str, *, wrangler_config: Path | None = None) -> None:
     """Push a secret to the deployed Worker via `wrangler secret put`."""
     typer.echo(f"Setting Cloudflare secret {name}")
@@ -2687,6 +2747,13 @@ def _deploy_tracked_capsule(
     _push_wrangler_secret(capsule, "YUTOME_PAIRING_CODE", effective_pairing_code, wrangler_config=wrangler_config)
 
     deployed_url = _extract_worker_url(output)
+    # Bridge the gap between `wrangler deploy` returning and the Cloudflare
+    # edge actually serving requests. Without this, the success card + next
+    # steps print before /mcp is reachable and the user's first paste into
+    # Claude / ChatGPT 502s.
+    if deployed_url:
+        if _wait_for_worker_online(deployed_url):
+            typer.secho(f"[OK] Worker responding at {deployed_url}", fg="green")
     return deployed_url, CAPSULE_PROJECT_NAME, effective_relay_token, effective_pairing_code
 
 
@@ -3077,15 +3144,16 @@ def setup(
                     assistant_apps=assistant_apps,
                 )
                 _restart_bridge_after_deploy(config_path=config, paths=paths)
-                # Card is the last thing printed — only shown when save +
-                # restart have actually succeeded. Otherwise the user
-                # would see a green "live" panel for a deploy whose state
-                # never persisted locally.
+                # Card is the last thing printed before the persistence
+                # prompt — only shown when save + restart have actually
+                # succeeded. Otherwise the user would see a green "live"
+                # panel for a deploy whose state never persisted locally.
                 try:
                     _, _deploy_mcp_url = normalize_endpoint(deployed_url)
                 except ValueError:
                     _deploy_mcp_url = deployed_url
                 _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
+                _offer_bridge_persistence(config)
             else:
                 typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
                 typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
@@ -3201,6 +3269,7 @@ def connect_command(
         except ValueError:
             _deploy_mcp_url = deployed_url
         _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
+        _offer_bridge_persistence(config)
         return
     try:
         state_path = _save_remote_connection(
@@ -5124,6 +5193,83 @@ def _systemd_installed() -> bool:
     return sys.platform.startswith("linux") and _systemd_unit_path().exists()
 
 
+def _launchd_bridge_pid() -> int | None:
+    """Return the PID of the launchd-managed bridge, or None if not running.
+
+    launchd doesn't write a PID file the way our detached-process path
+    does, so `bridge status` used to either show a stale manual PID or
+    "not started" while the bridge was very much running. Query launchd
+    directly via ``launchctl print gui/<uid>/<label>`` and parse the
+    ``pid = N`` line. Falls back to ``launchctl list <label>`` if the
+    modern form isn't recognised (older macOS / unusual launchctl).
+    """
+    if sys.platform != "darwin":
+        return None
+    target = f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 0:
+        match = re.search(r"^\s*pid\s*=\s*(\d+)", result.stdout, re.MULTILINE)
+        if match:
+            pid = int(match.group(1))
+            return pid if pid > 0 else None
+    # Fallback to the older `launchctl list <label>` plist-like output.
+    try:
+        legacy = subprocess.run(
+            ["launchctl", "list", LAUNCHD_BRIDGE_LABEL],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if legacy.returncode != 0:
+        return None
+    match = re.search(r'"PID"\s*=\s*(\d+)', legacy.stdout)
+    if match:
+        pid = int(match.group(1))
+        return pid if pid > 0 else None
+    return None
+
+
+def _systemd_bridge_pid() -> int | None:
+    """Return the PID of the systemd-managed bridge, or None if not running."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", SYSTEMD_BRIDGE_UNIT, "-p", "MainPID", "--value"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    if not text.isdigit():
+        return None
+    pid = int(text)
+    return pid if pid > 0 else None
+
+
+def _service_bridge_pid() -> int | None:
+    """Return the auto-start service's bridge PID if installed and running.
+
+    Used by `bridge status` and `bridge start` to avoid the duplicate-
+    bridge bug: if launchd / systemd already runs the bridge, the manual
+    PID file is irrelevant and a manual `bridge start` would spawn a
+    second process the service manager can't see.
+    """
+    if _launchd_installed():
+        return _launchd_bridge_pid()
+    if _systemd_installed():
+        return _systemd_bridge_pid()
+    return None
+
+
 def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None:
     """Called after connect/disconnect state changes. Restart any auto-managed bridge so it
     picks up the new relay token; or auto-start a detached bridge if no service is installed."""
@@ -5164,6 +5310,54 @@ def bridge_start_command(
     """Start the bridge so remote MCP clients can reach this laptop."""
     if foreground:
         _bridge_run_foreground(config)
+        return
+    # If launchd / systemd is installed, defer to it instead of spawning a
+    # detached process. Otherwise the manual start writes a PID file the
+    # service manager can't see, both processes connect to the worker, and
+    # `bridge stop` only kills the manual one — leaving a ghost bridge.
+    if _launchd_installed():
+        existing_pid = _launchd_bridge_pid()
+        if existing_pid:
+            typer.secho(
+                f"[OK] Bridge is already running under launchd (PID {existing_pid}).",
+                fg="green",
+            )
+            typer.echo(
+                f"     Restart it: launchctl kickstart -k gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"
+            )
+            typer.echo("     Remove auto-start: yutome bridge uninstall")
+            return
+        typer.echo("Bridge auto-start is installed but the service isn't running. Kickstarting via launchd…")
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
+            capture_output=True, check=False,
+        )
+        new_pid = _launchd_bridge_pid()
+        if new_pid:
+            typer.secho(f"[OK] Bridge running under launchd (PID {new_pid}).", fg="green")
+        else:
+            typer.echo("[WARN] launchctl kickstart returned but no PID was reported. Check `yutome bridge status`.")
+        return
+    if _systemd_installed():
+        existing_pid = _systemd_bridge_pid()
+        if existing_pid:
+            typer.secho(
+                f"[OK] Bridge is already running under systemd (PID {existing_pid}).",
+                fg="green",
+            )
+            typer.echo(f"     Restart it: systemctl --user restart {SYSTEMD_BRIDGE_UNIT}")
+            typer.echo("     Remove auto-start: yutome bridge uninstall")
+            return
+        typer.echo("Bridge auto-start is installed but the service isn't running. Starting via systemd…")
+        subprocess.run(
+            ["systemctl", "--user", "start", SYSTEMD_BRIDGE_UNIT],
+            capture_output=True, check=False,
+        )
+        new_pid = _systemd_bridge_pid()
+        if new_pid:
+            typer.secho(f"[OK] Bridge running under systemd (PID {new_pid}).", fg="green")
+        else:
+            typer.echo("[WARN] systemctl start returned but no MainPID was reported. Check `yutome bridge status`.")
         return
     _, paths = _load_runtime(config)
     pid, log_path = _bridge_start_detached(config, paths)
@@ -5210,28 +5404,51 @@ def bridge_status_command(
         typer.echo(f"  unit: {_systemd_unit_path()}")
     else:
         typer.echo("Bridge auto-start: not installed (run `yutome bridge install` to persist across reboots)")
-    pid = _read_bridge_pid(paths)
-    if pid is None:
+    # When auto-start is installed, the *service manager's* PID is the
+    # source of truth — not the local PID file, which only the manual
+    # detached-start path writes to.
+    service_pid = _service_bridge_pid()
+    if service_pid is not None:
+        source = "launchd" if _launchd_installed() else "systemd"
+        typer.echo(f"Bridge process: running via {source} (PID {service_pid}).")
+        typer.echo(f"  logs: {_bridge_log_path(paths)}")
+        manual_pid = _read_bridge_pid(paths)
+        if manual_pid is not None and manual_pid != service_pid and _pid_is_alive(manual_pid):
+            typer.secho(
+                f"[WARN] A second bridge process is also running (manual PID {manual_pid}). "
+                "Stop it with `yutome bridge stop` to avoid two bridges fighting for the worker.",
+                fg="yellow",
+            )
+        return
+    if _launchd_installed() or _systemd_installed():
+        typer.echo("Bridge process: auto-start is configured but the service isn't running.")
+        typer.echo("  Start it with: yutome bridge start")
+        return
+    manual_pid = _read_bridge_pid(paths)
+    if manual_pid is None:
         typer.echo("Bridge process: not started (no PID file).")
         return
-    if _pid_is_alive(pid):
-        typer.echo(f"Bridge process: running (PID {pid}).")
+    if _pid_is_alive(manual_pid):
+        typer.echo(f"Bridge process: running (PID {manual_pid}).")
         typer.echo(f"  logs: {_bridge_log_path(paths)}")
     else:
-        typer.echo(f"Bridge process: PID {pid} recorded but process is not alive.")
+        typer.echo(f"Bridge process: PID {manual_pid} recorded but process is not alive.")
         typer.echo("  Run `yutome bridge start` to restart it.")
 
 
 @bridge_app.command("install")
-def bridge_install_command(
-    config: Path = typer.Option(
-        Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
-    ),
-) -> None:
-    """Install the bridge as a launchd (macOS) or systemd user (Linux) service."""
-    _, paths = _load_runtime(config)
-    config_abs = config.resolve()
-    project_root = _project_root(config)
+def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str | None]:
+    """Install the bridge as a launchd / systemd user service.
+
+    Returns ``(installed, service_path, error_message)``. Used by both
+    ``yutome bridge install`` and the post-deploy setup step that offers
+    persistence after a successful Cloudflare deploy. Splitting it out
+    lets the setup wizard call this without raising ``typer.Exit`` on
+    failure — the wizard prefers to warn and continue.
+    """
+    _, paths = _load_runtime(config_path)
+    config_abs = config_path.resolve()
+    project_root = _project_root(config_path)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = _bridge_log_path(paths)
     binary_args = _bridge_binary_args()
@@ -5252,12 +5469,8 @@ def bridge_install_command(
             ["launchctl", "load", str(plist_path)], capture_output=True, text=True, check=False
         )
         if result.returncode != 0:
-            typer.echo(f"launchctl load failed: {result.stderr or result.stdout}", err=True)
-            raise typer.Exit(code=result.returncode)
-        typer.echo(f"[OK] Installed launchd agent: {plist_path}")
-        typer.echo(f"     Logs: {log_path}")
-        typer.echo("     Uninstall with: yutome bridge uninstall")
-        return
+            return False, None, f"launchctl load failed: {result.stderr or result.stdout}"
+        return True, plist_path, None
 
     if sys.platform.startswith("linux"):
         unit_path = _systemd_unit_path()
@@ -5276,19 +5489,84 @@ def bridge_install_command(
             capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
-            typer.echo(f"systemctl enable --now failed: {result.stderr or result.stdout}", err=True)
-            raise typer.Exit(code=result.returncode)
-        typer.echo(f"[OK] Installed systemd unit: {unit_path}")
-        typer.echo(f"     Logs: {log_path}")
-        typer.echo("     Uninstall with: yutome bridge uninstall")
-        return
+            return False, None, f"systemctl enable --now failed: {result.stderr or result.stdout}"
+        return True, unit_path, None
 
-    typer.echo(
+    return (
+        False,
+        None,
         f"`yutome bridge install` is not supported on platform {sys.platform!r} yet. "
         "Use `yutome bridge start` to run the bridge manually.",
-        err=True,
     )
-    raise typer.Exit(code=1)
+
+
+def _bridge_persistence_supported() -> bool:
+    return sys.platform == "darwin" or sys.platform.startswith("linux")
+
+
+def _offer_bridge_persistence(config_path: Path) -> None:
+    """Post-deploy: ask the user whether to install the bridge as a service.
+
+    Today the bridge auto-runs as a detached background process (started
+    by ``_restart_bridge_after_deploy``) — that survives this terminal
+    session but not a reboot. For the "use yutome from my phone" case
+    that the cloudflare deploy unlocks, "survives reboot" is what the
+    user almost always wants, so we default the confirm to Yes.
+
+    Non-interactive callers skip the prompt — the one-line hint
+    ``_restart_bridge_after_deploy`` already prints is enough for them.
+    """
+    if not _bridge_persistence_supported():
+        return
+    if _launchd_installed() or _systemd_installed():
+        typer.secho(
+            "[OK] Bridge auto-start service is already installed — survives reboots.",
+            fg="green",
+        )
+        return
+    if not setup_prompts.is_interactive():
+        return
+    typer.echo("")
+    typer.echo(
+        "The bridge is running in the background, but it'll stop the next time this "
+        "computer reboots. Install it as a "
+        + ("launchd agent (macOS)" if sys.platform == "darwin" else "systemd user service")
+        + " so your assistant can still reach yutome after a restart?"
+    )
+    if not setup_prompts.confirm(
+        "Install bridge auto-start so it survives reboots?",
+        default=True,
+    ):
+        typer.echo("Skipped. Run `yutome bridge install` later to enable persistence.")
+        return
+    installed, service_path, error_message = _install_bridge_service(config_path)
+    if installed and service_path is not None:
+        typer.secho(f"[OK] Installed bridge auto-start service: {service_path}", fg="green")
+        typer.echo("     Uninstall any time with: yutome bridge uninstall")
+    else:
+        typer.secho(
+            f"[WARN] Bridge auto-start didn't install: {error_message or 'unknown error'}",
+            fg="yellow",
+        )
+        typer.echo("       You can retry later with: yutome bridge install")
+
+
+def bridge_install_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
+    ),
+) -> None:
+    """Install the bridge as a launchd (macOS) or systemd user (Linux) service."""
+    installed, service_path, error_message = _install_bridge_service(config)
+    if not installed:
+        if error_message:
+            typer.echo(error_message, err=True)
+        raise typer.Exit(code=1)
+    _, paths = _load_runtime(config)
+    log_path = _bridge_log_path(paths)
+    typer.echo(f"[OK] Installed bridge auto-start service: {service_path}")
+    typer.echo(f"     Logs: {log_path}")
+    typer.echo("     Uninstall with: yutome bridge uninstall")
 
 
 @bridge_app.command("uninstall")

@@ -1210,6 +1210,9 @@ def test_connect_deploy_retries_after_recoverable_error_when_interactive(
     monkeypatch.setattr("yutome.cli._ensure_wrangler_authenticated", lambda _capsule: None)
     monkeypatch.setattr("yutome.cli._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
     monkeypatch.setattr("yutome.cli._push_wrangler_secret", lambda *a, **k: None)
+    # Skip the post-deploy /healthz probe — example.workers.dev doesn't
+    # exist, so the real probe would loop for ~60s waiting for DNS.
+    monkeypatch.setattr("yutome.cli._wait_for_worker_online", lambda *a, **k: True)
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
     monkeypatch.setattr("yutome.setup_prompts.confirm", lambda *_a, **_k: True)
 
