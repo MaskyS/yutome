@@ -17,9 +17,17 @@ from yutome.cli import (
     _build_yutome_mcpb,
     _channel_picker_labels,
     _cloudflare_deploy_runtime_problem,
+    _bridge_pid_path,
+    _bridge_start_detached,
     _deploy_tracked_capsule,
     _ensure_oauth_kv_namespace,
+    _ensure_workers_dev_subdomain,
     _ensure_wrangler_authenticated,
+    _launchd_plist_content,
+    _read_bridge_pid,
+    _restart_bridge_after_deploy,
+    _stop_bridge_pid,
+    _systemd_unit_content,
     _parse_node_version,
     _push_wrangler_secret,
     _prompt_channels_to_select,
@@ -683,7 +691,7 @@ def test_public_subscription_prompt_can_go_back_from_choice(monkeypatch) -> None
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
     monkeypatch.setattr(
         "yutome.setup_prompts.select",
-        lambda message, choices, default=None: "Back - choose a different subscription import method",
+        lambda message, choices, default=None: "Back - choose a different import method",
     )
 
     assert _prompt_public_subscription_target() == BACK_CHOICE
@@ -693,7 +701,7 @@ def test_public_subscription_prompt_can_go_back_from_target(monkeypatch) -> None
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
     monkeypatch.setattr(
         "yutome.setup_prompts.select",
-        lambda message, choices, default=None: "Yes - add another channel's public subscriptions",
+        lambda message, choices, default=None: "Yes - stack another channel's public subscriptions",
     )
     monkeypatch.setattr("yutome.setup_prompts.text", lambda message: "b")
 
@@ -901,7 +909,7 @@ def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(tmp_path: P
     assert state["relay_token"] == "relay-secret"
     assert state["pairing_code"] == "PAIR12"
     assert "Code: PAIR12" in result.output
-    assert "yutome remote bridge" in result.output
+    assert "yutome bridge" in result.output
 
 
 def test_connect_without_endpoint_prints_deploy_instructions_without_provider_keys(tmp_path: Path) -> None:
@@ -992,15 +1000,16 @@ def test_remote_status_reports_unconfigured_and_configured(tmp_path: Path) -> No
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
 
-    missing = runner.invoke(app, ["remote", "status", "--config", str(config_path)])
+    missing = runner.invoke(app, ["status", "--config", str(config_path)])
     assert missing.exit_code == 0
-    assert "Remote connector is not configured" in missing.output
+    assert "Remote connector:" in missing.output
+    assert "not configured" in missing.output
 
     connect_result = runner.invoke(app, ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev"])
     assert connect_result.exit_code == 0
-    configured = runner.invoke(app, ["remote", "status", "--config", str(config_path), "--json"])
+    configured = runner.invoke(app, ["status", "--config", str(config_path), "--json"])
     assert configured.exit_code == 0
-    payload = json.loads(configured.output)
+    payload = json.loads(configured.output)["remote"]
     assert payload["configured"] is True
     assert payload["mcp_url"] == "https://example.workers.dev/mcp"
     assert payload["relay_token_configured"] is False
@@ -1058,10 +1067,10 @@ def test_remote_status_uses_live_worker_relay_status(monkeypatch, tmp_path: Path
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
-    result = runner.invoke(app, ["remote", "status", "--config", str(config_path), "--json"])
+    result = runner.invoke(app, ["status", "--config", str(config_path), "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["remote"]
     assert seen == [("https://example.workers.dev/relay/status", "Bearer relay-secret", 2.0)]
     assert payload["desktop_connection"] == "online (live)"
     assert payload["desktop_connection_source"] == "worker"
@@ -1181,6 +1190,344 @@ def test_connect_deploy_explains_missing_workers_dev_subdomain(
     assert "This Cloudflare account has not finished Workers setup yet." in captured.err
     assert f"https://dash.cloudflare.com/{account_id}/workers/onboarding" in captured.err
     assert "rerun `yutome connect --deploy`" in captured.err
+
+
+def test_connect_deploy_retries_after_recoverable_error_when_interactive(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:  # noqa: ANN001
+    account_id = "1d653327475a6351fab5cbea055baf7c"
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    generated = tmp_path / "wrangler.generated.toml"
+
+    monkeypatch.setattr("yutome.cli._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._require_cloudflare_deploy_runtime", lambda: None)
+    monkeypatch.setattr("yutome.cli._ensure_capsule_node_modules", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_wrangler_authenticated", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+    monkeypatch.setattr("yutome.cli._push_wrangler_secret", lambda *a, **k: None)
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
+    monkeypatch.setattr("yutome.setup_prompts.confirm", lambda *_a, **_k: True)
+
+    fail_then_succeed = iter([
+        (
+            1,
+            "\n".join(
+                [
+                    f"A request to the Cloudflare API (/accounts/{account_id}/workers/scripts/yutome-remote-mcp) failed.",
+                    "You need to verify your email address to use Workers. [code: 10034]",
+                ]
+            ),
+        ),
+        (0, "Published yutome-remote-mcp https://yutome-remote-mcp.example.workers.dev"),
+    ])
+    call_count = {"n": 0}
+
+    def fake_stream(command: list[str], *, cwd: Path) -> tuple[int, str]:
+        call_count["n"] += 1
+        return next(fail_then_succeed)
+
+    monkeypatch.setattr("yutome.cli._run_command_streamed", fake_stream)
+
+    deployed_url, worker_name, _relay, _pair = _deploy_tracked_capsule(
+        paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair"
+    )
+
+    assert call_count["n"] == 2
+    assert deployed_url == "https://yutome-remote-mcp.example.workers.dev"
+    assert worker_name == "yutome-remote-mcp"
+    captured = capsys.readouterr()
+    assert "hasn't verified its email address yet" in captured.err
+
+
+def test_connect_deploy_explains_unverified_email(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:  # noqa: ANN001
+    account_id = "1d653327475a6351fab5cbea055baf7c"
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    generated = tmp_path / "wrangler.generated.toml"
+
+    monkeypatch.setattr("yutome.cli._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._require_cloudflare_deploy_runtime", lambda: None)
+    monkeypatch.setattr("yutome.cli._ensure_capsule_node_modules", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_wrangler_authenticated", lambda _capsule: None)
+    monkeypatch.setattr("yutome.cli._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+
+    def fake_stream(command: list[str], *, cwd: Path) -> tuple[int, str]:
+        assert command == ["npx", "--yes", "wrangler", "deploy", "--config", str(generated)]
+        assert cwd == capsule
+        return (
+            1,
+            "\n".join(
+                [
+                    f"A request to the Cloudflare API (/accounts/{account_id}/workers/scripts/yutome-remote-mcp) failed.",
+                    "You need to verify your email address to use Workers. [code: 10034]",
+                ]
+            ),
+        )
+
+    monkeypatch.setattr("yutome.cli._run_command_streamed", fake_stream)
+
+    with pytest.raises(typer.Exit) as exc:
+        _deploy_tracked_capsule(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
+
+    assert exc.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "hasn't verified its email address yet" in captured.err
+    assert "verification email" in captured.err
+    assert "rerun `yutome connect --deploy`" in captured.err
+    assert "developers.cloudflare.com/fundamentals/setup/account/verify-email-address" in captured.err
+
+
+def test_ensure_workers_dev_subdomain_creates_when_missing(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:  # noqa: ANN001
+    account_id = "1d653327475a6351fab5cbea055baf7c"
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account_id)
+
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def fake_api(method: str, path: str, token: str, payload: dict | None = None, **_kwargs: object) -> tuple[int, dict]:
+        assert token == "test-token"
+        calls.append((method, path, payload))
+        if method == "GET":
+            return 404, {"success": False, "errors": [{"code": 10007, "message": "no subdomain"}]}
+        if method == "PUT":
+            return 200, {"success": True, "result": {"subdomain": payload["subdomain"]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr("yutome.cli._cloudflare_api_call", fake_api)
+
+    _ensure_workers_dev_subdomain(capsule)
+
+    assert calls[0] == ("GET", f"/accounts/{account_id}/workers/subdomain", None)
+    assert calls[1][0] == "PUT"
+    assert calls[1][1] == f"/accounts/{account_id}/workers/subdomain"
+    assert calls[1][2]["subdomain"].startswith("yutome-")
+    captured = capsys.readouterr()
+    assert "Created workers.dev subdomain" in captured.out
+
+
+def test_ensure_workers_dev_subdomain_skips_when_already_exists(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "1d653327475a6351fab5cbea055baf7c")
+
+    methods: list[str] = []
+
+    def fake_api(method: str, path: str, token: str, payload: dict | None = None, **_kwargs: object) -> tuple[int, dict]:
+        methods.append(method)
+        return 200, {"success": True, "result": {"subdomain": "existing-name"}}
+
+    monkeypatch.setattr("yutome.cli._cloudflare_api_call", fake_api)
+
+    _ensure_workers_dev_subdomain(capsule)
+
+    assert methods == ["GET"]
+
+
+def test_ensure_workers_dev_subdomain_silent_when_no_token(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.setattr("yutome.cli._read_wrangler_oauth_token", lambda: None)
+
+    called = {"hit": False}
+
+    def fake_api(*_args: object, **_kwargs: object) -> tuple[int, dict]:
+        called["hit"] = True
+        return 0, {}
+
+    monkeypatch.setattr("yutome.cli._cloudflare_api_call", fake_api)
+
+    _ensure_workers_dev_subdomain(capsule)
+
+    assert called["hit"] is False
+
+
+def test_ensure_workers_dev_subdomain_retries_on_name_taken(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "1d653327475a6351fab5cbea055baf7c")
+
+    put_attempts: list[str] = []
+
+    def fake_api(method: str, path: str, token: str, payload: dict | None = None, **_kwargs: object) -> tuple[int, dict]:
+        if method == "GET":
+            return 404, {"success": False, "errors": [{"code": 10007}]}
+        put_attempts.append(payload["subdomain"])
+        if len(put_attempts) < 2:
+            return 409, {"success": False, "errors": [{"message": "subdomain is already taken"}]}
+        return 200, {"success": True, "result": {"subdomain": payload["subdomain"]}}
+
+    monkeypatch.setattr("yutome.cli._cloudflare_api_call", fake_api)
+
+    _ensure_workers_dev_subdomain(capsule)
+
+    assert len(put_attempts) == 2
+    assert put_attempts[0] != put_attempts[1]  # different names on retry
+
+
+def test_bridge_start_detached_writes_pid_and_kills_prior(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+
+    stale_pid = 999_991
+    pid_path = _bridge_pid_path(paths)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(stale_pid), encoding="utf-8")
+
+    killed: list[int] = []
+    monkeypatch.setattr("yutome.cli._pid_is_alive", lambda pid: pid == stale_pid)
+    monkeypatch.setattr("yutome.cli._stop_bridge_pid", lambda pid, **_kw: killed.append(pid) or True)
+
+    popen_calls: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], **_kwargs: object) -> None:
+            popen_calls.append(cmd)
+            self.pid = 424242
+
+    monkeypatch.setattr("yutome.cli.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("yutome.cli._bridge_binary_args", lambda: ["/fake/yutome"])
+
+    pid, log_path = _bridge_start_detached(config_path, paths)
+
+    assert killed == [stale_pid]
+    assert pid == 424242
+    assert log_path == paths.logs_dir / "bridge.log"
+    assert _read_bridge_pid(paths) == 424242
+    assert popen_calls and popen_calls[0][:1] == ["/fake/yutome"]
+    assert "bridge" in popen_calls[0] and "start" in popen_calls[0] and "--foreground" in popen_calls[0]
+
+
+def test_stop_bridge_pid_sends_sigterm_then_returns_true(monkeypatch) -> None:  # noqa: ANN001
+    killed_with: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        killed_with.append((pid, sig))
+
+    alive = {"value": True}
+
+    def fake_alive(_pid: int) -> bool:
+        # First check after SIGTERM: still alive; second check: dead
+        was = alive["value"]
+        alive["value"] = False
+        return was
+
+    monkeypatch.setattr("yutome.cli.os.kill", fake_kill)
+    monkeypatch.setattr("yutome.cli._pid_is_alive", fake_alive)
+    monkeypatch.setattr("yutome.cli.time.sleep", lambda _s: None)
+    monkeypatch.setattr("yutome.cli.time.time", lambda: 0.0)
+
+    assert _stop_bridge_pid(12345, timeout=0.5) is True
+    assert killed_with[0][0] == 12345  # SIGTERM was sent first
+
+
+def test_launchd_plist_content_has_expected_keys(tmp_path: Path) -> None:
+    plist = _launchd_plist_content(
+        ["/usr/local/bin/yutome"],
+        tmp_path / "yutome.toml",
+        tmp_path,
+        tmp_path / "bridge.log",
+    )
+    assert "<key>Label</key><string>ai.yutome.bridge</string>" in plist
+    assert "<key>RunAtLoad</key><true/>" in plist
+    assert "<key>KeepAlive</key><true/>" in plist
+    assert "/usr/local/bin/yutome" in plist
+    assert "bridge" in plist and "start" in plist and "--foreground" in plist
+    assert str(tmp_path / "bridge.log") in plist
+
+
+def test_systemd_unit_content_has_expected_directives(tmp_path: Path) -> None:
+    unit = _systemd_unit_content(
+        ["/usr/local/bin/yutome"],
+        tmp_path / "yutome.toml",
+        tmp_path,
+        tmp_path / "bridge.log",
+    )
+    assert "ExecStart=/usr/local/bin/yutome" in unit
+    assert "Restart=on-failure" in unit
+    assert "WantedBy=default.target" in unit
+    assert f"StandardOutput=append:{tmp_path / 'bridge.log'}" in unit
+
+
+def test_restart_bridge_after_deploy_spawns_detached_when_no_service(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+
+    # Pretend a connector state exists with a relay token
+    fake_state = type("S", (), {"relay_token": "rt"})()
+    monkeypatch.setattr("yutome.cli.load_remote_state", lambda _paths: fake_state)
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+
+    called = {"hit": False}
+
+    def fake_start(config_path: Path, paths: ProjectPaths) -> tuple[int, Path]:
+        called["hit"] = True
+        return 4242, paths.logs_dir / "bridge.log"
+
+    monkeypatch.setattr("yutome.cli._bridge_start_detached", fake_start)
+
+    _restart_bridge_after_deploy(config_path=config_path, paths=paths)
+
+    assert called["hit"] is True
+
+
+def test_restart_bridge_after_deploy_kicks_launchd_when_installed(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+
+    fake_state = type("S", (), {"relay_token": "rt"})()
+    monkeypatch.setattr("yutome.cli.load_remote_state", lambda _paths: fake_state)
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    spawn_called = {"hit": False}
+    monkeypatch.setattr(
+        "yutome.cli._bridge_start_detached",
+        lambda *_a, **_k: (spawn_called.update(hit=True) or (0, Path("/dev/null"))),
+    )
+
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        subprocess_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("yutome.cli.subprocess.run", fake_run)
+
+    _restart_bridge_after_deploy(config_path=config_path, paths=paths)
+
+    assert spawn_called["hit"] is False
+    assert any("launchctl" in cmd[0] and "kickstart" in cmd for cmd in subprocess_calls)
 
 
 def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
@@ -1328,7 +1675,7 @@ def test_remote_disconnect_alias_uses_disconnect_language(monkeypatch, tmp_path:
     )
     assert connect_result.exit_code == 0
 
-    result = runner.invoke(app, ["remote", "disconnect", "--config", str(config_path), "--yes"])
+    result = runner.invoke(app, ["disconnect", "--config", str(config_path), "--yes"])
 
     assert result.exit_code == 0
     assert "Disconnect complete" in result.output

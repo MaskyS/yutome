@@ -8,6 +8,7 @@ import platform
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -93,7 +94,8 @@ quality_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Tran
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local MCP server (for Claude Desktop, Cursor, Claude Code, and other MCP-aware apps on this machine).")
 http_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local HTTP API server.")
 eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run retrieval quality checks.")
-remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Prepare and serve authenticated remote access.")
+remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the authenticated HTTP / MCP server for private-network or reverse-proxy access.")
+bridge_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the long-lived bridge that lets remote MCP clients reach this laptop's corpus.")
 contract_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Inspect and export the MCP contract.")
 app.add_typer(export_app, name="export")
 app.add_typer(list_app, name="list")
@@ -103,6 +105,7 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(http_app, name="http")
 app.add_typer(eval_app, name="eval")
 app.add_typer(remote_app, name="remote")
+app.add_typer(bridge_app, name="bridge")
 app.add_typer(contract_app, name="contract")
 
 
@@ -844,12 +847,16 @@ def _prompt_oauth_client_secrets(env_path: Path) -> bool:
 
 def _prompt_public_subscription_target() -> str | None:
     back_values = {"b", "back"}
+    question = (
+        "Also pull in another YouTube channel's public subscriptions? "
+        "(You can stack several together — yours plus theirs — into one combined list to pick from.)"
+    )
     if setup_prompts.is_interactive():
-        add_choice = "Yes - add another channel's public subscriptions"
-        skip_choice = "No - continue with this subscription list"
-        back_choice = "Back - choose a different subscription import method"
+        add_choice = "Yes - stack another channel's public subscriptions"
+        skip_choice = "No - move on to picking channels"
+        back_choice = "Back - choose a different import method"
         choice = setup_prompts.select(
-            "Import the public subscriptions of another channel (someone else's library)?",
+            question,
             choices=[skip_choice, add_choice, back_choice],
             default=skip_choice,
         )
@@ -859,10 +866,7 @@ def _prompt_public_subscription_target() -> str | None:
             return None
         raw = setup_prompts.text("Public channel URL, handle, or channel id (blank to skip, b to go back)")
     else:
-        if not setup_prompts.confirm(
-            "Import the public subscriptions of another channel (someone else's library)?",
-            default=False,
-        ):
+        if not setup_prompts.confirm(question, default=False):
             return None
         raw = setup_prompts.text("Public channel URL, handle, or channel id")
 
@@ -976,6 +980,11 @@ def _setup_import_youtube_subscriptions(
                     except YouTubeImportError as oauth_exc:
                         typer.echo(f"[WARN] YouTube OAuth subscription import skipped: {oauth_exc}")
 
+        if imported:
+            typer.echo(
+                f"Found {len(imported)} subscription channel"
+                f"{'s' if len(imported) != 1 else ''} from your YouTube account."
+            )
         public_target = _prompt_public_subscription_target()
         if public_target == BACK_CHOICE:
             continue
@@ -1478,12 +1487,15 @@ def _print_connector_next_steps(
     typer.echo("and add this one again.")
     typer.echo("")
     if bridge_configured:
-        typer.echo("Start or restart the laptop bridge when you want Claude/ChatGPT to reach the local corpus:")
-        typer.echo("  yutome remote bridge")
-        typer.echo("  If you just reran `yutome connect --deploy`, restart any old bridge process")
-        typer.echo("  because deploy refreshes the Worker's bridge token.")
-        typer.echo("  (The bridge holds a long-lived WebSocket to the Worker. If you're behind a")
-        typer.echo("  corporate proxy that blocks WS, requests fall back to the offline response.)")
+        typer.echo("The laptop bridge keeps a WebSocket open to the Worker so Claude/ChatGPT can")
+        typer.echo("reach the local corpus. `yutome connect --deploy` auto-starts it in the background.")
+        typer.echo("")
+        typer.echo("Bridge controls:")
+        typer.echo("  yutome bridge status     # see if it's running")
+        typer.echo("  yutome bridge start      # start manually (e.g. if you stopped it)")
+        typer.echo("  yutome bridge stop       # stop it")
+        typer.echo("  yutome bridge install    # run it via launchd/systemd so it survives reboots")
+        typer.echo("  (Behind a corporate proxy that blocks WebSockets, requests fall back to the offline response.)")
     else:
         typer.echo("This endpoint is saved, but the local bridge token is not. This computer")
         typer.echo("cannot answer assistant requests until you save the Worker secrets locally:")
@@ -1569,10 +1581,10 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("    - Yutome deploys a small piece to your free Cloudflare account (you'll")
     typer.echo("      sign in to Cloudflare during setup; no card needed for the free tier)")
     typer.echo("    - Add one URL to your assistant once; it works from every device after")
-    typer.echo("    - Catch: this computer has to be on (with `yutome remote bridge`")
-    typer.echo("      running) for the assistant to actually get answers. When it's off,")
-    typer.echo("      the assistant just says 'Yutome Desktop offline' and the rest of")
-    typer.echo("      the chat keeps working.")
+    typer.echo("    - Catch: this computer has to be on (the laptop bridge runs in the")
+    typer.echo("      background; `yutome bridge install` makes it survive reboots). When")
+    typer.echo("      it's off, the assistant just says 'Yutome Desktop offline' and the")
+    typer.echo("      rest of the chat keeps working.")
     typer.echo("")
     typer.echo("  You can pick one, both, or skip and run `yutome connect` later.")
     if yes:
@@ -1909,6 +1921,156 @@ def _print_workers_dev_subdomain_help(output: str) -> None:
         )
 
 
+def _is_email_unverified_error(output: str) -> bool:
+    lower = output.lower()
+    return "10034" in lower or "verify your email" in lower
+
+
+def _print_email_unverified_help(output: str) -> None:
+    typer.echo("", err=True)
+    typer.echo("This Cloudflare account hasn't verified its email address yet.", err=True)
+    typer.echo(
+        "Check the inbox for the address you signed into Cloudflare with for a "
+        "verification email, click the link, then rerun `yutome connect --deploy`.",
+        err=True,
+    )
+    typer.echo(
+        "To resend the verification email, sign in at https://dash.cloudflare.com/ "
+        "and open the profile menu in the top right.",
+        err=True,
+    )
+    typer.echo(
+        "More info: https://developers.cloudflare.com/fundamentals/setup/account/verify-email-address/",
+        err=True,
+    )
+
+
+_WRANGLER_OAUTH_CONFIG_CANDIDATES = (
+    Path.home() / "Library/Preferences/.wrangler/config/default.toml",
+    Path.home() / ".config/.wrangler/config/default.toml",
+    Path.home() / ".wrangler/config/default.toml",
+)
+
+
+def _read_wrangler_oauth_token() -> str | None:
+    for path in _WRANGLER_OAUTH_CONFIG_CANDIDATES:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        match = re.search(r'^oauth_token\s*=\s*"([^"]+)"', content, re.MULTILINE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _cloudflare_bearer_token() -> str | None:
+    if env_token := os.environ.get("CLOUDFLARE_API_TOKEN"):
+        return env_token
+    return _read_wrangler_oauth_token()
+
+
+def _wrangler_account_id(capsule: Path) -> str | None:
+    if env_id := os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
+        return env_id
+    completed = _run_wrangler_capture(capsule, ["whoami"])
+    if completed.returncode != 0:
+        return None
+    matches = re.findall(r"\b([0-9a-f]{32})\b", completed.stdout or "")
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _cloudflare_api_call(
+    method: str,
+    path: str,
+    token: str,
+    payload: dict | None = None,
+    timeout: float = 15.0,
+) -> tuple[int, dict]:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4{path}",
+        method=method,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+            return response.status, data
+    except urllib.error.HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8") or "{}")
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        return exc.code, data
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return 0, {}
+
+
+def _workers_dev_subdomain_state(account_id: str, token: str) -> tuple[bool | None, str | None]:
+    """Return (exists, name). exists=None means we couldn't tell."""
+    status, body = _cloudflare_api_call(
+        "GET", f"/accounts/{account_id}/workers/subdomain", token
+    )
+    if status == 200 and body.get("success"):
+        name = (body.get("result") or {}).get("subdomain")
+        return (True, name) if name else (False, None)
+    error_codes = {error.get("code") for error in body.get("errors", []) if isinstance(error, dict)}
+    if status in (404,) or error_codes & {10007, 10063}:
+        return False, None
+    return None, None
+
+
+def _create_workers_dev_subdomain(account_id: str, token: str, name: str) -> tuple[bool, str]:
+    """Return (success, message). On success, message is the created subdomain."""
+    status, body = _cloudflare_api_call(
+        "PUT",
+        f"/accounts/{account_id}/workers/subdomain",
+        token,
+        {"subdomain": name},
+    )
+    if status == 200 and body.get("success"):
+        return True, (body.get("result") or {}).get("subdomain", name)
+    errors = body.get("errors") or [{}]
+    return False, errors[0].get("message", f"HTTP {status}")
+
+
+def _suggest_workers_dev_subdomain_name() -> str:
+    return f"yutome-{secrets.token_hex(4)}"
+
+
+def _ensure_workers_dev_subdomain(capsule: Path) -> None:
+    """Best-effort: make sure the user's account has a workers.dev subdomain.
+
+    If we can't tell or can't create one (missing token, multi-account ambiguity,
+    network error, insufficient permissions), we stay silent and let the
+    subsequent ``wrangler deploy`` surface the real error with the existing
+    10063 help message.
+    """
+    token = _cloudflare_bearer_token()
+    if not token:
+        return
+    account_id = _wrangler_account_id(capsule)
+    if not account_id:
+        return
+    exists, _ = _workers_dev_subdomain_state(account_id, token)
+    if exists is True or exists is None:
+        return
+    for _ in range(3):
+        name = _suggest_workers_dev_subdomain_name()
+        success, message = _create_workers_dev_subdomain(account_id, token, name)
+        if success:
+            typer.echo(f"[OK] Created workers.dev subdomain: {message}.workers.dev")
+            return
+        if "taken" not in message.lower() and "already" not in message.lower():
+            return
+
+
 def _run_wrangler_capture(capsule: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["npx", "--yes", "wrangler", *args],
@@ -2183,14 +2345,30 @@ def _deploy_tracked_capsule(
 
     _ensure_capsule_node_modules(capsule)
     _ensure_wrangler_authenticated(capsule)
+    _ensure_workers_dev_subdomain(capsule)
     wrangler_config = _ensure_oauth_kv_namespace(capsule, paths)
 
     typer.echo(f"Deploying Cloudflare Worker from {capsule}")
     command = ["npx", "--yes", "wrangler", "deploy", "--config", str(wrangler_config)]
-    returncode, output = _run_command_streamed(command, cwd=capsule)
-    if returncode != 0:
-        if _is_workers_dev_subdomain_error(output):
+    while True:
+        returncode, output = _run_command_streamed(command, cwd=capsule)
+        if returncode == 0:
+            break
+        if _is_email_unverified_error(output):
+            _print_email_unverified_help(output)
+            recoverable = True
+        elif _is_workers_dev_subdomain_error(output):
             _print_workers_dev_subdomain_help(output)
+            recoverable = True
+        else:
+            recoverable = False
+        if recoverable and setup_prompts.is_interactive():
+            typer.echo("", err=True)
+            if setup_prompts.confirm(
+                "Press Enter to retry the deploy once you've fixed the issue above (or 'n' to abort)",
+                default=True,
+            ):
+                continue
         typer.echo(
             "Cloudflare Worker deploy failed. Fix the Wrangler error above and rerun `yutome connect --deploy`.",
             err=True,
@@ -2549,6 +2727,7 @@ def setup(
                     pairing_code=deployed_pairing_code,
                     assistant_apps=assistant_apps,
                 )
+                _restart_bridge_after_deploy(config_path=config, paths=paths)
             else:
                 typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
                 typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
@@ -2657,6 +2836,7 @@ def connect_command(
             pairing_code=deployed_pairing_code,
             assistant_apps=assistant_app,
         )
+        _restart_bridge_after_deploy(config_path=config, paths=paths)
         return
     try:
         state_path = _save_remote_connection(
@@ -2682,6 +2862,8 @@ def connect_command(
             bridge_configured=bool(state.relay_token),
             assistant_apps=assistant_app,
         )
+        if state.relay_token:
+            _restart_bridge_after_deploy(config_path=config, paths=paths)
 
 
 @app.command("disconnect")
@@ -4395,18 +4577,97 @@ async def _bridge_ws_loop(
             backoff = min(backoff * 2, 30.0)
 
 
-@remote_app.command("bridge")
-def remote_bridge(
-    config: Path = typer.Option(
-        Path(DEFAULT_CONFIG_FILENAME),
-        "--config",
-        "-c",
-        help="Path to the yutome TOML config.",
-    ),
-    once: bool = typer.Option(False, "--once", help="Process one job and exit."),
-) -> None:
-    """Connect this laptop to the Cloudflare remote MCP Worker via WebSocket."""
-    app_config, paths = _load_runtime(config)
+BRIDGE_PID_FILENAME = "bridge.pid"
+BRIDGE_LOG_FILENAME = "bridge.log"
+LAUNCHD_BRIDGE_LABEL = "ai.yutome.bridge"
+SYSTEMD_BRIDGE_UNIT = "yutome-bridge.service"
+
+
+def _bridge_pid_path(paths: ProjectPaths) -> Path:
+    return paths.data_dir / "remote" / BRIDGE_PID_FILENAME
+
+
+def _bridge_log_path(paths: ProjectPaths) -> Path:
+    return paths.logs_dir / BRIDGE_LOG_FILENAME
+
+
+def _read_bridge_pid(paths: ProjectPaths) -> int | None:
+    try:
+        content = _bridge_pid_path(paths).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        return int(content)
+    except ValueError:
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_bridge_pid(pid: int, *, timeout: float = 2.0) -> bool:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
+def _bridge_binary_args() -> list[str]:
+    binary = shutil.which("yutome")
+    if binary:
+        return [binary]
+    return [sys.executable, "-m", "yutome"]
+
+
+def _bridge_start_detached(config_path: Path, paths: ProjectPaths) -> tuple[int, Path]:
+    """Spawn the bridge as a detached background process. Returns (pid, log_path)."""
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _bridge_log_path(paths)
+    pid_path = _bridge_pid_path(paths)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = _read_bridge_pid(paths)
+    if existing and _pid_is_alive(existing):
+        _stop_bridge_pid(existing)
+
+    log_handle = log_path.open("ab")
+    try:
+        binary_args = _bridge_binary_args()
+        command = [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
+        proc = subprocess.Popen(
+            command,
+            stdout=log_handle,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    return proc.pid, log_path
+
+
+def _bridge_run_foreground(config_path: Path, *, once: bool = False) -> None:
+    """Run the asyncio WS loop in this process. Used by --foreground and by launchd/systemd."""
+    app_config, paths = _load_runtime(config_path)
     state = load_remote_state(paths)
     if state is None:
         typer.echo("Remote connector is not configured. Run: yutome connect", err=True)
@@ -4418,7 +4679,6 @@ def remote_bridge(
             err=True,
         )
         raise typer.Exit(code=1)
-
     asyncio.run(
         _bridge_ws_loop(
             app_config=app_config,
@@ -4430,73 +4690,269 @@ def remote_bridge(
     )
 
 
-@remote_app.command("status")
-def remote_status(
-    config: Path = typer.Option(
-        Path(DEFAULT_CONFIG_FILENAME),
-        "--config",
-        "-c",
-        help="Path to the yutome TOML config.",
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Emit full remote status JSON."),
-) -> None:
-    """Show detailed remote connector state."""
-    _, paths = _load_runtime(config)
-    payload = remote_status_payload(paths)
-    if json_output:
-        _echo_json(payload)
-        return
-    if not payload["configured"]:
-        typer.echo("Remote connector is not configured.")
-        typer.echo("Run: yutome connect")
-        return
-    typer.echo("Remote connector:")
-    typer.echo(f"  provider: {payload['provider']}")
-    typer.echo(f"  mode: {payload['mode']}")
-    typer.echo(f"  endpoint: {payload['endpoint_url']}")
-    typer.echo(f"  mcp url: {payload['mcp_url']}")
-    typer.echo(f"  assistant oauth: {payload.get('assistant_oauth_status')}")
-    typer.echo(f"  desktop: {payload['desktop_connection']}")
-    if payload.get("relay_status_error"):
-        typer.echo(f"  live status: unavailable ({payload['relay_status_error']})")
-    typer.echo(f"  bridge token: {'configured' if payload.get('relay_token_configured') else 'missing'}")
-    typer.echo(f"  pairing code: {'configured' if payload.get('pairing_code_configured') else 'missing'}")
-    typer.echo("  oauth storage: worker OAUTH_KV")
-    typer.echo(f"  offline search: {payload['offline_search']}")
-    typer.echo(f"  last sync: {payload.get('last_sync_at') or 'never'}")
+def _launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_BRIDGE_LABEL}.plist"
 
 
-@remote_app.command("disconnect")
-def remote_disconnect(
-    config: Path = typer.Option(
-        Path(DEFAULT_CONFIG_FILENAME),
-        "--config",
-        "-c",
-        help="Path to the yutome TOML config.",
-    ),
-    worker_name: str | None = typer.Option(
-        None,
-        "--worker-name",
-        help="Cloudflare Worker name to remove. Defaults to the saved/generated worker name.",
-    ),
-    remove_cloudflare: bool = typer.Option(
-        True,
-        "--remove-cloudflare/--keep-cloudflare",
-        help="Remove the Yutome-managed Cloudflare Worker when one is recorded.",
-    ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
-    keep_state: bool = typer.Option(False, "--keep-state", help="Keep local remote connector state."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be disconnected without changing anything."),
-) -> None:
-    """Detailed remote disconnect command."""
-    _disconnect_remote(
-        config=config,
-        worker_name=worker_name,
-        remove_cloudflare=remove_cloudflare,
-        keep_state=keep_state,
-        dry_run=dry_run,
-        yes=yes,
+def _launchd_plist_content(
+    binary_args: list[str], config_path: Path, project_root: Path, log_path: Path
+) -> str:
+    args_xml = "\n".join(
+        f"        <string>{a}</string>"
+        for a in [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
     )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        f'    <key>Label</key><string>{LAUNCHD_BRIDGE_LABEL}</string>\n'
+        '    <key>ProgramArguments</key>\n'
+        '    <array>\n'
+        f'{args_xml}\n'
+        '    </array>\n'
+        f'    <key>WorkingDirectory</key><string>{project_root}</string>\n'
+        '    <key>RunAtLoad</key><true/>\n'
+        '    <key>KeepAlive</key><true/>\n'
+        f'    <key>StandardOutPath</key><string>{log_path}</string>\n'
+        f'    <key>StandardErrorPath</key><string>{log_path}</string>\n'
+        '    <key>ProcessType</key><string>Background</string>\n'
+        '</dict>\n'
+        '</plist>\n'
+    )
+
+
+def _systemd_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_BRIDGE_UNIT
+
+
+def _systemd_unit_content(
+    binary_args: list[str], config_path: Path, project_root: Path, log_path: Path
+) -> str:
+    exec_start = " ".join(
+        [*binary_args, "--config", str(config_path), "bridge", "start", "--foreground"]
+    )
+    return (
+        "[Unit]\n"
+        "Description=Yutome bridge to Cloudflare remote MCP Worker\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={exec_start}\n"
+        f"WorkingDirectory={project_root}\n"
+        "Restart=on-failure\n"
+        "RestartSec=10\n"
+        f"StandardOutput=append:{log_path}\n"
+        f"StandardError=append:{log_path}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def _launchd_installed() -> bool:
+    return sys.platform == "darwin" and _launchd_plist_path().exists()
+
+
+def _systemd_installed() -> bool:
+    return sys.platform.startswith("linux") and _systemd_unit_path().exists()
+
+
+def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None:
+    """Called after connect/disconnect state changes. Restart any auto-managed bridge so it
+    picks up the new relay token; or auto-start a detached bridge if no service is installed."""
+    state = load_remote_state(paths)
+    if state is None or not state.relay_token:
+        return
+    if _launchd_installed():
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"],
+            capture_output=True, check=False,
+        )
+        typer.echo("Bridge: restarted via launchd to pick up the new token.")
+        return
+    if _systemd_installed():
+        subprocess.run(
+            ["systemctl", "--user", "restart", SYSTEMD_BRIDGE_UNIT],
+            capture_output=True, check=False,
+        )
+        typer.echo("Bridge: restarted via systemd to pick up the new token.")
+        return
+    pid, log_path = _bridge_start_detached(config_path, paths)
+    typer.echo(f"Bridge: started in background (PID {pid}, logs at {log_path}).")
+    typer.echo("Survives this terminal session but not reboots. For persistence: yutome bridge install")
+
+
+@bridge_app.command("start")
+def bridge_start_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    foreground: bool = typer.Option(
+        False, "--foreground", help="Run in foreground (used by launchd/systemd)."
+    ),
+) -> None:
+    """Start the bridge so remote MCP clients can reach this laptop."""
+    if foreground:
+        _bridge_run_foreground(config)
+        return
+    _, paths = _load_runtime(config)
+    pid, log_path = _bridge_start_detached(config, paths)
+    typer.echo(f"[OK] Bridge started (PID {pid}).")
+    typer.echo(f"     Logs: {log_path}")
+    typer.echo("     Stop with: yutome bridge stop")
+    typer.echo("     Want it to survive reboots? Run: yutome bridge install")
+
+
+@bridge_app.command("stop")
+def bridge_stop_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
+    ),
+) -> None:
+    """Stop the background bridge process."""
+    _, paths = _load_runtime(config)
+    pid = _read_bridge_pid(paths)
+    if pid is None:
+        typer.echo("No bridge PID recorded; nothing to stop.")
+        return
+    if not _pid_is_alive(pid):
+        typer.echo(f"PID {pid} is not running. Clearing stale PID file.")
+        _bridge_pid_path(paths).unlink(missing_ok=True)
+        return
+    _stop_bridge_pid(pid)
+    _bridge_pid_path(paths).unlink(missing_ok=True)
+    typer.echo(f"[OK] Stopped bridge (PID {pid}).")
+
+
+@bridge_app.command("status")
+def bridge_status_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
+    ),
+) -> None:
+    """Show bridge process status."""
+    _, paths = _load_runtime(config)
+    if _launchd_installed():
+        typer.echo("Bridge auto-start: launchd")
+        typer.echo(f"  plist: {_launchd_plist_path()}")
+    elif _systemd_installed():
+        typer.echo("Bridge auto-start: systemd")
+        typer.echo(f"  unit: {_systemd_unit_path()}")
+    else:
+        typer.echo("Bridge auto-start: not installed (run `yutome bridge install` to persist across reboots)")
+    pid = _read_bridge_pid(paths)
+    if pid is None:
+        typer.echo("Bridge process: not started (no PID file).")
+        return
+    if _pid_is_alive(pid):
+        typer.echo(f"Bridge process: running (PID {pid}).")
+        typer.echo(f"  logs: {_bridge_log_path(paths)}")
+    else:
+        typer.echo(f"Bridge process: PID {pid} recorded but process is not alive.")
+        typer.echo("  Run `yutome bridge start` to restart it.")
+
+
+@bridge_app.command("install")
+def bridge_install_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
+    ),
+) -> None:
+    """Install the bridge as a launchd (macOS) or systemd user (Linux) service."""
+    _, paths = _load_runtime(config)
+    config_abs = config.resolve()
+    project_root = _project_root(config)
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _bridge_log_path(paths)
+    binary_args = _bridge_binary_args()
+
+    if sys.platform == "darwin":
+        plist_path = _launchd_plist_path()
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(
+            _launchd_plist_content(binary_args, config_abs, project_root, log_path),
+            encoding="utf-8",
+        )
+        existing = _read_bridge_pid(paths)
+        if existing and _pid_is_alive(existing):
+            _stop_bridge_pid(existing)
+        _bridge_pid_path(paths).unlink(missing_ok=True)
+        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
+        result = subprocess.run(
+            ["launchctl", "load", str(plist_path)], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            typer.echo(f"launchctl load failed: {result.stderr or result.stdout}", err=True)
+            raise typer.Exit(code=result.returncode)
+        typer.echo(f"[OK] Installed launchd agent: {plist_path}")
+        typer.echo(f"     Logs: {log_path}")
+        typer.echo("     Uninstall with: yutome bridge uninstall")
+        return
+
+    if sys.platform.startswith("linux"):
+        unit_path = _systemd_unit_path()
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text(
+            _systemd_unit_content(binary_args, config_abs, project_root, log_path),
+            encoding="utf-8",
+        )
+        existing = _read_bridge_pid(paths)
+        if existing and _pid_is_alive(existing):
+            _stop_bridge_pid(existing)
+        _bridge_pid_path(paths).unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, check=False)
+        result = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", SYSTEMD_BRIDGE_UNIT],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            typer.echo(f"systemctl enable --now failed: {result.stderr or result.stdout}", err=True)
+            raise typer.Exit(code=result.returncode)
+        typer.echo(f"[OK] Installed systemd unit: {unit_path}")
+        typer.echo(f"     Logs: {log_path}")
+        typer.echo("     Uninstall with: yutome bridge uninstall")
+        return
+
+    typer.echo(
+        f"`yutome bridge install` is not supported on platform {sys.platform!r} yet. "
+        "Use `yutome bridge start` to run the bridge manually.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+@bridge_app.command("uninstall")
+def bridge_uninstall_command() -> None:
+    """Remove the launchd / systemd auto-start configuration."""
+    if sys.platform == "darwin":
+        plist_path = _launchd_plist_path()
+        if not plist_path.exists():
+            typer.echo("No launchd agent installed.")
+            return
+        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
+        plist_path.unlink(missing_ok=True)
+        typer.echo(f"[OK] Removed launchd agent: {plist_path}")
+        return
+    if sys.platform.startswith("linux"):
+        unit_path = _systemd_unit_path()
+        if not unit_path.exists():
+            typer.echo("No systemd unit installed.")
+            return
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", SYSTEMD_BRIDGE_UNIT],
+            capture_output=True, check=False,
+        )
+        unit_path.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, check=False)
+        typer.echo(f"[OK] Removed systemd unit: {unit_path}")
+        return
+    typer.echo(f"Nothing to uninstall on platform {sys.platform!r}.")
 
 
 @remote_app.command("sync")

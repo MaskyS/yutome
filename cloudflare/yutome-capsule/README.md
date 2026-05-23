@@ -45,9 +45,10 @@ which is emitted by `uv run yutome contract emit`.
 - The tracked `wrangler.toml` intentionally omits account-specific Cloudflare
   resource ids. Assisted deploy writes those to ignored state under
   `data/remote/cloudflare/`.
-- Connector-only mode requires this computer and `yutome remote bridge` to be
-  online. The always-on replica mode is a separate future path, not a hidden
-  fallback in this Worker.
+- Connector-only mode requires this computer and the `yutome bridge` process to
+  be online (auto-spawned by `yutome connect --deploy`; `yutome bridge install`
+  registers it with launchd/systemd so it survives reboots). The always-on
+  replica mode is a separate future path, not a hidden fallback in this Worker.
 
 Useful external docs:
 
@@ -71,9 +72,10 @@ namespace, writes an ignored generated Wrangler config under
 `data/remote/cloudflare/`, runs `wrangler deploy`, pushes secrets, and saves the
 resulting URL to local state. The tracked `wrangler.toml` intentionally does not
 contain a real KV namespace id because those ids are Cloudflare-account-specific.
-Every assisted deploy refreshes the pairing code and bridge token. Use the
-newest printed code in the OAuth browser tab, and restart any already-running
-`uv run yutome remote bridge` process after redeploying.
+Every assisted deploy refreshes the pairing code and bridge token, and
+`yutome connect --deploy` automatically restarts the running bridge (or the
+installed launchd/systemd service) so it picks up the new token. Use the
+newest printed code in the OAuth browser tab.
 
 ## Secrets
 

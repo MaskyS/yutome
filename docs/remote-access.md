@@ -4,7 +4,7 @@ Remote access means authenticated read access to the same retrieval surface used
 
 There are now two remote surfaces:
 
-- `yutome connect` is the beginner path. It prepares or records a Cloudflare-backed remote MCP connector for Claude, ChatGPT, and other MCP apps. The V1 connector is laptop-backed: Claude/ChatGPT call the public `/mcp` URL, and `yutome remote bridge` answers from the local corpus while this computer is on.
+- `yutome connect` is the beginner path. It prepares or records a Cloudflare-backed remote MCP connector for Claude, ChatGPT, and other MCP apps. The V1 connector is laptop-backed: Claude/ChatGPT call the public `/mcp` URL, and `yutome bridge` answers from the local corpus while this computer is on.
 - `yutome remote serve` and `yutome remote mcp` are power-user surfaces for private networks, reverse proxies, scripts, and self-hosted authenticated MCP/HTTP clients.
 
 The product and architecture decision for the Cloudflare-backed connector is in [cloud-capsule-strategy.md](cloud-capsule-strategy.md).
@@ -14,13 +14,13 @@ The product and architecture decision for the Cloudflare-backed connector is in 
 Use this when the goal is "ask Claude or ChatGPT about my Yutome library" rather than "host my own API server."
 
 ```bash
-uv run yutome connect
-uv run yutome remote bridge
+uv run yutome connect --deploy           # deploys the Worker and auto-starts the bridge in the background
+uv run yutome bridge install             # optional: register the bridge as a launchd/systemd service so it survives reboots
 ```
 
-`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the account-local `OAUTH_KV` namespace if missing, writes an ignored generated Wrangler config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, and prints the pairing code. Node 22+ / npm / npx must be on PATH because current Wrangler requires Node 22 or newer.
+`yutome connect --deploy` deploys the tracked TypeScript Worker at `cloudflare/yutome-capsule/` to your Cloudflare account. It runs `yutome contract emit` first (refreshes the tool/resource JSON from the Python registry), creates the account-local `OAUTH_KV` namespace if missing, ensures the account has a `workers.dev` subdomain (creating one via the Cloudflare API if not), writes an ignored generated Wrangler config under `data/remote/cloudflare/`, runs `npx wrangler deploy`, generates a `YUTOME_RELAY_TOKEN` + `YUTOME_PAIRING_CODE` pair, pushes both as encrypted Wrangler secrets, prints the pairing code, and auto-spawns the laptop bridge so the deploy is fully self-contained. Node 22+ / npm / npx must be on PATH because current Wrangler requires Node 22 or newer.
 
-Each `--deploy` run refreshes the pairing code and bridge token. Use the newest printed code in the OAuth browser tab, and restart any old `uv run yutome remote bridge` process after redeploying.
+Each `--deploy` run refreshes the pairing code and bridge token. The auto-spawn handles the bridge restart for you (it kills the old bridge process or kicks the launchd/systemd service so the new token is picked up). Use the newest printed code in the OAuth browser tab.
 
 If you already have an endpoint URL, save it without redeploying. Include the Worker secrets if this computer should run the laptop bridge:
 

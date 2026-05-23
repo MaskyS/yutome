@@ -70,7 +70,7 @@ Run `yutome --help` for the full surface. The most-used commands:
 | Search | `yutome find "<query>"` |
 | List or inspect indexed objects | `yutome list videos`, `yutome show video <id>`, … |
 | Local MCP server | `yutome mcp serve` (usually invoked via Claude config, not by hand) |
-| Deploy/manage remote connector | `yutome connect --deploy`, `yutome remote bridge`, `yutome status` |
+| Deploy/manage remote connector | `yutome connect --deploy`, `yutome bridge start`, `yutome status` |
 
 Commands like `list`, `show`, `remote`, `export`, `quality` are groups — append `--help` (e.g. `yutome list --help`) to see their subcommands.
 
@@ -105,13 +105,13 @@ Where to paste it:
 ### Remote (Claude.ai web, ChatGPT, phone, any device)
 
 ```bash
-yutome connect --deploy   # one-time: deploy the Worker, generate secrets, save state
-yutome remote bridge      # keep this running while you want queries to work
+yutome connect --deploy        # one-time: deploy the Worker, generate secrets, auto-start the bridge
+yutome bridge install          # optional: keep the bridge running across reboots (launchd / systemd)
 ```
 
-`connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, and prints a pairing code. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
+`connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, prints a pairing code, and auto-spawns the laptop bridge in the background. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
 
-The Worker is just a relay — your corpus stays on your laptop. `yutome remote bridge` is the WebSocket process that lets the Worker reach it; if it's not running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
+The Worker is just a relay — your corpus stays on your laptop. The bridge is a WebSocket process that lets the Worker reach it; `yutome bridge status/start/stop` control it manually, and `yutome bridge install` registers it as a launchd (macOS) or systemd-user (Linux) service so it survives reboots. If the bridge isn't running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
 
 ## Docs
 
