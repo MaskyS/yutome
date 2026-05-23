@@ -5446,6 +5446,15 @@ def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str |
     lets the setup wizard call this without raising ``typer.Exit`` on
     failure — the wizard prefers to warn and continue.
     """
+    # Fail fast on unsupported platforms — avoid doing any I/O or path
+    # resolution if we know we can't install the service here.
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        return (
+            False,
+            None,
+            f"`yutome bridge install` is not supported on platform {sys.platform!r} yet. "
+            "Use `yutome bridge start` to run the bridge manually.",
+        )
     _, paths = _load_runtime(config_path)
     config_abs = config_path.resolve()
     project_root = _project_root(config_path)
@@ -5492,11 +5501,12 @@ def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str |
             return False, None, f"systemctl enable --now failed: {result.stderr or result.stdout}"
         return True, unit_path, None
 
+    # Unreachable — the platform check at the top of the function already
+    # returned for non-darwin / non-linux. Kept as a defensive catch-all.
     return (
         False,
         None,
-        f"`yutome bridge install` is not supported on platform {sys.platform!r} yet. "
-        "Use `yutome bridge start` to run the bridge manually.",
+        f"`yutome bridge install` is not supported on platform {sys.platform!r}.",
     )
 
 
