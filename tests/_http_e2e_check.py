@@ -6,11 +6,49 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
+
+from yutome.config import load_config
+from yutome.db import connect_catalog
+from yutome.paths import ProjectPaths
+
+
+_QUERY_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "friends",
+    "welcome",
+    "hello",
+    "music",
+    "there",
+    "these",
+    "thing",
+    "think",
+    "those",
+    "today",
+    "would",
+}
+
+
+def _live_corpus_smoke_query(repo_root: Path) -> str:
+    config = load_config(repo_root / "yutome.toml")
+    paths = ProjectPaths.from_config(config, project_root=repo_root)
+    with connect_catalog(paths.catalog_db) as connection:
+        rows = connection.execute(
+            "SELECT text FROM chunks WHERE text IS NOT NULL AND length(text) > 200 ORDER BY created_at LIMIT 50"
+        ).fetchall()
+    for row in rows:
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]{4,}", row["text"]):
+            candidate = word.strip("'").lower()
+            if len(candidate) >= 8 and candidate not in _QUERY_STOPWORDS:
+                return candidate
+    raise RuntimeError("could not derive a smoke-test query from indexed chunks")
 
 
 def _wait_for(port: int, timeout: float = 15.0) -> None:
@@ -45,6 +83,8 @@ def _post(port: int, path: str, body: dict) -> dict | list:
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
+    smoke_query = _live_corpus_smoke_query(repo_root)
+    print("SMOKE QUERY:", smoke_query)
     port = 8766  # use a non-default port to avoid colliding with a real server.
     env = os.environ.copy()
     env.pop("YUTOME_HTTP_TOKEN", None)
@@ -70,7 +110,7 @@ def main() -> int:
         )
         assert status["videos"] > 0
 
-        hits_result = _post(port, "/find", {"text": "Crohn probiotics", "mode": "lexical", "limit": 3})
+        hits_result = _post(port, "/find", {"text": smoke_query, "mode": "lexical", "limit": 3})
         hits = hits_result["rows"]
         assert isinstance(hits, list) and hits, "expected lexical hits"
         first = hits[0]

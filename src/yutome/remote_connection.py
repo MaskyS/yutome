@@ -21,6 +21,12 @@ Provider = Literal["cloudflare"]
 RemoteMode = Literal["connector_only", "replica"]
 PairingStatus = Literal["not_started", "paired"]
 
+RELAY_TOKEN_REJECTED_MESSAGE = (
+    "HTTP 401 Unauthorized: saved relay token was rejected by the deployed Worker; "
+    "local state and Worker YUTOME_RELAY_TOKEN do not match. Rerun `yutome connect --deploy` "
+    "or resync YUTOME_RELAY_TOKEN."
+)
+
 EXCLUDED_SECRET_CLASSES = (
     "local .env secrets file",
     "Google OAuth tokens",
@@ -63,8 +69,8 @@ class RemoteConnectionState:
             created_at=str(payload.get("created_at", "")),
             updated_at=str(payload.get("updated_at", "")),
             last_desktop_seen_at=payload.get("last_desktop_seen_at"),
-            relay_token=payload.get("relay_token"),
-            pairing_code=payload.get("pairing_code"),
+            relay_token=normalize_remote_secret(payload.get("relay_token")),
+            pairing_code=normalize_remote_secret(payload.get("pairing_code"), uppercase=True),
             token_secret=payload.get("token_secret"),
             replica_enabled=bool(payload.get("replica_enabled", False)),
             last_sync_at=payload.get("last_sync_at"),
@@ -135,6 +141,8 @@ def build_remote_state(
     cloud_resources = dict(existing.cloud_resources) if existing else {}
     if worker_name:
         cloud_resources["cloudflare_worker_name"] = worker_name
+    normalized_relay_token = normalize_remote_secret(relay_token)
+    normalized_pairing_code = normalize_remote_secret(pairing_code, uppercase=True)
     return RemoteConnectionState(
         schema_version=SCHEMA_VERSION,
         provider="cloudflare",
@@ -145,14 +153,23 @@ def build_remote_state(
         created_at=existing.created_at if existing else now,
         updated_at=now,
         last_desktop_seen_at=existing.last_desktop_seen_at if existing else None,
-        relay_token=relay_token or (existing.relay_token if existing else None),
-        pairing_code=pairing_code or (existing.pairing_code if existing else None),
+        relay_token=normalized_relay_token or (existing.relay_token if existing else None),
+        pairing_code=normalized_pairing_code or (existing.pairing_code if existing else None),
         token_secret=token_secret or (existing.token_secret if existing else None),
         replica_enabled=mode == "replica",
         last_sync_at=existing.last_sync_at if existing else None,
         semantic_replica=existing.semantic_replica if existing else {},
         cloud_resources=cloud_resources,
     )
+
+
+def normalize_remote_secret(value: object, *, uppercase: bool = False) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    return normalized.upper() if uppercase else normalized
 
 
 def normalize_endpoint(endpoint: str) -> tuple[str, str]:
@@ -240,7 +257,7 @@ def _fetch_relay_status(state: RemoteConnectionState, *, timeout: float) -> dict
         f"{state.endpoint_url.rstrip('/')}/relay/status",
         headers={
             "accept": "application/json",
-            "authorization": f"Bearer {state.relay_token}",
+            "authorization": f"Bearer {normalize_remote_secret(state.relay_token) or ''}",
             "user-agent": "Mozilla/5.0 (Macintosh; yutome-status) urllib/3.12",
         },
         method="GET",
@@ -250,6 +267,8 @@ def _fetch_relay_status(state: RemoteConnectionState, *, timeout: float) -> dict
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace").strip()
+        if exc.code == 401:
+            return {"error": RELAY_TOKEN_REJECTED_MESSAGE}
         suffix = f" {detail}" if detail else ""
         return {"error": f"HTTP {exc.code}{suffix}"}
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:

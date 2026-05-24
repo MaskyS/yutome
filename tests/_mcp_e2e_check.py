@@ -9,15 +9,55 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from yutome.config import load_config
+from yutome.db import connect_catalog
+from yutome.paths import ProjectPaths
+
+
+_QUERY_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "friends",
+    "welcome",
+    "hello",
+    "music",
+    "there",
+    "these",
+    "thing",
+    "think",
+    "those",
+    "today",
+    "would",
+}
+
+
+def _live_corpus_smoke_query(repo_root: Path) -> str:
+    config = load_config(repo_root / "yutome.toml")
+    paths = ProjectPaths.from_config(config, project_root=repo_root)
+    with connect_catalog(paths.catalog_db) as connection:
+        rows = connection.execute(
+            "SELECT text FROM chunks WHERE text IS NOT NULL AND length(text) > 200 ORDER BY created_at LIMIT 50"
+        ).fetchall()
+    for row in rows:
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]{4,}", row["text"]):
+            candidate = word.strip("'").lower()
+            if len(candidate) >= 8 and candidate not in _QUERY_STOPWORDS:
+                return candidate
+    raise RuntimeError("could not derive a smoke-test query from indexed chunks")
+
 
 async def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
+    smoke_query = _live_corpus_smoke_query(repo_root)
+    print("SMOKE QUERY:", smoke_query)
     params = StdioServerParameters(
         command="uv",
         args=["run", "yutome", "mcp", "serve", "--config", "yutome.toml"],
@@ -61,7 +101,7 @@ async def main() -> int:
 
             hits = await session.call_tool(
                 "find",
-                {"text": "Crohn probiotics", "mode": "lexical", "limit": 3},
+                {"text": smoke_query, "mode": "lexical", "limit": 3},
             )
             hit_result = hits.structuredContent or json.loads(hits.content[0].text)
             hit_payload = hit_result["rows"]

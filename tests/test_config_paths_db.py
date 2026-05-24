@@ -1,8 +1,10 @@
+import io
 import json
 import plistlib
 import shlex
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -17,6 +19,7 @@ from yutome.cli import (
     MCPB_MANIFEST_VERSION,
     _active_oauth_kv_id,
     _build_yutome_mcpb,
+    _bridge_connection_error_message,
     _channel_picker_labels,
     _cloudflare_deploy_runtime_problem,
     _bridge_pid_path,
@@ -25,6 +28,7 @@ from yutome.cli import (
     _ensure_oauth_kv_namespace,
     _ensure_workers_dev_subdomain,
     _ensure_wrangler_authenticated,
+    _finalize_remote_bridge_setup,
     _launchd_plist_content,
     _installed_bridge_config_path,
     _read_bridge_pid,
@@ -893,11 +897,14 @@ def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(
 ) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
-    starts: list[Path] = []
-    monkeypatch.setattr(
-        "yutome.cli._bridge_start_detached",
-        lambda cfg, paths: (starts.append(cfg) or (1234, paths.logs_dir / "bridge.log")),
-    )
+    finalized: list[Path] = []
+
+    def fake_finalize(*, config_path: Path, paths: ProjectPaths, before_persistence=None) -> None:  # noqa: ANN001
+        finalized.append(config_path)
+        if before_persistence is not None:
+            before_persistence()
+
+    monkeypatch.setattr("yutome.cli._finalize_remote_bridge_setup", fake_finalize)
 
     result = runner.invoke(
         app,
@@ -908,9 +915,9 @@ def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(
             "--endpoint",
             "https://example.workers.dev",
             "--relay-token",
-            "relay-secret",
+            " relay-secret \n",
             "--pairing-code",
-            "PAIR12",
+            " pair12 ",
         ],
     )
 
@@ -920,7 +927,28 @@ def test_connect_with_endpoint_and_tokens_writes_usable_remote_state(
     assert state["pairing_code"] == "PAIR12"
     assert "Code: PAIR12" in result.output
     assert "yutome bridge" in result.output
-    assert starts == [config_path]
+    assert finalized == [config_path]
+
+
+def test_connect_with_endpoint_without_relay_token_does_not_finalize_bridge(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+
+    def fail_finalize(**_kwargs: object) -> None:
+        raise AssertionError("bridge finalization should require a relay token")
+
+    monkeypatch.setattr("yutome.cli._finalize_remote_bridge_setup", fail_finalize)
+
+    result = runner.invoke(
+        app,
+        ["connect", "--config", str(config_path), "--endpoint", "https://example.workers.dev"],
+    )
+
+    assert result.exit_code == 0
+    state = json.loads((tmp_path / "data/remote/connection.json").read_text(encoding="utf-8"))
+    assert state.get("relay_token") is None
 
 
 def test_connect_without_endpoint_prints_deploy_instructions_without_provider_keys(tmp_path: Path) -> None:
@@ -959,7 +987,7 @@ def test_tracked_capsule_path_uses_packaged_bundle_when_repo_sibling_missing(
 def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
-    starts: list[Path] = []
+    finalized: list[Path] = []
 
     monkeypatch.setattr(
         "yutome.cli._deploy_tracked_capsule",
@@ -970,10 +998,12 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
             "ABCD12",
         ),
     )
-    monkeypatch.setattr(
-        "yutome.cli._bridge_start_detached",
-        lambda cfg, paths: (starts.append(cfg) or (1234, paths.logs_dir / "bridge.log")),
-    )
+    def fake_finalize(*, config_path: Path, paths: ProjectPaths, before_persistence=None) -> None:  # noqa: ANN001
+        finalized.append(config_path)
+        if before_persistence is not None:
+            before_persistence()
+
+    monkeypatch.setattr("yutome.cli._finalize_remote_bridge_setup", fake_finalize)
 
     result = runner.invoke(app, ["connect", "--config", str(config_path), "--deploy"])
 
@@ -987,7 +1017,7 @@ def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> 
     # The pairing prose must print the code so the user knows what to paste
     # when Claude/ChatGPT opens the OAuth browser.
     assert "ABCD12" in result.output
-    assert starts == [config_path]
+    assert finalized == [config_path]
 
 
 def test_status_reports_remote_unconfigured_and_configured(tmp_path: Path) -> None:
@@ -1099,6 +1129,62 @@ def test_remote_status_uses_live_worker_relay_status(monkeypatch, tmp_path: Path
     assert payload["relay_status_error"] is None
 
 
+def test_remote_status_401_reports_relay_token_mismatch(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    monkeypatch.setattr(
+        "yutome.cli._bridge_start_detached",
+        lambda _cfg, paths: (1234, paths.logs_dir / "bridge.log"),
+    )
+    connect_result = runner.invoke(
+        app,
+        [
+            "connect",
+            "--config",
+            str(config_path),
+            "--endpoint",
+            "https://example.workers.dev",
+            "--relay-token",
+            "relay-secret",
+            "--pairing-code",
+            "PAIR12",
+        ],
+    )
+    assert connect_result.exit_code == 0
+
+    def fake_urlopen(_request: object, timeout: float | None = None) -> object:
+        raise urllib.error.HTTPError(
+            "https://example.workers.dev/relay/status",
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b"Unauthorized"),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    result = runner.invoke(app, ["status", "--config", str(config_path), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)["remote"]
+    assert "saved relay token was rejected by the deployed Worker" in payload["relay_status_error"]
+    assert "YUTOME_RELAY_TOKEN" in payload["relay_status_error"]
+
+
+def test_bridge_connection_error_message_explains_401() -> None:
+    class Response:
+        status_code = 401
+
+    exc = RuntimeError("server rejected WebSocket connection: HTTP 401")
+    exc.response = Response()  # type: ignore[attr-defined]
+
+    message = _bridge_connection_error_message(exc)
+
+    assert "saved relay token was rejected by the deployed Worker" in message
+    assert "YUTOME_RELAY_TOKEN" in message
+
+
 def test_generated_wrangler_config_keeps_oauth_kv_account_local(tmp_path: Path) -> None:
     capsule = tmp_path / "capsule"
     capsule.mkdir()
@@ -1166,6 +1252,49 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 
     generated = _ensure_oauth_kv_namespace(capsule, paths)
 
+    assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
+    assert _active_oauth_kv_id(generated.read_text(encoding="utf-8")) == "33333333333333333333333333333333"
+
+
+def test_connect_deploy_refreshes_stale_generated_oauth_kv_namespace(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "wrangler.toml").write_text(
+        "\n".join(
+            [
+                'name = "yutome-remote-mcp"',
+                'main = "src/index.ts"',
+                'compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    stale = _write_generated_wrangler_config(capsule, paths, "22222222222222222222222222222222")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        assert kwargs["cwd"] == capsule
+        if command[-1] == "list":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps([{"id": "33333333333333333333333333333333", "title": "OAUTH_KV"}]),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    generated = _ensure_oauth_kv_namespace(capsule, paths)
+
+    assert generated == stale
     assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
     assert _active_oauth_kv_id(generated.read_text(encoding="utf-8")) == "33333333333333333333333333333333"
 
@@ -1692,6 +1821,7 @@ def test_restart_bridge_after_deploy_kicks_launchd_when_installed(
     monkeypatch.setattr("yutome.cli.load_remote_state", lambda _paths: fake_state)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     spawn_called = {"hit": False}
     monkeypatch.setattr(
         "yutome.cli._bridge_start_detached",
@@ -1710,6 +1840,55 @@ def test_restart_bridge_after_deploy_kicks_launchd_when_installed(
 
     assert spawn_called["hit"] is False
     assert any("launchctl" in cmd[0] and "kickstart" in cmd for cmd in subprocess_calls)
+
+
+def test_finalize_remote_bridge_setup_starts_then_prompts_for_persistence(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    fake_state = type("S", (), {"relay_token": "rt"})()
+    events: list[str] = []
+
+    monkeypatch.setattr("yutome.cli.load_remote_state", lambda _paths: fake_state)
+    monkeypatch.setattr(
+        "yutome.cli._restart_bridge_after_deploy",
+        lambda **_kwargs: events.append("restart"),
+    )
+    monkeypatch.setattr(
+        "yutome.cli._offer_bridge_persistence",
+        lambda _config_path: events.append("offer"),
+    )
+
+    _finalize_remote_bridge_setup(
+        config_path=config_path,
+        paths=paths,
+        before_persistence=lambda: events.append("callback"),
+    )
+
+    assert events == ["restart", "callback", "offer"]
+
+
+def test_finalize_remote_bridge_setup_noops_without_relay_token(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
+    fake_state = type("S", (), {"relay_token": None})()
+
+    monkeypatch.setattr("yutome.cli.load_remote_state", lambda _paths: fake_state)
+    monkeypatch.setattr(
+        "yutome.cli._restart_bridge_after_deploy",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not restart")),
+    )
+    monkeypatch.setattr(
+        "yutome.cli._offer_bridge_persistence",
+        lambda _config_path: (_ for _ in ()).throw(AssertionError("must not prompt")),
+    )
+
+    _finalize_remote_bridge_setup(config_path=config_path, paths=paths)
 
 
 def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
@@ -1901,6 +2080,72 @@ def test_setup_can_prepare_remote_mcp_worker_project_interactively(tmp_path: Pat
     assert "Claude (web, Desktop, mobile)" in result.output
     assert not (tmp_path / "data/remote/cloudflare-worker").exists()
     assert not (tmp_path / "data/remote/connection.json").exists()
+
+
+def test_setup_deploy_path_finalizes_bridge_after_saving_state(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    finalized: list[Path] = []
+
+    monkeypatch.setattr("yutome.cli._can_run_cloudflare_deploy", lambda: True)
+    monkeypatch.setattr(
+        "yutome.cli._deploy_tracked_capsule",
+        lambda paths, refresh_contract=True, relay_token=None, pairing_code=None: (
+            "https://example.workers.dev",
+            "yutome-remote-mcp",
+            "fake-relay-token",
+            "ABCD12",
+        ),
+    )
+
+    def fake_finalize(*, config_path: Path, paths: ProjectPaths, before_persistence=None) -> None:  # noqa: ANN001
+        finalized.append(config_path)
+        if before_persistence is not None:
+            before_persistence()
+
+    monkeypatch.setattr("yutome.cli._finalize_remote_bridge_setup", fake_finalize)
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input="n\nn\nn\n3\nn\nn\n2\n1\ny\n",
+    )
+
+    assert result.exit_code == 0
+    assert finalized == [config_path]
+    assert "ABCD12" in result.output
+
+
+def test_setup_pasted_endpoint_with_relay_token_finalizes_bridge(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    runner = CliRunner()
+    config_path = tmp_path / "yutome.toml"
+    finalized: list[Path] = []
+
+    def fake_finalize(*, config_path: Path, paths: ProjectPaths, before_persistence=None) -> None:  # noqa: ANN001
+        finalized.append(config_path)
+        if before_persistence is not None:
+            before_persistence()
+
+    monkeypatch.setattr("yutome.cli._finalize_remote_bridge_setup", fake_finalize)
+
+    result = runner.invoke(
+        app,
+        ["setup", "--config", str(config_path)],
+        input=(
+            "n\nn\nn\n3\nn\nn\n3\n1\n"
+            "https://example.workers.dev\nrelay-secret\nPAIR12\n"
+        ),
+    )
+
+    assert result.exit_code == 0
+    assert finalized == [config_path]
+    state = json.loads((tmp_path / "data/remote/connection.json").read_text(encoding="utf-8"))
+    assert state["relay_token"] == "relay-secret"
+    assert state["pairing_code"] == "PAIR12"
 
 
 def test_show_context_accepts_id_option(tmp_path: Path) -> None:

@@ -103,7 +103,7 @@ export class YutomeRelay extends DurableObject<Env> {
   }
 
   private authorizeRelayRequest(request: Request): Response | null {
-    const expected = this.env.YUTOME_RELAY_TOKEN;
+    const expected = String(this.env.YUTOME_RELAY_TOKEN || "").trim();
     if (!expected) {
       return Response.json({ error: "YUTOME_RELAY_TOKEN not configured" }, { status: 500 });
     }

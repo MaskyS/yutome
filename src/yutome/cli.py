@@ -20,6 +20,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +49,14 @@ from yutome.quality_upgrade import upgrade_active_transcripts
 from yutome.query import QueryRequest
 from yutome import setup_prompts
 from yutome.remote_connection import (
+    RELAY_TOKEN_REJECTED_MESSAGE,
     RemoteMode,
     build_remote_state,
     build_sync_dry_run_manifest,
     load_remote_state,
     mark_desktop_seen,
     normalize_endpoint,
+    normalize_remote_secret,
     remote_status_payload,
     remote_state_path,
     save_remote_state,
@@ -2558,6 +2561,15 @@ def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
     if generated_config.exists():
         existing_id = _active_oauth_kv_id(generated_config.read_text(encoding="utf-8"))
         if existing_id:
+            current_namespace_id = _existing_oauth_kv_namespace_id(capsule)
+            if current_namespace_id is None or current_namespace_id == existing_id:
+                return generated_config
+            typer.echo(
+                f"[WARN] Refreshing stale OAUTH_KV namespace id={existing_id}; "
+                f"current account has id={current_namespace_id}"
+            )
+            generated_config = _write_generated_wrangler_config(capsule, paths, current_namespace_id)
+            typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
             return generated_config
 
     existing_namespace_id = _existing_oauth_kv_namespace_id(capsule)
@@ -3104,6 +3116,8 @@ def setup(
                     )
                 except ValueError as exc:
                     typer.echo(f"[WARN] Remote endpoint not saved: {exc}")
+                else:
+                    _finalize_remote_bridge_setup(config_path=config, paths=paths)
         else:
             # Deploy path
             if not node_ready:
@@ -3145,17 +3159,17 @@ def setup(
                     pairing_code=deployed_pairing_code,
                     assistant_apps=assistant_apps,
                 )
-                _restart_bridge_after_deploy(config_path=config, paths=paths)
-                # Card is the last thing printed before the persistence
-                # prompt — only shown when save + restart have actually
-                # succeeded. Otherwise the user would see a green "live"
-                # panel for a deploy whose state never persisted locally.
                 try:
                     _, _deploy_mcp_url = normalize_endpoint(deployed_url)
                 except ValueError:
                     _deploy_mcp_url = deployed_url
-                _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
-                _offer_bridge_persistence(config)
+                _finalize_remote_bridge_setup(
+                    config_path=config,
+                    paths=paths,
+                    before_persistence=lambda: _print_deploy_secrets_card(
+                        _deploy_mcp_url, deployed_pairing_code
+                    ),
+                )
             else:
                 typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")
                 typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
@@ -3264,14 +3278,17 @@ def connect_command(
             pairing_code=deployed_pairing_code,
             assistant_apps=assistant_app,
         )
-        _restart_bridge_after_deploy(config_path=config, paths=paths)
-        # Card last — only shown when save + restart actually succeeded.
         try:
             _, _deploy_mcp_url = normalize_endpoint(deployed_url)
         except ValueError:
             _deploy_mcp_url = deployed_url
-        _print_deploy_secrets_card(_deploy_mcp_url, deployed_pairing_code)
-        _offer_bridge_persistence(config)
+        _finalize_remote_bridge_setup(
+            config_path=config,
+            paths=paths,
+            before_persistence=lambda: _print_deploy_secrets_card(
+                _deploy_mcp_url, deployed_pairing_code
+            ),
+        )
         return
     try:
         state_path = _save_remote_connection(
@@ -3298,7 +3315,7 @@ def connect_command(
             assistant_apps=assistant_app,
         )
         if state.relay_token:
-            _restart_bridge_after_deploy(config_path=config, paths=paths)
+            _finalize_remote_bridge_setup(config_path=config, paths=paths)
 
 
 @app.command("disconnect")
@@ -4939,6 +4956,20 @@ def _bridge_ws_url(endpoint_url: str) -> str:
     return urllib.parse.urlunsplit((scheme, parsed.netloc, "/relay/connect", "", ""))
 
 
+def _bridge_connection_error_message(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "status_code", None)
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        status = None
+    if status == 401:
+        return RELAY_TOKEN_REJECTED_MESSAGE
+    return str(exc)
+
+
 async def _bridge_ws_loop(
     *,
     app_config: AppConfig,
@@ -4951,8 +4982,10 @@ async def _bridge_ws_loop(
     frame is dispatched through ``_execute_bridge_job``; the result frame
     carries either ``result`` or ``error`` per the new envelope shape."""
     import websockets
+    from websockets.exceptions import WebSocketException
 
     ws_url = _bridge_ws_url(endpoint_url)
+    auth_token = normalize_remote_secret(token) or ""
     typer.echo(f"Yutome bridge connecting to {ws_url}")
     typer.echo("Keep this running while using Claude/ChatGPT remote MCP. Press Ctrl-C to stop.")
 
@@ -4961,7 +4994,7 @@ async def _bridge_ws_loop(
         try:
             async with websockets.connect(
                 ws_url,
-                additional_headers=[("Authorization", f"Bearer {token}")],
+                additional_headers=[("Authorization", f"Bearer {auth_token}")],
                 max_size=8 * 1024 * 1024,
                 ping_interval=20,
                 ping_timeout=20,
@@ -5004,8 +5037,8 @@ async def _bridge_ws_loop(
                     if once:
                         await ws.send(json.dumps({"type": "bye"}))
                         return
-        except (OSError, websockets.exceptions.WebSocketException) as exc:
-            typer.echo(f"[WARN] Bridge disconnected: {exc}", err=True)
+        except (OSError, WebSocketException) as exc:
+            typer.echo(f"[WARN] Bridge disconnected: {_bridge_connection_error_message(exc)}", err=True)
             if once:
                 raise typer.Exit(code=1) from exc
             await asyncio.sleep(backoff)
@@ -5403,6 +5436,27 @@ def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None
     typer.echo("Survives this terminal session but not reboots. For persistence: yutome bridge install")
 
 
+def _finalize_remote_bridge_setup(
+    *,
+    config_path: Path,
+    paths: ProjectPaths,
+    before_persistence: Callable[[], None] | None = None,
+) -> None:
+    """Start/restart the relay bridge, then handle reboot persistence consent.
+
+    Used by every remote setup path that saves a relay token. If a remote
+    endpoint is connector-only with no relay token, there is no laptop bridge
+    to run, so this intentionally no-ops.
+    """
+    state = load_remote_state(paths)
+    if state is None or not state.relay_token:
+        return
+    _restart_bridge_after_deploy(config_path=config_path, paths=paths)
+    if before_persistence is not None:
+        before_persistence()
+    _offer_bridge_persistence(config_path)
+
+
 @bridge_app.command("start")
 def bridge_start_command(
     config: Path = typer.Option(
@@ -5692,6 +5746,10 @@ def _bridge_persistence_supported() -> bool:
     return sys.platform == "darwin" or sys.platform.startswith("linux")
 
 
+def _bridge_install_command(config_path: Path) -> str:
+    return f"yutome bridge install --config {shlex.quote(str(config_path.resolve()))}"
+
+
 def _offer_bridge_persistence(config_path: Path) -> None:
     """Post-deploy: ask the user whether to install the bridge as a service.
 
@@ -5701,8 +5759,8 @@ def _offer_bridge_persistence(config_path: Path) -> None:
     that the cloudflare deploy unlocks, "survives reboot" is what the
     user almost always wants, so we default the confirm to Yes.
 
-    Non-interactive callers skip the prompt — the one-line hint
-    ``_restart_bridge_after_deploy`` already prints is enough for them.
+    Non-interactive callers cannot consent, so they get an explicit warning
+    and the exact command to install persistence later.
     """
     if not _bridge_persistence_supported():
         return
@@ -5715,9 +5773,16 @@ def _offer_bridge_persistence(config_path: Path) -> None:
             return
         typer.secho(f"[WARN] {_installed_service_mismatch_message(config_path)}", fg="yellow")
         if not setup_prompts.is_interactive():
-            typer.echo("Run `yutome bridge install --config <this yutome.toml>` to repoint auto-start.")
+            typer.echo(
+                "[WARN] Bridge auto-start was not installed because this run is non-interactive."
+            )
+            typer.echo(f"Run `{_bridge_install_command(config_path)}` to repoint auto-start.")
             return
     if not setup_prompts.is_interactive():
+        typer.echo(
+            "[WARN] Bridge auto-start was not installed because this run is non-interactive."
+        )
+        typer.echo(f"Run `{_bridge_install_command(config_path)}` to persist across reboots.")
         return
     typer.echo("")
     if _launchd_installed() or _systemd_installed():
@@ -5736,7 +5801,7 @@ def _offer_bridge_persistence(config_path: Path) -> None:
         "Install bridge auto-start so it survives reboots?",
         default=True,
     ):
-        typer.echo("Skipped. Run `yutome bridge install` later to enable persistence.")
+        typer.echo(f"Skipped. Run `{_bridge_install_command(config_path)}` later to enable persistence.")
         return
     installed, service_path, error_message = _install_bridge_service(config_path)
     if installed and service_path is not None:

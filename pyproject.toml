@@ -1,6 +1,6 @@
 [project]
 name = "yutome"
-version = "0.1.13"
+version = "0.1.14"
 description = "A local transcript library for the YouTube channels you point at"
 readme = "README.md"
 requires-python = ">=3.11"

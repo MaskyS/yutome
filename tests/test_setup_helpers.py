@@ -13,8 +13,8 @@ Covers:
 - `bridge_start_command` — defers to the service manager when installed.
 - `bridge_status_command` — reports the service PID and warns about a
   duplicate manual PID.
-- `_offer_bridge_persistence` — short-circuits when already installed or
-  non-interactive.
+- `_offer_bridge_persistence` — short-circuits when already installed and
+  warns when non-interactive.
 - `_print_deploy_secrets_card` — clipboard write gated on TTY.
 - `_install_bridge_service` — returns the error contract instead of raising.
 """
@@ -395,6 +395,7 @@ def test_bridge_start_with_launchd_running_does_not_spawn_detached(monkeypatch, 
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     monkeypatch.setattr("yutome.cli._launchd_bridge_pid", lambda: 5555)
 
     spawned = {"hit": False}
@@ -414,6 +415,7 @@ def test_bridge_start_with_launchd_installed_but_not_running_starts_service(monk
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     # First poll: not running. After kickstart: running.
     pid_returns = iter([None, 7777])
     monkeypatch.setattr("yutome.cli._launchd_bridge_pid", lambda: next(pid_returns))
@@ -467,6 +469,7 @@ def test_bridge_status_reports_service_pid_when_launchd_running(monkeypatch, tmp
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     monkeypatch.setattr("yutome.cli._service_bridge_pid", lambda: 9001)
     monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: None)
 
@@ -482,6 +485,7 @@ def test_bridge_status_warns_on_duplicate_manual_bridge(monkeypatch, tmp_path):
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     monkeypatch.setattr("yutome.cli._service_bridge_pid", lambda: 5555)
     monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: 8888)
     monkeypatch.setattr("yutome.cli._pid_is_alive", lambda _pid: True)
@@ -500,6 +504,7 @@ def test_bridge_status_does_not_warn_when_manual_pid_matches_service_pid(monkeyp
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     monkeypatch.setattr("yutome.cli._service_bridge_pid", lambda: 4242)
     monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: 4242)
     monkeypatch.setattr("yutome.cli._pid_is_alive", lambda _pid: True)
@@ -513,6 +518,7 @@ def test_bridge_status_when_service_installed_but_not_running(monkeypatch, tmp_p
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
     monkeypatch.setattr("yutome.cli._service_bridge_pid", lambda: None)
     monkeypatch.setattr("yutome.cli._read_bridge_pid", lambda _paths: None)
 
@@ -531,6 +537,7 @@ def test_offer_bridge_persistence_short_circuits_when_service_installed(monkeypa
     monkeypatch.setattr("yutome.cli._bridge_persistence_supported", lambda: True)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
     monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: True)
 
     confirm_calls = {"n": 0}
 
@@ -557,7 +564,7 @@ def test_offer_bridge_persistence_short_circuits_when_service_installed(monkeypa
     assert "already installed" in captured.out
 
 
-def test_offer_bridge_persistence_skips_on_non_interactive(monkeypatch, capsys, tmp_path):
+def test_offer_bridge_persistence_warns_on_non_interactive(monkeypatch, capsys, tmp_path):
     config_path = _make_config(tmp_path)
     monkeypatch.setattr("yutome.cli._bridge_persistence_supported", lambda: True)
     monkeypatch.setattr("yutome.cli._launchd_installed", lambda: False)
@@ -576,8 +583,34 @@ def test_offer_bridge_persistence_skips_on_non_interactive(monkeypatch, capsys, 
 
     assert confirm_calls["n"] == 0
     captured = capsys.readouterr()
-    # No prompt at all on non-interactive.
-    assert "survives reboots" not in captured.out
+    assert "non-interactive" in captured.out
+    assert "yutome bridge install --config" in captured.out
+
+
+def test_offer_bridge_persistence_noninteractive_mismatch_does_not_install(
+    monkeypatch, capsys, tmp_path
+):
+    config_path = _make_config(tmp_path)
+    monkeypatch.setattr("yutome.cli._bridge_persistence_supported", lambda: True)
+    monkeypatch.setattr("yutome.cli._launchd_installed", lambda: True)
+    monkeypatch.setattr("yutome.cli._systemd_installed", lambda: False)
+    monkeypatch.setattr("yutome.cli._installed_service_matches_config", lambda _cfg: False)
+    monkeypatch.setattr("yutome.cli._installed_bridge_config_path", lambda: tmp_path / "other.toml")
+    monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: False)
+
+    install_calls = {"n": 0}
+    monkeypatch.setattr(
+        "yutome.cli._install_bridge_service",
+        lambda _cfg: install_calls.update(n=install_calls["n"] + 1) or (True, Path("/x"), None),
+    )
+
+    _offer_bridge_persistence(config_path)
+
+    assert install_calls["n"] == 0
+    captured = capsys.readouterr()
+    assert "another config" in captured.out
+    assert "non-interactive" in captured.out
+    assert "repoint auto-start" in captured.out
 
 
 def test_offer_bridge_persistence_install_failure_warns_does_not_raise(
@@ -622,6 +655,7 @@ def test_offer_bridge_persistence_user_declines_prints_skip(monkeypatch, capsys,
     assert install_calls["n"] == 0
     captured = capsys.readouterr()
     assert "Skipped" in captured.out
+    assert "yutome bridge install --config" in captured.out
 
 
 # --------------------------------------------------------------------------- #
