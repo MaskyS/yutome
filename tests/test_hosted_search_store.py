@@ -10,6 +10,9 @@ from yutome.hosted.search_store import (
     POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
     PostgresVectorChordSearchStore,
     VECTORCHORD_REQUIRED_EXTENSIONS,
+    VECTORCHORD_BM25_CHUNKS_INDEX,
+    VECTORCHORD_BM25_LEXICAL_BACKEND,
+    VECTORCHORD_BM25_PGVECTOR_HYBRID_BACKEND,
     extension_check_sql,
     hybrid_query_plan,
     lexical_query_plan,
@@ -60,7 +63,7 @@ def test_extension_check_returns_installed_extension_map() -> None:
     }
 
 
-def test_lexical_query_plan_is_workspace_scoped_and_uses_websearch_by_default() -> None:
+def test_lexical_query_plan_prefers_vectorchord_bm25_by_default() -> None:
     plan = lexical_query_plan(
         workspace_id="ws_alice",
         query="crohn probiotics",
@@ -69,23 +72,52 @@ def test_lexical_query_plan_is_workspace_scoped_and_uses_websearch_by_default() 
     )
 
     assert plan.mode == "lexical"
-    assert "websearch_to_tsquery" in plan.statement.sql
+    assert "bm25_catalog.bm25_limit" in plan.statement.sql
+    assert "c.bm25_document <&> to_bm25query" in plan.statement.sql
+    assert "tokenize(%(query)s, sip.tokenizer)::bm25vector" in plan.statement.sql
+    assert "%(bm25_index_name)s::regclass" in plan.statement.sql
     assert "c.workspace_id = %(workspace_id)s" in plan.statement.sql
     assert "v.active_transcript_version_id = c.transcript_version_id" in plan.statement.sql
-    assert "fts_document @@ query.tsquery" in plan.statement.sql
+    assert "sip.backend = %(storage_backend)s" in plan.statement.sql
+    assert "ORDER BY bm25_score ASC" in plan.statement.sql
     assert plan.statement.params == {
         "workspace_id": "ws_alice",
         "query": "crohn probiotics",
         "index_profile_ref": "sip_default",
+        "bm25_index_name": VECTORCHORD_BM25_CHUNKS_INDEX,
+        "bm25_limit": 5,
+        "storage_backend": "postgres_vectorchord",
         "limit": 5,
     }
     assert plan.usage.operation == "lexical_query"
     assert plan.usage.units == {"queries": 1, "candidate_limit": 5}
+    assert plan.usage.backend == VECTORCHORD_BM25_LEXICAL_BACKEND
+    assert plan.usage.metadata == {
+        "storage_backend": "postgres_vectorchord",
+        "lexical_sql_backend": VECTORCHORD_BM25_LEXICAL_BACKEND,
+        "bm25_index_name": VECTORCHORD_BM25_CHUNKS_INDEX,
+        "configured_fallback": False,
+    }
+
+
+def test_lexical_query_plan_uses_fts_only_when_configured_as_fallback() -> None:
+    plan = lexical_query_plan(
+        workspace_id="ws_alice",
+        query="crohn probiotics",
+        limit=5,
+        index_profile_ref="sip_default",
+        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+    )
+
+    assert "websearch_to_tsquery" in plan.statement.sql
+    assert "fts_document @@ query.tsquery" in plan.statement.sql
+    assert "c.bm25_document <&> to_bm25query" not in plan.statement.sql
     assert plan.usage.backend == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND
     assert plan.usage.metadata == {
         "storage_backend": "postgres_vectorchord",
         "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-        "vectorchord_bm25_sql": "not_implemented",
+        "configured_fallback": True,
+        "fallback_reason": "configured_lexical_backend",
     }
 
 
@@ -122,6 +154,8 @@ def test_hybrid_query_plan_uses_rrf_fusion_and_candidate_multiplier() -> None:
     assert "FULL OUTER JOIN semantic USING (chunk_id)" in plan.statement.sql
     assert "1.0 / (%(rrf_k)s + lexical.lexical_rank)" in plan.statement.sql
     assert "1.0 / (%(rrf_k)s + semantic.semantic_rank)" in plan.statement.sql
+    assert "c.bm25_document <&> to_bm25query" in plan.statement.sql
+    assert "tokenize(%(query)s, sip.tokenizer)::bm25vector" in plan.statement.sql
     assert "ce.embedding <-> %(query_vector)s::vector(1024)" in plan.statement.sql
     assert "sip.embedding_dimension = %(embedding_dimension)s" in plan.statement.sql
     assert "c.workspace_id = %(workspace_id)s" in plan.statement.sql
@@ -129,14 +163,36 @@ def test_hybrid_query_plan_uses_rrf_fusion_and_candidate_multiplier() -> None:
     assert plan.statement.sql.count("v.active_transcript_version_id = c.transcript_version_id") == 3
     assert plan.statement.params["candidate_limit"] == 30
     assert plan.statement.params["embedding_dimension"] == 1024
+    assert plan.statement.params["bm25_index_name"] == VECTORCHORD_BM25_CHUNKS_INDEX
+    assert plan.statement.params["bm25_limit"] == 30
     assert plan.statement.params["rrf_k"] == 50
     assert plan.usage.operation == "hybrid_query"
-    assert plan.usage.backend == POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
+    assert plan.usage.backend == VECTORCHORD_BM25_PGVECTOR_HYBRID_BACKEND
     assert plan.usage.units["candidate_limit"] == 30
     assert plan.usage.units["result_limit"] == 10
     assert plan.usage.metadata["storage_backend"] == "postgres_vectorchord"
+    assert plan.usage.metadata["lexical_sql_backend"] == VECTORCHORD_BM25_LEXICAL_BACKEND
+    assert plan.usage.metadata["bm25_index_name"] == VECTORCHORD_BM25_CHUNKS_INDEX
+    assert plan.usage.metadata["configured_fallback"] is False
+
+
+def test_hybrid_query_plan_uses_fts_pgvector_only_when_configured_as_fallback() -> None:
+    plan = hybrid_query_plan(
+        workspace_id="ws_alice",
+        query="resistance training",
+        query_vector=[1.0] * 1024,
+        limit=10,
+        candidate_multiplier=3,
+        rrf_k=50,
+        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+    )
+
+    assert "fts_document @@ query.tsquery" in plan.statement.sql
+    assert "c.bm25_document <&> to_bm25query" not in plan.statement.sql
+    assert plan.usage.backend == POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
     assert plan.usage.metadata["lexical_sql_backend"] == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND
-    assert plan.usage.metadata["vectorchord_bm25_sql"] == "not_implemented"
+    assert plan.usage.metadata["configured_fallback"] is True
+    assert plan.usage.metadata["fallback_reason"] == "configured_lexical_backend"
 
 
 def test_query_plans_cast_nullable_index_profile_ref_for_postgres() -> None:
@@ -162,10 +218,49 @@ def test_search_store_executes_plan_and_adds_result_count_usage() -> None:
     assert rows == [{"chunk_id": "chunk_1", "score": 1.0}]
     assert len(connection.calls) == 1
     assert connection.calls[0][1]["workspace_id"] == "ws_alice"
+    assert connection.calls[0][1]["bm25_index_name"] == VECTORCHORD_BM25_CHUNKS_INDEX
     assert usage.operation == "lexical_query"
     assert usage.index_profile_ref == "sip_default"
+    assert usage.backend == VECTORCHORD_BM25_LEXICAL_BACKEND
     assert usage.units["result_count"] == 1
     assert usage.units["latency_ms"] >= 0
+
+
+def test_search_store_semantic_path_is_independent_of_lexical_backend() -> None:
+    connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
+    store = PostgresVectorChordSearchStore(
+        connection,
+        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+    )
+
+    rows, usage = store.semantic_search(workspace_id="ws_alice", query_vector=[0.1] * 1024, limit=3)
+
+    assert rows == [{"chunk_id": "chunk_1", "score": 1.0}]
+    assert "fts_document" not in connection.calls[0][0]
+    assert "ce.embedding <-> %(query_vector)s::vector(1024)" in connection.calls[0][0]
+    assert usage.backend == "postgres_vectorchord"
+    assert usage.metadata["semantic_sql_backend"] == PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND
+
+
+def test_search_store_hybrid_path_uses_configured_lexical_fallback() -> None:
+    connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
+    store = PostgresVectorChordSearchStore(
+        connection,
+        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+    )
+
+    rows, usage = store.hybrid_search(
+        workspace_id="ws_alice",
+        query="crohn",
+        query_vector=[0.1] * 1024,
+        limit=3,
+    )
+
+    assert rows == [{"chunk_id": "chunk_1", "score": 1.0}]
+    assert "fts_document @@ query.tsquery" in connection.calls[0][0]
+    assert "c.bm25_document <&> to_bm25query" not in connection.calls[0][0]
+    assert usage.backend == POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
+    assert usage.metadata["configured_fallback"] is True
 
 
 def test_resource_sql_is_workspace_scoped_for_supported_hosts() -> None:

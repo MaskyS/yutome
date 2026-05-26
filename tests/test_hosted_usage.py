@@ -11,7 +11,7 @@ from yutome.hosted.gate import UsageGate
 from yutome.hosted.errors import classify_provider_http_error
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.ids import idempotency_key, input_hash
-from yutome.hosted.ledger import JsonlUsageLedger, reconcile_reservation_usage
+from yutome.hosted.ledger import JsonlUsageLedger, PostgresUsageGate, PostgresUsageLedger, reconcile_reservation_usage
 from yutome.hosted.models import (
     EntitlementPolicy,
     ProviderAllocation,
@@ -42,6 +42,27 @@ def test_input_hash_is_stable_for_equivalent_payloads() -> None:
         input_hash_value=left,
         extras=["sip_default"],
     ) == f"ws_alice:vid_123:voyage.embed_documents:{left}:sip_default"
+
+
+def test_idempotency_key_escapes_component_boundaries() -> None:
+    left = idempotency_key(
+        workspace_id="ws:alice",
+        subject_id="vid",
+        operation="op",
+        input_hash_value="h",
+        extras=["a:b"],
+    )
+    right = idempotency_key(
+        workspace_id="ws",
+        subject_id="alice:vid",
+        operation="op",
+        input_hash_value="h",
+        extras=["a:b"],
+    )
+
+    assert left == "ws%3Aalice:vid:op:h:a%3Ab"
+    assert right == "ws:alice%3Avid:op:h:a%3Ab"
+    assert left != right
 
 
 def test_usage_gate_reserves_allowed_operation() -> None:
@@ -239,6 +260,161 @@ def test_usage_gate_denies_search_store_when_balance_is_missing() -> None:
 
     assert reservation.status == "denied"
     assert reservation.decision.reason == "insufficient_balance"
+    assert reservation.decision.denial_effect == "hard"
+
+
+class AtomicReservationConnection:
+    def __init__(self) -> None:
+        self.balance = {
+            "workspace_id": "ws_alice",
+            "entitlement_policy_id": "policy",
+            "remaining_units_jsonb": {"total_tokens": 500},
+            "reserved_units_jsonb": {},
+            "unlimited_units": [],
+        }
+        self.reservations: dict[str, dict[str, object]] = {}
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def execute(self, statement: str, params: dict[str, object] | None = None) -> list[dict[str, object]]:
+        params = dict(params or {})
+        self.calls.append((statement, params))
+        if statement in {"BEGIN", "COMMIT", "ROLLBACK"}:
+            return []
+        if "FROM workspace_balances" in statement and "FOR UPDATE" in statement:
+            return [dict(self.balance)]
+        if "FROM usage_reservations" in statement and "FOR UPDATE" in statement:
+            if "idempotency_key" in params:
+                key = str(params["idempotency_key"])
+                return [self.reservations[key]] if key in self.reservations else []
+            reservation_id = str(params["reservation_id"])
+            return [row for row in self.reservations.values() if row["id"] == reservation_id]
+        if "INSERT INTO usage_reservations" in statement:
+            row = {
+                "id": params["id"],
+                "workspace_id": params["workspace_id"],
+                "subject": params["subject"],
+                "operation": params["operation"],
+                "allocation_id": params["allocation_id"],
+                "allocation_kind": params["allocation_kind"],
+                "estimated_units_json": params["estimated_units_json"],
+                "idempotency_key": params["idempotency_key"],
+                "status": params["status"],
+                "decision_json": params["decision_json"],
+                "metadata_json": params["metadata_json"],
+                "created_at": params["created_at"],
+            }
+            self.reservations[str(params["idempotency_key"])] = row
+            return [row]
+        if "INSERT INTO usage_events" in statement:
+            return [
+                {
+                    "id": params["id"],
+                    "reservation_id": params["reservation_id"],
+                    "workspace_id": params["workspace_id"],
+                    "subject": params["subject"],
+                    "operation": params["operation"],
+                    "event_type": params["event_type"],
+                    "status": params["status"],
+                    "actual_units_json": params["actual_units_json"],
+                    "provider_request_id": params["provider_request_id"],
+                    "error_code": params["error_code"],
+                    "raw_usage_json": params["raw_usage_json"],
+                    "metadata_json": params["metadata_json"],
+                    "created_at": params["created_at"],
+                }
+            ]
+        if "UPDATE usage_reservations" in statement:
+            for row in self.reservations.values():
+                if row["id"] == params["reservation_id"]:
+                    row["status"] = params["status"]
+                    return [row]
+            return []
+        if "UPDATE workspace_balances" in statement:
+            self.balance["remaining_units_jsonb"] = json.loads(str(params["remaining_units_jsonb"]))
+            self.balance["reserved_units_jsonb"] = json.loads(str(params["reserved_units_jsonb"]))
+            return [dict(self.balance)]
+        return []
+
+
+def test_postgres_usage_gate_locks_balance_and_updates_reserved_units_once() -> None:
+    connection = AtomicReservationConnection()
+    gate = PostgresUsageGate(connection)
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+    policy = EntitlementPolicy(id="policy", workspace_id="ws_alice", allowed_operations={"voyage.embed_documents"})
+    balance = WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 500})
+
+    first = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100},
+        allocation=allocation,
+        policy=policy,
+        balance=balance,
+        idempotency_key="idem_once",
+    )
+    second = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100},
+        allocation=allocation,
+        policy=policy,
+        balance=balance,
+        idempotency_key="idem_once",
+    )
+
+    assert first.id == second.id
+    assert first.status == "reserved"
+    assert connection.balance["remaining_units_jsonb"] == {"total_tokens": 400}
+    assert connection.balance["reserved_units_jsonb"] == {"total_tokens": 100}
+    assert sum(1 for sql, _params in connection.calls if "UPDATE workspace_balances" in sql) == 1
+
+
+def test_postgres_usage_ledger_reconciles_reserved_units_once_on_success() -> None:
+    connection = AtomicReservationConnection()
+    gate = PostgresUsageGate(connection)
+    ledger = PostgresUsageLedger(connection)
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+    policy = EntitlementPolicy(id="policy", workspace_id="ws_alice", allowed_operations={"voyage.embed_documents"})
+    reservation = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100},
+        allocation=allocation,
+        policy=policy,
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 500}),
+        idempotency_key="idem_success",
+    )
+    event = UsageEvent(
+        reservation_id=reservation.id,
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        event_type="provider_attempt_succeeded",
+        status="succeeded",
+        actual_units={"total_tokens": 91},
+        provider_request_id="req_success",
+        metadata={"idempotency_key": "idem_success"},
+    )
+
+    ledger.append(event)
+    ledger.append(event)
+
+    assert connection.balance["remaining_units_jsonb"] == {"total_tokens": 409}
+    assert connection.balance["reserved_units_jsonb"] == {}
+    assert next(iter(connection.reservations.values()))["status"] == "reconciled"
 
 
 def test_gemini_usage_normalizer_preserves_raw_usage_and_core_units() -> None:

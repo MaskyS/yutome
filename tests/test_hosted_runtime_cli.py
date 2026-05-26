@@ -59,6 +59,103 @@ class FakeHostedRunner:
         self.calls.append(("search_smoke", {"workspace_id": workspace_id, "query": query, "limit": limit}))
         return {"rows": [{"chunk_id": "chunk_1", "score": 1.0}], "usage": {"operation": "lexical_query"}}
 
+    def source_add(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str,
+        display_name: str | None = None,
+        cadence_seconds: int = 900,
+        max_new_videos_per_run: int = 25,
+        refresh_enabled: bool = True,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "source_add",
+                {
+                    "workspace_id": workspace_id,
+                    "source_url": source_url,
+                    "display_name": display_name,
+                    "cadence_seconds": cadence_seconds,
+                    "max_new_videos_per_run": max_new_videos_per_run,
+                    "refresh_enabled": refresh_enabled,
+                },
+            )
+        )
+        return {
+            "ok": True,
+            "workspace_id": workspace_id,
+            "source_id": "src_cli",
+            "source_type": "handle",
+            "source_url": source_url,
+            "refresh_policy_id": "srp_cli",
+            "cadence_seconds": cadence_seconds,
+        }
+
+    def enqueue_index_video(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str,
+        display_name: str | None = None,
+        priority: int = 100,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "enqueue_index_video",
+                {
+                    "workspace_id": workspace_id,
+                    "source_url": source_url,
+                    "display_name": display_name,
+                    "priority": priority,
+                },
+            )
+        )
+        return {
+            "ok": True,
+            "workspace_id": workspace_id,
+            "source_id": "src_video",
+            "source_type": "video",
+            "source_url": source_url,
+            "job_id": "job_video",
+            "job_type": "index_video",
+            "youtube_video_id": "OEDoJyhQhXs",
+        }
+
+    def real_indexing_smoke(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        migrate: bool = False,
+        migration_phase: str = "hosted",
+        lease_owner: str = "hosted-real-indexing-smoke",
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "real_indexing_smoke",
+                {
+                    "workspace_id": workspace_id,
+                    "source_url": source_url,
+                    "migrate": migrate,
+                    "migration_phase": migration_phase,
+                    "lease_owner": lease_owner,
+                },
+            )
+        )
+        return {
+            "ok": True,
+            "dev_only": False,
+            "migrated": migrate,
+            "migration_phase": migration_phase if migrate else None,
+            "applied_migrations": 7 if migrate else 0,
+            "workspace_id": workspace_id,
+            "source_id": "src_video",
+            "job_id": "job_video",
+            "youtube_video_id": "OEDoJyhQhXs",
+            "worker": {"tick": "worker_once", "params": {"executions": [{"status": "succeeded"}]}},
+        }
+
     def billing_status(
         self,
         *,
@@ -129,6 +226,51 @@ class FakeHostedRunner:
                     ],
                 }
             ],
+        }
+
+    def billing_export_once(self, *, lease_owner: str, limit: int = 100) -> HostedTickResult:
+        self.calls.append(("billing_export_once", {"lease_owner": lease_owner, "limit": limit}))
+        class Result:
+            tick = "billing_export_once"
+            attempted = True
+            affected_rows = 1
+            succeeded = 1
+            failed = 0
+
+            def model_dump(self, mode: str = "json") -> dict[str, Any]:
+                return {
+                    "tick": self.tick,
+                    "attempted": self.attempted,
+                    "affected_rows": self.affected_rows,
+                    "succeeded": self.succeeded,
+                    "failed": self.failed,
+                }
+
+        return Result()  # type: ignore[return-value]
+
+    def reconcile_balance(
+        self,
+        *,
+        workspace_id: str,
+        entitlement_policy_id: str,
+        period_start_at: datetime,
+        period_end_at: datetime,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "reconcile_balance",
+                {
+                    "workspace_id": workspace_id,
+                    "entitlement_policy_id": entitlement_policy_id,
+                    "period_start_at": period_start_at,
+                    "period_end_at": period_end_at,
+                },
+            )
+        )
+        return {
+            "workspace_id": workspace_id,
+            "entitlement_policy_id": entitlement_policy_id,
+            "remaining_units": {"credits": "7.0"},
         }
 
     def mock_indexing_smoke(
@@ -266,8 +408,13 @@ def test_source_refresh_tick_sql_claims_due_policies_with_skip_locked() -> None:
     statement = source_refresh_tick_sql(lease_owner="worker-1", now=now, limit=5, lock_seconds=60)
 
     assert "FROM source_refresh_policies" in statement.sql
-    assert "FOR UPDATE SKIP LOCKED" in statement.sql
+    assert "INSERT INTO jobs" in statement.sql
+    assert "CASE WHEN due.source_type = 'video' THEN 'index_video' ELSE 'discover_source' END" in statement.sql
+    assert "'max_new_videos_per_run', due.max_new_videos_per_run" in statement.sql
+    assert "ON CONFLICT (workspace_id, idempotency_key)" in statement.sql
+    assert "FOR UPDATE OF policy SKIP LOCKED" in statement.sql
     assert "next_run_at <= %(now)s" in statement.sql
+    assert "policy.jitter_seconds" in statement.sql
     assert statement.params["lease_owner"] == "worker-1"
     assert statement.params["limit"] == 5
 
@@ -352,6 +499,85 @@ def test_worker_once_claims_and_executes_index_video_jobs(monkeypatch) -> None:
     assert result.params["executions"][0]["status"] == "succeeded"
     assert executions[0]["init"]["connection"] is connection
     assert "job_type = ANY(%(job_types)s)" in connection.calls[0][0]
+    assert connection.calls[0][1]["job_types"] == ["index_video", "discover_source"]
+
+
+def test_worker_once_dispatches_discover_source_jobs(monkeypatch) -> None:
+    created_at = datetime(2026, 5, 26, 4, 0, tzinfo=timezone.utc)
+    connection = RecordingConnection(
+        rows=[
+            {
+                "id": "job_discover",
+                "workspace_id": "ws_cli",
+                "source_id": "src_channel",
+                "job_type": "discover_source",
+                "status": "queued",
+                "priority": 100,
+                "idempotency_key": "ws_cli:src_channel:discover_source:h1",
+                "lease_owner": "worker-1",
+                "created_at": created_at,
+                "metadata_json": {"source_refresh_policy_id": "srp_1"},
+            }
+        ]
+    )
+    discoveries: list[dict[str, Any]] = []
+
+    class FakeDiscoveryExecutor:
+        def __init__(self, **kwargs: Any) -> None:
+            discoveries.append({"init": kwargs})
+
+        def execute(self, job: Job, *, lease_owner: str):
+            assert job.job_type == "discover_source"
+            assert lease_owner == "worker-1"
+
+            class Result:
+                def __init__(self) -> None:
+                    self.job_id = job.id
+                    self.workspace_id = job.workspace_id
+                    self.source_id = job.source_id or ""
+                    self.status = "succeeded"
+                    self.discovered_videos = 2
+                    self.enqueued_jobs = 2
+                    self.video_ids = ("OEDoJyhQhXs", "abcdefghijk")
+                    self.error_code = None
+                    self.error_message = None
+
+            return Result()
+
+    monkeypatch.setattr("yutome.hosted.runtime.HostedSourceDiscoveryExecutor", FakeDiscoveryExecutor)
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.worker_once(lease_owner="worker-1", workspace_id="ws_cli")
+
+    assert result.affected_rows == 1
+    assert result.params["executions"][0]["status"] == "succeeded"
+    assert result.params["executions"][0]["enqueued_jobs"] == 2
+    assert discoveries[0]["init"]["connection"] is connection
+
+
+def test_runner_can_seed_real_index_video_job_without_mock_plan() -> None:
+    connection = RecordingConnection(rows=[{"id": "job_seeded"}])
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.enqueue_index_video(workspace_id="ws_cli", source_url="https://www.youtube.com/watch?v=OEDoJyhQhXs")
+
+    assert result.job_id == "job_seeded"
+    assert result.youtube_video_id == "OEDoJyhQhXs"
+    assert [call[0].split()[2] for call in connection.calls[:3]] == ["workspaces", "sources", "jobs"]
+    assert connection.calls[2][1]["metadata_json"]
+
+
+def test_runner_can_seed_source_refresh_policy_without_mock_plan() -> None:
+    connection = RecordingConnection(rows=[{"id": "srp_1"}])
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.source_add(workspace_id="ws_cli", source_url="leoandlongevity", cadence_seconds=1800, max_new_videos_per_run=3)
+
+    assert result.source_type == "handle"
+    assert result.refresh_policy_id is not None
+    assert "INSERT INTO source_refresh_policies" in connection.calls[2][0]
+    assert connection.calls[2][1]["cadence_seconds"] == 1800
+    assert connection.calls[2][1]["max_new_videos_per_run"] == 3
 
 
 def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None:
@@ -431,6 +657,107 @@ def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None
     assert result["rows"][0]["billing_exports"][0]["replay_status"] == "failed"
 
 
+def test_runner_billing_export_once_skips_without_claiming_when_token_missing(monkeypatch) -> None:
+    monkeypatch.delenv("POLAR_ACCESS_TOKEN", raising=False)
+    connection = RecordingConnection(rows=[])
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.billing_export_once(lease_owner="worker-1", limit=1)
+
+    assert result.attempted is False
+    assert result.affected_rows == 0
+    assert result.skipped == 1
+    assert result.access_token_configured is False
+    assert result.rows[0]["status"] == "skipped"
+    assert connection.calls == []
+
+
+def test_runner_billing_export_once_posts_and_marks_success(monkeypatch) -> None:
+    created_at = datetime(2026, 5, 26, 4, 0, tzinfo=timezone.utc)
+    posted: list[dict[str, Any]] = []
+    connection = RecordingConnection(
+        rows=[
+            {
+                "id": "bill_1",
+                "workspace_id": "ws_cli",
+                "usage_event_id": "evt_1",
+                "reservation_id": "res_1",
+                "provider": "polar",
+                "event_name": "yutome.voyage.embed_documents",
+                "export_units_jsonb": json.dumps({"total_tokens": 91}),
+                "source_event_dedupe_key": "polar:evt_1:voyage.embed_documents",
+                "status": "processing",
+                "authorization_effect": "none",
+                "external_customer_id": "ws_cli",
+                "customer_id": None,
+                "event_timestamp": created_at,
+                "attempt_count": 1,
+                "metadata_json": json.dumps({"operation_key": "voyage.embed_documents"}),
+            }
+        ]
+    )
+
+    def fake_post(payload: dict[str, Any], *, access_token: str, api_base: str) -> dict[str, Any]:
+        posted.append({"payload": payload, "access_token": access_token, "api_base": api_base})
+        return {"inserted": 1}
+
+    monkeypatch.setattr("yutome.hosted.runtime._post_polar_usage_export", fake_post)
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.billing_export_once(
+        lease_owner="worker-1",
+        limit=1,
+        access_token="polar-token",
+        polar_api_base="https://api.polar.test",
+    )
+
+    assert result.succeeded == 1
+    assert result.failed == 0
+    assert posted[0]["access_token"] == "polar-token"
+    assert posted[0]["api_base"] == "https://api.polar.test"
+    assert sorted(posted[0]["payload"]) == ["events"]
+    assert posted[0]["payload"]["events"][0]["metadata"]["total_tokens"] == 91
+    assert posted[0]["payload"]["events"][0]["external_id"] == "polar:ws_cli:evt_1:voyage.embed_documents"
+    assert connection.calls[1][1]["status"] == "succeeded"
+    assert connection.calls[1][1]["external_event_id"] == "polar:ws_cli:evt_1:voyage.embed_documents"
+
+
+def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
+    period_start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    period_end = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    connection = RecordingConnection(
+        rows=[
+            {
+                "row_kind": "credit",
+                "id": "cred_1",
+                "workspace_id": "ws_cli",
+                "direction": "grant",
+                "unit": "credits",
+                "quantity_text": "10",
+                "row_timestamp": period_start,
+            },
+            {
+                "row_kind": "usage",
+                "id": "evt_1",
+                "workspace_id": "ws_cli",
+                "actual_units_json": json.dumps({"credits": "3"}),
+            },
+        ]
+    )
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.reconcile_balance(
+        workspace_id="ws_cli",
+        entitlement_policy_id="policy_cli",
+        period_start_at=period_start,
+        period_end_at=period_end,
+    )
+
+    assert result["remaining_units"] == {"credits": 7}
+    assert "FROM credit_ledger_entries" in connection.calls[0][0]
+    assert "INSERT INTO workspace_balances" in connection.calls[1][0]
+
+
 def test_mock_indexing_smoke_bootstraps_dependencies_and_executes_plan_before_query() -> None:
     connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
     runner = HostedCommandRunner(AppConfig(), connection=connection)
@@ -483,7 +810,23 @@ def test_runner_migrate_applies_usage_idempotency_constraints() -> None:
 
 
 def test_runner_exposes_postgres_usage_gate_and_ledger() -> None:
-    connection = RecordingConnection()
+    class UsageAdapterConnection(RecordingConnection):
+        def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            params = dict(params or {})
+            self.calls.append((statement, params))
+            if "FROM workspace_balances" in statement and "FOR UPDATE" in statement:
+                return [
+                    {
+                        "workspace_id": "ws_alice",
+                        "entitlement_policy_id": "policy",
+                        "remaining_units_jsonb": {"total_tokens": 500},
+                        "reserved_units_jsonb": {},
+                        "unlimited_units": [],
+                    }
+                ]
+            return []
+
+    connection = UsageAdapterConnection()
     runner = HostedCommandRunner(AppConfig(), connection=connection)
     idempotency_key = "ws_alice:vid_123:gemini.cleanup_transcript:h_fake"
 
@@ -521,10 +864,11 @@ def test_runner_exposes_postgres_usage_gate_and_ledger() -> None:
     persisted_event = runner.usage_ledger().append(event)
 
     assert reservation.id.startswith("res_")
-    assert "INSERT INTO usage_reservations" in connection.calls[0][0]
+    assert any("INSERT INTO usage_reservations" in sql for sql, _params in connection.calls)
     assert persisted_event.id.startswith("evt_")
-    assert "INSERT INTO usage_events" in connection.calls[-1][0]
-    assert connection.calls[-1][1]["provider_request_id"] == "req_123"
+    event_inserts = [params for sql, params in connection.calls if "INSERT INTO usage_events" in sql]
+    assert event_inserts
+    assert event_inserts[-1]["provider_request_id"] == "req_123"
 
 
 def test_build_hosted_api_app_attaches_runtime_postgres_components(monkeypatch) -> None:
@@ -622,6 +966,57 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
         app,
         ["hosted", "search-smoke", "vitamin d", "--config", str(config_path), "--limit", "4", "--json"],
     )
+    source_add = runner.invoke(
+        app,
+        [
+            "hosted",
+            "source-add",
+            "leoandlongevity",
+            "--config",
+            str(config_path),
+            "--workspace-id",
+            "ws_cli",
+            "--cadence-seconds",
+            "1800",
+            "--max-new-videos",
+            "3",
+            "--json",
+        ],
+    )
+    enqueue_video = runner.invoke(
+        app,
+        [
+            "hosted",
+            "enqueue-index-video",
+            "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+            "--config",
+            str(config_path),
+            "--workspace-id",
+            "ws_cli",
+            "--priority",
+            "5",
+            "--json",
+        ],
+    )
+    real_smoke = runner.invoke(
+        app,
+        [
+            "hosted",
+            "real-indexing-smoke",
+            "--config",
+            str(config_path),
+            "--workspace-id",
+            "ws_cli",
+            "--source-url",
+            "OEDoJyhQhXs",
+            "--migrate",
+            "--phase",
+            "hosted",
+            "--lease-owner",
+            "smoke-1",
+            "--json",
+        ],
+    )
     billing = runner.invoke(
         app,
         [
@@ -635,6 +1030,39 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
             "gemini.transcribe_media",
             "--limit",
             "5",
+            "--json",
+        ],
+    )
+    billing_export = runner.invoke(
+        app,
+        [
+            "hosted",
+            "billing-export-worker",
+            "--config",
+            str(config_path),
+            "--once",
+            "--lease-owner",
+            "billing-1",
+            "--limit",
+            "2",
+            "--json",
+        ],
+    )
+    reconcile = runner.invoke(
+        app,
+        [
+            "hosted",
+            "reconcile-balance",
+            "--config",
+            str(config_path),
+            "--workspace-id",
+            "ws_cli",
+            "--entitlement-policy-id",
+            "policy_cli",
+            "--period-start",
+            "2026-05-01T00:00:00Z",
+            "--period-end",
+            "2026-06-01T00:00:00Z",
             "--json",
         ],
     )
@@ -684,10 +1112,20 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
     assert json.loads(db_check.output)["database_reachable"] is True
     assert search.exit_code == 0, search.output
     assert json.loads(search.output)["rows"][0]["chunk_id"] == "chunk_1"
+    assert source_add.exit_code == 0, source_add.output
+    assert json.loads(source_add.output)["refresh_policy_id"] == "srp_cli"
+    assert enqueue_video.exit_code == 0, enqueue_video.output
+    assert json.loads(enqueue_video.output)["job_type"] == "index_video"
+    assert real_smoke.exit_code == 0, real_smoke.output
+    assert json.loads(real_smoke.output)["dev_only"] is False
     assert billing.exit_code == 0, billing.output
     billing_payload = json.loads(billing.output)
     assert billing_payload["rows"][0]["entitlement_decision"]["reason"] == "usage_limit_exceeded"
     assert billing_payload["rows"][0]["billing_exports"][0]["source_event_dedupe_key"] == "polar:evt_denied:gemini.transcribe_media"
+    assert billing_export.exit_code == 0, billing_export.output
+    assert json.loads(billing_export.output)["succeeded"] == 1
+    assert reconcile.exit_code == 0, reconcile.output
+    assert json.loads(reconcile.output)["remaining_units"] == {"credits": "7.0"}
     assert indexing.exit_code == 0, indexing.output
     indexing_payload = json.loads(indexing.output)
     assert indexing_payload["migrated"] is True
@@ -700,6 +1138,36 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
     assert maintenance_tick.exit_code == 0, maintenance_tick.output
     assert json.loads(maintenance_tick.output)["affected_rows"] == 3
     assert ("search_smoke", {"workspace_id": "ws_default", "query": "vitamin d", "limit": 4}) in fake.calls
+    assert (
+        "source_add",
+        {
+            "workspace_id": "ws_cli",
+            "source_url": "leoandlongevity",
+            "display_name": None,
+            "cadence_seconds": 1800,
+            "max_new_videos_per_run": 3,
+            "refresh_enabled": True,
+        },
+    ) in fake.calls
+    assert (
+        "enqueue_index_video",
+        {
+            "workspace_id": "ws_cli",
+            "source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+            "display_name": None,
+            "priority": 5,
+        },
+    ) in fake.calls
+    assert (
+        "real_indexing_smoke",
+        {
+            "workspace_id": "ws_cli",
+            "source_url": "OEDoJyhQhXs",
+            "migrate": True,
+            "migration_phase": "hosted",
+            "lease_owner": "smoke-1",
+        },
+    ) in fake.calls
     assert (
         "billing_status",
         {"workspace_id": "ws_cli", "limit": 5, "operation": "gemini.transcribe_media"},

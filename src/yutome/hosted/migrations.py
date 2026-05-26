@@ -4,7 +4,7 @@ from __future__ import annotations
 HOSTED_VECTOR_BACKEND = "postgres_vectorchord"
 HOSTED_DEFAULT_EMBEDDING_MODEL = "voyage-4-lite"
 HOSTED_DEFAULT_EMBEDDING_DIMENSION = 1024
-HOSTED_DEFAULT_TOKENIZER = "pg_tokenizer"
+HOSTED_DEFAULT_TOKENIZER = "yutome_llmlingua2"
 HOSTED_VECTOR_INDEX_METHOD = "vchordrq"
 
 
@@ -95,6 +95,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS vchord;
 CREATE EXTENSION IF NOT EXISTS pg_tokenizer;
 CREATE EXTENSION IF NOT EXISTS vchord_bm25;
+DO $yutome$ BEGIN BEGIN PERFORM create_tokenizer('yutome_llmlingua2', $$ model = "llmlingua2" $$); EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE 'Tokenizer already exists:%%' THEN NULL; ELSE RAISE; END IF; END; END $yutome$;
+DO $yutome$ BEGIN BEGIN PERFORM create_tokenizer('pg_tokenizer', $$ model = "llmlingua2" $$); EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE 'Tokenizer already exists:%%' THEN NULL; ELSE RAISE; END IF; END; END $yutome$;
 
 CREATE TABLE IF NOT EXISTS account_grants (
     id text PRIMARY KEY,
@@ -211,10 +213,14 @@ CREATE TABLE IF NOT EXISTS job_operations (
     attempt_count integer NOT NULL DEFAULT 0,
     usage_reservation_id text REFERENCES usage_reservations(id),
     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    output_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(workspace_id, idempotency_key)
 );
+
+ALTER TABLE job_operations
+    ADD COLUMN IF NOT EXISTS output_json jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS videos (
     id text PRIMARY KEY,
@@ -271,11 +277,28 @@ CREATE TABLE IF NOT EXISTS chunks (
     start_seconds numeric,
     end_seconds numeric,
     text text NOT NULL,
+    bm25_document bm25vector NOT NULL,
     fts_document tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(text, ''))) STORED,
     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(workspace_id, transcript_version_id, index_profile_id, chunk_index)
 );
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS bm25_document bm25vector;
+
+UPDATE chunks
+SET bm25_document = tokenize(chunks.text, sip.tokenizer)::bm25vector
+FROM search_index_profiles sip
+WHERE chunks.index_profile_id = sip.id
+  AND chunks.workspace_id = sip.workspace_id
+  AND chunks.bm25_document IS NULL;
+
+ALTER TABLE chunks
+    ALTER COLUMN bm25_document SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_chunks_bm25_document
+    ON chunks USING bm25 (bm25_document bm25_ops);
 
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     id text PRIMARY KEY,

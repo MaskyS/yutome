@@ -424,13 +424,17 @@ def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding
             allowed_operations={"search_store.hybrid_query", "search_store.lexical_query"},
         )
         balance = (
-            WorkspaceBalance(workspace_id=auth.workspace_id)
+            WorkspaceBalance(workspace_id=auth.workspace_id, unlimited_units=set(estimated_units))
             if operation == "hybrid_query"
             else WorkspaceBalance(workspace_id=auth.workspace_id, unlimited_units=set(estimated_units))
         )
         return HostedMcpUsageContext(
             allocation=default_search_store_allocation(workspace_id=auth.workspace_id, operation=operation),
-            policy=policy,
+            policy=policy.model_copy(
+                update={"soft_units_by_operation": {"search_store.hybrid_query": {"candidate_limit": 1}}}
+            )
+            if operation == "hybrid_query"
+            else policy,
             balance=balance,
         )
 
@@ -457,7 +461,7 @@ def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding
     assert result["rows"][0]["chunk_id"] == "chunk_soft_search"
     assert "hosted_find_fallback_to_lexical" in result["notes"]
     assert [event.status for event in ledger.events] == ["denied", "succeeded"]
-    assert ledger.events[0].error_code == "insufficient_balance"
+    assert ledger.events[0].error_code == "soft_limit_exceeded"
     assert ledger.events[0].metadata["mcp_search_mode"] == "hybrid"
 
 
@@ -513,8 +517,9 @@ def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
                 id="policy_voyage",
                 workspace_id="ws_alice",
                 allowed_operations={"voyage.embed_query"},
+                soft_units_by_operation={"voyage.embed_query": {"total_tokens": 1}},
             ),
-            balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 0, "vectors": 1}),
+            balance=WorkspaceBalance(workspace_id="ws_alice", unlimited_units={"total_tokens", "vectors"}),
         ),
         query_embedder=embedder,
     )
@@ -531,7 +536,7 @@ def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
     assert "hosted_find_fallback_to_lexical" in result["notes"]
     assert [event.subject for event in ledger.events] == ["voyage", "search_store", "search_store"]
     assert ledger.events[0].status == "denied"
-    assert ledger.events[0].error_code == "insufficient_balance"
+    assert ledger.events[0].error_code == "soft_limit_exceeded"
     assert ledger.events[1].event_type == "usage_reservation_released"
     assert ledger.events[1].metadata["release_reason"] == "provider_usage_denied"
 
@@ -1017,19 +1022,30 @@ def test_read_resource_dispatches_supported_contract_resources_with_workspace_sc
     store = RecordingSearchStore()
     payload = {"resource_uri": uri, f"{kind}_id" if kind != "transcript" else "transcript_version_id": id_}
     store.add_resource("ws_alice", kind, id_, payload)
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
 
     result = adapter.read_resource(auth=HostedMcpAuthContext(workspace_id="ws_alice"), uri=uri)
 
     assert result == payload
     assert store.calls[0]["workspace_id"] == "ws_alice"
     assert store.calls[0]["resource"] == kind
+    assert len(ledger.events) == 1
+    event = ledger.events[0]
+    assert event.subject == "search_store"
+    assert event.operation == "resource_read"
+    assert event.event_type == "service_operation_succeeded"
+    assert event.metadata["credential_mode"] == "service_internal"
+    assert event.metadata["service"] == "search_store"
+    assert event.metadata["mcp_tool"] == "resource"
+    assert event.metadata["mcp_resource_kind"] == kind
 
 
 def test_read_resource_missing_and_cross_workspace_are_both_404() -> None:
     store = RecordingSearchStore()
     store.add_resource("ws_alice", "chunk", "chunk_1", {"chunk_id": "chunk_1"})
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
 
     with pytest.raises(HostedMcpError) as missing_exc:
         adapter.read_resource(auth=HostedMcpAuthContext(workspace_id="ws_alice"), uri="yutome://chunk/missing")
@@ -1040,6 +1056,8 @@ def test_read_resource_missing_and_cross_workspace_are_both_404() -> None:
     assert missing_exc.value.status_code == 404
     assert cross_workspace_exc.value.code == "resource_not_found"
     assert cross_workspace_exc.value.status_code == 404
+    assert [event.event_type for event in ledger.events] == ["service_operation_failed", "service_operation_failed"]
+    assert [event.operation for event in ledger.events] == ["resource_read", "resource_read"]
 
 
 @pytest.mark.parametrize(
@@ -1056,7 +1074,8 @@ def test_show_maps_supported_kinds_to_resource_helpers(kind: str, id_: str) -> N
     store = RecordingSearchStore()
     payload = {"resource_uri": f"yutome://{kind}/{id_}", "id": id_}
     store.add_resource("ws_alice", kind, id_, payload)
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
 
     result = adapter.call_tool(
         auth=HostedMcpAuthContext(workspace_id="ws_alice"),
@@ -1070,6 +1089,12 @@ def test_show_maps_supported_kinds_to_resource_helpers(kind: str, id_: str) -> N
     if kind == "transcript":
         assert store.calls[0]["offset"] == 2
         assert store.calls[0]["limit"] == 3
+    assert len(ledger.events) == 1
+    event = ledger.events[0]
+    assert event.operation == "resource_read"
+    assert event.metadata["mcp_tool"] == "show"
+    assert event.metadata["mcp_resource_kind"] == kind
+    assert event.metadata["credential_mode"] == "service_internal"
 
 
 def test_show_context_returns_structured_unsupported_error() -> None:
@@ -1088,7 +1113,8 @@ def test_show_context_returns_structured_unsupported_error() -> None:
 
 def test_list_status_videos_and_channels_are_workspace_scoped() -> None:
     store = RecordingSearchStore()
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
     auth = HostedMcpAuthContext(workspace_id="ws_alice")
 
     status = adapter.call_tool(auth=auth, name="list", arguments={"entity": "status"})
@@ -1125,6 +1151,13 @@ def test_list_status_videos_and_channels_are_workspace_scoped() -> None:
             "channel": None,
             "selected": True,
         },
+    ]
+    assert [event.operation for event in ledger.events] == ["list_read", "list_read", "list_read"]
+    assert [event.metadata["mcp_tool"] for event in ledger.events] == ["list", "list", "list"]
+    assert [event.metadata["credential_mode"] for event in ledger.events] == [
+        "service_internal",
+        "service_internal",
+        "service_internal",
     ]
 
 
@@ -1164,7 +1197,8 @@ def test_q_accepts_safe_status_video_channel_and_chunk_shapes() -> None:
             }
         ]
     )
-    adapter = _allowing_adapter(search_store=store)
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
     auth = HostedMcpAuthContext(workspace_id="ws_alice")
 
     status = adapter.call_tool(auth=auth, name="q", arguments={"request": {"project": "status_breakdown"}})
@@ -1225,6 +1259,27 @@ def test_q_accepts_safe_status_video_channel_and_chunk_shapes() -> None:
         },
     ]
     assert store.calls[3] == {"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn", "limit": 1}
+    assert [event.operation for event in ledger.events] == ["list_read", "list_read", "list_read", "lexical_query"]
+    assert [event.metadata["mcp_tool"] for event in ledger.events] == ["q", "q", "q", "q"]
+    assert ledger.events[0].metadata["mcp_list_entity"] == "status"
+    assert ledger.events[3].metadata["q_kind"] == "chunk_lexical"
+
+
+def test_non_find_reads_are_denied_before_search_store_when_usage_context_is_unconfigured() -> None:
+    store = RecordingSearchStore()
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(auth=HostedMcpAuthContext(workspace_id="ws_alice"), name="list", arguments={"entity": "status"})
+
+    assert exc_info.value.code == "usage_denied"
+    assert exc_info.value.to_dict()["error"]["data"]["operation"] == "search_store.list_read"
+    assert store.calls == []
+    assert len(ledger.events) == 1
+    assert ledger.events[0].event_type == "reservation_created"
+    assert ledger.events[0].status == "denied"
+    assert ledger.events[0].operation == "list_read"
 
 
 def test_q_rejects_unsupported_shapes_and_nested_workspace_injection() -> None:

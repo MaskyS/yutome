@@ -52,6 +52,8 @@ FORBIDDEN_TOOL_ARGUMENT_KEYS = frozenset(
 SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "list", "q", "show"})
 SUPPORTED_TOOL = "find"
 SUPPORTED_RESOURCE_HOSTS: frozenset[str] = frozenset({"channel", "chunk", "transcript", "video"})
+SEARCH_STORE_READ_BACKEND = "hosted_search_store"
+SEARCH_STORE_READ_ESTIMATE_METHOD = "search_store.read_estimate"
 
 
 class UsageGateLike(Protocol):
@@ -414,28 +416,45 @@ class HostedMcpQueryAdapter:
         request: HostedFindRequest,
         estimate: Any,
     ) -> UsageReservation:
+        return self._reserve_search_store_operation(
+            auth=auth,
+            operation=estimate.operation,
+            estimated_units=estimate.estimated_units,
+            idempotency_key=_query_idempotency_key(auth=auth, request=request),
+            metadata={
+                "mcp_tool": request.mcp_tool,
+                "mcp_search_mode": request.mode,
+                "estimate_method": estimate.method,
+                **request.reservation_metadata,
+            },
+        )
+
+    def _reserve_search_store_operation(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        operation: str,
+        estimated_units: Mapping[str, UnitQuantity],
+        idempotency_key: str,
+        metadata: Mapping[str, Any],
+    ) -> UsageReservation:
         usage_context = self.usage_context_provider(
             auth,
-            estimate.operation,
-            estimate.estimated_units,
+            operation,
+            estimated_units,
         )
         reservation = self.gate.reserve(
             workspace_id=auth.workspace_id,
-            subject=estimate.subject,
-            operation=estimate.operation,
-            estimated_units=estimate.estimated_units,
+            subject="search_store",
+            operation=operation,
+            estimated_units=dict(estimated_units),
             allocation=usage_context.allocation,
             policy=usage_context.policy,
             balance=usage_context.balance,
-            idempotency_key=_query_idempotency_key(auth=auth, request=request),
+            idempotency_key=idempotency_key,
         )
-        reservation.metadata.update(
-            {
-                "mcp_tool": SUPPORTED_TOOL,
-                "mcp_search_mode": request.mode,
-                "estimate_method": estimate.method,
-            }
-        )
+        reservation.metadata.update(_search_store_reservation_metadata(usage_context.allocation))
+        reservation.metadata.update(dict(metadata))
         if not reservation.decision.allowed:
             event = denied_usage_event(reservation)
             self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
@@ -451,6 +470,74 @@ class HostedMcpQueryAdapter:
                 },
             )
         return reservation
+
+    def _reserve_search_store_list_read(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        tool: str,
+        entity: str,
+        limit: int,
+        offset: int,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> UsageReservation:
+        estimated_units = {"queries": 1.0, "candidate_limit": float(max(1, limit))}
+        return self._reserve_search_store_operation(
+            auth=auth,
+            operation="list_read",
+            estimated_units=estimated_units,
+            idempotency_key=_read_idempotency_key(
+                auth=auth,
+                operation="search_store.list_read",
+                payload={
+                    "tool": tool,
+                    "entity": entity,
+                    "limit": limit,
+                    "offset": offset,
+                    **dict(metadata or {}),
+                },
+            ),
+            metadata={
+                "mcp_tool": tool,
+                "mcp_read_kind": "list",
+                "mcp_list_entity": entity,
+                "estimate_method": SEARCH_STORE_READ_ESTIMATE_METHOD,
+                **dict(metadata or {}),
+            },
+        )
+
+    def _reserve_search_store_resource_read(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        tool: str,
+        kind: str,
+        id_: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> UsageReservation:
+        return self._reserve_search_store_operation(
+            auth=auth,
+            operation="resource_read",
+            estimated_units={"queries": 1.0, "resource_reads": 1.0},
+            idempotency_key=_read_idempotency_key(
+                auth=auth,
+                operation="search_store.resource_read",
+                payload={
+                    "tool": tool,
+                    "kind": kind,
+                    "id": id_,
+                    **dict(metadata or {}),
+                },
+            ),
+            metadata={
+                "mcp_tool": tool,
+                "mcp_read_kind": "resource",
+                "mcp_resource_kind": kind,
+                "mcp_resource_id": id_,
+                "estimate_method": SEARCH_STORE_READ_ESTIMATE_METHOD,
+                **dict(metadata or {}),
+            },
+        )
 
     def _record_search_store_success(
         self,
@@ -525,6 +612,28 @@ class HostedMcpQueryAdapter:
         )
         self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
 
+    def _record_search_store_read_success(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        reservation: UsageReservation,
+        actual_units: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        normalization = normalize_search_store_usage(
+            operation=reservation.operation,
+            backend=_search_store_backend_from_reservation(reservation),
+            index_profile_ref=_search_store_index_profile_from_reservation(reservation),
+            units=dict(actual_units),
+            metadata=dict(metadata or {}),
+        )
+        event = usage_event_from_normalization(
+            normalization,
+            reservation=reservation,
+            event_type="service_operation_succeeded",
+        )
+        self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
+
     def _voyage_query_context(self, *, auth: HostedMcpAuthContext, request: HostedFindRequest) -> ProviderCallContext:
         estimate = estimate_voyage_embeddings(
             operation="embed_query",
@@ -547,9 +656,10 @@ class HostedMcpQueryAdapter:
                 "mcp_client_id": auth.client_id,
                 "mcp_grant_id": auth.grant_id,
                 "mcp_session_id": auth.session_id,
-                "mcp_tool": SUPPORTED_TOOL,
+                "mcp_tool": request.mcp_tool,
                 "mcp_search_mode": request.mode,
                 "estimate_method": estimate.method,
+                **request.reservation_metadata,
             },
         )
 
@@ -565,82 +675,174 @@ class HostedMcpQueryAdapter:
 
     def _show(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> dict[str, Any]:
         request = HostedShowRequest.from_arguments(arguments)
+        reservation = self._reserve_search_store_resource_read(
+            auth=auth,
+            tool="show",
+            kind=request.kind,
+            id_=request.id_,
+            metadata={
+                "transcript_offset": request.transcript_offset,
+                "transcript_limit": request.transcript_limit,
+            }
+            if request.kind == "transcript"
+            else None,
+        )
         try:
             if request.kind == "chunk":
-                return self.search_store.resource_chunk(workspace_id=auth.workspace_id, chunk_id=request.id_)
-            if request.kind == "video":
-                return self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=request.id_)
-            if request.kind == "channel":
-                return self.search_store.resource_channel(workspace_id=auth.workspace_id, channel_id=request.id_)
-            if request.kind == "transcript":
-                return self.search_store.resource_transcript(
+                result = self.search_store.resource_chunk(workspace_id=auth.workspace_id, chunk_id=request.id_)
+            elif request.kind == "video":
+                result = self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=request.id_)
+            elif request.kind == "channel":
+                result = self.search_store.resource_channel(workspace_id=auth.workspace_id, channel_id=request.id_)
+            elif request.kind == "transcript":
+                result = self.search_store.resource_transcript(
                     workspace_id=auth.workspace_id,
                     transcript_version_id=request.id_,
                     offset=request.transcript_offset,
                     limit=request.transcript_limit,
                 )
-            if request.kind == "source":
-                return self.search_store.resource_source(workspace_id=auth.workspace_id, source_id=request.id_)
+            elif request.kind == "source":
+                result = self.search_store.resource_source(workspace_id=auth.workspace_id, source_id=request.id_)
+            else:
+                raise HostedMcpError(
+                    code="unsupported_show_kind",
+                    message="Hosted MCP show currently supports chunk, video, channel, transcript, and source.",
+                    status_code=501,
+                    data=_capability_data(
+                        capability="show",
+                        requested=request.kind,
+                        supported=HostedShowRequest.SUPPORTED_KINDS,
+                    ),
+                )
         except HostedResourceNotFound as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": "resource_not_found", "resource_kind": exc.kind, "resource_id": exc.id},
+                exc=exc,
+            )
             raise _resource_not_found(kind=exc.kind, id_=exc.id) from exc
-        raise HostedMcpError(
-            code="unsupported_show_kind",
-            message="Hosted MCP show currently supports chunk, video, channel, transcript, and source.",
-            status_code=501,
-            data={"kind": request.kind, "supported": sorted(HostedShowRequest.SUPPORTED_KINDS)},
+        except Exception as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": type(exc).__name__, "resource_kind": request.kind, "resource_id": request.id_},
+                exc=exc,
+            )
+            raise
+        self._record_search_store_read_success(
+            auth=auth,
+            reservation=reservation,
+            actual_units={"queries": 1, "resource_reads": 1, "result_count": 1},
+            metadata={"resource_kind": request.kind, "resource_id": request.id_},
         )
+        return result
 
     def _list(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> QueryResult:
         request = HostedListRequest.from_arguments(arguments)
-        if request.entity == "status":
-            return QueryResult(rows=[self.search_store.list_status(workspace_id=auth.workspace_id)])
-        if request.entity == "video":
-            return QueryResult(
-                rows=self.search_store.list_videos(
+        reservation = self._reserve_search_store_list_read(
+            auth=auth,
+            tool="list",
+            entity=request.entity,
+            limit=request.limit,
+            offset=request.offset,
+            metadata={
+                "channel": request.channel,
+                "selected": request.selected,
+                "order_by": request.order_by,
+            },
+        )
+        try:
+            if request.entity == "status":
+                rows = [self.search_store.list_status(workspace_id=auth.workspace_id)]
+            elif request.entity == "video":
+                rows = self.search_store.list_videos(
                     workspace_id=auth.workspace_id,
                     limit=request.limit,
                     offset=request.offset,
                     channel=request.channel,
                     order_by=request.order_by,
                 )
-            )
-        if request.entity == "channel":
-            return QueryResult(
-                rows=self.search_store.list_channels(
+            elif request.entity == "channel":
+                rows = self.search_store.list_channels(
                     workspace_id=auth.workspace_id,
                     limit=request.limit,
                     offset=request.offset,
                     channel=request.channel,
                     selected=request.selected,
                 )
+            else:
+                raise AssertionError("validated list request produced an unknown entity")
+        except Exception as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": type(exc).__name__, "list_entity": request.entity},
+                exc=exc,
             )
-        raise AssertionError("validated list request produced an unknown entity")
+            raise
+        self._record_search_store_read_success(
+            auth=auth,
+            reservation=reservation,
+            actual_units={"queries": 1, "candidate_limit": request.limit, "result_count": len(rows)},
+            metadata={"list_entity": request.entity},
+        )
+        return QueryResult(rows=rows)
 
     def _q(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> QueryResult:
         request = HostedQRequest.from_arguments(arguments)
-        if request.kind == "status":
-            return QueryResult(rows=[self.search_store.list_status(workspace_id=auth.workspace_id)])
-        if request.kind == "video":
-            return QueryResult(
-                rows=self.search_store.list_videos(
-                    workspace_id=auth.workspace_id,
-                    limit=request.limit,
-                    offset=request.offset,
-                    channel=request.channel,
-                    video_id=request.video_id,
-                    order_by=request.order_by,
-                )
+        if request.kind in {"status", "video", "channel"}:
+            entity = "status" if request.kind == "status" else request.kind
+            reservation = self._reserve_search_store_list_read(
+                auth=auth,
+                tool="q",
+                entity=entity,
+                limit=request.limit,
+                offset=request.offset,
+                metadata={
+                    "q_kind": request.kind,
+                    "project": request.project,
+                    "channel": request.channel,
+                    "video_id": request.video_id,
+                    "selected": request.selected,
+                    "order_by": request.order_by,
+                },
             )
-        if request.kind == "channel":
-            return QueryResult(
-                rows=self.search_store.list_channels(
-                    workspace_id=auth.workspace_id,
-                    limit=request.limit,
-                    offset=request.offset,
-                    channel=request.channel,
-                    selected=request.selected,
+            try:
+                if request.kind == "status":
+                    rows = [self.search_store.list_status(workspace_id=auth.workspace_id)]
+                elif request.kind == "video":
+                    rows = self.search_store.list_videos(
+                        workspace_id=auth.workspace_id,
+                        limit=request.limit,
+                        offset=request.offset,
+                        channel=request.channel,
+                        video_id=request.video_id,
+                        order_by=request.order_by,
+                    )
+                else:
+                    rows = self.search_store.list_channels(
+                        workspace_id=auth.workspace_id,
+                        limit=request.limit,
+                        offset=request.offset,
+                        channel=request.channel,
+                        selected=request.selected,
+                    )
+            except Exception as exc:
+                self._record_search_store_failure(
+                    auth=auth,
+                    reservation=reservation,
+                    metadata={"error_code": type(exc).__name__, "q_kind": request.kind},
+                    exc=exc,
                 )
+                raise
+            self._record_search_store_read_success(
+                auth=auth,
+                reservation=reservation,
+                actual_units={"queries": 1, "candidate_limit": request.limit, "result_count": len(rows)},
+                metadata={"q_kind": request.kind},
             )
+            return QueryResult(rows=rows)
         if request.kind == "chunk_lexical":
             return self._find_lexical(
                 auth=auth,
@@ -650,6 +852,8 @@ class HostedMcpQueryAdapter:
                     mode="lexical",
                     project=request.project,
                     notes=["hosted_q_mapped_to_lexical_chunk_search"],
+                    mcp_tool="q",
+                    reservation_metadata={"q_kind": request.kind},
                 ),
             )
         raise AssertionError("validated q request produced an unknown kind")
@@ -661,18 +865,50 @@ class HostedMcpQueryAdapter:
         host: str,
         params: Mapping[str, str],
     ) -> dict[str, Any]:
-        if host == "chunk":
-            return self.search_store.resource_chunk(workspace_id=auth.workspace_id, chunk_id=params["chunk_id"])
-        if host == "video":
-            return self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=params["video_id"])
-        if host == "channel":
-            return self.search_store.resource_channel(workspace_id=auth.workspace_id, channel_id=params["channel_id"])
-        if host == "transcript":
-            return self.search_store.resource_transcript(
-                workspace_id=auth.workspace_id,
-                transcript_version_id=params["transcript_version_id"],
+        resource_id = next(iter(params.values()), "")
+        reservation = self._reserve_search_store_resource_read(
+            auth=auth,
+            tool="resource",
+            kind=host,
+            id_=resource_id,
+        )
+        try:
+            if host == "chunk":
+                result = self.search_store.resource_chunk(workspace_id=auth.workspace_id, chunk_id=params["chunk_id"])
+            elif host == "video":
+                result = self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=params["video_id"])
+            elif host == "channel":
+                result = self.search_store.resource_channel(workspace_id=auth.workspace_id, channel_id=params["channel_id"])
+            elif host == "transcript":
+                result = self.search_store.resource_transcript(
+                    workspace_id=auth.workspace_id,
+                    transcript_version_id=params["transcript_version_id"],
+                )
+            else:
+                _raise_unsupported_resource(host, f"yutome://{host}")
+        except HostedResourceNotFound as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": "resource_not_found", "resource_kind": exc.kind, "resource_id": exc.id},
+                exc=exc,
             )
-        _raise_unsupported_resource(host, f"yutome://{host}")
+            raise
+        except Exception as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": type(exc).__name__, "resource_kind": host, "resource_id": resource_id},
+                exc=exc,
+            )
+            raise
+        self._record_search_store_read_success(
+            auth=auth,
+            reservation=reservation,
+            actual_units={"queries": 1, "resource_reads": 1, "result_count": 1},
+            metadata={"resource_kind": host, "resource_id": resource_id},
+        )
+        return result
 
 
 @dataclass(frozen=True)
@@ -682,6 +918,8 @@ class HostedFindRequest:
     mode: str = "lexical"
     project: str | None = None
     notes: list[str] = field(default_factory=list)
+    mcp_tool: str = SUPPORTED_TOOL
+    reservation_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedFindRequest:
@@ -776,14 +1014,19 @@ class HostedShowRequest:
                 code="unsupported_show_kind",
                 message="Hosted MCP show currently supports chunk, video, channel, transcript, source, and context.",
                 status_code=400,
-                data={"kind": kind, "supported": sorted(cls.SUPPORTED_KINDS)},
+                data=_capability_data(capability="show", requested=kind, supported=cls.SUPPORTED_KINDS),
             )
         if kind == "context":
             raise HostedMcpError(
                 code="unsupported_show_context",
                 message="Hosted MCP show context expansion is not implemented in this Python adapter slice.",
                 status_code=501,
-                data={"kind": kind},
+                data=_capability_data(
+                    capability="show.context",
+                    requested=kind,
+                    supported=cls.SUPPORTED_KINDS - {"context"},
+                    unsupported_reason="context_expansion_not_implemented",
+                ),
             )
         raw_id = arguments.get("id_", arguments.get("id"))
         id_ = str(raw_id or "").strip()
@@ -829,14 +1072,19 @@ class HostedListRequest:
                 code="unsupported_list_entity",
                 message="Hosted MCP list attention is not backed by the hosted schema yet.",
                 status_code=501,
-                data={"entity": raw_entity},
+                data=_capability_data(
+                    capability="list",
+                    requested=raw_entity,
+                    supported={"channels", "status", "videos"},
+                    unsupported_reason="attention_schema_not_implemented",
+                ),
             )
         else:
             raise HostedMcpError(
                 code="unsupported_list_entity",
                 message="Hosted MCP list supports status, videos, and channels.",
                 status_code=400,
-                data={"entity": raw_entity, "supported": ["channels", "status", "videos"]},
+                data=_capability_data(capability="list", requested=raw_entity, supported={"channels", "status", "videos"}),
             )
 
         unsupported_filters = [
@@ -849,7 +1097,12 @@ class HostedListRequest:
                 code="unsupported_list_filter",
                 message="Hosted MCP list only supports channel and selected filters in this adapter slice.",
                 status_code=501,
-                data={"filters": unsupported_filters},
+                data=_capability_data(
+                    capability="list.filters",
+                    requested=unsupported_filters,
+                    supported={"channel", "selected"},
+                    unsupported_reason="filter_not_implemented",
+                ),
             )
         if entity == "status":
             extra = [key for key in ("channel", "selected", "order_by", "project") if arguments.get(key) is not None]
@@ -858,14 +1111,24 @@ class HostedListRequest:
                     code="unsupported_list_filter",
                     message="Hosted MCP list status does not support filters or projections.",
                     status_code=501,
-                    data={"filters": extra},
+                    data=_capability_data(
+                        capability="list.status.filters",
+                        requested=extra,
+                        supported=set(),
+                        unsupported_reason="status_filters_not_supported",
+                    ),
                 )
         if entity == "video" and arguments.get("selected") is not None:
             raise HostedMcpError(
                 code="unsupported_list_filter",
                 message="Hosted MCP selected filtering is only supported for channel lists.",
                 status_code=501,
-                data={"filters": ["selected"]},
+                data=_capability_data(
+                    capability="list.video.filters",
+                    requested=["selected"],
+                    supported={"channel"},
+                    unsupported_reason="selected_only_supported_for_channels",
+                ),
             )
         order_by = _normalize_list_order(arguments.get("order_by"))
         if entity == "channel" and order_by is not None:
@@ -873,7 +1136,12 @@ class HostedListRequest:
                 code="unsupported_list_order",
                 message="Hosted MCP channel lists do not support order_by yet.",
                 status_code=501,
-                data={"order_by": order_by},
+                data=_capability_data(
+                    capability="list.channel.order_by",
+                    requested=order_by,
+                    supported=set(),
+                    unsupported_reason="channel_order_not_implemented",
+                ),
             )
         project = arguments.get("project")
         if project not in {None, "thin", "video_card", "channel_card", "status_breakdown"}:
@@ -881,7 +1149,11 @@ class HostedListRequest:
                 code="unsupported_list_project",
                 message="Hosted MCP list supports thin, video_card, channel_card, and status_breakdown projections.",
                 status_code=501,
-                data={"project": project},
+                data=_capability_data(
+                    capability="list.project",
+                    requested=project,
+                    supported={"channel_card", "status_breakdown", "thin", "video_card"},
+                ),
             )
         return cls(
             entity=entity,
@@ -1047,7 +1319,12 @@ def parse_yutome_resource_uri(uri: str) -> tuple[str, dict[str, str]]:
             code="unsupported_resource",
             message=f"Unsupported hosted MCP resource host: {host!r}.",
             status_code=404,
-            data={"uri": uri},
+            data=_capability_data(
+                capability="resource",
+                requested=host,
+                supported=SUPPORTED_RESOURCE_HOSTS,
+                uri=uri,
+            ),
         )
     placeholder_match = re.search(r"\{([^}]+)\}", spec.uri_template)
     if placeholder_match is None:
@@ -1107,7 +1384,12 @@ def _raise_unsupported_tool(name: str) -> None:
         code="unsupported_tool",
         message=message,
         status_code=404,
-        data={"tool": name, "supported": sorted(SUPPORTED_TOOLS)},
+        data=_capability_data(
+            capability="tool",
+            requested=name,
+            supported=SUPPORTED_TOOLS,
+            contract_supported={spec.name for spec in contract.TOOLS},
+        ),
     )
 
 
@@ -1118,7 +1400,13 @@ def _raise_unsupported_resource(host: str, uri: str) -> None:
         code="unsupported_resource",
         message=f"Hosted MCP resource {host!r} is not implemented in this Python adapter slice.",
         status_code=501,
-        data={"uri": uri, "supported": sorted(SUPPORTED_RESOURCE_HOSTS)},
+        data=_capability_data(
+            capability="resource",
+            requested=host,
+            supported=SUPPORTED_RESOURCE_HOSTS,
+            contract_supported={spec.host for spec in contract.RESOURCES},
+            uri=uri,
+        ),
     )
 
 
@@ -1140,11 +1428,12 @@ def _query_idempotency_key(*, auth: HostedMcpAuthContext, request: HostedFindReq
         operation=operation,
         input_hash_value=input_hash(
             {
-                "tool": SUPPORTED_TOOL,
+                "tool": request.mcp_tool,
                 "mode": request.mode,
                 "text": request.text,
                 "limit": request.limit,
                 "project": request.project,
+                **request.reservation_metadata,
             }
         ),
         extras=extras,
@@ -1181,11 +1470,81 @@ def _with_mcp_metadata(
         **event.metadata,
         "idempotency_key": reservation.idempotency_key,
         "allocation_id": reservation.allocation_id,
+        "allocation_kind": reservation.allocation_kind,
         "mcp_client_id": auth.client_id,
         "mcp_grant_id": auth.grant_id,
         "mcp_session_id": auth.session_id,
     }
     return event
+
+
+def _read_idempotency_key(
+    *,
+    auth: HostedMcpAuthContext,
+    operation: str,
+    payload: Mapping[str, Any],
+) -> str:
+    extras = [value for value in (auth.grant_id, auth.client_id, auth.session_id) if value]
+    return idempotency_key(
+        workspace_id=auth.workspace_id,
+        subject_id=auth.client_id or "hosted_mcp",
+        operation=operation,
+        input_hash_value=input_hash(dict(payload)),
+        extras=extras,
+    )
+
+
+def _search_store_reservation_metadata(allocation: Allocation | None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "service": "search_store",
+        "credential_mode": allocation.mode if allocation else "disabled",
+    }
+    if allocation is None:
+        return metadata
+    metadata["service_allocation_id"] = allocation.id
+    backend = getattr(allocation, "backend", None)
+    index_profile_ref = getattr(allocation, "index_profile_ref", None)
+    if backend is not None:
+        metadata["backend"] = backend
+    if index_profile_ref is not None:
+        metadata["index_profile_ref"] = index_profile_ref
+    return metadata
+
+
+def _search_store_backend_from_reservation(reservation: UsageReservation) -> str:
+    backend = reservation.metadata.get("backend")
+    if backend is None:
+        return SEARCH_STORE_READ_BACKEND
+    return str(backend)
+
+
+def _search_store_index_profile_from_reservation(reservation: UsageReservation) -> str | None:
+    index_profile_ref = reservation.metadata.get("index_profile_ref")
+    if index_profile_ref is None:
+        return None
+    return str(index_profile_ref)
+
+
+def _capability_data(
+    *,
+    capability: str,
+    requested: Any,
+    supported: set[str] | frozenset[str],
+    contract_supported: set[str] | frozenset[str] | None = None,
+    unsupported_reason: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    data = {
+        "capability": capability,
+        "requested": requested,
+        "supported": sorted(supported),
+    }
+    if contract_supported is not None:
+        data["contract_supported"] = sorted(contract_supported)
+    if unsupported_reason is not None:
+        data["unsupported_reason"] = unsupported_reason
+    data.update(extra)
+    return data
 
 
 def _contract_find_row(row: Mapping[str, Any], *, project: str | None) -> dict[str, Any]:
@@ -1663,7 +2022,12 @@ def _reject_unknown_filter_keys(filter_obj: Mapping[str, Any], supported: set[st
             code="unsupported_q_filter",
             message="Hosted MCP q received filters that are not supported by this hosted adapter slice.",
             status_code=501,
-            data={"filters": unknown, "supported": sorted(supported)},
+            data=_capability_data(
+                capability="q.filters",
+                requested=unknown,
+                supported=supported,
+                unsupported_reason="filter_not_implemented",
+            ),
         )
 
 
@@ -1672,6 +2036,12 @@ def _unsupported_q(message: str) -> HostedMcpError:
         code="unsupported_q_shape",
         message=message,
         status_code=501,
+        data=_capability_data(
+            capability="q",
+            requested="unsupported_query_shape",
+            supported={"channel.thin", "channel.channel_card", "chunk.lexical", "status_breakdown", "video.thin", "video.video_card"},
+            unsupported_reason=message,
+        ),
     )
 
 

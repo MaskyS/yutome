@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,12 +17,16 @@ from yutome.hosted.models import (
     UsageEvent,
     UsageReservation,
     WorkspaceBalance,
+    add_unit_maps,
+    jsonable_exact,
     normalize_unit_map,
+    subtract_unit_maps,
     unit_quantity_decimal,
 )
 from yutome.hosted.repositories import (
     SqlStatement,
     insert_usage_event_sql,
+    update_usage_reservation_status_sql,
     upsert_usage_reservation_sql,
     usage_event_from_row,
     usage_reservation_from_row,
@@ -68,7 +73,7 @@ class JsonlUsageLedger:
 
 
 class PostgresUsageGate:
-    """UsageGate adapter that durably upserts reservations before provider calls."""
+    """UsageGate adapter that durably reserves balance before provider calls."""
 
     def __init__(self, connection: Any, *, gate: UsageGate | None = None) -> None:
         self.connection = connection
@@ -86,19 +91,49 @@ class PostgresUsageGate:
         balance: WorkspaceBalance,
         idempotency_key: str,
     ) -> UsageReservation:
-        reservation = self.gate.reserve(
-            workspace_id=workspace_id,
-            subject=subject,
-            operation=operation,
-            estimated_units=estimated_units,
-            allocation=allocation,
-            policy=policy,
-            balance=balance,
-            idempotency_key=idempotency_key,
-        )
-        durable = stable_usage_reservation(reservation)
-        row = _execute_one(self.connection, upsert_usage_reservation_sql(durable))
-        return usage_reservation_from_row(row) if row else durable
+        with _transaction(self.connection):
+            balance_row = _lock_active_balance_row(
+                self.connection,
+                workspace_id=workspace_id,
+                entitlement_policy_id=policy.id,
+            )
+            existing = _lock_existing_reservation_row(
+                self.connection,
+                workspace_id=workspace_id,
+                idempotency_key=idempotency_key,
+            )
+            if existing is not None:
+                return usage_reservation_from_row(existing)
+
+            locked_balance = _workspace_balance_from_row(balance_row) if balance_row is not None else WorkspaceBalance(workspace_id=workspace_id)
+            reservation = self.gate.reserve(
+                workspace_id=workspace_id,
+                subject=subject,
+                operation=operation,
+                estimated_units=estimated_units,
+                allocation=allocation,
+                policy=policy,
+                balance=locked_balance,
+                idempotency_key=idempotency_key,
+            )
+            durable = stable_usage_reservation(reservation)
+            row = _execute_one(self.connection, upsert_usage_reservation_sql(durable))
+            persisted = usage_reservation_from_row(row) if row else durable
+            if persisted.decision.allowed and balance_row is not None:
+                remaining_units, reserved_units = _balance_after_reservation(balance_row, persisted)
+                _execute_one(
+                    self.connection,
+                    SqlStatement(
+                        sql=_UPDATE_WORKSPACE_BALANCE_RESERVATION_SQL,
+                        params={
+                            "workspace_id": workspace_id,
+                            "entitlement_policy_id": policy.id,
+                            "remaining_units_jsonb": _json_param(remaining_units),
+                            "reserved_units_jsonb": _json_param(reserved_units),
+                        },
+                    ),
+                )
+            return persisted
 
 
 @dataclass(frozen=True)
@@ -122,16 +157,26 @@ class PostgresUsageLedger:
     def append(self, event: UsageEvent) -> UsageEvent:
         durable = stable_usage_event(event)
         idempotency = "provider_request" if durable.provider_request_id else "event_id"
-        row = _execute_one(self.connection, insert_usage_event_sql(durable, idempotency=idempotency))
-        return usage_event_from_row(row) if row else durable
+        with _transaction(self.connection):
+            row = _execute_one(self.connection, insert_usage_event_sql(durable, idempotency=idempotency))
+            persisted = usage_event_from_row(row) if row else durable
+            _reconcile_balance_for_usage_event(self.connection, persisted)
+            return persisted
 
 
 def stable_usage_reservation(reservation: UsageReservation) -> UsageReservation:
     return reservation.model_copy(
         update={
-            "id": _stable_id("res", reservation.workspace_id, reservation.idempotency_key),
+            "id": stable_usage_reservation_id(
+                workspace_id=reservation.workspace_id,
+                idempotency_key=reservation.idempotency_key,
+            ),
         }
     )
+
+
+def stable_usage_reservation_id(*, workspace_id: str, idempotency_key: str) -> str:
+    return _stable_id("res", workspace_id, idempotency_key)
 
 
 def stable_usage_event(event: UsageEvent) -> UsageEvent:
@@ -212,6 +257,141 @@ def _numeric_actual_units(event: UsageEvent) -> UnitMap:
     return numeric
 
 
+def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> None:
+    if event.reservation_id is None or event.status not in {"succeeded", "failed", "released"}:
+        return
+    row = _lock_reservation_by_id(connection, workspace_id=event.workspace_id, reservation_id=event.reservation_id)
+    if row is None or str(row.get("status")) != "reserved":
+        return
+    reservation = usage_reservation_from_row(row)
+    balance_row = _lock_current_workspace_balance_row(connection, workspace_id=event.workspace_id)
+    if balance_row is not None:
+        remaining_units, reserved_units = _balance_after_usage_event(balance_row, reservation, event)
+        _execute_one(
+            connection,
+            SqlStatement(
+                sql=_UPDATE_CURRENT_WORKSPACE_BALANCE_SQL,
+                params={
+                    "workspace_id": event.workspace_id,
+                    "remaining_units_jsonb": _json_param(remaining_units),
+                    "reserved_units_jsonb": _json_param(reserved_units),
+                },
+            ),
+        )
+    next_status = "reconciled" if event.status == "succeeded" else "released"
+    _execute_one(
+        connection,
+        update_usage_reservation_status_sql(
+            reservation_id=reservation.id,
+            workspace_id=reservation.workspace_id,
+            status=next_status,
+        ),
+    )
+
+
+def _lock_reservation_by_id(connection: Any, *, workspace_id: str, reservation_id: str) -> Mapping[str, Any] | None:
+    return _execute_one(
+        connection,
+        SqlStatement(
+            sql=_LOCK_USAGE_RESERVATION_BY_ID_SQL,
+            params={"workspace_id": workspace_id, "reservation_id": reservation_id},
+        ),
+    )
+
+
+def _lock_active_balance_row(connection: Any, *, workspace_id: str, entitlement_policy_id: str) -> Mapping[str, Any] | None:
+    return _execute_one(
+        connection,
+        SqlStatement(
+            sql=_LOCK_ACTIVE_WORKSPACE_BALANCE_SQL,
+            params={"workspace_id": workspace_id, "entitlement_policy_id": entitlement_policy_id},
+        ),
+    )
+
+
+def _lock_existing_reservation_row(connection: Any, *, workspace_id: str, idempotency_key: str) -> Mapping[str, Any] | None:
+    return _execute_one(
+        connection,
+        SqlStatement(
+            sql=_LOCK_EXISTING_USAGE_RESERVATION_SQL,
+            params={"workspace_id": workspace_id, "idempotency_key": idempotency_key},
+        ),
+    )
+
+
+def _lock_current_workspace_balance_row(connection: Any, *, workspace_id: str) -> Mapping[str, Any] | None:
+    return _execute_one(
+        connection,
+        SqlStatement(
+            sql=_LOCK_CURRENT_WORKSPACE_BALANCE_SQL,
+            params={"workspace_id": workspace_id},
+        ),
+    )
+
+
+def _workspace_balance_from_row(row: Mapping[str, Any]) -> WorkspaceBalance:
+    return WorkspaceBalance(
+        workspace_id=str(row["workspace_id"]),
+        remaining_units=_json_mapping(row.get("remaining_units_jsonb")),
+        unlimited_units=set(_text_array(row.get("unlimited_units"))),
+    )
+
+
+def _balance_after_reservation(row: Mapping[str, Any], reservation: UsageReservation) -> tuple[UnitMap, UnitMap]:
+    unlimited_units = set(_text_array(row.get("unlimited_units")))
+    chargeable_estimate = {
+        unit: quantity for unit, quantity in normalize_unit_map(reservation.estimated_units).items() if unit not in unlimited_units
+    }
+    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")))
+    reserved = normalize_unit_map(_json_mapping(row.get("reserved_units_jsonb")))
+    return subtract_unit_maps(remaining, chargeable_estimate), add_unit_maps(reserved, chargeable_estimate)
+
+
+def _balance_after_usage_event(
+    row: Mapping[str, Any],
+    reservation: UsageReservation,
+    event: UsageEvent,
+) -> tuple[UnitMap, UnitMap]:
+    unlimited_units = set(_text_array(row.get("unlimited_units")))
+    estimated = {
+        unit: quantity for unit, quantity in normalize_unit_map(reservation.estimated_units).items() if unit not in unlimited_units
+    }
+    if event.status == "succeeded":
+        actual = _numeric_actual_units(event) or estimated
+        actual = {unit: quantity for unit, quantity in actual.items() if unit not in unlimited_units}
+    else:
+        actual = {}
+    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")))
+    reserved = normalize_unit_map(_json_mapping(row.get("reserved_units_jsonb")))
+    remaining_delta = subtract_unit_maps(estimated, actual)
+    return _clamp_non_negative(add_unit_maps(remaining, remaining_delta)), _clamp_non_negative(subtract_unit_maps(reserved, estimated))
+
+
+def _clamp_non_negative(units: Mapping[str, UnitQuantity]) -> UnitMap:
+    clamped: UnitMap = {}
+    for unit, quantity in units.items():
+        exact = unit_quantity_decimal(quantity)
+        if exact > 0:
+            clamped[unit] = quantity
+    return clamped
+
+
+@contextmanager
+def _transaction(connection: Any):
+    transaction = getattr(connection, "transaction", None)
+    if callable(transaction):
+        with transaction():
+            yield
+        return
+    connection.execute("BEGIN", {})
+    try:
+        yield
+    except Exception:
+        connection.execute("ROLLBACK", {})
+        raise
+    connection.execute("COMMIT", {})
+
+
 def _execute_one(connection: Any, statement: SqlStatement) -> Mapping[str, Any] | None:
     result = connection.execute(statement.sql, statement.params)
     return _one_row_from_result(result)
@@ -239,3 +419,99 @@ def _one_row_from_result(result: Any) -> Mapping[str, Any] | None:
     except StopIteration:
         return None
     return dict(row)
+
+
+def _json_param(value: Any) -> str:
+    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        parsed = json.loads(value)
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    if isinstance(value, bytes):
+        parsed = json.loads(value.decode("utf-8"))
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _text_array(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
+
+
+_LOCK_ACTIVE_WORKSPACE_BALANCE_SQL = """
+SELECT
+    workspace_id,
+    entitlement_policy_id,
+    remaining_units_jsonb,
+    reserved_units_jsonb,
+    unlimited_units
+FROM workspace_balances
+WHERE workspace_id = %(workspace_id)s
+  AND entitlement_policy_id = %(entitlement_policy_id)s
+  AND period_start_at <= now()
+  AND period_end_at > now()
+FOR UPDATE;
+""".strip()
+
+
+_LOCK_EXISTING_USAGE_RESERVATION_SQL = """
+SELECT *
+FROM usage_reservations
+WHERE workspace_id = %(workspace_id)s
+  AND idempotency_key = %(idempotency_key)s
+FOR UPDATE;
+""".strip()
+
+
+_LOCK_USAGE_RESERVATION_BY_ID_SQL = """
+SELECT *
+FROM usage_reservations
+WHERE workspace_id = %(workspace_id)s
+  AND id = %(reservation_id)s
+FOR UPDATE;
+""".strip()
+
+
+_LOCK_CURRENT_WORKSPACE_BALANCE_SQL = """
+SELECT
+    workspace_id,
+    entitlement_policy_id,
+    remaining_units_jsonb,
+    reserved_units_jsonb,
+    unlimited_units
+FROM workspace_balances
+WHERE workspace_id = %(workspace_id)s
+  AND period_start_at <= now()
+  AND period_end_at > now()
+FOR UPDATE;
+""".strip()
+
+
+_UPDATE_WORKSPACE_BALANCE_RESERVATION_SQL = """
+UPDATE workspace_balances
+SET remaining_units_jsonb = %(remaining_units_jsonb)s::jsonb,
+    reserved_units_jsonb = %(reserved_units_jsonb)s::jsonb,
+    updated_at = now()
+WHERE workspace_id = %(workspace_id)s
+  AND entitlement_policy_id = %(entitlement_policy_id)s
+RETURNING *;
+""".strip()
+
+
+_UPDATE_CURRENT_WORKSPACE_BALANCE_SQL = """
+UPDATE workspace_balances
+SET remaining_units_jsonb = %(remaining_units_jsonb)s::jsonb,
+    reserved_units_jsonb = %(reserved_units_jsonb)s::jsonb,
+    updated_at = now()
+WHERE workspace_id = %(workspace_id)s
+RETURNING *;
+""".strip()

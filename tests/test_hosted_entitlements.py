@@ -154,7 +154,7 @@ def test_postgres_usage_context_provider_denies_missing_policy_closed() -> None:
     assert context.balance.unlimited_units == set()
 
 
-def test_postgres_usage_context_provider_missing_balance_is_soft_denial() -> None:
+def test_postgres_usage_context_provider_missing_balance_is_hard_denial() -> None:
     connection = EntitlementConnection(balance=False)
     provider = PostgresUsageContextProvider(connection)
 
@@ -172,5 +172,5 @@ def test_postgres_usage_context_provider_missing_balance_is_soft_denial() -> Non
 
     assert reservation.status == "denied"
     assert reservation.decision.reason == "insufficient_balance"
-    assert reservation.decision.denial_effect == "soft"
+    assert reservation.decision.denial_effect == "hard"
     assert context.balance.unlimited_units == set()

@@ -231,11 +231,13 @@ def update_job_operation_status_sql(
     now: datetime,
     error_code: str | None = None,
     error_message: str | None = None,
+    usage_reservation_id: str | None = None,
 ) -> SqlStatement:
     return SqlStatement(
         sql="""
 UPDATE job_operations
 SET status = %(status)s,
+    usage_reservation_id = COALESCE(%(usage_reservation_id)s, usage_reservation_id),
     attempt_count = CASE
         WHEN %(status)s IN ('started', 'failed_retryable', 'failed_final') THEN attempt_count + 1
         ELSE attempt_count
@@ -251,6 +253,7 @@ RETURNING *;
             "workspace_id": workspace_id,
             "status": status,
             "now": now,
+            "usage_reservation_id": usage_reservation_id,
             "status_metadata_json": _json_param({"error_code": error_code, "error_message": error_message}),
         },
     )

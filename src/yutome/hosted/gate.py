@@ -99,7 +99,6 @@ class UsageGate:
                 allowed=False,
                 reason="insufficient_balance",
                 message=f"Workspace does not have enough {unit}.",
-                denial_effect="soft",
             )
 
         return UsageDecision(allowed=True)

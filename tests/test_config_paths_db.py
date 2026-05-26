@@ -2456,22 +2456,32 @@ def test_env_can_enable_webshare_proxy_and_gemini(monkeypatch, tmp_path: Path) -
     monkeypatch.setenv("YUTOME_WEBSHARE_PASSWORD", "proxy-pass")
     monkeypatch.setenv("YUTOME_WEBSHARE_DOMAIN", "p.webshare.io")
     monkeypatch.setenv("YUTOME_WEBSHARE_PORT", "80")
+    monkeypatch.setenv("YUTOME_PROXY_USE_FOR_DISCOVERY", "true")
+    monkeypatch.setenv("YUTOME_PROXY_USE_FOR_METADATA", "1")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("YUTOME_GEMINI_MODEL", "gemini-test-model")
     monkeypatch.setenv("YUTOME_GEMINI_MEDIA_RESOLUTION", "medium")
     monkeypatch.setenv("YUTOME_GEMINI_REQUEST_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("YUTOME_GEMINI_WINDOW_SECONDS", "600")
+    monkeypatch.setenv("YUTOME_GEMINI_FALLBACK_ENABLED", "yes")
+    monkeypatch.setenv("YUTOME_TRANSCRIPTS_PREFER_YTDLP_SUBTITLES", "true")
+    monkeypatch.setenv("YUTOME_TRANSCRIPTS_REQUEST_TIMEOUT_SECONDS", "12.5")
 
     config = apply_env_to_config(load_config(config_path))
 
     assert config.proxy.enabled is True
     assert config.proxy.kind == "webshare"
+    assert config.proxy.use_for_discovery is True
+    assert config.proxy.use_for_metadata is True
     assert proxy_url_for_ytdlp(config.proxy, key="video123") == "http://proxy-user-rotate:proxy-pass@p.webshare.io:80/"
     assert config.gemini.enabled is True
     assert config.gemini.model == "gemini-test-model"
     assert config.gemini.media_resolution == "medium"
     assert config.gemini.request_timeout_seconds == 45.0
     assert config.gemini.window_seconds == 600
+    assert config.gemini.fallback_enabled is True
+    assert config.transcripts.prefer_ytdlp_subtitles is True
+    assert config.transcripts.request_timeout_seconds == 12.5
 
 
 def test_oauth_client_secrets_loader_accepts_installed_shape(tmp_path: Path) -> None:

@@ -36,17 +36,27 @@ def test_phase4_schema_statements_include_hosted_runtime_tables_and_extensions()
 
     assert "CREATE EXTENSION IF NOT EXISTS vector" in joined
     assert "CREATE EXTENSION IF NOT EXISTS vchord" in joined
+    assert "CREATE EXTENSION IF NOT EXISTS pg_tokenizer" in joined
     assert "CREATE EXTENSION IF NOT EXISTS vchord_bm25" in joined
+    assert "create_tokenizer('yutome_llmlingua2'" in joined
+    assert "create_tokenizer('pg_tokenizer'" in joined
+    assert "Tokenizer already exists:%" in joined
     assert "CREATE TABLE IF NOT EXISTS sources" in joined
     assert "CREATE TABLE IF NOT EXISTS source_refresh_policies" in joined
     assert "CREATE TABLE IF NOT EXISTS jobs" in joined
     assert "CREATE TABLE IF NOT EXISTS job_operations" in joined
+    assert "output_json jsonb NOT NULL DEFAULT '{}'::jsonb" in joined
+    assert "ADD COLUMN IF NOT EXISTS output_json" in joined
     assert "CREATE TABLE IF NOT EXISTS search_index_profiles" in joined
     assert "embedding_model text NOT NULL DEFAULT 'voyage-4-lite'" in joined
     assert "embedding_dimension integer NOT NULL DEFAULT 1024" in joined
     assert "chk_search_index_profiles_embedding_dimension_supported" in joined
     assert "CHECK (embedding_dimension = 1024)" in joined
     assert "CREATE TABLE IF NOT EXISTS chunks" in joined
+    assert "bm25_document bm25vector NOT NULL" in joined
+    assert "tokenize(chunks.text, sip.tokenizer)::bm25vector" in joined
+    assert "idx_chunks_bm25_document" in joined
+    assert "ON chunks USING bm25 (bm25_document bm25_ops)" in joined
     assert "CREATE TABLE IF NOT EXISTS chunk_embeddings" in joined
     assert "embedding vector(1024) NOT NULL" in joined
     assert "chk_chunk_embeddings_embedding_dimension" in joined

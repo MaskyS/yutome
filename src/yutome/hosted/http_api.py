@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import Request
 
 from yutome import contract
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpError, HostedMcpQueryAdapter
@@ -19,6 +21,7 @@ GRANT_HEADER = "X-Yutome-Grant-Id"
 CLIENT_HEADER = "X-Yutome-Client-Id"
 SESSION_HEADER = "X-Yutome-Session-Id"
 TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
+POLAR_WEBHOOK_SECRET_ENV_VAR = "POLAR_WEBHOOK_SECRET"
 _SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
 
@@ -50,6 +53,7 @@ def build_postgres_app(
     voyage_usage_context_provider: Any | None = None,
     index_profile_ref: str | None = None,
     expected_api_token: str | None = None,
+    polar_webhook_secret: str | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -67,6 +71,8 @@ def build_postgres_app(
         adapter=adapter,
         readiness_check=readiness_check,
         expected_api_token=_normalize_api_token(expected_api_token) or _api_token_from_env(),
+        billing_connection=connection,
+        polar_webhook_secret=_normalize_api_token(polar_webhook_secret) or _polar_webhook_secret_from_env(),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -80,9 +86,17 @@ def build_app(
     auth_dependency: AuthDependency | None = None,
     readiness_check: ReadinessCheck | None = None,
     expected_api_token: str | None = None,
+    billing_connection: Any | None = None,
+    polar_webhook_secret: str | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
+    from yutome.hosted.billing import (
+        PolarWebhookVerificationError,
+        polar_webhook_processing_statements,
+        process_polar_webhook_payload,
+        verify_standard_webhook_signature,
+    )
 
     app = FastAPI(
         title="yutome-hosted-mcp",
@@ -90,9 +104,12 @@ def build_app(
         version="0.1.0",
     )
     app.state.hosted_adapter = adapter
+    app.state.hosted_billing_connection = billing_connection
     normalized_api_token = _normalize_api_token(expected_api_token)
+    normalized_polar_webhook_secret = _normalize_api_token(polar_webhook_secret)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
+    app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -197,6 +214,62 @@ def build_app(
             raise _http_error(exc) from exc
         return {"ok": True, "result": result}
 
+    @app.post("/billing/polar/webhook")
+    @app.post("/webhooks/polar")
+    async def polar_webhook(request: Request) -> dict[str, Any]:
+        if not normalized_polar_webhook_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="polar_webhook_secret_unconfigured",
+                    message=f"Set {POLAR_WEBHOOK_SECRET_ENV_VAR} before accepting Polar webhooks.",
+                    status_code=503,
+                )
+            )
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="billing_connection_unconfigured",
+                    message="Hosted billing webhook processing requires a database connection.",
+                    status_code=503,
+                )
+            )
+        raw_body = await request.body()
+        try:
+            webhook_event_id = verify_standard_webhook_signature(
+                raw_body=raw_body,
+                headers=dict(request.headers),
+                secret=normalized_polar_webhook_secret,
+            )
+        except PolarWebhookVerificationError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code=str(exc),
+                    message="Invalid Polar webhook signature.",
+                    status_code=401,
+                )
+            ) from exc
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code="polar_webhook_invalid_json",
+                    message="Polar webhook body must be valid JSON.",
+                    status_code=400,
+                )
+            ) from exc
+        result = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id=webhook_event_id)
+        _execute_billing_statements(billing_connection, polar_webhook_processing_statements(result))
+        return {
+            "ok": True,
+            "event_id": result.snapshot.webhook_event_id,
+            "payload_hash": result.snapshot.payload_hash,
+            "event_type": result.snapshot.event_type,
+            "credit_entries": len(result.credit_entries),
+            "billing_customer": result.billing_customer.id if result.billing_customer else None,
+            "ignored": result.ignored,
+        }
+
     return app
 
 
@@ -209,6 +282,11 @@ def _parse_scopes(scopes_header: str | None) -> set[str]:
 def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     return _normalize_api_token(env.get(TOKEN_ENV_VAR))
+
+
+def _polar_webhook_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return _normalize_api_token(env.get(POLAR_WEBHOOK_SECRET_ENV_VAR))
 
 
 def _normalize_api_token(token: str | None) -> str | None:
@@ -290,6 +368,17 @@ def _sanitize_readiness_payload(value: Any, *, field_name: str | None = None) ->
 def _looks_sensitive_readiness_string(value: str) -> bool:
     lowered = value.lower()
     return "://" in value or "password" in lowered or "credential" in lowered or "secret" in lowered
+
+
+def _execute_billing_statements(connection: Any, statements: tuple[Any, ...]) -> None:
+    transaction = getattr(connection, "transaction", None)
+    if callable(transaction):
+        with transaction():
+            for statement in statements:
+                connection.execute(statement.sql, statement.params)
+        return
+    for statement in statements:
+        connection.execute(statement.sql, statement.params)
 
 
 def error_body(response_json: Mapping[str, Any]) -> Mapping[str, Any]:

@@ -198,7 +198,7 @@ def _failed_event(
         subject=reservation.subject,
         operation=reservation.operation,
         event_type="provider_attempt_failed",
-        status="failed",
+        status="unknown" if failure.kind == "unknown" and failure.retryable else "failed",
         error_code=failure.code,
         metadata={
             "failure_kind": failure.kind,

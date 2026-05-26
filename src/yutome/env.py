@@ -45,6 +45,12 @@ def apply_env_to_config(config):
         proxy_updates["webshare_port"] = int(port)
         proxy_updates["enabled"] = True
         proxy_updates["kind"] = "webshare"
+    if use_for_discovery := os.environ.get("YUTOME_PROXY_USE_FOR_DISCOVERY"):
+        proxy_updates["use_for_discovery"] = _env_bool(use_for_discovery)
+    if use_for_metadata := os.environ.get("YUTOME_PROXY_USE_FOR_METADATA"):
+        proxy_updates["use_for_metadata"] = _env_bool(use_for_metadata)
+    if use_for_asr_audio := os.environ.get("YUTOME_PROXY_USE_FOR_ASR_AUDIO"):
+        proxy_updates["use_for_asr_audio"] = _env_bool(use_for_asr_audio)
 
     gemini_updates = {}
     if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
@@ -68,9 +74,19 @@ def apply_env_to_config(config):
         gemini_updates["window_seconds"] = int(gemini_window_seconds)
         gemini_updates["enabled"] = True
     if gemini_cache_enabled := os.environ.get("YUTOME_GEMINI_CLEANUP_CACHE_ENABLED"):
-        gemini_updates["cleanup_cache_enabled"] = gemini_cache_enabled.strip().lower() in ("1", "true", "yes", "on")
+        gemini_updates["cleanup_cache_enabled"] = _env_bool(gemini_cache_enabled)
     if gemini_cache_ttl := os.environ.get("YUTOME_GEMINI_CLEANUP_CACHE_TTL_SECONDS"):
         gemini_updates["cleanup_cache_ttl_seconds"] = int(gemini_cache_ttl)
+    if gemini_fallback_enabled := os.environ.get("YUTOME_GEMINI_FALLBACK_ENABLED"):
+        gemini_updates["fallback_enabled"] = _env_bool(gemini_fallback_enabled)
+
+    transcript_updates = {}
+    if prefer_ytdlp := os.environ.get("YUTOME_TRANSCRIPTS_PREFER_YTDLP_SUBTITLES"):
+        transcript_updates["prefer_ytdlp_subtitles"] = _env_bool(prefer_ytdlp)
+    if allow_translated := os.environ.get("YUTOME_TRANSCRIPTS_ALLOW_TRANSLATED_CAPTIONS"):
+        transcript_updates["allow_translated_captions"] = _env_bool(allow_translated)
+    if request_timeout := os.environ.get("YUTOME_TRANSCRIPTS_REQUEST_TIMEOUT_SECONDS"):
+        transcript_updates["request_timeout_seconds"] = float(request_timeout)
 
     youtube_updates = {}
     if youtube_client_secrets := os.environ.get("YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS"):
@@ -87,8 +103,14 @@ def apply_env_to_config(config):
         updates["proxy"] = config.proxy.model_copy(update=proxy_updates)
     if gemini_updates:
         updates["gemini"] = config.gemini.model_copy(update=gemini_updates)
+    if transcript_updates:
+        updates["transcripts"] = config.transcripts.model_copy(update=transcript_updates)
     if youtube_updates:
         updates["youtube"] = config.youtube.model_copy(update=youtube_updates)
     if updates:
         return config.model_copy(update=updates)
     return config
+
+
+def _env_bool(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")

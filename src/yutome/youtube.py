@@ -108,6 +108,10 @@ _is_ytdlp_block_error = is_youtube_block_error
 
 def canonical_channel_tabs(target: str) -> list[tuple[str, str]]:
     cleaned = target.rstrip("/")
+    parsed = urlsplit(cleaned if "://" in cleaned else f"https://www.youtube.com/{cleaned.lstrip('/')}")
+    parts = [part for part in parsed.path.split("/") if part]
+    if (parts and parts[0] == "playlist") or parse_qs(parsed.query).get("list"):
+        return [("playlist", cleaned)]
     if cleaned.endswith("/videos") or cleaned.endswith("/streams"):
         return [(cleaned.rsplit("/", 1)[-1], cleaned)]
     return [("videos", f"{cleaned}/videos"), ("streams", f"{cleaned}/streams")]

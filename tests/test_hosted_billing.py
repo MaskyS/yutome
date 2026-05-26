@@ -1,29 +1,41 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 from yutome.hosted.billing import (
     BillingCustomer,
+    PolarWebhookVerificationError,
     CreditLedgerEntry,
     EntitlementPolicyRecord,
     PriceBook,
     PriceBookProduct,
     ProductLimit,
     WorkspaceBalanceSnapshot,
+    balance_reconciliation_input_sql,
     billing_debug_reservation_from_row,
     billing_debug_snapshot_from_rows,
     billing_debug_snapshot_sql,
+    claim_billing_exports_sql,
     billing_export_event_from_usage_event,
+    billing_export_event_from_row,
     billing_export_idempotency_key,
     billing_schema_statements,
     credit_ledger_entry_from_order,
+    derive_workspace_balance_snapshot_from_rows,
     derive_workspace_balance_snapshot,
+    finish_billing_export_sql,
     mark_billing_export_replay,
+    payload_sha256,
     polar_webhook_event_from_payload,
+    polar_webhook_processing_statements,
     polar_webhook_snapshot_from_payload,
+    process_polar_webhook_payload,
     upsert_billing_customer_sql,
     upsert_credit_ledger_entry_sql,
     upsert_billing_export_sql,
@@ -31,6 +43,7 @@ from yutome.hosted.billing import (
     upsert_polar_webhook_snapshot_sql,
     upsert_price_book_sql,
     upsert_workspace_balance_sql,
+    verify_standard_webhook_signature,
 )
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, WorkspaceBalance
@@ -51,6 +64,17 @@ def _usage_event(**overrides: object) -> UsageEvent:
     }
     values.update(overrides)
     return UsageEvent(**values)  # type: ignore[arg-type]
+
+
+def _standard_webhook_headers(raw_body: bytes, *, secret: str = "polar-secret", webhook_id: str = "wh_msg_123") -> dict[str, str]:
+    timestamp = "1780000000"
+    signed = webhook_id.encode() + b"." + timestamp.encode() + b"." + raw_body
+    signature = base64.b64encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest()).decode("ascii")
+    return {
+        "webhook-id": webhook_id,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": f"v1,{signature}",
+    }
 
 
 def test_price_book_models_product_limits_without_authorizing_usage() -> None:
@@ -85,7 +109,7 @@ def test_billing_export_key_is_stable_for_usage_event_replay() -> None:
 
     assert polar.name == "yutome.voyage.embed_documents"
     assert polar.external_customer_id == "ws_alice"
-    assert polar.external_id == "polar:evt_usage_1:voyage.embed_documents"
+    assert polar.external_id == "polar:ws_alice:evt_usage_1:voyage.embed_documents"
     assert polar.metadata["total_tokens"] == 91
     assert polar.metadata["vectors"] == 2
     assert polar.metadata["usage_event_id"] == "evt_usage_1"
@@ -102,6 +126,26 @@ def test_billing_export_preserves_large_integer_units_without_float_rounding() -
 
     assert export.actual_units["total_tokens"] == huge
     assert polar.metadata["total_tokens"] == huge
+
+
+def test_billing_export_polar_metadata_uses_exact_decimal_json() -> None:
+    event = _usage_event(
+        actual_units={"credits": Decimal("0.30")},
+        metadata={"minimum_billable_credit": Decimal("0.10")},
+    )
+
+    export = billing_export_event_from_usage_event(event)
+    polar = export.to_polar_event()
+    payload = export.to_polar_export().model_dump(mode="json")
+
+    assert polar.metadata["credits"] == 0.3
+    assert polar.metadata["credits_exact"] == "0.30"
+    assert polar.metadata["credits_micros"] == 300000
+    assert polar.metadata["minimum_billable_credit"] == "0.10"
+    assert payload["events"][0]["metadata"]["credits"] == 0.3
+    assert payload["events"][0]["metadata"]["credits_exact"] == "0.30"
+    assert payload["events"][0]["metadata"]["credits_micros"] == 300000
+    assert payload["events"][0]["metadata"]["minimum_billable_credit"] == "0.10"
 
 
 def test_billing_export_rejects_negative_usage_units_for_explicit_reconciliation() -> None:
@@ -252,6 +296,8 @@ def test_billing_schema_statements_cover_durable_phase6_tables() -> None:
     assert "CREATE TABLE IF NOT EXISTS billing_customers" in joined
     assert "CREATE TABLE IF NOT EXISTS billing_exports" in joined
     assert "CREATE TABLE IF NOT EXISTS polar_webhook_snapshots" in joined
+    assert "ADD COLUMN IF NOT EXISTS payload_hash text" in joined
+    assert "ALTER COLUMN payload_hash SET NOT NULL" in joined
     assert "UNIQUE(provider, source_event_dedupe_key)" in joined
     assert "idx_billing_exports_replay" in joined
     assert "idx_polar_webhook_snapshots_replay" in joined
@@ -357,6 +403,38 @@ def test_workspace_balance_derives_from_starting_units_credits_usage_and_reserva
     }
 
 
+def test_workspace_balance_overdraw_clamps_remaining_and_records_deficit() -> None:
+    snapshot = derive_workspace_balance_snapshot(
+        workspace_id="ws_alice",
+        entitlement_policy_id="policy_pro",
+        period_start_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        period_end_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        starting_units={"credits": Decimal("1.00"), "total_tokens": 100},
+        used_units={"credits": Decimal("1.25"), "total_tokens": 125},
+        reserved_units={"credits": Decimal("0.25"), "total_tokens": 5},
+    )
+    runtime_balance = snapshot.to_runtime_balance()
+    statement = upsert_workspace_balance_sql(snapshot)
+
+    assert snapshot.remaining_units == {}
+    assert snapshot.metadata["balance_status"] == "overdrawn"
+    assert snapshot.metadata["remaining_units_clamped"] is True
+    assert snapshot.metadata["net_remaining_units"] == {
+        "credits": Decimal("-0.50"),
+        "total_tokens": -30,
+    }
+    assert snapshot.metadata["overdrawn_units"] == {
+        "credits": Decimal("0.50"),
+        "total_tokens": 30,
+    }
+    assert runtime_balance.has_units({"credits": Decimal("0.01")}) == (False, "credits")
+    assert json.loads(statement.params["remaining_units_jsonb"]) == {}
+    assert json.loads(statement.params["metadata_json"])["overdrawn_units"] == {
+        "credits": "0.50",
+        "total_tokens": 30,
+    }
+
+
 def test_billing_customer_and_export_sql_preserve_local_replay_keys() -> None:
     customer = BillingCustomer(
         id="bc_alice",
@@ -383,12 +461,12 @@ def test_billing_customer_and_export_sql_preserve_local_replay_keys() -> None:
     assert json.loads(customer_statement.params["subscription_status_snapshot_jsonb"]) == {"status": "active"}
     assert "ON CONFLICT (provider, source_event_dedupe_key) DO UPDATE" in export_statement.sql
     assert export_statement.params["id"] == export.idempotency_key
-    assert export_statement.params["source_event_dedupe_key"] == "polar:evt_usage_1:voyage.embed_documents"
+    assert export_statement.params["source_event_dedupe_key"] == "polar:ws_alice:evt_usage_1:voyage.embed_documents"
     assert export_statement.params["external_event_id"] == "evt_polar_123"
     assert polar_event.metadata["billing_export_idempotency_key"] == export.idempotency_key
-    assert polar_event.metadata["source_event_dedupe_key"] == "polar:evt_usage_1:voyage.embed_documents"
+    assert polar_event.metadata["source_event_dedupe_key"] == "polar:ws_alice:evt_usage_1:voyage.embed_documents"
     assert polar_event.metadata["external_meter_key"] == "ai_usage"
-    assert polar_event.external_id == "polar:evt_usage_1:voyage.embed_documents"
+    assert polar_event.external_id == "polar:ws_alice:evt_usage_1:voyage.embed_documents"
 
 
 def test_billing_debug_snapshot_sql_reads_usage_and_export_state_without_authorizing() -> None:
@@ -502,10 +580,231 @@ def test_polar_webhook_snapshot_sql_is_idempotent_and_keeps_customer_state() -> 
     statement = upsert_polar_webhook_snapshot_sql(snapshot)
 
     assert snapshot.id == "polar_wh_wh_123"
+    assert snapshot.payload_hash == payload_sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
     assert snapshot.workspace_id == "ws_alice"
     assert snapshot.external_customer_id == "cus_123"
     assert snapshot.external_subscription_id == "sub_123"
     assert snapshot.customer_state_snapshot["active_meters"][0]["balance"] == 500
     assert "ON CONFLICT (id) DO UPDATE" in statement.sql
+    assert statement.params["payload_hash"] == snapshot.payload_hash
     assert json.loads(statement.params["customer_state_snapshot_jsonb"])["active_benefit_ids"] == ["ben_123"]
     assert json.loads(statement.params["payload_jsonb"]) == payload
+
+
+def test_standard_webhook_signature_accepts_raw_body_and_rejects_mutation() -> None:
+    raw_body = b'{"type":"customer.state_changed","timestamp":"2026-05-26T03:00:00Z","data":{"id":"cus_123"}}'
+    headers = _standard_webhook_headers(raw_body)
+
+    webhook_id = verify_standard_webhook_signature(
+        raw_body=raw_body,
+        headers=headers,
+        secret="polar-secret",
+        now=1780000000,
+    )
+
+    assert webhook_id == "wh_msg_123"
+    with pytest.raises(PolarWebhookVerificationError, match="webhook_signature_invalid"):
+        verify_standard_webhook_signature(
+            raw_body=raw_body + b"\n",
+            headers=headers,
+            secret="polar-secret",
+            now=1780000000,
+        )
+
+
+def test_polar_order_paid_processing_creates_customer_and_deduped_credit_entry() -> None:
+    raw_body = json.dumps(
+        {
+            "type": "order.paid",
+            "timestamp": "2026-05-26T03:00:00Z",
+            "data": {
+                "id": "ord_123",
+                "billing_reason": "purchase",
+                "customer_id": "cus_123",
+                "product_id": "prod_topup",
+                "customer": {"id": "cus_123", "external_id": "ws_alice"},
+                "metadata": {"yutome_credit_grants": [{"unit": "credits", "quantity": "12.50"}]},
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    payload = json.loads(raw_body)
+
+    first = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id="msg_1")
+    second = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id="msg_1")
+    statements = polar_webhook_processing_statements(first)
+
+    assert first.snapshot.webhook_event_id == "msg_1"
+    assert first.snapshot.payload_hash == payload_sha256(raw_body)
+    assert first.billing_customer is not None
+    assert first.billing_customer.workspace_id == "ws_alice"
+    assert first.credit_entries[0].idempotency_key == second.credit_entries[0].idempotency_key
+    assert first.credit_entries[0].signed_units == {"credits": Decimal("12.50")}
+    assert [statement.sql.split()[2] for statement in statements if statement.sql.startswith("INSERT INTO")] == [
+        "polar_webhook_snapshots",
+        "billing_customers",
+        "credit_ledger_entries",
+        "polar_webhook_snapshots",
+    ]
+    assert "ON CONFLICT (workspace_id, idempotency_key) DO UPDATE" in statements[2].sql
+
+
+def test_polar_subscription_and_customer_events_upsert_billing_customer() -> None:
+    subscription_payload = {
+        "type": "subscription.active",
+        "timestamp": "2026-05-26T03:00:00Z",
+        "data": {
+            "id": "sub_123",
+            "status": "active",
+            "customer_id": "cus_123",
+            "customer": {"id": "cus_123", "external_id": "ws_alice"},
+        },
+    }
+    customer_payload = {
+        "type": "customer.state_changed",
+        "timestamp": "2026-05-26T03:01:00Z",
+        "data": {
+            "id": "cus_123",
+            "external_id": "ws_alice",
+            "active_subscriptions": [{"id": "sub_123"}],
+            "active_meters": [{"name": "ai_credits", "balance": 1200}],
+        },
+    }
+
+    subscription = process_polar_webhook_payload(subscription_payload)
+    customer = process_polar_webhook_payload(customer_payload)
+
+    assert subscription.billing_customer is not None
+    assert subscription.billing_customer.external_subscription_id == "sub_123"
+    assert subscription.billing_customer.status == "active"
+    assert customer.billing_customer is not None
+    assert customer.billing_customer.subscription_status_snapshot["active_meters"][0]["balance"] == 1200
+
+
+def test_balance_reconciliation_from_credit_usage_and_reserved_rows() -> None:
+    period_start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    period_end = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    snapshot = derive_workspace_balance_snapshot_from_rows(
+        workspace_id="ws_alice",
+        entitlement_policy_id="policy_pro",
+        period_start_at=period_start,
+        period_end_at=period_end,
+        credit_rows=(
+            {
+                "id": "cred_1",
+                "workspace_id": "ws_alice",
+                "idempotency_key": "cred_1",
+                "direction": "grant",
+                "unit": "credits",
+                "quantity_text": "10",
+                "occurred_at": period_start,
+            },
+        ),
+        usage_rows=(
+            {
+                "id": "evt_1",
+                "actual_units_json": json.dumps({"credits": "2.5", "ignored": "label"}),
+            },
+        ),
+        reserved_rows=(
+            {
+                "id": "res_1",
+                "estimated_units_json": json.dumps({"credits": "1.5"}),
+            },
+        ),
+        starting_units={"credits": Decimal("1")},
+    )
+    statement = balance_reconciliation_input_sql(
+        workspace_id="ws_alice",
+        period_start_at=period_start,
+        period_end_at=period_end,
+    )
+
+    assert snapshot.used_units == {"credits": Decimal("2.5")}
+    assert snapshot.reserved_units == {"credits": Decimal("1.5")}
+    assert snapshot.remaining_units == {"credits": Decimal("7.0")}
+    assert "FROM credit_ledger_entries" in statement.sql
+    assert "FROM usage_events" in statement.sql
+    assert "FROM usage_reservations" in statement.sql
+
+
+def test_billing_export_claim_and_finish_sql_marks_rows() -> None:
+    now = datetime(2026, 5, 26, 4, 0, tzinfo=timezone.utc)
+
+    claim = claim_billing_exports_sql(lease_owner="worker-1", now=now, limit=5)
+    success = finish_billing_export_sql(
+        export_id="bill_1",
+        now=now,
+        replay_status="succeeded",
+        external_event_id="polar:evt_1:voyage.embed_documents",
+    )
+    failure = finish_billing_export_sql(
+        export_id="bill_2",
+        now=now,
+        replay_status="failed",
+        error_code="polar_unavailable",
+        error_message="timeout",
+    )
+
+    assert "FOR UPDATE SKIP LOCKED" in claim.sql
+    assert "status = 'processing'" in claim.sql
+    assert claim.params["lease_owner"] == "worker-1"
+    assert success.params["status"] == "succeeded"
+    assert success.params["external_event_id"] == "polar:evt_1:voyage.embed_documents"
+    assert json.loads(failure.params["last_error_jsonb"]) == {
+        "code": "polar_unavailable",
+        "message": "timeout",
+    }
+
+
+def test_billing_export_event_from_row_posts_polar_ingest_shape() -> None:
+    row = {
+        "id": "bill_1",
+        "workspace_id": "ws_alice",
+        "usage_event_id": "evt_1",
+        "reservation_id": "res_1",
+        "provider": "polar",
+        "event_name": "yutome.voyage.embed_documents",
+        "export_units_jsonb": json.dumps({"total_tokens": 91}),
+        "source_event_dedupe_key": "polar:evt_1:voyage.embed_documents",
+        "status": "processing",
+        "authorization_effect": "none",
+        "external_customer_id": "ws_alice",
+        "customer_id": None,
+        "event_timestamp": datetime(2026, 5, 26, 3, 0, tzinfo=timezone.utc),
+        "attempt_count": 1,
+        "metadata_json": json.dumps({"operation_key": "voyage.embed_documents"}),
+    }
+
+    export = billing_export_event_from_row(row)
+    payload = export.to_polar_export().model_dump(mode="json")
+
+    assert payload["events"][0]["name"] == "yutome.voyage.embed_documents"
+    assert payload["events"][0]["external_customer_id"] == "ws_alice"
+    assert payload["events"][0]["metadata"]["total_tokens"] == 91
+    assert payload["events"][0]["external_id"] == "polar:ws_alice:evt_1:voyage.embed_documents"
+
+
+def test_billing_export_event_from_row_parses_workspace_scoped_dedupe_key_without_metadata() -> None:
+    row = {
+        "id": "bill_1",
+        "workspace_id": "ws_alice",
+        "usage_event_id": "evt_1",
+        "reservation_id": "res_1",
+        "provider": "polar",
+        "event_name": "yutome.fallback",
+        "export_units_jsonb": json.dumps({"total_tokens": 91}),
+        "source_event_dedupe_key": "polar:ws_alice:evt_1:voyage.embed_documents",
+        "status": "processing",
+        "authorization_effect": "none",
+        "external_customer_id": "ws_alice",
+        "customer_id": None,
+        "event_timestamp": datetime(2026, 5, 26, 3, 0, tzinfo=timezone.utc),
+        "attempt_count": 1,
+        "metadata_json": json.dumps({}),
+    }
+
+    export = billing_export_event_from_row(row)
+
+    assert export.operation_key == "voyage.embed_documents"

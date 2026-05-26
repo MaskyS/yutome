@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -25,7 +30,7 @@ from yutome.hosted.models import (
 
 
 BillingProvider = Literal["polar"]
-BillingReplayStatus = Literal["pending", "succeeded", "failed", "skipped"]
+BillingReplayStatus = Literal["pending", "processing", "succeeded", "failed", "skipped"]
 BillingRecordStatus = Literal["draft", "active", "paused", "archived"]
 CreditLedgerDirection = Literal["grant", "debit", "refund", "reversal"]
 
@@ -34,6 +39,10 @@ CreditLedgerDirection = Literal["grant", "debit", "refund", "reversal"]
 class BillingSqlStatement:
     sql: str
     params: dict[str, Any]
+
+
+class PolarWebhookVerificationError(ValueError):
+    pass
 
 
 class ProductLimit(BaseModel):
@@ -198,6 +207,7 @@ class PolarWebhookSnapshot(BaseModel):
     id: str
     event_type: str
     webhook_event_id: str | None = None
+    payload_hash: str
     workspace_id: str | None = None
     external_customer_id: str | None = None
     external_subscription_id: str | None = None
@@ -241,8 +251,8 @@ class BillingExportEvent(BaseModel):
         return normalize_unit_map(value)
 
     def to_polar_event(self) -> PolarEventIngestionEvent:
-        metadata = dict(self.metadata)
-        metadata.update(self.actual_units)
+        metadata = dict(jsonable_exact(self.metadata))
+        metadata.update(_polar_meter_metadata(self.actual_units))
         metadata["billing_export_idempotency_key"] = self.idempotency_key
         metadata["source_event_dedupe_key"] = self.source_event_dedupe_key
         if self.price_book_id is not None:
@@ -263,7 +273,43 @@ class BillingExportEvent(BaseModel):
 
     @property
     def source_event_dedupe_key(self) -> str:
-        return f"{self.provider}:{self.usage_event_id}:{self.operation_key}"
+        return f"{self.provider}:{self.workspace_id}:{self.usage_event_id}:{self.operation_key}"
+
+
+def _polar_meter_metadata(units: Mapping[str, UnitQuantity]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for unit, quantity in units.items():
+        exact = unit_quantity_decimal(quantity)
+        metadata[unit] = _polar_numeric_value(exact)
+        if isinstance(quantity, Decimal):
+            metadata[f"{unit}_exact"] = str(quantity)
+        if unit == "credits":
+            metadata["credits_micros"] = int((exact * Decimal("1000000")).to_integral_value())
+    return metadata
+
+
+def _polar_numeric_value(value: Decimal) -> int | float:
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
+class PolarWebhookProcessingResult(BaseModel):
+    snapshot: PolarWebhookSnapshot
+    billing_customer: BillingCustomer | None = None
+    credit_entries: tuple[CreditLedgerEntry, ...] = ()
+    ignored: bool = False
+
+
+class BillingExportWorkerResult(BaseModel):
+    tick: str = "billing_export_once"
+    attempted: bool
+    affected_rows: int
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    access_token_configured: bool = False
+    rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BillingDebugUsageEvent(BaseModel):
@@ -434,6 +480,7 @@ CREATE TABLE IF NOT EXISTS billing_exports (
 CREATE TABLE IF NOT EXISTS polar_webhook_snapshots (
     id text PRIMARY KEY,
     webhook_event_id text,
+    payload_hash text NOT NULL,
     event_type text NOT NULL,
     workspace_id text REFERENCES workspaces(id),
     external_customer_id text,
@@ -447,6 +494,16 @@ CREATE TABLE IF NOT EXISTS polar_webhook_snapshots (
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(webhook_event_id)
 );
+
+ALTER TABLE polar_webhook_snapshots
+    ADD COLUMN IF NOT EXISTS payload_hash text;
+
+UPDATE polar_webhook_snapshots
+SET payload_hash = 'legacy-md5:' || md5(payload_jsonb::text)
+WHERE payload_hash IS NULL;
+
+ALTER TABLE polar_webhook_snapshots
+    ALTER COLUMN payload_hash SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_billing_exports_replay
     ON billing_exports(status, updated_at)
@@ -529,6 +586,10 @@ def credit_order_idempotency_key(
     external_order_id: str,
     unit: str,
     reason: str = "order_grant",
+    billing_reason: str | None = None,
+    product_id: str | None = None,
+    billing_period_start: str | None = None,
+    billing_period_end: str | None = None,
 ) -> str:
     return input_hash(
         {
@@ -537,6 +598,10 @@ def credit_order_idempotency_key(
             "external_order_id": external_order_id,
             "unit": unit,
             "reason": reason,
+            "billing_reason": billing_reason,
+            "product_id": product_id,
+            "billing_period_start": billing_period_start,
+            "billing_period_end": billing_period_end,
         },
         prefix="cred",
     )
@@ -552,6 +617,10 @@ def credit_ledger_entry_from_order(
     provider: BillingProvider = "polar",
     external_customer_id: str | None = None,
     reason: str = "order_grant",
+    billing_reason: str | None = None,
+    product_id: str | None = None,
+    billing_period_start: str | None = None,
+    billing_period_end: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> CreditLedgerEntry:
     idempotency_key = credit_order_idempotency_key(
@@ -560,6 +629,10 @@ def credit_ledger_entry_from_order(
         external_order_id=external_order_id,
         unit=unit,
         reason=reason,
+        billing_reason=billing_reason,
+        product_id=product_id,
+        billing_period_start=billing_period_start,
+        billing_period_end=billing_period_end,
     )
     return CreditLedgerEntry(
         id=idempotency_key,
@@ -596,16 +669,21 @@ def derive_workspace_balance_snapshot(
     used = normalize_unit_map(used_units or {})
     reserved = normalize_unit_map(reserved_units or {})
     available = add_unit_maps(opening, credits)
-    remaining = {
+    net_remaining = {
         unit: quantity
         for unit, quantity in add_unit_maps(available, _negated_units(used), _negated_units(reserved)).items()
         if unit not in unlimited_units
     }
+    remaining, overdrawn = _clamped_remaining_units(net_remaining)
     snapshot_metadata = dict(metadata or {})
     snapshot_metadata["derived_from"] = {
         "credit_entry_ids": [entry.id for entry in credit_entries],
         "starting_units": opening,
     }
+    snapshot_metadata["balance_status"] = "overdrawn" if overdrawn else "available"
+    snapshot_metadata["remaining_units_clamped"] = bool(overdrawn)
+    snapshot_metadata["net_remaining_units"] = net_remaining
+    snapshot_metadata["overdrawn_units"] = overdrawn
     return WorkspaceBalanceSnapshot(
         workspace_id=workspace_id,
         entitlement_policy_id=entitlement_policy_id,
@@ -617,6 +695,104 @@ def derive_workspace_balance_snapshot(
         unlimited_units=unlimited_units,
         updated_at=updated_at,
         metadata=snapshot_metadata,
+    )
+
+
+def derive_workspace_balance_snapshot_from_rows(
+    *,
+    workspace_id: str,
+    entitlement_policy_id: str,
+    period_start_at: datetime,
+    period_end_at: datetime,
+    credit_rows: tuple[Mapping[str, Any], ...] = (),
+    usage_rows: tuple[Mapping[str, Any], ...] = (),
+    reserved_rows: tuple[Mapping[str, Any], ...] = (),
+    starting_units: dict[str, UnitQuantity] | None = None,
+    unlimited_units: tuple[str, ...] = (),
+    updated_at: datetime | None = None,
+) -> WorkspaceBalanceSnapshot:
+    credit_entries = tuple(_credit_ledger_entry_from_row(row) for row in credit_rows)
+    used_units = add_unit_maps(*(_units_from_json_row(row, "actual_units_json") for row in usage_rows)) if usage_rows else {}
+    reserved_units = (
+        add_unit_maps(*(_units_from_json_row(row, "estimated_units_json") for row in reserved_rows)) if reserved_rows else {}
+    )
+    return derive_workspace_balance_snapshot(
+        workspace_id=workspace_id,
+        entitlement_policy_id=entitlement_policy_id,
+        period_start_at=period_start_at,
+        period_end_at=period_end_at,
+        starting_units=starting_units,
+        credit_entries=credit_entries,
+        used_units=used_units,
+        reserved_units=reserved_units,
+        unlimited_units=unlimited_units,
+        updated_at=updated_at,
+        metadata={
+            "reconciliation": "credits_usage_reservations",
+            "usage_event_ids": [row.get("id") for row in usage_rows if row.get("id") is not None],
+            "reserved_reservation_ids": [row.get("id") for row in reserved_rows if row.get("id") is not None],
+        },
+    )
+
+
+def balance_reconciliation_input_sql(
+    *,
+    workspace_id: str,
+    period_start_at: datetime,
+    period_end_at: datetime,
+) -> BillingSqlStatement:
+    return BillingSqlStatement(
+        sql="""
+SELECT 'credit' AS row_kind,
+       id,
+       workspace_id,
+       direction,
+       unit,
+       quantity_text,
+       NULL::jsonb AS actual_units_json,
+       NULL::jsonb AS estimated_units_json,
+       occurred_at AS row_timestamp
+FROM credit_ledger_entries
+WHERE workspace_id = %(workspace_id)s
+  AND occurred_at >= %(period_start_at)s
+  AND occurred_at < %(period_end_at)s
+UNION ALL
+SELECT 'usage' AS row_kind,
+       id,
+       workspace_id,
+       NULL::text AS direction,
+       NULL::text AS unit,
+       NULL::text AS quantity_text,
+       actual_units_json,
+       NULL::jsonb AS estimated_units_json,
+       created_at AS row_timestamp
+FROM usage_events
+WHERE workspace_id = %(workspace_id)s
+  AND status IN ('succeeded', 'released')
+  AND created_at >= %(period_start_at)s
+  AND created_at < %(period_end_at)s
+UNION ALL
+SELECT 'reservation' AS row_kind,
+       id,
+       workspace_id,
+       NULL::text AS direction,
+       NULL::text AS unit,
+       NULL::text AS quantity_text,
+       NULL::jsonb AS actual_units_json,
+       estimated_units_json,
+       created_at AS row_timestamp
+FROM usage_reservations
+WHERE workspace_id = %(workspace_id)s
+  AND status = 'reserved'
+  AND created_at >= %(period_start_at)s
+  AND created_at < %(period_end_at)s
+ORDER BY row_timestamp ASC, id ASC;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "period_start_at": period_start_at,
+            "period_end_at": period_end_at,
+        },
     )
 
 
@@ -652,6 +828,8 @@ def polar_webhook_event_from_payload(payload: dict[str, Any]) -> PolarWebhookEve
 def polar_webhook_snapshot_from_payload(
     payload: dict[str, Any],
     *,
+    raw_body: bytes | None = None,
+    webhook_event_id: str | None = None,
     workspace_id: str | None = None,
     received_at: datetime | None = None,
 ) -> PolarWebhookSnapshot:
@@ -659,11 +837,12 @@ def polar_webhook_snapshot_from_payload(
     data = event.data
     customer = _first_mapping(data, "customer", "customer_state") or {}
     subscription = _first_mapping(data, "subscription") or {}
-    webhook_event_id = _optional_string(payload.get("id") or payload.get("event_id"))
+    resolved_event_id = _optional_string(webhook_event_id or payload.get("id") or payload.get("event_id"))
 
     return PolarWebhookSnapshot(
         id=polar_webhook_snapshot_id(payload),
-        webhook_event_id=webhook_event_id,
+        webhook_event_id=resolved_event_id,
+        payload_hash=payload_sha256(raw_body if raw_body is not None else _json_param(payload).encode("utf-8")),
         event_type=event.type,
         workspace_id=workspace_id or _optional_string(customer.get("external_id") or customer.get("external_customer_id")),
         external_customer_id=_optional_string(customer.get("id") or data.get("customer_id") or data.get("external_customer_id")),
@@ -679,6 +858,74 @@ def polar_webhook_snapshot_id(payload: dict[str, Any]) -> str:
     if event_id is not None:
         return f"polar_wh_{event_id}"
     return input_hash(payload, prefix="polar_wh")
+
+
+def payload_sha256(raw_body: bytes) -> str:
+    return hashlib.sha256(raw_body).hexdigest()
+
+
+def verify_standard_webhook_signature(
+    *,
+    raw_body: bytes,
+    headers: Mapping[str, str],
+    secret: str,
+    now: int | None = None,
+    tolerance_seconds: int = 300,
+) -> str:
+    normalized_headers = {str(key).lower(): str(value) for key, value in headers.items()}
+    webhook_id = normalized_headers.get("webhook-id")
+    timestamp = normalized_headers.get("webhook-timestamp")
+    signature_header = normalized_headers.get("webhook-signature")
+    if not webhook_id or not timestamp or not signature_header:
+        raise PolarWebhookVerificationError("webhook_signature_missing")
+    try:
+        timestamp_int = int(timestamp)
+    except ValueError as exc:
+        raise PolarWebhookVerificationError("webhook_timestamp_invalid") from exc
+    clock = int(time.time()) if now is None else int(now)
+    if tolerance_seconds >= 0 and abs(clock - timestamp_int) > tolerance_seconds:
+        raise PolarWebhookVerificationError("webhook_timestamp_outside_tolerance")
+    signed = webhook_id.encode("utf-8") + b"." + timestamp.encode("utf-8") + b"." + raw_body
+    expected = base64.b64encode(hmac.new(_standard_webhook_secret_bytes(secret), signed, hashlib.sha256).digest()).decode("ascii")
+    if not any(hmac.compare_digest(expected, candidate) for candidate in _standard_webhook_signatures(signature_header)):
+        raise PolarWebhookVerificationError("webhook_signature_invalid")
+    return webhook_id
+
+
+def process_polar_webhook_payload(
+    payload: dict[str, Any],
+    *,
+    raw_body: bytes | None = None,
+    webhook_event_id: str | None = None,
+) -> PolarWebhookProcessingResult:
+    body = raw_body if raw_body is not None else _json_param(payload).encode("utf-8")
+    event = polar_webhook_event_from_payload(payload)
+    snapshot = polar_webhook_snapshot_from_payload(payload, raw_body=body, webhook_event_id=webhook_event_id)
+    billing_customer = _billing_customer_from_polar_event(event, snapshot=snapshot)
+    workspace_id = billing_customer.workspace_id if billing_customer else snapshot.workspace_id
+    credit_entries = tuple(_credit_entries_from_polar_event(event, workspace_id=workspace_id))
+    ignored = billing_customer is None and not credit_entries
+    return PolarWebhookProcessingResult(
+        snapshot=snapshot,
+        billing_customer=billing_customer,
+        credit_entries=credit_entries,
+        ignored=ignored,
+    )
+
+
+def polar_webhook_processing_statements(result: PolarWebhookProcessingResult) -> tuple[BillingSqlStatement, ...]:
+    statements: list[BillingSqlStatement] = [upsert_polar_webhook_snapshot_sql(result.snapshot)]
+    if result.billing_customer is not None:
+        statements.append(upsert_billing_customer_sql(result.billing_customer))
+    statements.extend(upsert_credit_ledger_entry_sql(entry) for entry in result.credit_entries)
+    final_snapshot = result.snapshot.model_copy(
+        update={
+            "replay_status": "skipped" if result.ignored else "succeeded",
+            "processed_at": datetime.now(tz=result.snapshot.received_at.tzinfo),
+        }
+    )
+    statements.append(upsert_polar_webhook_snapshot_sql(final_snapshot))
+    return tuple(statements)
 
 
 def billing_schema_statements(sql: str = POSTGRES_BILLING_SCHEMA_SQL) -> list[str]:
@@ -970,12 +1217,107 @@ RETURNING *;
     )
 
 
+def claim_billing_exports_sql(
+    *,
+    lease_owner: str,
+    now: datetime,
+    limit: int = 100,
+    provider: BillingProvider = "polar",
+) -> BillingSqlStatement:
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    return BillingSqlStatement(
+        sql="""
+WITH due AS (
+    SELECT id
+    FROM billing_exports
+    WHERE provider = %(provider)s
+      AND status IN ('pending', 'failed')
+    ORDER BY updated_at ASC, id ASC
+    LIMIT %(limit)s
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE billing_exports AS billing_export
+SET status = 'processing',
+    attempt_count = billing_export.attempt_count + 1,
+    metadata_json = jsonb_set(
+        billing_export.metadata_json,
+        '{last_claim}',
+        jsonb_build_object('lease_owner', %(lease_owner)s, 'claimed_at', %(now)s::text),
+        true
+    ),
+    updated_at = %(now)s
+FROM due
+WHERE billing_export.id = due.id
+RETURNING billing_export.*;
+""".strip(),
+        params={"lease_owner": lease_owner, "now": now, "limit": limit, "provider": provider},
+    )
+
+
+def finish_billing_export_sql(
+    *,
+    export_id: str,
+    now: datetime,
+    replay_status: BillingReplayStatus,
+    external_event_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> BillingSqlStatement:
+    if replay_status == "processing":
+        raise ValueError("finish status must be terminal or retryable")
+    return BillingSqlStatement(
+        sql="""
+UPDATE billing_exports
+SET status = %(status)s,
+    external_event_id = COALESCE(%(external_event_id)s, external_event_id),
+    last_error_jsonb = %(last_error_jsonb)s::jsonb,
+    exported_at = CASE WHEN %(status)s = 'succeeded' THEN %(now)s ELSE exported_at END,
+    updated_at = %(now)s
+WHERE id = %(id)s
+RETURNING *;
+""".strip(),
+        params={
+            "id": export_id,
+            "now": now,
+            "status": replay_status,
+            "external_event_id": external_event_id,
+            "last_error_jsonb": _json_param(_error_snapshot(error_code, error_message)),
+        },
+    )
+
+
+def billing_export_event_from_row(row: Mapping[str, Any]) -> BillingExportEvent:
+    return BillingExportEvent(
+        idempotency_key=str(row["id"]),
+        provider=row.get("provider", "polar"),
+        usage_event_id=str(row["usage_event_id"]),
+        reservation_id=_optional_string(row.get("reservation_id")),
+        workspace_id=str(row["workspace_id"]),
+        billing_customer_id=_optional_string(row.get("billing_customer_id")),
+        price_book_id=_optional_string(row.get("price_book_id")),
+        operation_key=_operation_key_from_export_row(row),
+        event_name=str(row["event_name"]),
+        external_meter_key=_optional_string(row.get("external_meter_key")),
+        replay_status=row.get("status", "pending"),
+        authorization_effect=row.get("authorization_effect", "none"),
+        actual_units=dict(_json_value(row.get("export_units_jsonb"), default={})),
+        external_customer_id=_optional_string(row.get("external_customer_id")),
+        customer_id=_optional_string(row.get("customer_id")),
+        timestamp=row.get("event_timestamp"),
+        external_event_id=_optional_string(row.get("external_event_id")),
+        attempt_count=int(row.get("attempt_count") or 0),
+        metadata=dict(_json_value(row.get("metadata_json"), default={})),
+    )
+
+
 def upsert_polar_webhook_snapshot_sql(snapshot: PolarWebhookSnapshot) -> BillingSqlStatement:
     return BillingSqlStatement(
         sql="""
 INSERT INTO polar_webhook_snapshots (
     id,
     webhook_event_id,
+    payload_hash,
     event_type,
     workspace_id,
     external_customer_id,
@@ -990,6 +1332,7 @@ INSERT INTO polar_webhook_snapshots (
 VALUES (
     %(id)s,
     %(webhook_event_id)s,
+    %(payload_hash)s,
     %(event_type)s,
     %(workspace_id)s,
     %(external_customer_id)s,
@@ -1003,6 +1346,7 @@ VALUES (
 )
 ON CONFLICT (id) DO UPDATE
 SET replay_status = EXCLUDED.replay_status,
+    payload_hash = EXCLUDED.payload_hash,
     processed_at = COALESCE(EXCLUDED.processed_at, polar_webhook_snapshots.processed_at),
     last_error_jsonb = EXCLUDED.last_error_jsonb
 RETURNING *;
@@ -1196,6 +1540,18 @@ def _negated_units(units: dict[str, UnitQuantity]) -> UnitMap:
     return {unit: -unit_quantity_decimal(quantity) for unit, quantity in units.items()}
 
 
+def _clamped_remaining_units(units: dict[str, UnitQuantity]) -> tuple[UnitMap, UnitMap]:
+    remaining: UnitMap = {}
+    overdrawn: dict[str, UnitQuantity] = {}
+    for unit, quantity in units.items():
+        exact = unit_quantity_decimal(quantity)
+        if exact < 0:
+            overdrawn[unit] = -exact
+        else:
+            remaining[unit] = quantity
+    return remaining, normalize_unit_map(overdrawn)
+
+
 def price_book_params(price_book: PriceBook) -> dict[str, Any]:
     return {
         "id": price_book.id,
@@ -1305,6 +1661,7 @@ def polar_webhook_snapshot_params(snapshot: PolarWebhookSnapshot) -> dict[str, A
     return {
         "id": snapshot.id,
         "webhook_event_id": snapshot.webhook_event_id,
+        "payload_hash": snapshot.payload_hash,
         "event_type": snapshot.event_type,
         "workspace_id": snapshot.workspace_id,
         "external_customer_id": snapshot.external_customer_id,
@@ -1349,6 +1706,221 @@ def _first_mapping(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
     return None
 
 
+def _customer_from_event_data(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
+    if event_type == "customer.state_changed":
+        return data
+    return _first_mapping(data, "customer", "customer_state") or {}
+
+
+def _credit_ledger_entry_from_row(row: Mapping[str, Any]) -> CreditLedgerEntry:
+    return CreditLedgerEntry(
+        id=str(row["id"]),
+        workspace_id=str(row["workspace_id"]),
+        idempotency_key=str(row.get("idempotency_key") or row["id"]),
+        provider=row.get("provider", "polar"),
+        external_order_id=_optional_string(row.get("external_order_id")),
+        external_customer_id=_optional_string(row.get("external_customer_id")),
+        direction=row.get("direction", "grant"),
+        unit=str(row["unit"]),
+        quantity=row.get("quantity") or row.get("quantity_text"),
+        reason=str(row.get("reason") or "reconciliation"),
+        occurred_at=row.get("occurred_at") or row.get("row_timestamp"),
+        metadata=dict(_json_value(row.get("metadata_json"), default={})),
+    )
+
+
+def _units_from_json_row(row: Mapping[str, Any], key: str) -> UnitMap:
+    return _billable_units(dict(_json_value(row.get(key), default={})))
+
+
+def _operation_key_from_export_row(row: Mapping[str, Any]) -> str:
+    metadata = dict(_json_value(row.get("metadata_json"), default={}))
+    operation_key = metadata.get("operation_key")
+    if operation_key:
+        return str(operation_key)
+    source_dedupe = str(row.get("source_event_dedupe_key") or "")
+    parts = source_dedupe.split(":")
+    if len(parts) >= 4 and parts[-1]:
+        return parts[-1]
+    if len(parts) == 3 and parts[2]:
+        return parts[2]
+    event_name = str(row.get("event_name") or "")
+    return event_name.removeprefix("yutome.") or "usage"
+
+
+def _billing_customer_from_polar_event(
+    event: PolarWebhookEvent,
+    *,
+    snapshot: PolarWebhookSnapshot,
+) -> BillingCustomer | None:
+    data = event.data
+    customer = _customer_from_event_data(event.type, data)
+    subscription = _first_mapping(data, "subscription") or {}
+    if event.type.startswith("subscription."):
+        subscription = data
+        customer = _first_mapping(data, "customer") or customer
+    external_customer_id = _optional_string(customer.get("id") or data.get("customer_id") or snapshot.external_customer_id)
+    workspace_id = _optional_string(
+        snapshot.workspace_id
+        or customer.get("external_id")
+        or customer.get("external_customer_id")
+        or _metadata_value(data, "workspace_id")
+        or _metadata_value(data, "billing_account_id")
+    )
+    if workspace_id is None or external_customer_id is None:
+        return None
+    subscription_id = _optional_string(
+        subscription.get("id")
+        or data.get("subscription_id")
+        or snapshot.external_subscription_id
+    )
+    status = _customer_record_status(event.type, data, subscription)
+    return BillingCustomer(
+        id=input_hash({"provider": "polar", "external_customer_id": external_customer_id}, prefix="bc"),
+        workspace_id=workspace_id,
+        external_customer_id=external_customer_id,
+        external_subscription_id=subscription_id,
+        subscription_status_snapshot=_billing_customer_state_snapshot(event, customer=customer, subscription=subscription),
+        last_webhook_at=event.timestamp,
+        status=status,
+        metadata={
+            "last_polar_event_type": event.type,
+            "webhook_snapshot_id": snapshot.id,
+            "webhook_event_id": snapshot.webhook_event_id,
+        },
+    )
+
+
+def _credit_entries_from_polar_event(event: PolarWebhookEvent, *, workspace_id: str | None) -> list[CreditLedgerEntry]:
+    if event.type != "order.paid" or workspace_id is None:
+        return []
+    order = event.data
+    order_id = _optional_string(order.get("id"))
+    if order_id is None:
+        return []
+    external_customer_id = _optional_string(order.get("customer_id") or (_first_mapping(order, "customer") or {}).get("id"))
+    product_id = _optional_string(order.get("product_id") or (_first_mapping(order, "product") or {}).get("id"))
+    billing_reason = _optional_string(order.get("billing_reason")) or "purchase"
+    occurred_at = event.timestamp
+    entries: list[CreditLedgerEntry] = []
+    for grant in _credit_grants_from_order(order):
+        unit = str(grant["unit"])
+        quantity = normalize_unit_quantity(grant["quantity"])
+        reason = str(grant.get("reason") or "order_grant")
+        period_start = _optional_string(grant.get("period_start") or order.get("current_period_start"))
+        period_end = _optional_string(grant.get("period_end") or order.get("current_period_end"))
+        entry = credit_ledger_entry_from_order(
+            workspace_id=workspace_id,
+            external_order_id=order_id,
+            unit=unit,
+            quantity=quantity,
+            occurred_at=occurred_at,
+            external_customer_id=external_customer_id,
+            reason=reason,
+            billing_reason=billing_reason,
+            product_id=product_id,
+            billing_period_start=period_start,
+            billing_period_end=period_end,
+            metadata={
+                "polar_event_type": event.type,
+                "billing_reason": billing_reason,
+                "product_id": product_id,
+                "checkout_id": order.get("checkout_id"),
+                "subscription_id": order.get("subscription_id"),
+                **{key: value for key, value in grant.items() if key not in {"unit", "quantity"}},
+            },
+        )
+        entries.append(entry)
+    return entries
+
+
+def _credit_grants_from_order(order: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = _first_mapping(order, "metadata") or {}
+    product_metadata = (_first_mapping(order, "product") or {}).get("metadata")
+    grants_source: Any = (
+        metadata.get("yutome_credit_grants")
+        or metadata.get("credit_grants")
+        or (product_metadata or {}).get("yutome_credit_grants")
+        or (product_metadata or {}).get("credit_grants")
+    )
+    if isinstance(grants_source, str):
+        grants_source = json.loads(grants_source)
+    if isinstance(grants_source, list):
+        return [
+            dict(grant)
+            for grant in grants_source
+            if isinstance(grant, Mapping) and grant.get("unit") is not None and grant.get("quantity") is not None
+        ]
+    unit = metadata.get("yutome_credit_unit") or metadata.get("credit_unit")
+    quantity = metadata.get("yutome_credit_quantity") or metadata.get("credit_quantity")
+    if unit is not None and quantity is not None:
+        return [{"unit": unit, "quantity": quantity}]
+    return []
+
+
+def _metadata_value(data: dict[str, Any], key: str) -> Any:
+    metadata = data.get("metadata")
+    return metadata.get(key) if isinstance(metadata, Mapping) else None
+
+
+def _customer_record_status(
+    event_type: str,
+    data: dict[str, Any],
+    subscription: dict[str, Any],
+) -> BillingRecordStatus:
+    status = str(subscription.get("status") or data.get("status") or "").lower()
+    if event_type.endswith(".revoked") or status in {"revoked", "canceled", "deleted"}:
+        return "archived"
+    if event_type.endswith(".past_due") or status in {"past_due", "incomplete", "unpaid"}:
+        return "paused"
+    return "active"
+
+
+def _billing_customer_state_snapshot(
+    event: PolarWebhookEvent,
+    *,
+    customer: dict[str, Any],
+    subscription: dict[str, Any],
+) -> dict[str, Any]:
+    if event.type == "customer.state_changed":
+        return dict(event.data)
+    snapshot: dict[str, Any] = {
+        "event_type": event.type,
+        "customer": customer,
+    }
+    if subscription:
+        snapshot["subscription"] = subscription
+    else:
+        snapshot["subscription"] = event.data if event.type.startswith("subscription.") else {}
+    return snapshot
+
+
+def _standard_webhook_secret_bytes(secret: str) -> bytes:
+    stripped = secret.strip()
+    if stripped.startswith("whsec_"):
+        encoded = stripped[len("whsec_") :]
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            return base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
+        except Exception:
+            return base64.b64decode((encoded + padding).encode("ascii"))
+    return stripped.encode("utf-8")
+
+
+def _standard_webhook_signatures(header: str) -> list[str]:
+    signatures: list[str] = []
+    for part in header.replace(" ", ",").split(","):
+        candidate = part.strip()
+        if not candidate or candidate == "v1":
+            continue
+        if candidate.startswith("v1,"):
+            candidate = candidate[3:]
+        elif candidate.startswith("v1="):
+            candidate = candidate[3:]
+        signatures.append(candidate)
+    return signatures
+
+
 def _optional_string(value: Any) -> str | None:
     if value is None:
         return None
@@ -1361,6 +1933,7 @@ __all__ = [
     "BillingDebugSnapshot",
     "BillingDebugUsageEvent",
     "BillingExportEvent",
+    "BillingExportWorkerResult",
     "BillingCustomer",
     "BillingProvider",
     "BillingRecordStatus",
@@ -1372,27 +1945,36 @@ __all__ = [
     "POSTGRES_BILLING_SCHEMA_SQL",
     "PolarEventIngestionEvent",
     "PolarUsageExport",
+    "PolarWebhookProcessingResult",
     "PolarWebhookEvent",
     "PolarWebhookSnapshot",
+    "PolarWebhookVerificationError",
     "PriceBook",
     "PriceBookProduct",
     "ProductLimit",
     "WorkspaceBalanceSnapshot",
+    "balance_reconciliation_input_sql",
     "billing_customer_params",
     "billing_debug_reservation_from_row",
     "billing_debug_snapshot_from_rows",
     "billing_debug_snapshot_sql",
+    "billing_export_event_from_row",
     "billing_export_event_from_usage_event",
     "billing_export_idempotency_key",
     "billing_export_params",
     "billing_schema_statements",
+    "claim_billing_exports_sql",
     "credit_ledger_entry_from_order",
     "credit_ledger_entry_params",
     "credit_order_idempotency_key",
+    "derive_workspace_balance_snapshot_from_rows",
     "derive_workspace_balance_snapshot",
     "entitlement_policy_params",
+    "finish_billing_export_sql",
     "mark_billing_export_replay",
+    "payload_sha256",
     "polar_webhook_event_from_payload",
+    "polar_webhook_processing_statements",
     "polar_webhook_snapshot_from_payload",
     "polar_webhook_snapshot_id",
     "polar_webhook_snapshot_params",
@@ -1404,5 +1986,6 @@ __all__ = [
     "upsert_polar_webhook_snapshot_sql",
     "upsert_price_book_sql",
     "upsert_workspace_balance_sql",
+    "verify_standard_webhook_signature",
     "workspace_balance_params",
 ]

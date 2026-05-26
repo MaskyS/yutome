@@ -21,6 +21,7 @@ import webbrowser
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -3553,6 +3554,16 @@ def _parse_hosted_phase(value: str, *, json_output: bool) -> str:
     return phase
 
 
+def _parse_cli_datetime(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _echo_hosted_result(value: object, *, json_output: bool, message: str | None = None) -> None:
     if json_output:
         _echo_json(value)
@@ -3746,6 +3757,69 @@ def hosted_billing_status(
     _echo_billing_status(result)
 
 
+@hosted_app.command("billing-export-worker")
+def hosted_billing_export_worker(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    once: bool = typer.Option(False, "--once", help="Run one billing export claim tick and exit."),
+    lease_owner: str | None = typer.Option(None, "--lease-owner", help="Lease owner id. Defaults to RAILWAY_REPLICA_ID or this process."),
+    limit: int = typer.Option(100, "--limit", min=1, help="Maximum billing export rows to claim per tick."),
+    poll_interval: float = typer.Option(10.0, "--poll-interval", min=0.1, help="Loop sleep when --once is not set."),
+    json_output: bool = typer.Option(False, "--json", help="Emit billing export tick result as JSON."),
+) -> None:
+    """Export pending usage mirror events to Polar when POLAR_ACCESS_TOKEN is configured."""
+    runner = _hosted_runner(config)
+    owner = _hosted_lease_owner(lease_owner)
+    while True:
+        try:
+            result = runner.billing_export_once(lease_owner=owner, limit=limit)
+        except HostedRuntimeError as exc:
+            _hosted_error(str(exc), json_output=json_output)
+        _echo_hosted_result(
+            result,
+            json_output=json_output,
+            message=f"Billing export tick claimed {result.affected_rows} rows; succeeded={result.succeeded} failed={result.failed}.",
+        )
+        if once:
+            return
+        time.sleep(poll_interval)
+
+
+@hosted_app.command("reconcile-balance")
+def hosted_reconcile_balance(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    entitlement_policy_id: str = typer.Option(..., "--entitlement-policy-id", help="Policy id to write on workspace_balances."),
+    period_start: str = typer.Option(..., "--period-start", help="Inclusive billing period start timestamp."),
+    period_end: str = typer.Option(..., "--period-end", help="Exclusive billing period end timestamp."),
+    json_output: bool = typer.Option(False, "--json", help="Emit reconciled balance as JSON."),
+) -> None:
+    """Recompute a workspace balance from credit ledger entries and settled usage events."""
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running reconcile-balance.", json_output=json_output, code=2)
+    try:
+        result = runner.reconcile_balance(
+            workspace_id=workspace,
+            entitlement_policy_id=entitlement_policy_id,
+            period_start_at=_parse_cli_datetime(period_start),
+            period_end_at=_parse_cli_datetime(period_end),
+        )
+    except (HostedRuntimeError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(result, json_output=json_output, message=f"Reconciled balance for workspace {workspace}.")
+
+
 @hosted_app.command("search-smoke")
 def hosted_search_smoke(
     query: str = typer.Argument(..., help="Lexical search query to smoke test."),
@@ -3769,6 +3843,114 @@ def hosted_search_smoke(
     except HostedRuntimeError as exc:
         _hosted_error(str(exc), json_output=json_output)
     _echo_hosted_result(result, json_output=json_output, message=f"Search smoke returned {len(result.get('rows', []))} rows.")
+
+
+@hosted_app.command("source-add")
+def hosted_source_add(
+    source_url: str = typer.Argument(..., help="Public YouTube channel, handle, playlist, or video URL."),
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    display_name: str | None = typer.Option(None, "--display-name", help="Optional source display name."),
+    cadence_seconds: int = typer.Option(900, "--cadence-seconds", min=1, help="Source refresh cadence."),
+    max_new_videos: int = typer.Option(25, "--max-new-videos", min=1, help="Maximum discovered videos to enqueue per run."),
+    refresh_enabled: bool = typer.Option(True, "--refresh/--no-refresh", help="Create or update the source refresh policy."),
+    json_output: bool = typer.Option(False, "--json", help="Emit seed result as JSON."),
+) -> None:
+    """Create or update a hosted source and its refresh policy."""
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running source-add.", json_output=json_output, code=2)
+    try:
+        result = runner.source_add(
+            workspace_id=workspace,
+            source_url=source_url,
+            display_name=display_name,
+            cadence_seconds=cadence_seconds,
+            max_new_videos_per_run=max_new_videos,
+            refresh_enabled=refresh_enabled,
+        )
+    except (HostedRuntimeError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    source_id = result.get("source_id") if isinstance(result, dict) else result.source_id
+    _echo_hosted_result(result, json_output=json_output, message=f"Seeded hosted source {source_id}.")
+
+
+@hosted_app.command("enqueue-index-video")
+def hosted_enqueue_index_video(
+    source_url: str = typer.Argument(..., help="Public YouTube video URL or 11-character video id."),
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    display_name: str | None = typer.Option(None, "--display-name", help="Optional source display name."),
+    priority: int = typer.Option(100, "--priority", min=1, help="Job priority; lower runs sooner."),
+    json_output: bool = typer.Option(False, "--json", help="Emit seed result as JSON."),
+) -> None:
+    """Seed a real hosted index_video job for the worker."""
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running enqueue-index-video.", json_output=json_output, code=2)
+    try:
+        result = runner.enqueue_index_video(
+            workspace_id=workspace,
+            source_url=source_url,
+            display_name=display_name,
+            priority=priority,
+        )
+    except (HostedRuntimeError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    job_id = result.get("job_id") if isinstance(result, dict) else result.job_id
+    _echo_hosted_result(result, json_output=json_output, message=f"Queued hosted index job {job_id}.")
+
+
+@hosted_app.command("real-indexing-smoke")
+def hosted_real_indexing_smoke(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    source_url: str = typer.Option(
+        "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        "--source-url",
+        help="Public YouTube video URL or id to index through the real worker path.",
+    ),
+    migrate: bool = typer.Option(False, "--migrate", help="Apply hosted migrations before enqueueing."),
+    phase: str = typer.Option("hosted", "--phase", help="Migration phase when --migrate is set: phase1, phase4, or hosted."),
+    lease_owner: str | None = typer.Option(None, "--lease-owner", help="Worker lease owner for the smoke run."),
+    json_output: bool = typer.Option(False, "--json", help="Emit smoke result as JSON."),
+) -> None:
+    """Enqueue a real video and run one real hosted worker tick."""
+    phase_value = _parse_hosted_phase(phase, json_output=json_output)
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running real-indexing-smoke.", json_output=json_output, code=2)
+    try:
+        result = runner.real_indexing_smoke(
+            workspace_id=workspace,
+            source_url=source_url,
+            migrate=migrate,
+            migration_phase=phase_value,  # type: ignore[arg-type]
+            lease_owner=_hosted_lease_owner(lease_owner),
+        )
+    except (HostedRuntimeError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    job_id = result.get("job_id") if isinstance(result, dict) else result.job_id
+    ok = result.get("ok") if isinstance(result, dict) else result.ok
+    _echo_hosted_result(result, json_output=json_output, message=f"Real indexing smoke job {job_id}: ok={ok}.")
 
 
 @hosted_app.command("mock-indexing-smoke")

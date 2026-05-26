@@ -34,6 +34,16 @@ class RecordingConnection:
 
     def execute(self, statement: str, params: dict[str, object] | None = None) -> list[dict[str, object]]:
         self.calls.append((statement, dict(params or {})))
+        if "FROM workspace_balances" in statement and "FOR UPDATE" in statement:
+            return [
+                {
+                    "workspace_id": "ws_alice",
+                    "entitlement_policy_id": "policy",
+                    "remaining_units_jsonb": {"total_tokens": 500},
+                    "reserved_units_jsonb": {},
+                    "unlimited_units": [],
+                }
+            ]
         return []
 
 
@@ -182,6 +192,23 @@ def test_provider_wrapper_records_retryable_failed_event() -> None:
     assert failed.metadata["failure_kind"] == "transient"
     assert failed.metadata["retryable"] is True
     assert failed.metadata["exception_type"] == "FakeProviderError"
+
+
+def test_provider_wrapper_records_unknown_outcome_for_unclassified_retryable_failure() -> None:
+    ledger = RecordingLedger()
+
+    def call() -> object:
+        raise RuntimeError("connection dropped after request submission")
+
+    with pytest.raises(RuntimeError):
+        execute_provider_call(_context(ledger), call)
+
+    failed = ledger.events[1]
+    assert failed.event_type == "provider_attempt_failed"
+    assert failed.status == "unknown"
+    assert failed.error_code == "unknown"
+    assert failed.metadata["failure_kind"] == "unknown"
+    assert failed.metadata["retryable"] is True
 
 
 def test_provider_wrapper_redacts_sensitive_failure_metadata() -> None:

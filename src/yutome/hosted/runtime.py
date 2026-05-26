@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,13 +12,26 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from yutome.config import AppConfig
-from yutome.hosted.control_plane import Job, Source, TERMINAL_JOB_STATUSES
+from yutome.hosted.control_plane import Job, Source, SourceRefreshPolicy, TERMINAL_JOB_STATUSES
+from yutome.hosted.errors import redact_sensitive_failure_text
 from yutome.hosted.ids import input_hash
-from yutome.hosted.billing import billing_debug_snapshot_from_rows, billing_debug_snapshot_sql
+from yutome.hosted.billing import (
+    BillingExportWorkerResult,
+    balance_reconciliation_input_sql,
+    billing_debug_snapshot_from_rows,
+    billing_debug_snapshot_sql,
+    billing_export_event_from_row,
+    claim_billing_exports_sql,
+    derive_workspace_balance_snapshot_from_rows,
+    finish_billing_export_sql,
+    upsert_workspace_balance_sql,
+)
 from yutome.hosted.indexing import (
     HostedIndexingExecutor,
+    HostedSourceDiscoveryExecutor,
     HostedVideoInput,
     TranscriptChunkInput,
+    enqueue_index_video_job_sql,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
     source_from_public_youtube_input,
@@ -70,6 +85,32 @@ class HostedIndexingSmokeResult(BaseModel):
     operation_names: list[str]
     rows: list[dict[str, Any]]
     usage: dict[str, Any]
+
+
+class HostedJobSeedResult(BaseModel):
+    ok: bool = True
+    workspace_id: str
+    source_id: str
+    source_type: str
+    source_url: str
+    job_id: str | None = None
+    job_type: str | None = None
+    youtube_video_id: str | None = None
+    refresh_policy_id: str | None = None
+    cadence_seconds: int | None = None
+
+
+class HostedRealIndexingSmokeResult(BaseModel):
+    ok: bool
+    dev_only: bool = False
+    migrated: bool
+    migration_phase: MigrationPhase | None = None
+    applied_migrations: int = 0
+    workspace_id: str
+    source_id: str
+    job_id: str
+    youtube_video_id: str
+    worker: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -136,6 +177,105 @@ class HostedCommandRunner:
         rows, usage = store.lexical_search(workspace_id=workspace_id, query=query, limit=limit)
         return {"rows": rows, "usage": usage.model_dump(mode="json")}
 
+    def source_add(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str,
+        display_name: str | None = None,
+        cadence_seconds: int = 900,
+        max_new_videos_per_run: int = 25,
+        refresh_enabled: bool = True,
+    ) -> HostedJobSeedResult:
+        _validate_positive("cadence_seconds", cadence_seconds)
+        _validate_positive("max_new_videos_per_run", max_new_videos_per_run)
+        source = _source_from_cli_input(workspace_id=workspace_id, source_url=source_url, display_name=display_name)
+        policy_id = f"srp_{input_hash({'workspace_id': workspace_id, 'source_id': source.id}, prefix='').lstrip('_')[:24]}"
+        policy = SourceRefreshPolicy(
+            id=policy_id,
+            workspace_id=workspace_id,
+            source_id=source.id,
+            enabled=refresh_enabled,
+            cadence_seconds=cadence_seconds,
+            next_run_at=datetime.now(timezone.utc),
+            max_new_videos_per_run=max_new_videos_per_run,
+        )
+        self.connect().execute(ensure_workspace_sql(workspace_id=workspace_id).sql, ensure_workspace_sql(workspace_id=workspace_id).params)
+        self.connect().execute(upsert_hosted_source_sql(source).sql, upsert_hosted_source_sql(source).params)
+        self.connect().execute(upsert_source_refresh_policy_sql(policy).sql, upsert_source_refresh_policy_sql(policy).params)
+        return HostedJobSeedResult(
+            workspace_id=workspace_id,
+            source_id=source.id,
+            source_type=source.source_type,
+            source_url=source.source_url,
+            refresh_policy_id=policy.id,
+            cadence_seconds=cadence_seconds,
+        )
+
+    def enqueue_index_video(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str,
+        display_name: str | None = None,
+        priority: int = 100,
+    ) -> HostedJobSeedResult:
+        _validate_positive("priority", priority)
+        source = _source_from_cli_input(workspace_id=workspace_id, source_url=source_url, display_name=display_name)
+        video_id = source.canonical_video_id
+        if not video_id:
+            raise HostedRuntimeError("enqueue-index-video requires a concrete YouTube video URL or 11-character video id.")
+        now = datetime.now(timezone.utc)
+        workspace_statement = ensure_workspace_sql(workspace_id=workspace_id)
+        source_statement = upsert_hosted_source_sql(source)
+        job_statement = enqueue_index_video_job_sql(
+            workspace_id=workspace_id,
+            source_id=source.id,
+            video_id=video_id,
+            priority=priority,
+            now=now,
+            metadata={"seeded_by": "hosted_cli"},
+        )
+        self.connect().execute(workspace_statement.sql, workspace_statement.params)
+        self.connect().execute(source_statement.sql, source_statement.params)
+        rows = _rows_from_result(self.connect().execute(job_statement.sql, job_statement.params))
+        row = rows[0] if rows else {}
+        return HostedJobSeedResult(
+            workspace_id=workspace_id,
+            source_id=source.id,
+            source_type=source.source_type,
+            source_url=source.source_url,
+            job_id=str(row.get("id") or job_statement.params["id"]),
+            job_type="index_video",
+            youtube_video_id=video_id,
+        )
+
+    def real_indexing_smoke(
+        self,
+        *,
+        workspace_id: str,
+        source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        migrate: bool = False,
+        migration_phase: MigrationPhase = "hosted",
+        lease_owner: str = "hosted-real-indexing-smoke",
+    ) -> HostedRealIndexingSmokeResult:
+        applied_migrations = self.migrate(phase=migration_phase) if migrate else 0
+        seeded = self.enqueue_index_video(workspace_id=workspace_id, source_url=source_url)
+        worker = self.worker_once(lease_owner=lease_owner, limit=1, workspace_id=workspace_id)
+        executions = worker.params.get("executions") if isinstance(worker.params, dict) else None
+        ok = bool(executions and executions[0].get("status") == "succeeded")
+        return HostedRealIndexingSmokeResult(
+            ok=ok,
+            migrated=migrate,
+            migration_phase=migration_phase if migrate else None,
+            applied_migrations=applied_migrations,
+            workspace_id=workspace_id,
+            source_id=seeded.source_id,
+            job_id=seeded.job_id or "",
+            youtube_video_id=seeded.youtube_video_id or "",
+            worker=worker.model_dump(mode="json"),
+        )
+
     def mock_indexing_smoke(
         self,
         *,
@@ -196,19 +336,26 @@ class HostedCommandRunner:
             lease_seconds=lease_seconds,
             limit=limit,
             workspace_id=workspace_id,
-            job_types=["index_video"],
+            job_types=["index_video", "discover_source"],
             executor_kind="railway",
             executor_ref=lease_owner,
         )
         result = self.connect().execute(statement.sql, statement.params)
         rows = _rows_from_result(result)
         executor = HostedIndexingExecutor(connection=self.connect(), config=self.config, gate=self.usage_gate(), ledger=self.usage_ledger())
+        discovery_executor = HostedSourceDiscoveryExecutor(
+            connection=self.connect(),
+            config=self.config,
+            gate=self.usage_gate(),
+            ledger=self.usage_ledger(),
+        )
         executions = []
         for row in rows:
             job = _job_from_row(row)
-            if job.job_type != "index_video":
-                continue
-            executions.append(_execution_result_dict(executor.execute(job, lease_owner=lease_owner)))
+            if job.job_type == "index_video":
+                executions.append(_execution_result_dict(executor.execute(job, lease_owner=lease_owner)))
+            elif job.job_type == "discover_source":
+                executions.append(_execution_result_dict(discovery_executor.execute(job, lease_owner=lease_owner)))
         return HostedTickResult(
             tick="worker_once",
             attempted=True,
@@ -270,6 +417,112 @@ class HostedCommandRunner:
         )
         return snapshot.model_dump(mode="json")
 
+    def reconcile_balance(
+        self,
+        *,
+        workspace_id: str,
+        entitlement_policy_id: str,
+        period_start_at: datetime,
+        period_end_at: datetime,
+        starting_units: dict[str, Any] | None = None,
+        unlimited_units: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        statement = balance_reconciliation_input_sql(
+            workspace_id=workspace_id,
+            period_start_at=period_start_at,
+            period_end_at=period_end_at,
+        )
+        rows = _rows_from_result(self.connect().execute(statement.sql, statement.params))
+        credit_rows = tuple(row for row in rows if row.get("row_kind") == "credit")
+        usage_rows = tuple(row for row in rows if row.get("row_kind") == "usage")
+        reserved_rows = tuple(row for row in rows if row.get("row_kind") == "reservation")
+        snapshot = derive_workspace_balance_snapshot_from_rows(
+            workspace_id=workspace_id,
+            entitlement_policy_id=entitlement_policy_id,
+            period_start_at=period_start_at,
+            period_end_at=period_end_at,
+            credit_rows=credit_rows,
+            usage_rows=usage_rows,
+            reserved_rows=reserved_rows,
+            starting_units=starting_units,
+            unlimited_units=unlimited_units,
+            updated_at=datetime.now(timezone.utc),
+        )
+        upsert = upsert_workspace_balance_sql(snapshot)
+        self.connect().execute(upsert.sql, upsert.params)
+        return snapshot.model_dump(mode="json")
+
+    def billing_export_once(
+        self,
+        *,
+        lease_owner: str,
+        limit: int = 100,
+        access_token: str | None = None,
+        polar_api_base: str | None = None,
+    ) -> BillingExportWorkerResult:
+        token = access_token if access_token is not None else os.environ.get("POLAR_ACCESS_TOKEN")
+        if not token:
+            return BillingExportWorkerResult(
+                attempted=False,
+                affected_rows=0,
+                skipped=1,
+                access_token_configured=False,
+                rows=[
+                    {
+                        "status": "skipped",
+                        "reason": "POLAR_ACCESS_TOKEN is not configured; no billing export rows were claimed.",
+                    }
+                ],
+            )
+        now = datetime.now(timezone.utc)
+        claim = claim_billing_exports_sql(lease_owner=lease_owner, now=now, limit=limit)
+        rows = _rows_from_result(self.connect().execute(claim.sql, claim.params))
+        api_base = (polar_api_base or os.environ.get("POLAR_API_BASE") or "https://api.polar.sh").rstrip("/")
+        result = BillingExportWorkerResult(
+            attempted=True,
+            affected_rows=len(rows),
+            access_token_configured=True,
+            rows=[],
+        )
+        for row in rows:
+            export_id = str(row["id"])
+            try:
+                export = billing_export_event_from_row(row)
+                payload = {"events": [export.to_polar_event().model_dump(mode="json", exclude_none=True)]}
+                response = _post_polar_usage_export(
+                    payload,
+                    access_token=token,
+                    api_base=api_base,
+                )
+                inserted = int(response.get("inserted") or 0)
+                duplicates = int(response.get("duplicates") or 0)
+                if inserted + duplicates < 1:
+                    raise HostedRuntimeError(
+                        f"Polar export did not acknowledge usage event: inserted={inserted}, duplicates={duplicates}"
+                    )
+                finish = finish_billing_export_sql(
+                    export_id=export_id,
+                    now=datetime.now(timezone.utc),
+                    replay_status="succeeded",
+                    external_event_id=export.source_event_dedupe_key,
+                )
+                self.connect().execute(finish.sql, finish.params)
+                result.succeeded += 1
+                result.rows.append({"id": export_id, "status": "succeeded", "polar_response": response})
+            except Exception as exc:  # billing mirror failure must not affect authorization paths
+                error_message = redact_sensitive_failure_text(str(exc))
+                finish = finish_billing_export_sql(
+                    export_id=export_id,
+                    now=datetime.now(timezone.utc),
+                    replay_status="failed",
+                    error_code="polar_export_failed" if token else "polar_access_token_missing",
+                    error_message=error_message,
+                )
+                self.connect().execute(finish.sql, finish.params)
+                result.failed += 1
+                result.rows.append({"id": export_id, "status": "failed", "error": error_message})
+        return result
+
 
 def build_hosted_api_app(
     runner: HostedCommandRunner,
@@ -302,24 +555,96 @@ def source_refresh_tick_sql(
     return SqlStatement(
         sql="""
 WITH due AS (
-    SELECT id
-    FROM source_refresh_policies
-    WHERE enabled = true
-      AND next_run_at <= %(now)s
-      AND (locked_by IS NULL OR locked_until <= %(now)s)
-    ORDER BY next_run_at ASC, id ASC
+    SELECT
+        policy.id AS policy_id,
+        policy.workspace_id,
+        policy.source_id,
+        policy.next_run_at,
+        policy.cadence_seconds,
+        policy.jitter_seconds,
+        source.source_type,
+        source.canonical_video_id,
+        policy.max_new_videos_per_run
+    FROM source_refresh_policies AS policy
+    JOIN sources AS source
+      ON source.id = policy.source_id
+     AND source.workspace_id = policy.workspace_id
+    WHERE policy.enabled = true
+      AND policy.next_run_at <= %(now)s
+      AND (policy.locked_by IS NULL OR policy.locked_until <= %(now)s)
+      AND source.status = 'active'
+      AND source.auto_index_allowed = true
+    ORDER BY policy.next_run_at ASC, policy.id ASC
     LIMIT %(limit)s
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF policy SKIP LOCKED
+),
+enqueued AS (
+    INSERT INTO jobs (
+        id,
+        workspace_id,
+        source_id,
+        job_type,
+        status,
+        priority,
+        idempotency_key,
+        run_after,
+        executor_kind,
+        executor_ref,
+        metadata_json,
+        created_at
+    )
+    SELECT
+        'job_' || md5(due.workspace_id || ':' || due.source_id || ':' || due.next_run_at::text || ':source_refresh'),
+        due.workspace_id,
+        due.source_id,
+        CASE WHEN due.source_type = 'video' THEN 'index_video' ELSE 'discover_source' END,
+        'queued',
+        100,
+        due.workspace_id || ':' || due.source_id || ':source_refresh:' || due.next_run_at::text,
+        %(now)s,
+        'railway',
+        %(lease_owner)s,
+        jsonb_build_object(
+            'source_refresh_policy_id', due.policy_id,
+            'scheduled_for', due.next_run_at,
+            'source_type', due.source_type,
+            'canonical_video_id', due.canonical_video_id,
+            'max_new_videos_per_run', due.max_new_videos_per_run
+        ),
+        %(now)s
+    FROM due
+    ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
+    SET idempotency_key = jobs.idempotency_key
+    RETURNING id, workspace_id, source_id, job_type, idempotency_key
+),
+advanced AS (
+    UPDATE source_refresh_policies AS policy
+    SET last_started_at = %(now)s,
+        locked_by = %(lease_owner)s,
+        locked_until = %(locked_until)s,
+        next_run_at = GREATEST(policy.next_run_at, %(now)s)
+            + make_interval(
+                secs => policy.cadence_seconds
+                    + CASE
+                        WHEN policy.jitter_seconds > 0
+                        THEN floor(random() * ((policy.jitter_seconds * 2) + 1))::integer - policy.jitter_seconds
+                        ELSE 0
+                      END
+            ),
+        updated_at = %(now)s
+    FROM due
+    WHERE policy.id = due.policy_id
+    RETURNING policy.*
 )
-UPDATE source_refresh_policies AS policy
-SET last_started_at = %(now)s,
-    locked_by = %(lease_owner)s,
-    locked_until = %(locked_until)s,
-    next_run_at = GREATEST(policy.next_run_at, %(now)s) + make_interval(secs => policy.cadence_seconds),
-    updated_at = %(now)s
-FROM due
-WHERE policy.id = due.id
-RETURNING policy.*;
+SELECT
+    advanced.*,
+    enqueued.id AS job_id,
+    enqueued.job_type AS job_type,
+    enqueued.idempotency_key AS job_idempotency_key
+FROM advanced
+JOIN enqueued
+  ON enqueued.workspace_id = advanced.workspace_id
+ AND enqueued.source_id = advanced.source_id;
 """.strip(),
         params={
             "lease_owner": lease_owner,
@@ -433,6 +758,104 @@ def mock_hosted_public_indexing_plan(
         ),
     )
     return plan_mock_hosted_public_indexing(source=source, job=job, video=video, chunks=chunks, search_query=query)
+
+
+def ensure_workspace_sql(*, workspace_id: str, name: str | None = None) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+INSERT INTO workspaces (id, name, status)
+VALUES (%(workspace_id)s, %(name)s, 'active')
+ON CONFLICT (id) DO NOTHING
+RETURNING *;
+""".strip(),
+        params={"workspace_id": workspace_id, "name": name or workspace_id},
+    )
+
+
+def upsert_hosted_source_sql(source: Source) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+INSERT INTO sources (
+    id, workspace_id, source_type, source_url, canonical_channel_id,
+    canonical_playlist_id, canonical_video_id, display_name, selected,
+    auto_index_allowed, import_source, auth_grant_id, metadata_json, status
+)
+VALUES (
+    %(id)s, %(workspace_id)s, %(source_type)s, %(source_url)s,
+    %(canonical_channel_id)s, %(canonical_playlist_id)s, %(canonical_video_id)s,
+    %(display_name)s, %(selected)s, %(auto_index_allowed)s, %(import_source)s,
+    %(auth_grant_id)s, %(metadata_json)s::jsonb, %(status)s
+)
+ON CONFLICT (workspace_id, source_url) DO UPDATE
+SET source_type = EXCLUDED.source_type,
+    canonical_channel_id = COALESCE(EXCLUDED.canonical_channel_id, sources.canonical_channel_id),
+    canonical_playlist_id = COALESCE(EXCLUDED.canonical_playlist_id, sources.canonical_playlist_id),
+    canonical_video_id = COALESCE(EXCLUDED.canonical_video_id, sources.canonical_video_id),
+    display_name = COALESCE(EXCLUDED.display_name, sources.display_name),
+    selected = EXCLUDED.selected,
+    auto_index_allowed = EXCLUDED.auto_index_allowed,
+    import_source = EXCLUDED.import_source,
+    auth_grant_id = EXCLUDED.auth_grant_id,
+    metadata_json = sources.metadata_json || EXCLUDED.metadata_json,
+    status = EXCLUDED.status,
+    updated_at = now()
+RETURNING *;
+""".strip(),
+        params={
+            "id": source.id,
+            "workspace_id": source.workspace_id,
+            "source_type": source.source_type,
+            "source_url": source.source_url,
+            "canonical_channel_id": source.canonical_channel_id,
+            "canonical_playlist_id": source.canonical_playlist_id,
+            "canonical_video_id": source.canonical_video_id,
+            "display_name": source.display_name,
+            "selected": source.selected,
+            "auto_index_allowed": source.auto_index_allowed,
+            "import_source": source.import_source,
+            "auth_grant_id": source.auth_grant_id,
+            "metadata_json": _json_param(source.metadata_jsonb),
+            "status": source.status,
+        },
+    )
+
+
+def upsert_source_refresh_policy_sql(policy: SourceRefreshPolicy) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+INSERT INTO source_refresh_policies (
+    id, workspace_id, source_id, enabled, cadence_seconds, jitter_seconds,
+    next_run_at, max_new_videos_per_run, max_index_jobs_per_day, policy_snapshot_json
+)
+VALUES (
+    %(id)s, %(workspace_id)s, %(source_id)s, %(enabled)s,
+    %(cadence_seconds)s, %(jitter_seconds)s, %(next_run_at)s,
+    %(max_new_videos_per_run)s, %(max_index_jobs_per_day)s,
+    %(policy_snapshot_json)s::jsonb
+)
+ON CONFLICT (workspace_id, source_id) DO UPDATE
+SET enabled = EXCLUDED.enabled,
+    cadence_seconds = EXCLUDED.cadence_seconds,
+    jitter_seconds = EXCLUDED.jitter_seconds,
+    max_new_videos_per_run = EXCLUDED.max_new_videos_per_run,
+    max_index_jobs_per_day = EXCLUDED.max_index_jobs_per_day,
+    policy_snapshot_json = EXCLUDED.policy_snapshot_json,
+    updated_at = now()
+RETURNING *;
+""".strip(),
+        params={
+            "id": policy.id,
+            "workspace_id": policy.workspace_id,
+            "source_id": policy.source_id,
+            "enabled": policy.enabled,
+            "cadence_seconds": policy.cadence_seconds,
+            "jitter_seconds": policy.jitter_seconds,
+            "next_run_at": policy.next_run_at,
+            "max_new_videos_per_run": policy.max_new_videos_per_run,
+            "max_index_jobs_per_day": policy.max_index_jobs_per_day,
+            "policy_snapshot_json": _json_param(policy.policy_snapshot_jsonb),
+        },
+    )
 
 
 def mock_hosted_public_indexing_bootstrap_statements(source: Source, job: Job) -> tuple[SqlStatement, ...]:
@@ -603,12 +1026,44 @@ def _job_from_row(row: Mapping[str, Any]) -> Job:
     )
 
 
+def _source_from_cli_input(*, workspace_id: str, source_url: str, display_name: str | None = None) -> Source:
+    source_hash = input_hash({"workspace_id": workspace_id, "source_url": source_url.strip()}, prefix="").lstrip("_")[:24]
+    return source_from_public_youtube_input(
+        workspace_id=workspace_id,
+        source_id=f"src_{source_hash}",
+        value=source_url,
+        import_source="cli",
+        display_name=display_name,
+    )
+
+
 def _execution_result_dict(value: Any) -> dict[str, Any]:
     if is_dataclass(value):
         return asdict(value)
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return dict(getattr(value, "__dict__", {}))
+
+
+def _post_polar_usage_export(payload: dict[str, Any], *, access_token: str, api_base: str) -> dict[str, Any]:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_base}/v1/events/ingest",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "yutome-hosted-billing/0.1",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            text = response.read().decode("utf-8")
+            return json.loads(text) if text else {}
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        raise HostedRuntimeError(f"Polar export failed with HTTP {exc.code}: {error_text[:500]}") from exc
 
 
 def _validate_positive(name: str, value: int) -> None:
@@ -634,15 +1089,20 @@ __all__ = [
     "HostedCommandRunner",
     "HostedDbCheck",
     "HostedIndexingSmokeResult",
+    "HostedJobSeedResult",
     "HostedPostgresSettings",
+    "HostedRealIndexingSmokeResult",
     "HostedRuntimeError",
     "HostedTickResult",
     "build_hosted_api_app",
     "connect_postgres",
+    "ensure_workspace_sql",
     "maintenance_tick_sql",
     "mock_hosted_public_indexing_bootstrap_statements",
     "mock_hosted_public_indexing_plan",
     "postgres_url_from_env",
     "redact_postgres_url",
     "source_refresh_tick_sql",
+    "upsert_hosted_source_sql",
+    "upsert_source_refresh_policy_sql",
 ]

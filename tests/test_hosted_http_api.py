@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import time
 from typing import Any
 
 import pytest
@@ -17,6 +22,17 @@ TEST_API_TOKEN = "hosted-test-token"
 
 def auth_headers(workspace_id: str, *, token: str = TEST_API_TOKEN) -> dict[str, str]:
     return {WORKSPACE_HEADER: workspace_id, "Authorization": f"Bearer {token}"}
+
+
+def polar_headers(raw_body: bytes, *, secret: str = "polar-secret", webhook_id: str = "wh_msg_123") -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    signed = webhook_id.encode() + b"." + timestamp.encode() + b"." + raw_body
+    signature = base64.b64encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest()).decode("ascii")
+    return {
+        "webhook-id": webhook_id,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": f"v1,{signature}",
+    }
 
 
 def _allow_search_usage_context(
@@ -317,7 +333,8 @@ def test_postgres_app_builder_wires_connection_search_store_and_adapter() -> Non
     assert app.state.hosted_search_store.connection is connection
     assert app.state.hosted_adapter.search_store is app.state.hosted_search_store
     assert len(connection.calls) == 1
-    assert "websearch_to_tsquery" in connection.calls[0][0]
+    assert "to_bm25query" in connection.calls[0][0]
+    assert "bm25_catalog.bm25_limit" in connection.calls[0][0]
     assert connection.calls[0][1]["workspace_id"] == "ws_pg"
     assert connection.calls[0][1]["limit"] == 2
 
@@ -339,6 +356,74 @@ def test_postgres_app_builder_default_usage_context_denies_without_entitlement()
     assert body["data"]["operation"] == "search_store.lexical_query"
     assert all("websearch_to_tsquery" not in statement for statement, _params in connection.calls)
     assert any("FROM entitlement_policies" in statement for statement, _params in connection.calls)
+
+
+def test_polar_webhook_rejects_invalid_signature_before_db_write() -> None:
+    connection = RecordingConnection()
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            polar_webhook_secret="polar-secret",
+        )
+    )
+    raw_body = b'{"type":"customer.state_changed","timestamp":"2026-05-26T03:00:00Z","data":{"id":"cus_123"}}'
+    headers = polar_headers(raw_body)
+    headers["webhook-signature"] = "v1,wrong"
+
+    response = client.post("/billing/polar/webhook", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "webhook_signature_invalid"
+    assert connection.calls == []
+
+
+def test_polar_webhook_accepts_signature_and_processes_order_credit() -> None:
+    connection = RecordingConnection()
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            polar_webhook_secret="polar-secret",
+        )
+    )
+    raw_body = json.dumps(
+        {
+            "type": "order.paid",
+            "timestamp": "2026-05-26T03:00:00Z",
+            "data": {
+                "id": "ord_123",
+                "customer_id": "cus_123",
+                "customer": {"id": "cus_123", "external_id": "ws_http"},
+                "metadata": {"yutome_credit_grants": [{"unit": "credits", "quantity": "5"}]},
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    response = client.post("/billing/polar/webhook", content=raw_body, headers=polar_headers(raw_body))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["event_id"] == "wh_msg_123"
+    assert body["credit_entries"] == 1
+    assert body["billing_customer"].startswith("bc_")
+    assert [call[0].split()[2] for call in connection.calls if call[0].startswith("INSERT INTO")] == [
+        "polar_webhook_snapshots",
+        "billing_customers",
+        "credit_ledger_entries",
+        "polar_webhook_snapshots",
+    ]
+    credit_params = connection.calls[2][1]
+    assert credit_params["workspace_id"] == "ws_http"
+    assert credit_params["external_order_id"] == "ord_123"
+    assert credit_params["quantity_text"] == "5"
 
 
 def test_tool_call_endpoint_uses_workspace_from_auth_header(
@@ -449,7 +534,7 @@ def test_unconfigured_api_token_rejects_tool_and_resource_before_adapter_dispatc
 
 def test_explicit_auth_dependency_can_be_used_for_tests_without_token() -> None:
     store = RecordingSearchStore()
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    adapter = HostedMcpQueryAdapter(search_store=store, usage_context_provider=_allow_search_usage_context)
 
     def test_auth() -> Any:
         from yutome.hosted.mcp_query import HostedMcpAuthContext
@@ -534,7 +619,11 @@ def test_missing_or_invalid_workspace_header_is_rejected(
 def test_configured_api_token_protects_resource_read_before_adapter_dispatch() -> None:
     store = RecordingSearchStore()
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
     client = TestClient(build_app(adapter=adapter, expected_api_token="hosted-secret"))
 
     missing = client.post(
@@ -560,7 +649,8 @@ def test_configured_api_token_protects_resource_read_before_adapter_dispatch() -
     assert valid.status_code == 200
     assert valid.json()["result"]["chunk_id"] == "chunk_http"
     assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]
-    assert ledger.events == []
+    assert len(ledger.events) == 1
+    assert ledger.events[0].operation == "resource_read"
 
 
 def test_resource_read_endpoint_returns_payload(

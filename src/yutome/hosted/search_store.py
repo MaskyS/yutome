@@ -26,6 +26,7 @@ class SearchStoreUsage(BaseModel):
 
 SearchQueryMode = Literal["lexical", "semantic", "hybrid"]
 SearchQuerySyntax = Literal["websearch", "plain", "tsquery"]
+LexicalSqlBackend = Literal["vectorchord_bm25", "postgres_fts_fallback"]
 
 
 class SqlConnection(Protocol):
@@ -115,8 +116,8 @@ class PostgresVectorChordSearchStore:
     """Hosted search adapter for the VectorChord-first Postgres substrate.
 
     Dense-vector SQL uses pgvector-compatible operators. Lexical and hybrid
-    recall currently use the native Postgres FTS fallback; they are labeled as
-    fallback usage until real VectorChord-BM25 SQL is implemented.
+    recall use VectorChord-BM25 by default; native Postgres FTS is available
+    only as an explicit configured fallback for managed pgvector deployments.
     """
 
     backend = HOSTED_VECTOR_BACKEND
@@ -128,16 +129,19 @@ class PostgresVectorChordSearchStore:
         index_profile_ref: str | None = None,
         embedding_model: str = HOSTED_DEFAULT_EMBEDDING_MODEL,
         embedding_dimension: int = HOSTED_DEFAULT_EMBEDDING_DIMENSION,
+        lexical_backend: LexicalSqlBackend = "vectorchord_bm25",
     ) -> None:
         validate_supported_embedding_profile(
             backend=self.backend,
             embedding_model=embedding_model,
             embedding_dimension=embedding_dimension,
         )
+        validate_supported_lexical_backend(lexical_backend)
         self.connection = connection
         self.index_profile_ref = index_profile_ref
         self.embedding_model = embedding_model
         self.embedding_dimension = embedding_dimension
+        self.lexical_backend = lexical_backend
         self.resources = HostedResourceQueries(connection)
 
     def extension_check(self) -> dict[str, bool]:
@@ -171,6 +175,7 @@ class PostgresVectorChordSearchStore:
             query=query,
             limit=limit,
             index_profile_ref=self.index_profile_ref,
+            lexical_backend=self.lexical_backend,
         )
         return _execute_plan(self.connection, plan)
 
@@ -205,6 +210,7 @@ class PostgresVectorChordSearchStore:
             limit=limit,
             index_profile_ref=self.index_profile_ref,
             expected_dimension=self.embedding_dimension,
+            lexical_backend=self.lexical_backend,
         )
         return _execute_plan(self.connection, plan)
 
@@ -276,9 +282,12 @@ class PostgresVectorChordSearchStore:
 
 
 VECTORCHORD_REQUIRED_EXTENSIONS = ("vector", "vchord", "pg_tokenizer", "vchord_bm25")
+VECTORCHORD_BM25_LEXICAL_BACKEND = "vectorchord_bm25"
 POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND = "postgres_fts_fallback"
 PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND = "pgvector_vector_distance"
+VECTORCHORD_BM25_PGVECTOR_HYBRID_BACKEND = "vectorchord_bm25_pgvector"
 POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND = "postgres_fts_pgvector_fallback"
+VECTORCHORD_BM25_CHUNKS_INDEX = "idx_chunks_bm25_document"
 SUPPORTED_EMBEDDING_PROFILES = frozenset(
     {
         (
@@ -287,6 +296,9 @@ SUPPORTED_EMBEDDING_PROFILES = frozenset(
             HOSTED_DEFAULT_EMBEDDING_DIMENSION,
         )
     }
+)
+SUPPORTED_LEXICAL_BACKENDS: frozenset[LexicalSqlBackend] = frozenset(
+    {VECTORCHORD_BM25_LEXICAL_BACKEND, POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND}
 )
 
 
@@ -303,6 +315,12 @@ def validate_supported_embedding_profile(*, backend: str, embedding_model: str, 
             f"hosted storage is currently vector({HOSTED_DEFAULT_EMBEDDING_DIMENSION}) "
             f"with supported profiles: {supported}"
         )
+
+
+def validate_supported_lexical_backend(lexical_backend: str) -> None:
+    if lexical_backend not in SUPPORTED_LEXICAL_BACKENDS:
+        supported = ", ".join(sorted(SUPPORTED_LEXICAL_BACKENDS))
+        raise ValueError(f"unsupported lexical backend {lexical_backend!r}; supported backends: {supported}")
 
 
 def extension_check_sql(extensions: Sequence[str] = VECTORCHORD_REQUIRED_EXTENSIONS) -> SqlStatement:
@@ -324,15 +342,41 @@ def lexical_query_plan(
     limit: int,
     index_profile_ref: str | None = None,
     syntax: SearchQuerySyntax = "websearch",
+    lexical_backend: LexicalSqlBackend = VECTORCHORD_BM25_LEXICAL_BACKEND,
+    bm25_index_name: str = VECTORCHORD_BM25_CHUNKS_INDEX,
 ) -> SearchStoreQueryPlan:
     _validate_limit(limit)
-    statement = _postgres_fts_fallback_lexical_sql(
-        workspace_id=workspace_id,
-        query=query,
-        limit=limit,
-        index_profile_ref=index_profile_ref,
-        syntax=syntax,
-    )
+    validate_supported_lexical_backend(lexical_backend)
+    if lexical_backend == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND:
+        statement = _postgres_fts_fallback_lexical_sql(
+            workspace_id=workspace_id,
+            query=query,
+            limit=limit,
+            index_profile_ref=index_profile_ref,
+            syntax=syntax,
+        )
+        backend = POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND
+        metadata = {
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+            "configured_fallback": True,
+            "fallback_reason": "configured_lexical_backend",
+        }
+    else:
+        statement = _vectorchord_bm25_lexical_sql(
+            workspace_id=workspace_id,
+            query=query,
+            limit=limit,
+            index_profile_ref=index_profile_ref,
+            bm25_index_name=bm25_index_name,
+        )
+        backend = VECTORCHORD_BM25_LEXICAL_BACKEND
+        metadata = {
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "lexical_sql_backend": VECTORCHORD_BM25_LEXICAL_BACKEND,
+            "bm25_index_name": bm25_index_name,
+            "configured_fallback": False,
+        }
     return SearchStoreQueryPlan(
         mode="lexical",
         statement=statement,
@@ -340,12 +384,8 @@ def lexical_query_plan(
             "lexical_query",
             index_profile_ref,
             {"queries": 1, "candidate_limit": limit},
-            backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-            metadata={
-                "storage_backend": HOSTED_VECTOR_BACKEND,
-                "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-                "vectorchord_bm25_sql": "not_implemented",
-            },
+            backend=backend,
+            metadata=metadata,
         ),
     )
 
@@ -393,23 +433,57 @@ def hybrid_query_plan(
     rrf_k: int = 60,
     syntax: SearchQuerySyntax = "websearch",
     expected_dimension: int = HOSTED_DEFAULT_EMBEDDING_DIMENSION,
+    lexical_backend: LexicalSqlBackend = VECTORCHORD_BM25_LEXICAL_BACKEND,
+    bm25_index_name: str = VECTORCHORD_BM25_CHUNKS_INDEX,
 ) -> SearchStoreQueryPlan:
     _validate_limit(limit)
     _validate_positive("candidate_multiplier", candidate_multiplier)
     _validate_positive("rrf_k", rrf_k)
     _validate_query_vector_dimension(query_vector, expected_dimension)
     candidate_limit = limit * candidate_multiplier
-    statement = _postgres_fts_fallback_hybrid_sql(
-        workspace_id=workspace_id,
-        query=query,
-        query_vector=query_vector,
-        limit=limit,
-        candidate_limit=candidate_limit,
-        index_profile_ref=index_profile_ref,
-        rrf_k=rrf_k,
-        syntax=syntax,
-        embedding_dimension=expected_dimension,
-    )
+    validate_supported_lexical_backend(lexical_backend)
+    if lexical_backend == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND:
+        statement = _postgres_fts_fallback_hybrid_sql(
+            workspace_id=workspace_id,
+            query=query,
+            query_vector=query_vector,
+            limit=limit,
+            candidate_limit=candidate_limit,
+            index_profile_ref=index_profile_ref,
+            rrf_k=rrf_k,
+            syntax=syntax,
+            embedding_dimension=expected_dimension,
+        )
+        backend = POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
+        metadata = {
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
+            "semantic_sql_backend": PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND,
+            "fusion": "rrf",
+            "configured_fallback": True,
+            "fallback_reason": "configured_lexical_backend",
+        }
+    else:
+        statement = _vectorchord_bm25_hybrid_sql(
+            workspace_id=workspace_id,
+            query=query,
+            query_vector=query_vector,
+            limit=limit,
+            candidate_limit=candidate_limit,
+            index_profile_ref=index_profile_ref,
+            rrf_k=rrf_k,
+            embedding_dimension=expected_dimension,
+            bm25_index_name=bm25_index_name,
+        )
+        backend = VECTORCHORD_BM25_PGVECTOR_HYBRID_BACKEND
+        metadata = {
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "lexical_sql_backend": VECTORCHORD_BM25_LEXICAL_BACKEND,
+            "semantic_sql_backend": PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND,
+            "fusion": "rrf",
+            "bm25_index_name": bm25_index_name,
+            "configured_fallback": False,
+        }
     return SearchStoreQueryPlan(
         mode="hybrid",
         statement=statement,
@@ -422,14 +496,8 @@ def hybrid_query_plan(
                 "result_limit": limit,
                 "query_vector_dimensions": len(query_vector),
             },
-            backend=POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND,
-            metadata={
-                "storage_backend": HOSTED_VECTOR_BACKEND,
-                "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-                "semantic_sql_backend": PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND,
-                "fusion": "rrf",
-                "vectorchord_bm25_sql": "not_implemented",
-            },
+            backend=backend,
+            metadata=metadata,
         ),
     )
 
@@ -481,6 +549,79 @@ SELECT * FROM activated;
             "language_code": language_code,
             "content_hash": content_hash,
             "metadata_json": _json_param(metadata or {}),
+        },
+    )
+
+
+def _vectorchord_bm25_lexical_sql(
+    *,
+    workspace_id: str,
+    query: str,
+    limit: int,
+    index_profile_ref: str | None,
+    bm25_index_name: str,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+WITH bm25_settings AS (
+    SELECT set_config('bm25_catalog.bm25_limit', %(bm25_limit)s::text, true)
+),
+scored AS (
+    SELECT
+        c.id AS chunk_id,
+        c.bm25_document <&> to_bm25query(
+            %(bm25_index_name)s::regclass,
+            tokenize(%(query)s, sip.tokenizer)::bm25vector
+        ) AS bm25_score
+    FROM chunks c
+    JOIN videos v ON v.id = c.video_id
+        AND v.workspace_id = c.workspace_id
+        AND v.active_transcript_version_id = c.transcript_version_id
+    JOIN search_index_profiles sip ON sip.id = c.index_profile_id
+        AND sip.workspace_id = c.workspace_id
+    CROSS JOIN bm25_settings
+    WHERE c.workspace_id = %(workspace_id)s
+      AND sip.backend = %(storage_backend)s
+      AND (%(index_profile_ref)s::text IS NULL OR sip.id = %(index_profile_ref)s::text)
+    ORDER BY bm25_score ASC, c.video_id, c.chunk_index
+    LIMIT %(limit)s
+)
+SELECT
+    c.id AS chunk_id,
+    c.video_id,
+    v.youtube_video_id,
+    c.transcript_version_id,
+    c.chunk_index,
+    c.start_seconds,
+    c.end_seconds,
+    c.text,
+    v.title,
+    v.channel_id,
+    v.published_at,
+    v.duration_seconds,
+    v.metadata_json->>'channel_title' AS channel_title,
+    v.metadata_json->>'channel_handle' AS channel_handle,
+    v.metadata_json->>'thumbnail_url' AS thumbnail_url,
+    scored.bm25_score AS lexical_score,
+    NULL::double precision AS vector_distance,
+    -scored.bm25_score AS score,
+    'lexical' AS match_type
+FROM scored
+JOIN chunks c ON c.id = scored.chunk_id
+JOIN videos v ON v.id = c.video_id
+    AND v.workspace_id = c.workspace_id
+    AND v.active_transcript_version_id = c.transcript_version_id
+WHERE c.workspace_id = %(workspace_id)s
+ORDER BY scored.bm25_score ASC, c.video_id, c.chunk_index;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "query": query,
+            "index_profile_ref": index_profile_ref,
+            "bm25_index_name": bm25_index_name,
+            "bm25_limit": limit,
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "limit": limit,
         },
     )
 
@@ -587,6 +728,124 @@ LIMIT %(limit)s;
             "query_vector": _vector_literal(query_vector),
             "embedding_dimension": embedding_dimension,
             "index_profile_ref": index_profile_ref,
+            "limit": limit,
+        },
+    )
+
+
+def _vectorchord_bm25_hybrid_sql(
+    *,
+    workspace_id: str,
+    query: str,
+    query_vector: Sequence[float],
+    limit: int,
+    candidate_limit: int,
+    index_profile_ref: str | None,
+    rrf_k: int,
+    embedding_dimension: int,
+    bm25_index_name: str,
+) -> SqlStatement:
+    return SqlStatement(
+        sql=f"""
+WITH bm25_settings AS (
+    SELECT set_config('bm25_catalog.bm25_limit', %(bm25_limit)s::text, true)
+),
+lexical_scored AS (
+    SELECT
+        c.id AS chunk_id,
+        c.bm25_document <&> to_bm25query(
+            %(bm25_index_name)s::regclass,
+            tokenize(%(query)s, sip.tokenizer)::bm25vector
+        ) AS lexical_score
+    FROM chunks c
+    JOIN videos v ON v.id = c.video_id
+        AND v.workspace_id = c.workspace_id
+        AND v.active_transcript_version_id = c.transcript_version_id
+    JOIN search_index_profiles sip ON sip.id = c.index_profile_id
+        AND sip.workspace_id = c.workspace_id
+    CROSS JOIN bm25_settings
+    WHERE c.workspace_id = %(workspace_id)s
+      AND sip.backend = %(storage_backend)s
+      AND (%(index_profile_ref)s::text IS NULL OR sip.id = %(index_profile_ref)s::text)
+    ORDER BY lexical_score ASC, c.id
+    LIMIT %(candidate_limit)s
+),
+lexical AS (
+    SELECT
+        chunk_id,
+        lexical_score,
+        row_number() OVER (ORDER BY lexical_score ASC, chunk_id) AS lexical_rank
+    FROM lexical_scored
+),
+semantic AS (
+    SELECT
+        c.id AS chunk_id,
+        ce.embedding <-> %(query_vector)s::vector({embedding_dimension}) AS vector_distance,
+        row_number() OVER (ORDER BY ce.embedding <-> %(query_vector)s::vector({embedding_dimension}) ASC, c.id) AS semantic_rank
+    FROM chunk_embeddings ce
+    JOIN chunks c ON c.id = ce.chunk_id AND c.workspace_id = ce.workspace_id
+    JOIN videos v ON v.id = c.video_id
+        AND v.workspace_id = c.workspace_id
+        AND v.active_transcript_version_id = c.transcript_version_id
+    JOIN search_index_profiles sip ON sip.id = ce.index_profile_id
+        AND sip.workspace_id = ce.workspace_id
+    WHERE ce.workspace_id = %(workspace_id)s
+      AND sip.backend = %(storage_backend)s
+      AND (%(index_profile_ref)s::text IS NULL OR sip.id = %(index_profile_ref)s::text)
+      AND sip.embedding_dimension = %(embedding_dimension)s
+    ORDER BY vector_distance ASC, c.id
+    LIMIT %(candidate_limit)s
+),
+fused AS (
+    SELECT
+        COALESCE(lexical.chunk_id, semantic.chunk_id) AS chunk_id,
+        lexical.lexical_score,
+        semantic.vector_distance,
+        COALESCE(1.0 / (%(rrf_k)s + lexical.lexical_rank), 0.0)
+          + COALESCE(1.0 / (%(rrf_k)s + semantic.semantic_rank), 0.0) AS score
+    FROM lexical
+    FULL OUTER JOIN semantic USING (chunk_id)
+)
+SELECT
+    c.id AS chunk_id,
+    c.video_id,
+    v.youtube_video_id,
+    c.transcript_version_id,
+    c.chunk_index,
+    c.start_seconds,
+    c.end_seconds,
+    c.text,
+    v.title,
+    v.channel_id,
+    v.published_at,
+    v.duration_seconds,
+    v.metadata_json->>'channel_title' AS channel_title,
+    v.metadata_json->>'channel_handle' AS channel_handle,
+    v.metadata_json->>'thumbnail_url' AS thumbnail_url,
+    fused.lexical_score,
+    fused.vector_distance,
+    fused.score,
+    'hybrid' AS match_type
+FROM fused
+JOIN chunks c ON c.id = fused.chunk_id
+JOIN videos v ON v.id = c.video_id
+    AND v.workspace_id = c.workspace_id
+    AND v.active_transcript_version_id = c.transcript_version_id
+WHERE c.workspace_id = %(workspace_id)s
+ORDER BY fused.score DESC, c.video_id, c.chunk_index
+LIMIT %(limit)s;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "query": query,
+            "query_vector": _vector_literal(query_vector),
+            "embedding_dimension": embedding_dimension,
+            "index_profile_ref": index_profile_ref,
+            "candidate_limit": candidate_limit,
+            "bm25_index_name": bm25_index_name,
+            "bm25_limit": candidate_limit,
+            "storage_backend": HOSTED_VECTOR_BACKEND,
+            "rrf_k": rrf_k,
             "limit": limit,
         },
     )
@@ -781,6 +1040,7 @@ def _validate_positive(name: str, value: int) -> None:
 
 __all__ = [
     "PostgresVectorChordSearchStore",
+    "LexicalSqlBackend",
     "SearchQueryMode",
     "SearchQuerySyntax",
     "SearchStore",
@@ -790,11 +1050,16 @@ __all__ = [
     "POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND",
     "POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND",
     "SUPPORTED_EMBEDDING_PROFILES",
+    "SUPPORTED_LEXICAL_BACKENDS",
     "VECTORCHORD_REQUIRED_EXTENSIONS",
+    "VECTORCHORD_BM25_CHUNKS_INDEX",
+    "VECTORCHORD_BM25_LEXICAL_BACKEND",
+    "VECTORCHORD_BM25_PGVECTOR_HYBRID_BACKEND",
     "extension_check_sql",
     "hybrid_query_plan",
     "lexical_query_plan",
     "replace_active_transcript_sql",
     "semantic_query_plan",
     "validate_supported_embedding_profile",
+    "validate_supported_lexical_backend",
 ]

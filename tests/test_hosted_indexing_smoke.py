@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,14 +15,16 @@ from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provide
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
     HostedIndexingExecutor,
+    HostedSourceDiscoveryExecutor,
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
+    enqueue_index_video_job_sql,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
     source_from_public_youtube_input,
 )
-from yutome.youtube import TranscriptFetchResult
+from yutome.youtube import DiscoveredVideo, TranscriptFetchResult
 
 
 NOW = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
@@ -122,13 +125,31 @@ class HostedExecutorConnection:
                     "workspace_id": self.policy.workspace_id,
                     "allowed_operations": list(self.policy.allowed_operations),
                     "hard_limits_jsonb": self.policy.max_units_by_operation,
+                    "soft_limits_jsonb": self.policy.soft_units_by_operation,
                 }
             ]
         if "FROM workspace_balances" in statement:
             return [
                 {
                     "workspace_id": self.balance.workspace_id,
+                    "entitlement_policy_id": self.policy.id,
                     "remaining_units_jsonb": self.balance.remaining_units,
+                    "reserved_units_jsonb": {},
+                    "unlimited_units": list(self.balance.unlimited_units),
+                }
+            ]
+        if "UPDATE workspace_balances" in statement:
+            self.balance = WorkspaceBalance(
+                workspace_id=self.balance.workspace_id,
+                remaining_units=json.loads(str((params or {})["remaining_units_jsonb"])),
+                unlimited_units=self.balance.unlimited_units,
+            )
+            return [
+                {
+                    "workspace_id": self.balance.workspace_id,
+                    "entitlement_policy_id": self.policy.id,
+                    "remaining_units_jsonb": self.balance.remaining_units,
+                    "reserved_units_jsonb": json.loads(str((params or {})["reserved_units_jsonb"])),
                     "unlimited_units": list(self.balance.unlimited_units),
                 }
             ]
@@ -160,12 +181,16 @@ def _executor_job() -> Job:
     )
 
 
-def _executor_policy(limits: dict[str, dict[str, float]] | None = None) -> EntitlementPolicy:
+def _executor_policy(
+    limits: dict[str, dict[str, float]] | None = None,
+    soft_limits: dict[str, dict[str, float]] | None = None,
+) -> EntitlementPolicy:
     return EntitlementPolicy(
         id="policy_ws_alice",
         workspace_id="ws_alice",
         allowed_operations={"gemini.cleanup_transcript", "voyage.embed_documents", "search_store.index_write"},
         max_units_by_operation=limits or {},
+        soft_units_by_operation=soft_limits or {},
     )
 
 
@@ -315,6 +340,16 @@ def test_real_world_youtube_url_and_handle_parse_without_media_fetch() -> None:
         source_id="src_leo_handle",
         value="leoandlongevity",
     )
+    playlist_source = source_from_public_youtube_input(
+        workspace_id="ws_alice",
+        source_id="src_playlist",
+        value="https://www.youtube.com/playlist?list=PL1234567890",
+    )
+    channel_source = source_from_public_youtube_input(
+        workspace_id="ws_alice",
+        source_id="src_channel",
+        value="https://www.youtube.com/channel/UC1234567890123456789012",
+    )
 
     assert video_source.is_public_source is True
     assert video_source.source_type == "video"
@@ -323,6 +358,10 @@ def test_real_world_youtube_url_and_handle_parse_without_media_fetch() -> None:
     assert handle_source.is_public_source is True
     assert handle_source.source_type == "handle"
     assert handle_source.source_url == "https://www.youtube.com/@leoandlongevity"
+    assert playlist_source.source_type == "playlist"
+    assert playlist_source.canonical_playlist_id == "PL1234567890"
+    assert channel_source.source_type == "channel"
+    assert channel_source.canonical_channel_id == "UC1234567890123456789012"
 
 
 def test_mock_hosted_indexing_plan_is_idempotent_and_operation_scoped() -> None:
@@ -463,6 +502,8 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     assert "INSERT INTO videos" in sql
     assert "INSERT INTO transcript_versions" in sql
     assert "INSERT INTO chunks" in sql
+    assert "bm25_document" in sql
+    assert "tokenize(%(text)s, %(tokenizer)s)::bm25vector" in sql
     assert "INSERT INTO chunk_embeddings" in sql
     assert "UPDATE videos" in sql
     assert "active_transcript_version_id = upserted.id" in sql
@@ -490,11 +531,33 @@ def test_real_hosted_executor_orders_provider_calls_before_transactional_writes(
     statements = [sql for sql, _params in connection.calls]
     first_write_index = next(index for index, statement in enumerate(statements) if statement.startswith("INSERT INTO videos"))
     transaction_sql = statements[first_write_index:]
+    operation_reservation_ids = [
+        params.get("usage_reservation_id")
+        for statement, params in connection.calls
+        if statement.startswith("INSERT INTO job_operations")
+    ]
+    output_reservation_ids = [
+        params.get("usage_reservation_id")
+        for statement, params in connection.calls
+        if statement.startswith("UPDATE job_operations") and "output_json" in statement
+    ]
+    embedding_metadata = [
+        json.loads(params["metadata_json"])
+        for statement, params in connection.calls
+        if statement.startswith("INSERT INTO chunk_embeddings")
+    ]
+    chunk_params = [params for statement, params in connection.calls if statement.startswith("INSERT INTO chunks")]
 
     assert result.status == "succeeded"
     assert result.chunks_written == 1
     assert result.embeddings_written == 1
     assert provider_calls == ["gemini", "voyage"]
+    assert len(operation_reservation_ids) == 3
+    assert operation_reservation_ids[:2] == [None, None]
+    assert operation_reservation_ids[2] and str(operation_reservation_ids[2]).startswith("res_")
+    assert output_reservation_ids == [None, None]
+    assert embedding_metadata[0]["usage_reservation_id"].startswith("res_")
+    assert chunk_params[0]["tokenizer"] == "yutome_llmlingua2"
     assert connection.transaction_events == ["begin", "commit"]
     assert "INSERT INTO videos" in "\n".join(transaction_sql)
     assert "INSERT INTO chunks" in "\n".join(transaction_sql)
@@ -529,6 +592,30 @@ def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() ->
     assert any(params.get("status") == "denied" for _statement, params in connection.calls)
 
 
+def test_real_hosted_executor_uses_entitlement_soft_limits_from_postgres_provider() -> None:
+    provider_calls: list[str] = []
+    policy = _executor_policy(soft_limits={"gemini.cleanup_transcript": {"total_tokens": 1}})
+    connection = HostedExecutorConnection(policy=policy)
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "denied"
+    assert result.denied_operation == "gemini.cleanup_transcript"
+    assert result.error_code == "soft_limit_exceeded"
+    assert provider_calls == []
+    assert connection.transaction_events == []
+
+
 def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
     provider_calls: list[str] = []
     policy = _executor_policy({"search_store.index_write": {"chunks": 0}})
@@ -552,6 +639,176 @@ def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
     assert provider_calls == ["gemini", "voyage"]
     assert connection.transaction_events == []
     assert "INSERT INTO videos" not in sql
+
+
+def test_real_hosted_executor_reuses_persisted_provider_outputs() -> None:
+    provider_calls: list[str] = []
+
+    class CachedOutputConnection(HostedExecutorConnection):
+        def __init__(self) -> None:
+            super().__init__(policy=_executor_policy())
+            self.output_reads = 0
+
+        def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            if "SELECT status, output_json" in statement:
+                self.calls.append((statement, dict(params or {})))
+                self.output_reads += 1
+                if self.output_reads == 1:
+                    return [
+                        {
+                            "status": "succeeded",
+                            "output_json": {
+                                "transcript": {
+                                    "version_id": "cached_tx",
+                                    "video_id": "OEDoJyhQhXs",
+                                    "source": "youtube-transcript-api",
+                                    "language": "en",
+                                    "is_generated": False,
+                                    "text_hash": "cached_hash",
+                                    "segments": [
+                                        {
+                                            "segment_id": "seg_1",
+                                            "sequence": 0,
+                                            "start_ms": 0,
+                                            "end_ms": 5000,
+                                            "text": "Cached cleaned transcript text for hosted indexing.",
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ]
+                return [
+                    {
+                        "status": "succeeded",
+                        "output_json": {"vectors": [[0.25] * DEFAULT_EMBEDDING_DIMENSION]},
+                    }
+                ]
+            return super().execute(statement, params)
+
+    connection = CachedOutputConnection()
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "succeeded"
+    assert provider_calls == []
+    assert connection.output_reads == 2
+    assert result.chunks_written == 1
+
+
+def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
+    class DiscoveryConnection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            params = dict(params or {})
+            self.calls.append((statement, params))
+            if "FROM sources" in statement:
+                return [
+                    {
+                        "id": "src_leo",
+                        "workspace_id": "ws_alice",
+                        "source_type": "handle",
+                        "source_url": "https://www.youtube.com/@leoandlongevity",
+                        "canonical_channel_id": None,
+                        "canonical_playlist_id": None,
+                        "canonical_video_id": None,
+                        "display_name": "@leoandlongevity",
+                        "selected": True,
+                        "auto_index_allowed": True,
+                        "import_source": "cli",
+                        "metadata_json": {},
+                        "status": "active",
+                    }
+                ]
+            if statement.startswith("INSERT INTO jobs"):
+                return [{"id": params["id"]}]
+            return []
+
+    def discoverer(_source: Source, _context: ProviderCallContext | None, limit: int | None) -> list[DiscoveredVideo]:
+        assert limit == 2
+        return [
+            DiscoveredVideo(
+                video_id="OEDoJyhQhXs",
+                title="One",
+                url="https://www.youtube.com/watch?v=OEDoJyhQhXs",
+                channel_id="UC1",
+                channel_title="Leo",
+                channel_handle="@leoandlongevity",
+                duration_seconds=60,
+                playlist_tab="videos",
+                raw={},
+            ),
+            DiscoveredVideo(
+                video_id="abcdefghijk",
+                title="Two",
+                url="https://www.youtube.com/watch?v=abcdefghijk",
+                channel_id="UC1",
+                channel_title="Leo",
+                channel_handle="@leoandlongevity",
+                duration_seconds=90,
+                playlist_tab="streams",
+                raw={},
+            ),
+        ]
+
+    connection = DiscoveryConnection()
+    executor = HostedSourceDiscoveryExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        video_discoverer=discoverer,
+    )
+    job = Job(
+        id="job_discover",
+        workspace_id="ws_alice",
+        source_id="src_leo",
+        job_type="discover_source",
+        status="queued",
+        priority=10,
+        idempotency_key="ws_alice:src_leo:discover_source",
+        lease_owner="worker-1",
+        metadata_jsonb={"source_refresh_policy_id": "srp_1", "max_new_videos_per_run": 2},
+        created_at=NOW,
+    )
+
+    result = executor.execute(job, lease_owner="worker-1", now=NOW)
+    job_inserts = [params for statement, params in connection.calls if statement.startswith("INSERT INTO jobs")]
+
+    assert result.status == "succeeded"
+    assert result.enqueued_jobs == 2
+    assert result.video_ids == ("OEDoJyhQhXs", "abcdefghijk")
+    assert [json.loads(params["metadata_json"])["youtube_video_id"] for params in job_inserts] == [
+        "OEDoJyhQhXs",
+        "abcdefghijk",
+    ]
+
+
+def test_enqueue_index_video_job_sql_keeps_terminal_jobs_terminal() -> None:
+    statement = enqueue_index_video_job_sql(
+        workspace_id="ws_alice",
+        source_id="src_leo",
+        video_id="OEDoJyhQhXs",
+        priority=10,
+        now=NOW,
+        metadata={"seeded_by": "test"},
+    )
+
+    assert "WHEN jobs.status IN ('denied', 'failed', 'succeeded', 'cancelled') THEN jobs.status" in statement.sql
+    assert "updated_at" not in statement.sql
+    assert json.loads(statement.params["metadata_json"])["youtube_video_id"] == "OEDoJyhQhXs"
 
 
 def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
@@ -579,6 +836,46 @@ def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
     assert "ON CONFLICT (workspace_id, youtube_video_id) DO UPDATE" in sql
     assert "ON CONFLICT (workspace_id, transcript_version_id, index_profile_id, chunk_index) DO UPDATE" in sql
     assert "ON CONFLICT (workspace_id, chunk_id, index_profile_id) DO UPDATE" in sql
+
+
+def test_real_hosted_executor_redacts_provider_errors_before_persisting_job_failure() -> None:
+    def failing_cleaner(
+        _transcript: Any,
+        _video: Any,
+        _context: ProviderCallContext,
+    ) -> Any:
+        raise RuntimeError(
+            "Proxy failed for http://webshare_user:SuperSecretPass@proxy.webshare.io:80 "
+            "with api_key=pa-1234567890abcdef"
+        )
+
+    connection = HostedExecutorConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=failing_cleaner,
+        voyage_embedder=_fake_voyage_embedder([]),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+    persisted_messages = [
+        str(params.get("error_message") or "")
+        for statement, params in connection.calls
+        if "UPDATE job" in statement and params.get("error_message")
+    ]
+
+    assert result.status == "failed"
+    assert result.error_message is not None
+    assert "SuperSecretPass" not in result.error_message
+    assert "pa-1234567890abcdef" not in result.error_message
+    assert "http://***:***@proxy.webshare.io:80" in result.error_message
+    assert persisted_messages
+    assert all("SuperSecretPass" not in message for message in persisted_messages)
+    assert all("pa-1234567890abcdef" not in message for message in persisted_messages)
 
 
 def test_hosted_indexing_module_has_no_local_store_backend_references() -> None:

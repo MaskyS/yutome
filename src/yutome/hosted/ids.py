@@ -42,10 +42,14 @@ def idempotency_key(
     subject_id: str | None = None,
     extras: Sequence[str] | None = None,
 ) -> str:
-    parts = [workspace_id]
+    parts = [_idempotency_component(workspace_id)]
     if subject_id:
-        parts.append(subject_id)
-    parts.extend([operation, input_hash_value])
+        parts.append(_idempotency_component(subject_id))
+    parts.extend([_idempotency_component(operation), _idempotency_component(input_hash_value)])
     if extras:
-        parts.extend(str(item) for item in extras if item)
+        parts.extend(_idempotency_component(str(item)) for item in extras if item)
     return ":".join(parts)
+
+
+def _idempotency_component(value: str) -> str:
+    return value.replace("%", "%25").replace(":", "%3A")
