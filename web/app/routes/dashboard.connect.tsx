@@ -2,8 +2,8 @@ import type { Route } from "./+types/dashboard.connect";
 import { getEnv } from "~/lib/env.server";
 import { getAssistants } from "~/lib/hosted-api.server";
 import { isUnauthorized, requireSessionToken, signupRedirect } from "~/lib/session.server";
-import { Badge } from "~/components/ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
+import { Card, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
+import { ConnectGuides } from "~/components/connect-guides";
 import { CopyField } from "~/components/copy-field";
 
 export async function loader({ request, context }: Route.LoaderArgs) {
@@ -27,21 +27,11 @@ export default function DashboardConnect({ loaderData }: Route.ComponentProps) {
       <section className="grid gap-3">
         <h1 className="text-xl font-semibold">Connect an assistant</h1>
         <p className="text-muted-foreground text-sm">
-          Paste this URL as a custom connector in Claude or ChatGPT, then approve access in the browser.
+          Your personal MCP endpoint — paste it into any MCP-capable assistant, then approve access in the
+          browser.
         </p>
         <CopyField value={mcpUrl} />
-        <Card>
-          <CardContent className="text-muted-foreground grid gap-2 pt-6 text-sm">
-            <p>
-              <span className="text-foreground font-medium">Claude:</span> Settings → Connectors → Add custom
-              connector → paste the URL above.
-            </p>
-            <p>
-              <span className="text-foreground font-medium">ChatGPT:</span> Settings → Connectors → add the URL
-              above.
-            </p>
-          </CardContent>
-        </Card>
+        <ConnectGuides mcpUrl={mcpUrl} />
       </section>
 
       <section className="grid gap-3">
