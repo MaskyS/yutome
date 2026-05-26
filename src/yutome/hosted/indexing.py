@@ -1959,7 +1959,7 @@ policy_update AS (
     SET last_succeeded_at = CASE WHEN %(error_code)s::text IS NULL THEN %(now)s ELSE last_succeeded_at END,
         failure_code = %(error_code)s,
         failure_message = %(error_message)s,
-        cursor_jsonb = cursor_jsonb || %(cursor_json)s::jsonb,
+        cursor_json = cursor_json || %(cursor_json)s::jsonb,
         locked_by = CASE WHEN locked_by = %(lease_owner)s THEN NULL ELSE locked_by END,
         locked_until = CASE WHEN locked_by = %(lease_owner)s THEN NULL ELSE locked_until END,
         updated_at = %(now)s

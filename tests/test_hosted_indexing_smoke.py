@@ -20,6 +20,7 @@ from yutome.hosted.indexing import (
     IndexProfileInput,
     TranscriptChunkInput,
     enqueue_index_video_job_sql,
+    finish_source_discovery_sql,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
     plan_real_hosted_public_indexing,
@@ -829,6 +830,9 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
         "OEDoJyhQhXs",
         "abcdefghijk",
     ]
+    finish_sql = "\n".join(statement for statement, _params in connection.calls if "UPDATE source_refresh_policies" in statement)
+    assert "cursor_json = cursor_json ||" in finish_sql
+    assert "cursor_jsonb" not in finish_sql
 
 
 def test_enqueue_index_video_job_sql_keeps_terminal_jobs_terminal() -> None:
