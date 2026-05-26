@@ -21,8 +21,15 @@ from yutome.hosted.jobs import (
     retry_job_sql,
     update_job_operation_status_sql,
 )
+from yutome.hosted.models import UsageDecision, UsageEvent, UsageReservation
 from yutome.hosted.postgres import (
     apply_phase1_schema,
+)
+from yutome.hosted.repositories import (
+    insert_usage_event_sql,
+    update_usage_reservation_status_sql,
+    usage_repository_constraint_statements,
+    upsert_usage_reservation_sql,
 )
 from yutome.hosted.search_store import extension_check_sql
 
@@ -167,6 +174,122 @@ def test_phase1_schema_applies_to_fresh_postgres_schema(live_postgres_dsn: str) 
             assert "credential_mode" in reservation_columns
         finally:
             connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
+
+
+def test_live_postgres_executes_core_built_usage_repository_upserts(live_postgres_dsn: str) -> None:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    with psycopg.connect(live_postgres_dsn, autocommit=False, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE usage_reservations (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    subject text NOT NULL,
+                    operation text NOT NULL,
+                    allocation_id text,
+                    credential_mode text NOT NULL,
+                    estimated_units_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    idempotency_key text NOT NULL,
+                    status text NOT NULL,
+                    decision_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE usage_events (
+                    id text PRIMARY KEY,
+                    reservation_id text,
+                    workspace_id text NOT NULL,
+                    subject text NOT NULL,
+                    operation text NOT NULL,
+                    event_type text NOT NULL,
+                    status text NOT NULL,
+                    actual_units_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    provider_request_id text,
+                    error_code text,
+                    raw_usage_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            for statement in usage_repository_constraint_statements():
+                cursor.execute(statement)
+
+            reservation = UsageReservation(
+                id="res_1",
+                workspace_id="ws_1",
+                subject="voyage",
+                operation="embed_documents",
+                allocation_id="alloc_voyage",
+                credential_mode="hosted",
+                estimated_units={"total_tokens": 2000, "vectors": 2},
+                idempotency_key="idem_res_1",
+                status="reserved",
+                decision=UsageDecision(allowed=True),
+                created_at=now,
+                metadata={"job_id": "job_1"},
+            )
+            reservation_statement = upsert_usage_reservation_sql(reservation)
+            first_reservation = cursor.execute(reservation_statement.sql, reservation_statement.params).fetchone()
+            duplicate_reservation = cursor.execute(
+                reservation_statement.sql,
+                {
+                    **reservation_statement.params,
+                    "id": "res_other",
+                    "estimated_units_json": '{"total_tokens":9999}',
+                },
+            ).fetchone()
+
+            assert first_reservation["id"] == "res_1"
+            assert first_reservation["estimated_units_json"] == {"total_tokens": 2000, "vectors": 2}
+            assert duplicate_reservation["id"] == "res_1"
+            assert duplicate_reservation["estimated_units_json"] == {"total_tokens": 2000, "vectors": 2}
+
+            released_reservation_statement = update_usage_reservation_status_sql(
+                reservation_id="res_1",
+                workspace_id="ws_1",
+                status="released",
+            )
+            released_reservation = cursor.execute(
+                released_reservation_statement.sql,
+                released_reservation_statement.params,
+            ).fetchone()
+            assert released_reservation["status"] == "released"
+
+            event = UsageEvent(
+                id="evt_1",
+                reservation_id="res_1",
+                workspace_id="ws_1",
+                subject="voyage",
+                operation="embed_documents",
+                event_type="provider_attempt_succeeded",
+                status="succeeded",
+                actual_units={"total_tokens": 1900, "vectors": 2},
+                provider_request_id="provider_req_1",
+                raw_usage={"usage": {"total_tokens": 1900}},
+                created_at=now,
+            )
+            event_statement = insert_usage_event_sql(event, idempotency="provider_request")
+            first_event = cursor.execute(event_statement.sql, event_statement.params).fetchone()
+            duplicate_event = cursor.execute(
+                event_statement.sql,
+                {**event_statement.params, "id": "evt_other", "actual_units_json": '{"total_tokens":1}'},
+            ).fetchone()
+
+            assert first_event["id"] == "evt_1"
+            assert first_event["actual_units_json"] == {"total_tokens": 1900, "vectors": 2}
+            assert duplicate_event["id"] == "evt_1"
+            assert duplicate_event["actual_units_json"] == {"total_tokens": 1900, "vectors": 2}
+
+        connection.rollback()
 
 
 def test_live_postgres_executes_hosted_job_sql_with_lease_and_type_guards(live_postgres_dsn: str) -> None:

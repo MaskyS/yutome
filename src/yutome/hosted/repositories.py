@@ -6,7 +6,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sqlalchemy import bindparam, update
+from sqlalchemy.dialects.postgresql import insert
+
 from yutome.hosted.models import ReservationStatus, UsageDecision, UsageEvent, UsageReservation, jsonable_exact
+from yutome.hosted.schema import usage_events, usage_reservations
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 JsonParam = str
@@ -55,42 +60,17 @@ def upsert_usage_reservation_sql(reservation: UsageReservation) -> SqlStatement:
     idempotency key does not overwrite the original decision or estimated units.
     """
 
-    return SqlStatement(
-        sql="""
-INSERT INTO usage_reservations (
-    id,
-    workspace_id,
-    subject,
-    operation,
-    allocation_id,
-    credential_mode,
-    estimated_units_json,
-    idempotency_key,
-    status,
-    decision_json,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(subject)s,
-    %(operation)s,
-    %(allocation_id)s,
-    %(credential_mode)s,
-    %(estimated_units_json)s::jsonb,
-    %(idempotency_key)s,
-    %(status)s,
-    %(decision_json)s::jsonb,
-    %(metadata_json)s::jsonb,
-    %(created_at)s
-)
-ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET idempotency_key = usage_reservations.idempotency_key
-RETURNING *;
-""".strip(),
-        params=usage_reservation_params(reservation),
+    statement = (
+        insert(usage_reservations)
+        .values(**usage_reservation_params(reservation))
+        .on_conflict_do_update(
+            index_elements=[usage_reservations.c.workspace_id, usage_reservations.c.idempotency_key],
+            set_={"idempotency_key": usage_reservations.c.idempotency_key},
+        )
+        .returning(usage_reservations)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def usage_reservation_params(reservation: UsageReservation) -> SqlParams:
@@ -116,20 +96,17 @@ def update_usage_reservation_status_sql(
     workspace_id: str,
     status: ReservationStatus,
 ) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-UPDATE usage_reservations
-SET status = %(status)s
-WHERE id = %(reservation_id)s
-  AND workspace_id = %(workspace_id)s
-RETURNING *;
-""".strip(),
-        params={
-            "reservation_id": reservation_id,
-            "workspace_id": workspace_id,
-            "status": status,
-        },
+    statement = (
+        update(usage_reservations)
+        .where(
+            usage_reservations.c.id == bindparam("reservation_id", value=reservation_id),
+            usage_reservations.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+        )
+        .values(status=bindparam("status", value=status))
+        .returning(usage_reservations)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def insert_usage_event_sql(
@@ -137,55 +114,26 @@ def insert_usage_event_sql(
     *,
     idempotency: UsageEventIdempotency = "event_id",
 ) -> SqlStatement:
+    statement = insert(usage_events).values(**usage_event_params(event))
     if idempotency == "event_id":
-        conflict_sql = """
-ON CONFLICT (id) DO UPDATE
-SET id = usage_events.id
-""".strip()
+        statement = statement.on_conflict_do_update(
+            index_elements=[usage_events.c.id],
+            set_={"id": usage_events.c.id},
+        )
     else:
-        conflict_sql = """
-ON CONFLICT (workspace_id, subject, operation, event_type, provider_request_id)
-WHERE provider_request_id IS NOT NULL
-DO UPDATE SET provider_request_id = usage_events.provider_request_id
-""".strip()
-
-    return SqlStatement(
-        sql=f"""
-INSERT INTO usage_events (
-    id,
-    reservation_id,
-    workspace_id,
-    subject,
-    operation,
-    event_type,
-    status,
-    actual_units_json,
-    provider_request_id,
-    error_code,
-    raw_usage_json,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(reservation_id)s,
-    %(workspace_id)s,
-    %(subject)s,
-    %(operation)s,
-    %(event_type)s,
-    %(status)s,
-    %(actual_units_json)s::jsonb,
-    %(provider_request_id)s,
-    %(error_code)s,
-    %(raw_usage_json)s::jsonb,
-    %(metadata_json)s::jsonb,
-    %(created_at)s
-)
-{conflict_sql}
-RETURNING *;
-""".strip(),
-        params=usage_event_params(event),
-    )
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                usage_events.c.workspace_id,
+                usage_events.c.subject,
+                usage_events.c.operation,
+                usage_events.c.event_type,
+                usage_events.c.provider_request_id,
+            ],
+            index_where=usage_events.c.provider_request_id.is_not(None),
+            set_={"provider_request_id": usage_events.c.provider_request_id},
+        )
+    sql, params = compile_postgres_statement(statement.returning(usage_events))
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def usage_event_params(event: UsageEvent) -> SqlParams:

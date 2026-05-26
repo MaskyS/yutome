@@ -13,6 +13,14 @@ from yutome.hosted.repositories import (
     usage_repository_constraint_statements,
     usage_reservation_from_row,
 )
+from yutome.hosted.schema import hosted_metadata, usage_events, usage_reservations
+
+
+def test_usage_repository_tables_are_in_hosted_metadata() -> None:
+    assert usage_reservations.metadata is hosted_metadata
+    assert usage_events.metadata is hosted_metadata
+    assert usage_reservations.c.credential_mode.type.python_type is str
+    assert usage_events.c.actual_units_json.type.python_type is dict
 
 
 def test_usage_reservation_upsert_preserves_idempotency_boundary() -> None:
@@ -85,7 +93,7 @@ def test_usage_reservation_status_update_is_workspace_scoped() -> None:
     )
 
     assert "UPDATE usage_reservations" in statement.sql
-    assert "workspace_id = %(workspace_id)s" in statement.sql
+    assert "usage_reservations.workspace_id" in statement.sql
     assert statement.params == {"reservation_id": "res_1", "workspace_id": "ws_alice", "status": "released"}
 
 
