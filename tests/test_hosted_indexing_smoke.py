@@ -22,6 +22,7 @@ from yutome.hosted.indexing import (
     enqueue_index_video_job_sql,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
+    plan_real_hosted_public_indexing,
     source_from_public_youtube_input,
 )
 from yutome.youtube import DiscoveredVideo, TranscriptFetchResult
@@ -410,9 +411,43 @@ def test_mock_hosted_indexing_defaults_to_fixed_hosted_vector_dimension() -> Non
     assert plan.index_profile.embedding_dimension == 1024
     assert plan.search_operations[0].statement.params["embedding_dimension"] == 1024
     assert plan.search_operations[0].usage.units["query_vector_dimensions"] == 1024
-    assert embedding_statement.params["index_profile_id"] == "sip_voyage4lite_bm25_default"
+    assert embedding_statement.params["index_profile_id"].startswith("sip_")
+    assert embedding_statement.params["index_profile_id"] != "sip_voyage4lite_bm25_default"
     assert len(embedding_vector) == 1024
     assert [call["estimated_units"].get("query_vector_dimensions") for call in gate.calls] == [None, None, 1024.0]
+
+
+def test_default_index_profile_ids_are_workspace_scoped_for_search_joins() -> None:
+    source = _source()
+    other_source = _source().model_copy(update={"workspace_id": "ws_bob", "id": "src_bob"})
+
+    first = plan_real_hosted_public_indexing(
+        source=source,
+        job=_job(source),
+        video=_video(),
+        chunks=_chunks(),
+        embedding_vectors=[mock_embedding_vector(chunk.text) for chunk in _chunks()],
+        transcript_source="youtube_transcript",
+        language_code="en",
+    )
+    second = plan_real_hosted_public_indexing(
+        source=other_source,
+        job=_job(other_source),
+        video=_video(),
+        chunks=_chunks(),
+        embedding_vectors=[mock_embedding_vector(chunk.text) for chunk in _chunks()],
+        transcript_source="youtube_transcript",
+        language_code="en",
+    )
+    first_profile_upsert = next(operation.statement for operation in first.sql_operations if operation.name == "search_index_profiles.upsert")
+    first_chunk_upsert = next(operation.statement for operation in first.sql_operations if operation.name == "chunks.upsert")
+
+    assert first.index_profile.id != second.index_profile.id
+    assert first.index_profile.id.startswith("sip_")
+    assert first.index_profile.id != "sip_voyage4lite_bm25_default"
+    assert first_profile_upsert.params["workspace_id"] == source.workspace_id
+    assert first_profile_upsert.params["id"] == first.index_profile.id
+    assert first_chunk_upsert.params["index_profile_id"] == first.index_profile.id
 
 
 def test_mock_hosted_indexing_rejects_unsupported_embedding_profile_before_reservations() -> None:

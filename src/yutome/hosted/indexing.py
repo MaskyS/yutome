@@ -5,7 +5,7 @@ import re
 from datetime import timedelta
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
@@ -291,7 +291,7 @@ def plan_mock_hosted_public_indexing(
     """Build the first hosted public indexing smoke plan as pure data and SQL."""
 
     _validate_public_indexing_inputs(source=source, job=job, video=video, chunks=chunks)
-    profile = index_profile or IndexProfileInput()
+    profile = index_profile or _default_mock_index_profile(source.workspace_id)
     validate_supported_embedding_profile(
         backend=profile.backend,
         embedding_model=profile.embedding_model,
@@ -516,7 +516,7 @@ def plan_real_hosted_public_indexing(
     """Build replay-safe hosted write operations for a real transcript and embeddings."""
 
     _validate_public_indexing_inputs(source=source, job=job, video=video, chunks=chunks)
-    profile = index_profile or _default_real_index_profile()
+    profile = index_profile or _default_real_index_profile(source.workspace_id)
     validate_supported_embedding_profile(
         backend=profile.backend,
         embedding_model=profile.embedding_model,
@@ -1088,7 +1088,7 @@ class HostedIndexingExecutor:
             operation=f"{subject}.{operation}",
             input_hash_value=operation_input_hash,
             video_id=subject_id,
-            extras=_real_index_profile_extras(),
+            extras=_real_index_profile_extras(workspace_id),
         )
         return ProviderCallContext(
             gate=self.gate,
@@ -1166,7 +1166,7 @@ class HostedIndexingExecutor:
             operation="search_store.index_write",
             input_hash_value=operation_input_hash,
             video_id=video.youtube_video_id,
-            extras=_real_index_profile_extras(),
+            extras=_real_index_profile_extras(job.workspace_id),
         )
         usage_context = self._usage_context(
             workspace_id=job.workspace_id,
@@ -1191,7 +1191,7 @@ class HostedIndexingExecutor:
                 "metadata": {
                     **reservation.metadata,
                     "input_hash": operation_input_hash,
-                    "idempotency_extras": list(_real_index_profile_extras()),
+                    "idempotency_extras": list(_real_index_profile_extras(job.workspace_id)),
                 },
             }
         )
@@ -1213,7 +1213,7 @@ class HostedIndexingExecutor:
             video_id=video_id,
             operation=operation_name,
             input_payload={"idempotency_key": context.idempotency_key, "input_hash": context.metadata.get("input_hash")},
-            idempotency_extras=_real_index_profile_extras(),
+            idempotency_extras=_real_index_profile_extras(job.workspace_id),
             usage_reservation_id="",
             created_at=job.created_at,
         )
@@ -1237,7 +1237,7 @@ class HostedIndexingExecutor:
             video_id=video_id,
             operation=operation_name,
             input_payload=input_payload,
-            idempotency_extras=_real_index_profile_extras(),
+            idempotency_extras=_real_index_profile_extras(job.workspace_id),
             usage_reservation_id=usage_reservation_id,
             created_at=job.created_at,
         )
@@ -1883,7 +1883,7 @@ def enqueue_index_video_job_sql(
         "source_id": source_id,
         "video_id": video_id,
         "job_type": "index_video",
-        "profile": _real_index_profile_extras(),
+        "profile": _real_index_profile_extras(workspace_id),
     }
     job_hash = input_hash(idempotency_payload, prefix="").lstrip("_")[:24]
     idempotency = job_operation_idempotency_key(
@@ -1892,7 +1892,7 @@ def enqueue_index_video_job_sql(
         input_hash_value=input_hash(idempotency_payload),
         source_id=source_id,
         video_id=video_id,
-        extras=_real_index_profile_extras(),
+        extras=_real_index_profile_extras(workspace_id),
     )
     return SqlStatement(
         sql="""
@@ -2190,13 +2190,31 @@ def _index_profile_fingerprint(profile: IndexProfileInput) -> str:
     return input_hash(_index_profile_identity(profile), prefix="sip")
 
 
-def _default_real_index_profile() -> IndexProfileInput:
-    return IndexProfileInput(chunking_version=REAL_HOSTED_CHUNKING_VERSION)
+def _default_mock_index_profile(workspace_id: str) -> IndexProfileInput:
+    profile = IndexProfileInput()
+    return replace(profile, id=_workspace_index_profile_id(workspace_id, profile))
 
 
-def _real_index_profile_extras() -> tuple[str, str]:
-    profile = _default_real_index_profile()
+def _default_real_index_profile(workspace_id: str) -> IndexProfileInput:
+    profile = IndexProfileInput(chunking_version=REAL_HOSTED_CHUNKING_VERSION)
+    return replace(profile, id=_workspace_index_profile_id(workspace_id, profile))
+
+
+def _real_index_profile_extras(workspace_id: str) -> tuple[str, str]:
+    profile = _default_real_index_profile(workspace_id)
     return (profile.id, _index_profile_fingerprint(profile))
+
+
+def _workspace_index_profile_id(workspace_id: str, profile: IndexProfileInput) -> str:
+    return _stable_id(
+        "sip",
+        workspace_id,
+        profile.backend,
+        profile.embedding_model,
+        str(profile.embedding_dimension),
+        profile.chunking_version,
+        profile.tokenizer,
+    )
 
 
 def _token_estimate(text: str) -> int:
