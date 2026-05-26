@@ -458,6 +458,33 @@ def test_postgres_usage_ledger_persists_overage_as_negative_balance() -> None:
     assert connection.balance["reserved_units_jsonb"] == {}
 
 
+def test_postgres_usage_gate_allows_new_reservations_with_existing_negative_balance_units() -> None:
+    connection = AtomicReservationConnection()
+    connection.balance["remaining_units_jsonb"] = {"total_tokens": 500, "request_duration": -1.2}
+    gate = PostgresUsageGate(connection)
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+
+    reservation = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100},
+        allocation=allocation,
+        policy=EntitlementPolicy(id="policy", workspace_id="ws_alice", allowed_operations={"voyage.embed_documents"}),
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 500, "request_duration": -1.2}),
+        idempotency_key="idem_after_overage",
+    )
+
+    assert reservation.status == "reserved"
+    assert connection.balance["remaining_units_jsonb"] == {"request_duration": "-1.2", "total_tokens": 400}
+    assert connection.balance["reserved_units_jsonb"] == {"total_tokens": 100}
+
+
 def test_gemini_usage_normalizer_preserves_raw_usage_and_core_units() -> None:
     normalized = normalize_gemini_generate_content(
         {

@@ -344,7 +344,7 @@ def _balance_after_reservation(row: Mapping[str, Any], reservation: UsageReserva
     chargeable_estimate = {
         unit: quantity for unit, quantity in normalize_unit_map(reservation.estimated_units).items() if unit not in unlimited_units
     }
-    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")))
+    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")), allow_negative=True)
     reserved = normalize_unit_map(_json_mapping(row.get("reserved_units_jsonb")))
     return subtract_unit_maps(remaining, chargeable_estimate), add_unit_maps(reserved, chargeable_estimate)
 
@@ -363,7 +363,7 @@ def _balance_after_usage_event(
         actual = {unit: quantity for unit, quantity in actual.items() if unit not in unlimited_units}
     else:
         actual = {}
-    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")))
+    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")), allow_negative=True)
     reserved = normalize_unit_map(_json_mapping(row.get("reserved_units_jsonb")))
     remaining_delta = subtract_unit_maps(estimated, actual)
     return add_unit_maps(remaining, remaining_delta), _clamp_non_negative(subtract_unit_maps(reserved, estimated))
