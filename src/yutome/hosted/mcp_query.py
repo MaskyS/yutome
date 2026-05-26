@@ -5,7 +5,7 @@ import math
 import re
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -16,7 +16,7 @@ from yutome.hosted.allocation_policy import (
     estimate_search_store_query,
     estimate_voyage_embeddings,
 )
-from yutome.hosted.errors import classify_provider_http_error
+from yutome.hosted.errors import ProviderFailure, classify_provider_http_error
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.ids import idempotency_key, input_hash
@@ -201,7 +201,13 @@ class HostedMcpQueryAdapter:
             return self._find_lexical(auth=auth, request=request)
         return self._find_vector(auth=auth, request=request)
 
-    def _find_lexical(self, *, auth: HostedMcpAuthContext, request: HostedFindRequest) -> QueryResult:
+    def _find_lexical(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        request: HostedFindRequest,
+        fallback_metadata: Mapping[str, Any] | None = None,
+    ) -> QueryResult:
         estimate = estimate_search_store_query(
             operation="lexical_query",
             candidate_limit=request.limit,
@@ -212,7 +218,13 @@ class HostedMcpQueryAdapter:
             query=request.text,
             limit=request.limit,
         )
-        self._record_search_store_success(auth=auth, reservation=reservation, rows=rows, usage=usage)
+        self._record_search_store_success(
+            auth=auth,
+            reservation=reservation,
+            rows=rows,
+            usage=usage,
+            metadata=fallback_metadata,
+        )
         return QueryResult(
             rows=[_contract_find_row(row, project=request.project) for row in rows],
             notes=request.notes,
@@ -231,6 +243,16 @@ class HostedMcpQueryAdapter:
         try:
             query_vector = self.query_embedder(request.text, vector_context)
         except UsageReservationDenied as exc:
+            self._record_search_store_release(
+                auth=auth,
+                reservation=search_reservation,
+                metadata={
+                    "release_reason": "provider_usage_denied",
+                    "provider": "voyage",
+                    "provider_operation": "voyage.embed_query",
+                    "provider_reservation_id": exc.reservation.id,
+                },
+            )
             raise HostedMcpError(
                 code="usage_denied",
                 message=exc.reservation.decision.message or exc.reservation.decision.reason,
@@ -243,6 +265,31 @@ class HostedMcpQueryAdapter:
             ) from exc
         except Exception as exc:
             failure = classify_provider_http_error(provider="voyage", status_code=_status_code_from_exception(exc), message=str(exc))
+            if _provider_failure_allows_lexical_fallback(failure=failure, exc=exc):
+                fallback_metadata = _provider_fallback_metadata(
+                    request=request,
+                    failure=failure,
+                    operation="voyage.embed_query",
+                )
+                self._record_search_store_release(
+                    auth=auth,
+                    reservation=search_reservation,
+                    metadata=fallback_metadata,
+                )
+                return self._find_lexical_fallback(
+                    auth=auth,
+                    request=request,
+                    fallback_metadata=fallback_metadata,
+                )
+            self._record_search_store_release(
+                auth=auth,
+                reservation=search_reservation,
+                metadata=_provider_failure_metadata(
+                    failure=failure,
+                    operation="voyage.embed_query",
+                    exc=exc,
+                ),
+            )
             raise HostedMcpError(
                 code="provider_call_failed",
                 message="Hosted MCP semantic query embedding failed.",
@@ -256,24 +303,75 @@ class HostedMcpQueryAdapter:
                 },
             ) from exc
 
-        if request.mode == "semantic":
-            rows, usage = self.search_store.semantic_search(
-                workspace_id=auth.workspace_id,
-                query_vector=query_vector,
-                limit=request.limit,
+        try:
+            if request.mode == "semantic":
+                rows, usage = self.search_store.semantic_search(
+                    workspace_id=auth.workspace_id,
+                    query_vector=query_vector,
+                    limit=request.limit,
+                )
+            else:
+                rows, usage = self.search_store.hybrid_search(
+                    workspace_id=auth.workspace_id,
+                    query=request.text,
+                    query_vector=query_vector,
+                    limit=request.limit,
+                )
+        except Exception as exc:
+            if _search_store_exception_allows_lexical_fallback(exc):
+                fallback_metadata = _search_store_fallback_metadata(
+                    request=request,
+                    exc=exc,
+                    operation=f"search_store.{search_operation}",
+                )
+                self._record_search_store_failure(
+                    auth=auth,
+                    reservation=search_reservation,
+                    metadata=fallback_metadata,
+                    exc=exc,
+                )
+                return self._find_lexical_fallback(
+                    auth=auth,
+                    request=request,
+                    fallback_metadata=fallback_metadata,
+                )
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=search_reservation,
+                metadata=_search_store_failure_metadata(
+                    exc=exc,
+                    operation=f"search_store.{search_operation}",
+                ),
+                exc=exc,
             )
-        else:
-            rows, usage = self.search_store.hybrid_search(
-                workspace_id=auth.workspace_id,
-                query=request.text,
-                query_vector=query_vector,
-                limit=request.limit,
-            )
+            raise
         self._record_search_store_success(auth=auth, reservation=search_reservation, rows=rows, usage=usage)
         return QueryResult(
             rows=[_contract_find_row(row, project=request.project) for row in rows],
             notes=request.notes,
             total=None,
+        )
+
+    def _find_lexical_fallback(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        request: HostedFindRequest,
+        fallback_metadata: Mapping[str, Any],
+    ) -> QueryResult:
+        fallback_request = replace(
+            request,
+            mode="lexical",
+            notes=[
+                *request.notes,
+                "hosted_find_fallback_to_lexical",
+                _fallback_metadata_note(fallback_metadata),
+            ],
+        )
+        return self._find_lexical(
+            auth=auth,
+            request=fallback_request,
+            fallback_metadata=fallback_metadata,
         )
 
     def _reserve_search_store(
@@ -320,6 +418,7 @@ class HostedMcpQueryAdapter:
         reservation: UsageReservation,
         rows: list[dict[str, Any]],
         usage: Any,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         actual_units = {
             **usage.units,
@@ -330,12 +429,58 @@ class HostedMcpQueryAdapter:
             backend=usage.backend,
             index_profile_ref=usage.index_profile_ref,
             units=actual_units,
-            metadata=usage.metadata,
+            metadata={**usage.metadata, **dict(metadata or {})},
         )
         event = usage_event_from_normalization(
             normalization,
             reservation=reservation,
             event_type="service_operation_succeeded",
+        )
+        self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
+
+    def _record_search_store_release(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        reservation: UsageReservation,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        event = UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id=reservation.workspace_id,
+            subject=reservation.subject,
+            operation=reservation.operation,
+            event_type="usage_reservation_released",
+            status="released",
+            metadata={
+                "estimated_units": dict(reservation.estimated_units),
+                **dict(metadata),
+            },
+        )
+        self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
+
+    def _record_search_store_failure(
+        self,
+        *,
+        auth: HostedMcpAuthContext,
+        reservation: UsageReservation,
+        metadata: Mapping[str, Any],
+        exc: BaseException,
+    ) -> None:
+        event = UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id=reservation.workspace_id,
+            subject=reservation.subject,
+            operation=reservation.operation,
+            event_type="service_operation_failed",
+            status="failed",
+            error_code=str(metadata.get("fallback_error_code") or metadata.get("error_code") or type(exc).__name__),
+            metadata={
+                "estimated_units": dict(reservation.estimated_units),
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                **dict(metadata),
+            },
         )
         self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
 
@@ -1133,6 +1278,201 @@ def _status_code_from_exception(exc: BaseException) -> int | None:
             if isinstance(value, int):
                 return value
     return None
+
+
+def _provider_failure_allows_lexical_fallback(*, failure: ProviderFailure, exc: BaseException) -> bool:
+    if _looks_like_auth_or_tenant_error(exc):
+        return False
+    if failure.kind in {"rate_limit", "transient"}:
+        return True
+    return failure.kind == "unknown" and _looks_like_availability_error(exc)
+
+
+def _search_store_exception_allows_lexical_fallback(exc: BaseException) -> bool:
+    if _looks_like_auth_or_tenant_error(exc):
+        return False
+    status_code = _status_code_from_exception(exc)
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    return _looks_like_vector_availability_error(exc) or _looks_like_availability_error(exc)
+
+
+def _provider_fallback_metadata(
+    *,
+    request: HostedFindRequest,
+    failure: ProviderFailure,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "fallback": True,
+        "fallback_from": request.mode,
+        "fallback_to": "lexical",
+        "fallback_reason": "provider_availability",
+        "fallback_subject": failure.provider,
+        "fallback_operation": operation,
+        "fallback_failure_kind": failure.kind,
+        "fallback_error_code": failure.code,
+        "fallback_retryable": failure.retryable,
+    }
+
+
+def _provider_failure_metadata(
+    *,
+    failure: ProviderFailure,
+    operation: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    return {
+        "release_reason": "provider_failure",
+        "provider": failure.provider,
+        "provider_operation": operation,
+        "failure_kind": failure.kind,
+        "error_code": failure.code,
+        "retryable": failure.retryable,
+        "exception_type": type(exc).__name__,
+    }
+
+
+def _search_store_fallback_metadata(
+    *,
+    request: HostedFindRequest,
+    exc: BaseException,
+    operation: str,
+) -> dict[str, Any]:
+    failure = classify_provider_http_error(
+        provider="search_store",
+        status_code=_status_code_from_exception(exc),
+        message=str(exc),
+    )
+    return {
+        "fallback": True,
+        "fallback_from": request.mode,
+        "fallback_to": "lexical",
+        "fallback_reason": "vector_store_availability",
+        "fallback_subject": "search_store",
+        "fallback_operation": operation,
+        "fallback_failure_kind": failure.kind,
+        "fallback_error_code": failure.code,
+        "fallback_retryable": failure.retryable,
+        "fallback_exception_type": type(exc).__name__,
+    }
+
+
+def _search_store_failure_metadata(
+    *,
+    exc: BaseException,
+    operation: str,
+) -> dict[str, Any]:
+    failure = classify_provider_http_error(
+        provider="search_store",
+        status_code=_status_code_from_exception(exc),
+        message=str(exc),
+    )
+    return {
+        "failure_subject": "search_store",
+        "failure_operation": operation,
+        "failure_kind": failure.kind,
+        "error_code": failure.code,
+        "retryable": failure.retryable,
+        "exception_type": type(exc).__name__,
+    }
+
+
+def _fallback_metadata_note(metadata: Mapping[str, Any]) -> str:
+    public_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key == "fallback" or key.startswith("fallback_")
+    }
+    return "hosted_find_fallback_metadata:" + json.dumps(
+        public_metadata,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _looks_like_auth_or_tenant_error(exc: BaseException) -> bool:
+    if _status_code_from_exception(exc) in {401, 403}:
+        return True
+    text = _exception_text(exc)
+    return any(
+        marker in text
+        for marker in (
+            "api key",
+            "apikey",
+            "auth",
+            "credential",
+            "forbidden",
+            "invalid key",
+            "permission denied",
+            "policy",
+            "row-level security",
+            "rls",
+            "tenant",
+            "unauthorized",
+            "workspace mismatch",
+            "workspace_mismatch",
+        )
+    )
+
+
+def _looks_like_vector_availability_error(exc: BaseException) -> bool:
+    text = _exception_text(exc)
+    has_vector_marker = any(
+        marker in text
+        for marker in (
+            "chunk_embeddings",
+            "embedding",
+            "extension",
+            "pgvector",
+            "vchord",
+            "vector",
+        )
+    )
+    has_availability_marker = any(
+        marker in text
+        for marker in (
+            "does not exist",
+            "missing",
+            "not available",
+            "not installed",
+            "undefined",
+            "unavailable",
+        )
+    )
+    return has_vector_marker and has_availability_marker
+
+
+def _looks_like_availability_error(exc: BaseException) -> bool:
+    text = _exception_text(exc)
+    return any(
+        marker in text
+        for marker in (
+            "408",
+            "429",
+            "502",
+            "503",
+            "504",
+            "connection",
+            "dns",
+            "network",
+            "rate limit",
+            "service unavailable",
+            "temporarily",
+            "timed out",
+            "timeout",
+            "too many requests",
+            "unavailable",
+        )
+    )
+
+
+def _exception_text(exc: BaseException) -> str:
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        parts.append(str(response))
+    return " ".join(part for part in parts if part).lower()
 
 
 def _snippet(text: str, *, max_chars: int = 240) -> str:

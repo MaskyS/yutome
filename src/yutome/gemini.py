@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from dataclasses import replace
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
 from yutome.config import GeminiConfig
+from yutome.hosted.normalizers import normalize_gemini_generate_content
+from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
 from yutome.youtube import TranscriptFetchResult
 
 
@@ -130,6 +133,54 @@ def _normalize_window_segments(
     return normalized
 
 
+def _hosted_context_for_window(
+    hosted_context: ProviderCallContext | None,
+    *,
+    window_start: int,
+    window_end: int | None,
+    window_index: int | None = None,
+    window_count: int | None = None,
+) -> ProviderCallContext | None:
+    if hosted_context is None:
+        return None
+    window_end_label = str(window_end) if window_end is not None else "end"
+    window_label = str(window_index) if window_index is not None else f"{window_start}-{window_end_label}"
+    metadata = {
+        **dict(hosted_context.metadata),
+        "parent_idempotency_key": hosted_context.idempotency_key,
+        "gemini_call_kind": "transcribe_window",
+        "window_start_seconds": window_start,
+        "window_end_seconds": window_end,
+    }
+    if window_index is not None:
+        metadata["window_index"] = window_index
+    if window_count is not None:
+        metadata["window_count"] = window_count
+    return replace(
+        hosted_context,
+        idempotency_key=f"{hosted_context.idempotency_key}:window:{window_label}:{window_start}:{window_end_label}",
+        estimated_units=_window_estimated_units(
+            hosted_context,
+            window_start=window_start,
+            window_end=window_end,
+        ),
+        metadata=metadata,
+    )
+
+
+def _window_estimated_units(
+    hosted_context: ProviderCallContext,
+    *,
+    window_start: int,
+    window_end: int | None,
+) -> dict[str, float]:
+    estimated_units = dict(hosted_context.estimated_units)
+    if window_end is None or "media_seconds" not in estimated_units:
+        return estimated_units
+    estimated_units["media_seconds"] = max(0.0, float(window_end - window_start))
+    return estimated_units
+
+
 def _transcribe_gemini_window(
     *,
     client,
@@ -138,6 +189,9 @@ def _transcribe_gemini_window(
     config: GeminiConfig,
     window_start: int,
     window_end: int | None,
+    hosted_context: ProviderCallContext | None = None,
+    window_index: int | None = None,
+    window_count: int | None = None,
 ) -> list[dict[str, float | str]]:
     window_label = (
         "the whole video"
@@ -159,22 +213,32 @@ def _transcribe_gemini_window(
             startOffset=_offset(window_start),
             endOffset=_offset(window_end) if window_end is not None else None,
         )
-    response = client.models.generate_content(
-        model=config.model,
-        contents=types.Content(
-            parts=[
-                types.Part(
-                    fileData=types.FileData(fileUri=video_url),
-                    videoMetadata=video_metadata,
-                ),
-                types.Part(text=prompt),
-            ]
-        ),
-        config=types.GenerateContentConfig(
-            maxOutputTokens=config.max_output_tokens,
-            responseMimeType="application/json",
-            responseJsonSchema=GEMINI_TRANSCRIPT_SCHEMA,
-            mediaResolution=_media_resolution(types, config.media_resolution),
+    call_context = _hosted_context_for_window(
+        hosted_context,
+        window_start=window_start,
+        window_end=window_end,
+        window_index=window_index,
+        window_count=window_count,
+    )
+    response = _generate_content_with_hosted_usage(
+        call_context,
+        lambda: client.models.generate_content(
+            model=config.model,
+            contents=types.Content(
+                parts=[
+                    types.Part(
+                        fileData=types.FileData(fileUri=video_url),
+                        videoMetadata=video_metadata,
+                    ),
+                    types.Part(text=prompt),
+                ]
+            ),
+            config=types.GenerateContentConfig(
+                maxOutputTokens=config.max_output_tokens,
+                responseMimeType="application/json",
+                responseJsonSchema=GEMINI_TRANSCRIPT_SCHEMA,
+                mediaResolution=_media_resolution(types, config.media_resolution),
+            ),
         ),
     )
     payload = _drop_blank_segment_text(json.loads(_strip_json_fence(_response_text(response))))
@@ -191,6 +255,7 @@ def transcribe_youtube_url_with_gemini(
     video_id: str,
     config: GeminiConfig,
     duration_seconds: int | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> TranscriptFetchResult:
     try:
         from google import genai
@@ -201,7 +266,8 @@ def transcribe_youtube_url_with_gemini(
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     client = genai.Client()
     snippets = []
-    for window_start, window_end in _window_bounds(duration_seconds, config.window_seconds):
+    windows = _window_bounds(duration_seconds, config.window_seconds)
+    for window_index, (window_start, window_end) in enumerate(windows):
         snippets.extend(
             _transcribe_gemini_window(
                 client=client,
@@ -210,6 +276,9 @@ def transcribe_youtube_url_with_gemini(
                 config=config,
                 window_start=window_start,
                 window_end=window_end,
+                hosted_context=hosted_context,
+                window_index=window_index,
+                window_count=len(windows),
             )
         )
     if not snippets:
@@ -219,4 +288,20 @@ def transcribe_youtube_url_with_gemini(
         source=f"gemini:{config.model}",
         language=None,
         is_generated=True,
+    )
+
+
+def _generate_content_with_hosted_usage(
+    hosted_context: ProviderCallContext | None,
+    call: Callable[[], Any],
+) -> Any:
+    if hosted_context is None:
+        return call()
+    return execute_provider_call(
+        hosted_context,
+        call,
+        normalize_usage=lambda response: normalize_gemini_generate_content(
+            response,
+            operation=hosted_context.operation,
+        ),
     )

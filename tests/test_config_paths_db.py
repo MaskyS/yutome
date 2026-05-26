@@ -124,6 +124,10 @@ def test_default_config_round_trip(tmp_path: Path) -> None:
     assert config.gemini.cleanup_thinking_level == "low"
     assert config.gemini.media_resolution == "low"
     assert config.gemini.window_seconds == 900
+    assert config.hosted.enabled is False
+    assert config.hosted.workspace_id == ""
+    assert str(config.hosted.usage_ledger_path) == "data/hosted/usage_events.jsonl"
+    assert config.hosted.postgres_url_env == "YUTOME_POSTGRES_URL"
 
 
 def test_project_paths_include_timestamped_and_plain_transcript_artifacts(tmp_path: Path) -> None:

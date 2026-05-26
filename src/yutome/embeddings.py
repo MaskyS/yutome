@@ -6,9 +6,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeAlias
 
 from yutome.config import AppConfig
+
+if TYPE_CHECKING:
+    from yutome.hosted.provider_wrappers import ProviderCallContext
 
 LANCEDB_CHUNKS_TABLE = "chunks"
 LANCEDB_REQUIRED_COLUMNS = {
@@ -31,6 +34,11 @@ LANCEDB_REQUIRED_COLUMNS = {
     "embedding_dim",
     "vector",
 }
+
+VoyageHostedContextFactory: TypeAlias = Callable[
+    [list[dict[str, Any]]],
+    "ProviderCallContext | None",
+]
 
 
 @dataclass(frozen=True)
@@ -77,42 +85,124 @@ def _embed_voyage_batch(
     dimension: int,
     max_retries: int,
     retry_base_seconds: float,
+    hosted_context: ProviderCallContext | None = None,
 ) -> list[dict[str, Any]]:
     import voyageai
 
-    client = voyageai.Client()
+    client: Any | None = None
     texts = [row["text"] for row in batch]
+
+    def call() -> Any:
+        nonlocal client
+        if client is None:
+            client = voyageai.Client()
+        return client.embed(
+            texts,
+            model=model,
+            input_type="document",
+            output_dimension=dimension,
+        )
+
+    response = _execute_hosted_voyage_call(
+        lambda: _call_with_retries(
+            call,
+            max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
+        ),
+        hosted_context=hosted_context,
+        input_type="document",
+        output_dimension=dimension,
+    )
+    return [
+        {
+            "chunk_id": row["chunk_id"],
+            "channel_id": row["channel_id"] or "",
+            "video_id": row["video_id"],
+            "transcript_version_id": row["transcript_version_id"],
+            "source": row["source"],
+            "language": row["language"] or "",
+            "is_generated": bool(row["is_generated"]),
+            "sequence": row["sequence"],
+            "start_ms": row["start_ms"],
+            "end_ms": row["end_ms"],
+            "text": row["text"],
+            "token_count": row["token_count"] or 0,
+            "text_hash": row["text_hash"],
+            "chunker_version": row["chunker_version"],
+            "active": True,
+            "embedding_model": model,
+            "embedding_dim": dimension,
+            "vector": vector,
+        }
+        for row, vector in zip(batch, response.embeddings, strict=True)
+    ]
+
+
+def _embed_voyage_query(
+    *,
+    query: str,
+    model: str,
+    dimension: int,
+    hosted_context: ProviderCallContext | None = None,
+) -> list[float]:
+    import voyageai
+
+    client: Any | None = None
+
+    def call() -> Any:
+        nonlocal client
+        if client is None:
+            client = voyageai.Client()
+        return client.embed(
+            [query],
+            model=model,
+            input_type="query",
+            output_dimension=dimension,
+        )
+
+    response = _execute_hosted_voyage_call(
+        call,
+        hosted_context=hosted_context,
+        input_type="query",
+        output_dimension=dimension,
+    )
+    return response.embeddings[0]
+
+
+def _execute_hosted_voyage_call(
+    call: Callable[[], Any],
+    *,
+    hosted_context: ProviderCallContext | None,
+    input_type: str,
+    output_dimension: int,
+) -> Any:
+    if hosted_context is None:
+        return call()
+
+    from yutome.hosted.normalizers import normalize_voyage_embeddings_response
+    from yutome.hosted.provider_wrappers import execute_provider_call
+
+    return execute_provider_call(
+        hosted_context,
+        call,
+        normalize_usage=lambda response: normalize_voyage_embeddings_response(
+            response,
+            operation=hosted_context.operation,
+            input_type=input_type,
+            output_dimension=output_dimension,
+        ),
+    )
+
+
+def _call_with_retries(
+    call: Callable[[], Any],
+    *,
+    max_retries: int,
+    retry_base_seconds: float,
+) -> Any:
     for attempt in range(max_retries + 1):
         try:
-            response = client.embed(
-                texts,
-                model=model,
-                input_type="document",
-                output_dimension=dimension,
-            )
-            return [
-                {
-                    "chunk_id": row["chunk_id"],
-                    "channel_id": row["channel_id"] or "",
-                    "video_id": row["video_id"],
-                    "transcript_version_id": row["transcript_version_id"],
-                    "source": row["source"],
-                    "language": row["language"] or "",
-                    "is_generated": bool(row["is_generated"]),
-                    "sequence": row["sequence"],
-                    "start_ms": row["start_ms"],
-                    "end_ms": row["end_ms"],
-                    "text": row["text"],
-                    "token_count": row["token_count"] or 0,
-                    "text_hash": row["text_hash"],
-                    "chunker_version": row["chunker_version"],
-                    "active": True,
-                    "embedding_model": model,
-                    "embedding_dim": dimension,
-                    "vector": vector,
-                }
-                for row, vector in zip(batch, response.embeddings, strict=True)
-            ]
+            return call()
         except Exception as exc:  # noqa: BLE001 - provider clients expose mixed exception types.
             if attempt >= max_retries or not _retryable_embedding_error(exc):
                 raise
@@ -120,20 +210,7 @@ def _embed_voyage_batch(
             if retry_base_seconds:
                 sleep_seconds += random.uniform(0, retry_base_seconds)
             time.sleep(sleep_seconds)
-    return []
-
-
-def _embed_voyage_query(*, query: str, model: str, dimension: int) -> list[float]:
-    import voyageai
-
-    client = voyageai.Client()
-    response = client.embed(
-        [query],
-        model=model,
-        input_type="query",
-        output_dimension=dimension,
-    )
-    return response.embeddings[0]
+    raise AssertionError("unreachable retry loop exit")
 
 
 def rebuild_lancedb_chunks(
@@ -201,6 +278,7 @@ def embed_pending_chunks(
     limit: int | None = None,
     batch_size: int | None = None,
     concurrency: int | None = None,
+    hosted_context_factory: VoyageHostedContextFactory | None = None,
 ) -> EmbeddingStats:
     if not config.embeddings.enabled:
         return EmbeddingStats(embedded_chunks=0, skipped=True, message="embeddings disabled")
@@ -283,6 +361,11 @@ def embed_pending_chunks(
                 dimension=dimension,
                 max_retries=config.embeddings.max_retries,
                 retry_base_seconds=config.embeddings.retry_base_seconds,
+                hosted_context=(
+                    hosted_context_factory(batch)
+                    if hosted_context_factory is not None
+                    else None
+                ),
             )
             for batch in batches
         ]

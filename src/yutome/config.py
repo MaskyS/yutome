@@ -134,6 +134,14 @@ subprocess_timeout_seconds = 300.0
 # embedding setup. `yutome setup` rewrites this to "lexical" when no
 # VOYAGE_API_KEY is configured. "semantic" forces vectors only.
 default_mode = "hybrid"
+
+[hosted]
+enabled = false
+# Hosted mode is opt-in and uses the same CLI entry points with a hosted
+# provider/search-store broker behind them.
+workspace_id = ""
+usage_ledger_path = "data/hosted/usage_events.jsonl"
+postgres_url_env = "YUTOME_POSTGRES_URL"
 """
 
 
@@ -248,6 +256,13 @@ class FindConfig(BaseModel):
     default_mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
 
 
+class HostedConfig(BaseModel):
+    enabled: bool = False
+    workspace_id: str = ""
+    usage_ledger_path: Path = Path("data/hosted/usage_events.jsonl")
+    postgres_url_env: str = "YUTOME_POSTGRES_URL"
+
+
 class GeminiConfig(BaseModel):
     enabled: bool = False
     model: str = "gemini-3.1-flash-lite"
@@ -278,6 +293,7 @@ class AppConfig(BaseModel):
     yt_dlp: YtDlpConfig = Field(default_factory=YtDlpConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
     find: FindConfig = Field(default_factory=FindConfig)
+    hosted: HostedConfig = Field(default_factory=HostedConfig)
 
 
 def default_config() -> AppConfig:

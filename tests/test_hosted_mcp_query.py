@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -361,16 +362,37 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
     assert exc_info.value.to_dict()["error"]["data"]["operation"] == "voyage.embed_query"
     assert provider_called is False
     assert store.calls == []
-    assert [event.subject for event in ledger.events] == ["voyage"]
+    assert [event.subject for event in ledger.events] == ["voyage", "search_store"]
     assert ledger.events[0].status == "denied"
+    release = ledger.events[1]
+    assert release.event_type == "usage_reservation_released"
+    assert release.status == "released"
+    assert release.operation == "semantic_query"
+    assert release.metadata["release_reason"] == "provider_usage_denied"
+    assert release.metadata["provider_operation"] == "voyage.embed_query"
 
 
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
 @pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
-def test_voyage_provider_failure_is_structured_and_preserves_provider_events(
+def test_voyage_provider_availability_failure_falls_back_to_lexical(
+    mode: str,
     status_code: int,
     failure_kind: str,
 ) -> None:
-    store = RecordingSearchStore()
+    store = RecordingSearchStore(
+        rows=[
+            {
+                "chunk_id": "chunk_lexical",
+                "video_id": "vid_1",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "text": "Lexical fallback result.",
+                "lexical_score": 0.5,
+                "score": 0.5,
+                "match_type": "lexical",
+            }
+        ]
+    )
     ledger = RecordingLedger()
 
     class FakeProviderError(RuntimeError):
@@ -387,6 +409,56 @@ def test_voyage_provider_failure_is_structured_and_preserves_provider_events(
 
     adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
 
+    payload = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn probiotics", "mode": mode, "limit": 5},
+    )
+
+    assert store.calls == [{"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5}]
+    assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
+    assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
+    note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
+    assert note_metadata["fallback_from"] == mode
+    assert note_metadata["fallback_reason"] == "provider_availability"
+    assert note_metadata["fallback_failure_kind"] == failure_kind
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_failed",
+        "usage_reservation_released",
+        "service_operation_succeeded",
+    ]
+    failed = ledger.events[1]
+    assert failed.metadata["failure_kind"] == failure_kind
+    assert failed.metadata["retryable"] is True
+    assert failed.metadata["mcp_search_mode"] == mode
+    release = ledger.events[2]
+    assert release.status == "released"
+    assert release.operation == f"{mode}_query"
+    assert release.metadata["fallback_reason"] == "provider_availability"
+    fallback_event = ledger.events[3]
+    assert fallback_event.operation == "lexical_query"
+    assert fallback_event.metadata["fallback"] is True
+    assert fallback_event.metadata["fallback_from"] == mode
+    assert fallback_event.metadata["fallback_to"] == "lexical"
+
+
+def test_voyage_auth_failure_does_not_fall_back_to_lexical() -> None:
+    store = RecordingSearchStore()
+    ledger = RecordingLedger()
+
+    class FakeProviderAuthError(RuntimeError):
+        status_code = 401
+
+    def embedder(_query: str, context: ProviderCallContext) -> list[float]:
+        def call() -> object:
+            raise FakeProviderAuthError("invalid api key")
+
+        execute_provider_call(context, call)
+        raise AssertionError("unreachable")
+
+    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
+
     with pytest.raises(HostedMcpError) as exc_info:
         adapter.call_tool(
             auth=HostedMcpAuthContext(workspace_id="ws_alice"),
@@ -395,13 +467,121 @@ def test_voyage_provider_failure_is_structured_and_preserves_provider_events(
         )
 
     assert exc_info.value.code == "provider_call_failed"
-    assert exc_info.value.to_dict()["error"]["data"]["failure_kind"] == failure_kind
+    assert exc_info.value.to_dict()["error"]["data"]["failure_kind"] == "auth"
     assert store.calls == []
-    assert [event.event_type for event in ledger.events] == ["provider_attempt_started", "provider_attempt_failed"]
-    failed = ledger.events[1]
-    assert failed.metadata["failure_kind"] == failure_kind
-    assert failed.metadata["retryable"] is True
-    assert failed.metadata["mcp_search_mode"] == "semantic"
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_failed",
+        "usage_reservation_released",
+    ]
+    release = ledger.events[2]
+    assert release.operation == "semantic_query"
+    assert release.status == "released"
+    assert release.metadata["release_reason"] == "provider_failure"
+    assert release.metadata["failure_kind"] == "auth"
+
+
+def test_vector_store_availability_failure_falls_back_to_lexical() -> None:
+    class VectorUnavailableStore(RecordingSearchStore):
+        def semantic_search(
+            self,
+            *,
+            workspace_id: str,
+            query_vector: list[float],
+            limit: int,
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            raise RuntimeError("vector extension unavailable")
+
+    store = VectorUnavailableStore(
+        rows=[
+            {
+                "chunk_id": "chunk_lexical",
+                "video_id": "vid_1",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "text": "Lexical fallback result.",
+                "lexical_score": 0.5,
+                "score": 0.5,
+                "match_type": "lexical",
+            }
+        ]
+    )
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
+    )
+
+    payload = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn probiotics", "mode": "semantic", "limit": 5},
+    )
+
+    assert store.calls == [
+        {"mode": "semantic", "workspace_id": "ws_alice", "query_vector": [0.1, 0.2], "limit": 5},
+        {"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5},
+    ]
+    assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
+    assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
+    note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
+    assert note_metadata["fallback_reason"] == "vector_store_availability"
+    assert note_metadata["fallback_operation"] == "search_store.semantic_query"
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_succeeded",
+        "service_operation_failed",
+        "service_operation_succeeded",
+    ]
+    failed = ledger.events[2]
+    assert failed.operation == "semantic_query"
+    assert failed.status == "failed"
+    assert failed.metadata["fallback_reason"] == "vector_store_availability"
+    fallback_event = ledger.events[3]
+    assert fallback_event.operation == "lexical_query"
+    assert fallback_event.metadata["fallback_reason"] == "vector_store_availability"
+
+
+def test_vector_store_tenant_error_does_not_fall_back_to_lexical() -> None:
+    class TenantDeniedStore(RecordingSearchStore):
+        def semantic_search(
+            self,
+            *,
+            workspace_id: str,
+            query_vector: list[float],
+            limit: int,
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            raise PermissionError("permission denied by tenant policy")
+
+    store = TenantDeniedStore()
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
+    )
+
+    with pytest.raises(PermissionError):
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "semantic", "limit": 5},
+        )
+
+    assert store.calls == [{"mode": "semantic", "workspace_id": "ws_alice", "query_vector": [0.1, 0.2], "limit": 5}]
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_succeeded",
+        "service_operation_failed",
+    ]
+    failed = ledger.events[2]
+    assert failed.operation == "semantic_query"
+    assert failed.status == "failed"
+    assert failed.metadata["failure_kind"] == "unknown"
+    assert failed.metadata["message"] == "permission denied by tenant policy"
 
 
 def test_semantic_success_records_voyage_then_search_store_events_and_metadata() -> None:

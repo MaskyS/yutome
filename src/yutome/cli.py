@@ -20,7 +20,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,9 @@ from yutome.env import apply_env_to_config, load_dotenv
 from yutome.evals import load_eval_suite, run_eval_suite
 from yutome.exports import export_markdown
 from yutome.gemini import transcribe_youtube_url_with_gemini
+from yutome.hosted.cli_helpers import append_demo_usage_events, summarize_usage_events
+from yutome.hosted.ledger import JsonlUsageLedger, default_usage_ledger_path
+from yutome.hosted.runtime import HostedCommandRunner, HostedRuntimeError
 from yutome.indexer import sync_channel, sync_video
 from yutome.paths import ProjectPaths
 from yutome.maintenance import rebuild_active_chunks
@@ -103,6 +106,7 @@ eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run ret
 remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the authenticated HTTP / MCP server for private-network or reverse-proxy access.")
 bridge_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the long-lived bridge that lets remote MCP clients reach this laptop's corpus.")
 contract_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Inspect and export the MCP contract.")
+hosted_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Hosted Postgres runtime commands.")
 app.add_typer(export_app, name="export")
 app.add_typer(list_app, name="list")
 app.add_typer(show_app, name="show")
@@ -113,6 +117,7 @@ app.add_typer(eval_app, name="eval")
 app.add_typer(remote_app, name="remote")
 app.add_typer(bridge_app, name="bridge")
 app.add_typer(contract_app, name="contract")
+app.add_typer(hosted_app, name="hosted")
 
 
 def _version_callback(value: bool) -> None:
@@ -307,8 +312,39 @@ def _load_runtime(config_path: Path) -> tuple[object, ProjectPaths]:
     return app_config, paths
 
 
+def _load_hosted_config(config_path: Path) -> AppConfig:
+    load_dotenv(_project_root(config_path) / ".env")
+    return apply_env_to_config(_load_config_or_exit(config_path))
+
+
+def _hosted_runner(config_path: Path) -> HostedCommandRunner:
+    return HostedCommandRunner(_load_hosted_config(config_path))
+
+
+def _hosted_api_app(config_path: Path) -> Any:
+    from yutome.hosted.runtime import build_hosted_api_app
+
+    return build_hosted_api_app(_hosted_runner(config_path))
+
+
+def _run_hosted_api_app(api_app: Any, *, host: str, port: int, log_level: str = "info") -> None:
+    import uvicorn
+
+    uvicorn.run(api_app, host=host, port=port, log_level=log_level)
+
+
+def _jsonable(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")  # type: ignore[no-any-return, attr-defined]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def _echo_json(value: object) -> None:
-    typer.echo(json.dumps(value, ensure_ascii=False, indent=2))
+    typer.echo(json.dumps(_jsonable(value), ensure_ascii=False, indent=2, default=str))
 
 
 def _echo_query_result(result: object, *, json_output: bool) -> None:
@@ -3424,6 +3460,438 @@ def status_command(
     else:
         typer.echo("  not configured")
         typer.echo("  run: yutome connect")
+
+
+@app.command("usage")
+def usage_command(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    ledger: Path | None = typer.Option(
+        None,
+        "--ledger",
+        help="Override the hosted usage JSONL ledger path.",
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", min=0, help="Maximum usage events to show."),
+    summary: bool = typer.Option(False, "--summary", help="Summarize usage totals by provider/service operation."),
+    append_demo: bool = typer.Option(False, "--append-demo", help="Append synthetic hosted usage rows for diagnostics."),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON output."),
+) -> None:
+    """Inspect recent hosted provider/search-store usage events."""
+    ledger_path = ledger or default_usage_ledger_path(config)
+    if append_demo:
+        append_demo_usage_events(ledger_path)
+    events = JsonlUsageLedger(ledger_path).recent(limit=limit)
+    if summary:
+        summaries = summarize_usage_events(events)
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    [
+                        {
+                            "operation_key": item.operation_key,
+                            "subject": item.subject,
+                            "operation": item.operation,
+                            "event_count": item.event_count,
+                            "status_counts": item.status_counts,
+                            "unit_totals": item.unit_totals,
+                        }
+                        for item in summaries
+                    ],
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return
+        if append_demo:
+            typer.echo(f"Appended demo hosted usage events to {ledger_path}.")
+        if not summaries:
+            typer.echo(f"No hosted usage events recorded at {ledger_path}.")
+            return
+        typer.echo(f"Hosted usage summary from {ledger_path}:")
+        for item in summaries:
+            units = ", ".join(f"{key}={value:g}" for key, value in item.unit_totals.items()) or "-"
+            statuses = ", ".join(f"{key}={value}" for key, value in item.status_counts.items()) or "-"
+            typer.echo(f"{item.operation_key} events={item.event_count} statuses[{statuses}] units[{units}]")
+        return
+    if json_output:
+        typer.echo(json.dumps([event.model_dump(mode="json") for event in events], indent=2, sort_keys=True))
+        return
+    if append_demo:
+        typer.echo(f"Appended demo hosted usage events to {ledger_path}.")
+    if not events:
+        typer.echo(f"No hosted usage events recorded at {ledger_path}.")
+        return
+    typer.echo(f"Recent hosted usage events from {ledger_path}:")
+    for event in events:
+        units = ", ".join(f"{key}={value}" for key, value in sorted(event.actual_units.items())) or "-"
+        typer.echo(
+            f"{event.created_at.isoformat()} {event.workspace_id} {event.subject}.{event.operation} "
+            f"{event.status} {event.event_type} units[{units}]"
+        )
+
+
+def _hosted_error(message: str, *, json_output: bool, code: int = 1) -> None:
+    if json_output:
+        _echo_json({"ok": False, "error": message})
+    else:
+        typer.echo(message, err=True)
+    raise typer.Exit(code=code)
+
+
+def _hosted_lease_owner(explicit: str | None) -> str:
+    return explicit or os.environ.get("RAILWAY_REPLICA_ID") or f"hosted-cli-{os.getpid()}"
+
+
+def _parse_hosted_phase(value: str, *, json_output: bool) -> str:
+    phase = value.lower()
+    if phase not in {"phase1", "phase4", "hosted"}:
+        _hosted_error("phase must be one of: phase1, phase4, hosted", json_output=json_output, code=2)
+    return phase
+
+
+def _echo_hosted_result(value: object, *, json_output: bool, message: str | None = None) -> None:
+    if json_output:
+        _echo_json(value)
+        return
+    if message is not None:
+        typer.echo(message)
+        return
+    typer.echo(str(value))
+
+
+def _format_debug_mapping(values: Mapping[str, Any] | None) -> str:
+    if not values:
+        return "-"
+    parts = []
+    for key, value in sorted(values.items()):
+        if isinstance(value, float):
+            parts.append(f"{key}={value:g}")
+        else:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def _decision_summary(decision: Mapping[str, Any] | None) -> str:
+    if not decision:
+        return "unknown"
+    allowed = decision.get("allowed")
+    status = "allowed" if allowed is True else "denied" if allowed is False else "unknown"
+    reason = decision.get("reason") or "-"
+    message = decision.get("message")
+    return f"{status}:{reason}" + (f" ({message})" if message else "")
+
+
+def _echo_billing_status(result: Mapping[str, Any]) -> None:
+    workspace_id = result.get("workspace_id")
+    operation = result.get("operation")
+    rows = result.get("rows") or []
+    scope = f" workspace={workspace_id}" + (f" operation={operation}" if operation else "")
+    typer.echo(f"Hosted billing/usage status:{scope}")
+    if not rows:
+        typer.echo("  no reservations found")
+        return
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decision = row.get("entitlement_decision") if isinstance(row.get("entitlement_decision"), Mapping) else {}
+        estimated_units = row.get("estimated_units") if isinstance(row.get("estimated_units"), Mapping) else {}
+        typer.echo(
+            "  "
+            f"{row.get('created_at') or '-'} "
+            f"{row.get('operation_key')} "
+            f"reservation={row.get('reservation_status')} "
+            f"decision={_decision_summary(decision)}"
+        )
+        typer.echo(
+            "    "
+            f"job={row.get('job_id') or '-'}({row.get('job_status') or '-'}) "
+            f"operation={row.get('operation_id') or '-'}({row.get('operation_status') or '-'}) "
+            f"units[{_format_debug_mapping(estimated_units)}]"
+        )
+        if row.get("job_error_code") or row.get("job_error_message"):
+            typer.echo(f"    job_error={row.get('job_error_code') or '-'} {row.get('job_error_message') or ''}".rstrip())
+        usage_events = row.get("usage_events") or []
+        if usage_events:
+            typer.echo("    usage_events:")
+            for event in usage_events:
+                if not isinstance(event, Mapping):
+                    continue
+                actual_units = event.get("actual_units") if isinstance(event.get("actual_units"), Mapping) else {}
+                error = f" error={event.get('error_code')}" if event.get("error_code") else ""
+                typer.echo(
+                    "      "
+                    f"{event.get('id')} {event.get('status')} {event.get('event_type')} "
+                    f"units[{_format_debug_mapping(actual_units)}]{error}"
+                )
+        else:
+            typer.echo("    usage_events: none")
+        billing_exports = row.get("billing_exports") or []
+        if billing_exports:
+            typer.echo("    billing_exports:")
+            for export in billing_exports:
+                if not isinstance(export, Mapping):
+                    continue
+                last_error = export.get("last_error") if isinstance(export.get("last_error"), Mapping) else {}
+                error = f" error[{_format_debug_mapping(last_error)}]" if last_error else ""
+                typer.echo(
+                    "      "
+                    f"{export.get('id')} status={export.get('replay_status')} "
+                    f"external_event_id={export.get('external_event_id') or '-'} "
+                    f"dedupe={export.get('source_event_dedupe_key')}"
+                    f"{error}"
+                )
+        else:
+            typer.echo("    billing_exports: none")
+
+
+@hosted_app.command("api")
+def hosted_api(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind address for the hosted MCP query API."),
+    port: int = typer.Option(8000, "--port", min=1, help="Bind port. On Railway, pass --port $PORT."),
+    log_level: str = typer.Option("info", "--log-level", help="Uvicorn log level."),
+) -> None:
+    """Run the hosted MCP query API for Railway/API deployments."""
+    try:
+        api_app = _hosted_api_app(config)
+        _run_hosted_api_app(api_app, host=host, port=port, log_level=log_level)
+    except (HostedRuntimeError, RuntimeError) as exc:
+        _hosted_error(str(exc), json_output=False)
+
+
+@hosted_app.command("migrate")
+def hosted_migrate(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    phase: str = typer.Option("hosted", "--phase", help="Migration phase: phase1, phase4, or hosted."),
+    json_output: bool = typer.Option(False, "--json", help="Emit migration result as JSON."),
+) -> None:
+    """Apply hosted Postgres migrations."""
+    phase_value = _parse_hosted_phase(phase, json_output=json_output)
+    try:
+        applied = _hosted_runner(config).migrate(phase=phase_value)  # type: ignore[arg-type]
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    payload = {"ok": True, "phase": phase_value, "applied": applied}
+    _echo_hosted_result(payload, json_output=json_output, message=f"Applied {applied} hosted migration statements ({phase_value}).")
+
+
+@hosted_app.command("db-check")
+def hosted_db_check(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit database check as JSON."),
+) -> None:
+    """Check hosted Postgres configuration and required extensions."""
+    try:
+        result = _hosted_runner(config).db_check()
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    if json_output:
+        _echo_json(result)
+        return
+    status = "ok" if result.ok else "not ready"
+    typer.echo(f"Hosted database: {status}")
+    typer.echo(f"  url_env={result.url_env} configured={result.url_configured}")
+    typer.echo(f"  reachable={result.database_reachable}")
+    if result.extensions:
+        extensions = ", ".join(f"{name}={installed}" for name, installed in sorted(result.extensions.items()))
+        typer.echo(f"  extensions: {extensions}")
+    if result.error:
+        typer.echo(f"  error={result.error}")
+
+
+@hosted_app.command("billing-status")
+def hosted_billing_status(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    operation: str | None = typer.Option(None, "--operation", help="Filter by operation key or operation name."),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum recent reservations to inspect."),
+    json_output: bool = typer.Option(False, "--json", help="Emit billing/usage status as JSON."),
+) -> None:
+    """Inspect hosted usage reservations, decisions, events, and billing exports."""
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running billing-status.", json_output=json_output, code=2)
+    try:
+        result = runner.billing_status(workspace_id=workspace, limit=limit, operation=operation)
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    if json_output:
+        _echo_json(result)
+        return
+    _echo_billing_status(result)
+
+
+@hosted_app.command("search-smoke")
+def hosted_search_smoke(
+    query: str = typer.Argument(..., help="Lexical search query to smoke test."),
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    limit: int = typer.Option(3, "--limit", min=1, help="Maximum rows to return."),
+    json_output: bool = typer.Option(False, "--json", help="Emit search result as JSON."),
+) -> None:
+    """Run a hosted Postgres lexical search smoke query."""
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running search-smoke.", json_output=json_output, code=2)
+    try:
+        result = runner.search_smoke(workspace_id=workspace, query=query, limit=limit)
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(result, json_output=json_output, message=f"Search smoke returned {len(result.get('rows', []))} rows.")
+
+
+@hosted_app.command("mock-indexing-smoke")
+def hosted_mock_indexing_smoke(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Hosted workspace id."),
+    migrate: bool = typer.Option(False, "--migrate", help="Apply hosted migrations before writing smoke rows."),
+    phase: str = typer.Option("hosted", "--phase", help="Migration phase when --migrate is set: phase1, phase4, or hosted."),
+    query: str | None = typer.Option(None, "--query", help="Hybrid search query. Defaults to the mocked transcript text."),
+    source_url: str = typer.Option(
+        "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        "--source-url",
+        help="Public YouTube source URL or video id to mock.",
+    ),
+    limit: int = typer.Option(3, "--limit", min=1, help="Maximum rows to return."),
+    json_output: bool = typer.Option(False, "--json", help="Emit smoke result as JSON."),
+) -> None:
+    """Write mocked hosted indexing rows and query them from Postgres."""
+    phase_value = _parse_hosted_phase(phase, json_output=json_output)
+    runner = _hosted_runner(config)
+    workspace = workspace_id or runner.config.hosted.workspace_id
+    if not workspace:
+        _hosted_error("Set --workspace-id or [hosted].workspace_id before running mock-indexing-smoke.", json_output=json_output, code=2)
+    try:
+        result = runner.mock_indexing_smoke(
+            workspace_id=workspace,
+            migrate=migrate,
+            migration_phase=phase_value,  # type: ignore[arg-type]
+            query=query,
+            limit=limit,
+            source_url=source_url,
+        )
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(
+        result,
+        json_output=json_output,
+        message=f"Mock indexing smoke wrote {result.operations_executed} operations and returned {len(result.rows)} rows.",
+    )
+
+
+@hosted_app.command("worker")
+def hosted_worker(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    once: bool = typer.Option(False, "--once", help="Run one claim tick and exit."),
+    lease_owner: str | None = typer.Option(None, "--lease-owner", help="Lease owner id. Defaults to RAILWAY_REPLICA_ID or this process."),
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Optional workspace scope."),
+    limit: int = typer.Option(1, "--limit", min=1, help="Maximum jobs to claim per tick."),
+    lease_seconds: int = typer.Option(900, "--lease-seconds", min=1, help="Job lease duration in seconds."),
+    poll_interval: float = typer.Option(5.0, "--poll-interval", min=0.1, help="Loop sleep when --once is not set."),
+    json_output: bool = typer.Option(False, "--json", help="Emit worker tick result as JSON."),
+) -> None:
+    """Run the hosted worker claim loop or a single worker tick."""
+    runner = _hosted_runner(config)
+    owner = _hosted_lease_owner(lease_owner)
+    while True:
+        try:
+            result = runner.worker_once(
+                lease_owner=owner,
+                limit=limit,
+                lease_seconds=lease_seconds,
+                workspace_id=workspace_id,
+            )
+        except HostedRuntimeError as exc:
+            _hosted_error(str(exc), json_output=json_output)
+        _echo_hosted_result(result, json_output=json_output, message=f"Worker tick claimed {result.affected_rows or 0} jobs.")
+        if once:
+            return
+        time.sleep(poll_interval)
+
+
+@hosted_app.command("source-refresh-tick")
+def hosted_source_refresh_tick(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    lease_owner: str | None = typer.Option(None, "--lease-owner", help="Refresh lock owner. Defaults to RAILWAY_REPLICA_ID or this process."),
+    limit: int = typer.Option(25, "--limit", min=1, help="Maximum due source policies to lock."),
+    lock_seconds: int = typer.Option(900, "--lock-seconds", min=1, help="Refresh policy lock duration."),
+    json_output: bool = typer.Option(False, "--json", help="Emit tick result as JSON."),
+) -> None:
+    """Claim due hosted source refresh policies."""
+    try:
+        result = _hosted_runner(config).source_refresh_tick(
+            lease_owner=_hosted_lease_owner(lease_owner),
+            limit=limit,
+            lock_seconds=lock_seconds,
+        )
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(result, json_output=json_output, message=f"Source refresh tick claimed {result.affected_rows or 0} policies.")
+
+
+@hosted_app.command("maintenance-tick")
+def hosted_maintenance_tick(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    limit: int = typer.Option(100, "--limit", min=1, help="Maximum expired rows per maintenance category."),
+    json_output: bool = typer.Option(False, "--json", help="Emit tick result as JSON."),
+) -> None:
+    """Release expired hosted job and source-refresh leases."""
+    try:
+        result = _hosted_runner(config).maintenance_tick(limit=limit)
+    except HostedRuntimeError as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(result, json_output=json_output, message=f"Maintenance tick released {result.affected_rows or 0} rows.")
 
 
 @app.command()

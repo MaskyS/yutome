@@ -3,10 +3,15 @@ import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   buildOfflineResponseMetadata,
+  HostedMcpApiClient,
+  HostedMcpApiError,
+  HostedMcpAuthError,
   deriveBridgeRelayObjectName,
   deriveConnectorMcpObjectName,
   resolveBridgeRelayIdentityFromHeaders,
+  resolveHostedMcpAuthContext,
   resolveMcpBridgeIdentity,
+  shouldServeConnectorRelayRoutes,
   TenantRoutingError,
   validateTenantIdsNotInToolArguments,
 } from "../src/tenant-routing.ts";
@@ -87,6 +92,9 @@ test("hosted mode rejects missing verified tenant identity before routing", () =
 });
 
 test("connector-only mode keeps explicit local bridge compatibility", () => {
+  assert.equal(shouldServeConnectorRelayRoutes("hosted"), false);
+  assert.equal(shouldServeConnectorRelayRoutes("connector_only"), true);
+
   assert.deepEqual(
     resolveBridgeRelayIdentityFromHeaders(new Headers(), {
       YUTOME_WORKER_MODE: "connector_only",
@@ -140,4 +148,151 @@ test("offline metadata identifies attempted route, workspace, and Durable Object
   assert.equal(metadata.install_id, "inst_mac");
   assert.match(metadata.durable_object_name, /^yutome:v1:relay:workspace:/);
   assert.notEqual(metadata.durable_object_name, "default");
+});
+
+test("hosted auth context comes from OAuth props and requires search scope", () => {
+  const auth = resolveHostedMcpAuthContext(
+    {
+      workspace_id: "ws_alice",
+      connector_grant_id: "grant_claude",
+      client_id: "client_chatgpt",
+      user_id: "user_alice",
+      scopes: ["profile", "yutome.search.read"],
+      audience: "https://mcp.yutome.com/mcp",
+      expires_at: "2026-05-26T12:00:00.000Z",
+      token_version: "v1",
+    },
+    { requiredScope: "yutome.search.read", sessionId: "session_123" },
+  );
+
+  assert.deepEqual(auth, {
+    workspace_id: "ws_alice",
+    scopes: ["profile", "yutome.search.read"],
+    user_id: "user_alice",
+    grant_id: "grant_claude",
+    client_id: "client_chatgpt",
+    session_id: "session_123",
+    audience: "https://mcp.yutome.com/mcp",
+    expires_at: "2026-05-26T12:00:00.000Z",
+    token_version: "v1",
+  });
+
+  assert.throws(
+    () =>
+      resolveHostedMcpAuthContext(
+        { workspace_id: "ws_alice", scopes: ["profile"] },
+        { requiredScope: "yutome.search.read" },
+      ),
+    (err) =>
+      err instanceof HostedMcpAuthError &&
+      err.code === "insufficient_scope" &&
+      /yutome\.search\.read/.test(err.message),
+  );
+});
+
+test("hosted API client dispatches tool calls with Yutome auth headers", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), init: init ?? {} });
+    return Response.json({
+      ok: true,
+      result: { rows: [{ chunk_id: "chunk_1", snippet: "hello" }], notes: [], total: null },
+    });
+  }) as typeof fetch;
+  const client = new HostedMcpApiClient(
+    {
+      YUTOME_HOSTED_API_URL: "https://hosted.example/mcp/",
+      YUTOME_HOSTED_API_TOKEN: "edge-secret",
+    },
+    fetcher,
+  );
+
+  const result = await client.callTool(
+    {
+      workspace_id: "ws_alice",
+      scopes: ["yutome.search.read"],
+      user_id: "user_alice",
+      grant_id: "grant_1",
+      client_id: "client_1",
+      session_id: "session_1",
+    },
+    "find",
+    { text: "vector databases" },
+  );
+
+  assert.deepEqual(result, {
+    rows: [{ chunk_id: "chunk_1", snippet: "hello" }],
+    notes: [],
+    total: null,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://hosted.example/mcp/tools/call");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(String(calls[0].init.body)), {
+    name: "find",
+    arguments: { text: "vector databases" },
+  });
+  const headers = new Headers(calls[0].init.headers);
+  assert.equal(headers.get("authorization"), "Bearer edge-secret");
+  assert.equal(headers.get("x-yutome-workspace-id"), "ws_alice");
+  assert.equal(headers.get("x-yutome-scopes"), "yutome.search.read");
+  assert.equal(headers.get("x-yutome-user-id"), "user_alice");
+  assert.equal(headers.get("x-yutome-grant-id"), "grant_1");
+  assert.equal(headers.get("x-yutome-client-id"), "client_1");
+  assert.equal(headers.get("x-yutome-session-id"), "session_1");
+});
+
+test("hosted API client dispatches resource reads and surfaces API failures", async () => {
+  const resourceCalls: Array<{ url: string; init: RequestInit }> = [];
+  const resourceClient = new HostedMcpApiClient(
+    {
+      YUTOME_HOSTED_API_URL: "https://hosted.example",
+      YUTOME_HOSTED_API_TOKEN: "edge-secret",
+    },
+    (async (input: RequestInfo | URL, init?: RequestInit) => {
+      resourceCalls.push({ url: String(input), init: init ?? {} });
+      return Response.json({ ok: true, result: { contents: [{ uri: "yutome://chunk/ch_1", text: "{}" }] } });
+    }) as typeof fetch,
+  );
+
+  await resourceClient.readResource(
+    { workspace_id: "ws_alice", scopes: ["yutome.search.read"] },
+    "yutome://chunk/ch_1",
+  );
+
+  assert.equal(resourceCalls[0].url, "https://hosted.example/resources/read");
+  assert.deepEqual(JSON.parse(String(resourceCalls[0].init.body)), { uri: "yutome://chunk/ch_1" });
+
+  const failingClient = new HostedMcpApiClient(
+    {
+      YUTOME_HOSTED_API_URL: "https://hosted.example",
+      YUTOME_HOSTED_API_TOKEN: "edge-secret",
+    },
+    (async () =>
+      Response.json(
+        {
+          detail: {
+            code: "insufficient_scope",
+            message: "Hosted MCP requests require the yutome.search.read scope.",
+          },
+        },
+        { status: 403 },
+      )) as typeof fetch,
+  );
+
+  let caught: unknown;
+  try {
+    await failingClient.callTool(
+      { workspace_id: "ws_alice", scopes: ["profile"] },
+      "find",
+      { text: "anything" },
+    );
+  } catch (err) {
+    caught = err;
+  }
+  assert.equal(caught instanceof HostedMcpApiError, true);
+  const apiError = caught as HostedMcpApiError;
+  assert.equal(apiError.status, 403);
+  assert.equal(apiError.code, "insufficient_scope");
+  assert.match(apiError.message, /yutome\.search\.read/);
 });

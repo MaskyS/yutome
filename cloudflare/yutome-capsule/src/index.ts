@@ -3,9 +3,9 @@
  *
  * Architecture:
  *   /mcp                  → OAuth-protected. McpAgent (YutomeMcpAgent) handles
- *                           the MCP streamable-HTTP transport. Tool/resource
- *                           calls are routed through the YutomeRelay DO to
- *                           the laptop bridge.
+ *                           the MCP streamable-HTTP transport. Hosted mode
+ *                           calls the hosted API; connector_only calls the
+ *                           YutomeRelay DO to reach the laptop bridge.
  *   /authorize, /token,   → workers-oauth-provider handles OAuth 2.1.
  *   /register, /.well-known/oauth-*  Consent is gated on the pairing code.
  *   /relay/connect        → laptop bridge WebSocket upgrade (Bearer-token).
@@ -13,16 +13,22 @@
  */
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import type { Env } from "./env";
-import { YutomeMcpAgent } from "./yutome-mcp-agent";
-import { YutomeRelay } from "./yutome-relay";
-import { handleAuthorizeRequest, handlePairingRequest } from "./pairing";
-import { iconResponse } from "./icon-asset";
+import type { Env } from "./env.ts";
+import { YutomeMcpAgent } from "./yutome-mcp-agent.ts";
+import { YutomeRelay } from "./yutome-relay.ts";
+import { handleAuthorizeRequest, handlePairingRequest } from "./pairing.ts";
+import { iconResponse } from "./icon-asset.ts";
+import {
+  DEFAULT_MCP_AUDIENCE,
+  handleRevokeRequest,
+  YUTOME_MCP_SCOPE,
+} from "./account-grants.ts";
 import {
   deriveBridgeRelayObjectName,
   resolveBridgeRelayIdentityFromHeaders,
+  shouldServeConnectorRelayRoutes,
   TenantRoutingError,
-} from "./tenant-routing";
+} from "./tenant-routing.ts";
 
 interface DefaultHandlerEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -51,6 +57,12 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
     }
 
     if (url.pathname === "/relay/connect" || url.pathname === "/relay/status") {
+      if (!shouldServeConnectorRelayRoutes(env.YUTOME_WORKER_MODE)) {
+        return new Response("Not Found", {
+          status: 404,
+          headers: { "cache-control": "no-store" },
+        });
+      }
       const identity = bridgeIdentityFromRequest(request, env);
       if (identity instanceof Response) {
         return identity;
@@ -66,6 +78,10 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
 
     if (url.pathname === "/pair") {
       return handlePairingRequest({ request, env, oauthHelpers: env.OAUTH_PROVIDER });
+    }
+
+    if (url.pathname === "/revoke") {
+      return handleRevokeRequest({ request, env, oauthHelpers: env.OAUTH_PROVIDER });
     }
 
     if (url.pathname === "/") {
@@ -113,9 +129,16 @@ const provider = new OAuthProvider<DefaultHandlerEnv>({
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/token",
   clientRegistrationEndpoint: "/register",
-  scopesSupported: ["yutome.search.read"],
+  scopesSupported: [YUTOME_MCP_SCOPE],
   allowPlainPKCE: false,
   clientIdMetadataDocumentEnabled: true,
+  resourceMetadata: {
+    resource: DEFAULT_MCP_AUDIENCE,
+    authorization_servers: ["https://mcp.yutome.com"],
+    scopes_supported: [YUTOME_MCP_SCOPE],
+    bearer_methods_supported: ["header"],
+    resource_name: "Yutome MCP",
+  },
 });
 
 export default provider;

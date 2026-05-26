@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import re
-import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import dataclass, replace
+from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
 from yutome.config import GeminiConfig
 from yutome.hashing import sha256_text
+from yutome.hosted.normalizers import normalize_gemini_generate_content
+from yutome.hosted.provider_wrappers import (
+    ProviderCallContext,
+    execute_provider_call,
+    execute_provider_call_async,
+)
 from yutome.quality import derived_transcript
 from yutome.transcripts import NormalizedTranscript, TranscriptSegment, clean_text
 
@@ -97,6 +104,7 @@ def cleanup_transcript_with_gemini(
     concurrency: int = 2,
     max_change_ratio: float = 0.35,
     max_patch_retries: int = 2,
+    hosted_context: ProviderCallContext | None = None,
     batch_cleaner: Callable[[list[TranscriptSegment]], TranscriptCorrectionResponse] | None = None,
 ) -> tuple[NormalizedTranscript, LlmCleanupStats]:
     replacements: dict[int, str] = {}
@@ -111,6 +119,7 @@ def cleanup_transcript_with_gemini(
             max_change_ratio=max_change_ratio,
             max_patch_retries=max_patch_retries,
             video_id=transcript.video_id,
+            hosted_context=hosted_context,
         )
     else:
         payloads = _cleanup_batches_with_cleaner(
@@ -183,6 +192,7 @@ def _run_async_cleanup(
     max_change_ratio: float,
     max_patch_retries: int,
     video_id: str,
+    hosted_context: ProviderCallContext | None,
 ) -> list[TranscriptCorrectionResponse]:
     try:
         asyncio.get_running_loop()
@@ -196,6 +206,7 @@ def _run_async_cleanup(
                 max_change_ratio=max_change_ratio,
                 max_patch_retries=max_patch_retries,
                 video_id=video_id,
+                hosted_context=hosted_context,
             )
         )
     raise RuntimeError("cleanup_transcript_with_gemini cannot be called from an active event loop yet")
@@ -210,6 +221,7 @@ async def _cleanup_batches_with_gemini_async(
     max_change_ratio: float,
     max_patch_retries: int,
     video_id: str,
+    hosted_context: ProviderCallContext | None,
 ) -> list[TranscriptCorrectionResponse]:
     if not batches:
         return []
@@ -230,7 +242,7 @@ async def _cleanup_batches_with_gemini_async(
     )
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def cleanup_one(batch: list[TranscriptSegment]) -> TranscriptCorrectionResponse:
+    async def cleanup_one(batch_index: int, batch: list[TranscriptSegment]) -> TranscriptCorrectionResponse:
         async with semaphore:
             return await _cleanup_batch_async(
                 client=client,
@@ -241,10 +253,13 @@ async def _cleanup_batches_with_gemini_async(
                 cache_name=cache_name,
                 max_change_ratio=max_change_ratio,
                 max_patch_retries=max_patch_retries,
+                hosted_context=hosted_context,
+                batch_index=batch_index,
+                batch_count=len(batches),
             )
 
     try:
-        return await asyncio.gather(*(cleanup_one(batch) for batch in batches))
+        return await asyncio.gather(*(cleanup_one(batch_index, batch) for batch_index, batch in enumerate(batches)))
     finally:
         if cache_name is not None:
             try:
@@ -293,16 +308,29 @@ async def _cleanup_batch_async(
     cache_name: str | None,
     max_change_ratio: float,
     max_patch_retries: int,
+    hosted_context: ProviderCallContext | None = None,
+    batch_index: int | None = None,
+    batch_count: int | None = None,
 ) -> TranscriptCorrectionResponse:
-    async def generate_patch(validation_error: str | None) -> TranscriptCorrectionResponse:
+    batch_context = _hosted_context_for_cleanup_batch(
+        hosted_context,
+        batch=batch,
+        batch_index=batch_index,
+        batch_count=batch_count,
+    )
+
+    async def generate_patch(validation_error: str | None, attempt: int) -> TranscriptCorrectionResponse:
         if cache_name:
             contents = _batch_tail_text(batch, validation_error)
         else:
             contents = _cleanup_prompt(batch=batch, context=context, validation_error=validation_error)
-        response = await client.aio.models.generate_content(
-            model=config.model,
-            contents=contents,
-            config=_generate_content_config(types, config, cache_name=cache_name),
+        response = await _generate_content_with_hosted_usage_async(
+            _hosted_context_for_cleanup_attempt(batch_context, attempt=attempt),
+            lambda: client.aio.models.generate_content(
+                model=config.model,
+                contents=contents,
+                config=_generate_content_config(types, config, cache_name=cache_name),
+            ),
         )
         return _parse_correction_response(_response_text(response))
 
@@ -321,6 +349,9 @@ def _cleanup_batch(
     context: TranscriptCleanupContext | None,
     max_change_ratio: float,
     max_patch_retries: int,
+    hosted_context: ProviderCallContext | None = None,
+    batch_index: int | None = None,
+    batch_count: int | None = None,
 ) -> TranscriptCorrectionResponse:
     try:
         from google import genai
@@ -331,11 +362,21 @@ def _cleanup_batch(
     http_options = types.HttpOptions(timeout=int(config.request_timeout_seconds * 1000))
     client = genai.Client(http_options=http_options)
 
-    def generate_patch(validation_error: str | None) -> TranscriptCorrectionResponse:
-        response = client.models.generate_content(
-            model=config.model,
-            contents=_cleanup_prompt(batch=batch, context=context, validation_error=validation_error),
-            config=_generate_content_config(types, config),
+    batch_context = _hosted_context_for_cleanup_batch(
+        hosted_context,
+        batch=batch,
+        batch_index=batch_index,
+        batch_count=batch_count,
+    )
+
+    def generate_patch(validation_error: str | None, attempt: int) -> TranscriptCorrectionResponse:
+        response = _generate_content_with_hosted_usage(
+            _hosted_context_for_cleanup_attempt(batch_context, attempt=attempt),
+            lambda: client.models.generate_content(
+                model=config.model,
+                contents=_cleanup_prompt(batch=batch, context=context, validation_error=validation_error),
+                config=_generate_content_config(types, config),
+            ),
         )
         return _parse_correction_response(_response_text(response))
 
@@ -347,17 +388,99 @@ def _cleanup_batch(
     )
 
 
+def _hosted_context_for_cleanup_batch(
+    hosted_context: ProviderCallContext | None,
+    *,
+    batch: list[TranscriptSegment],
+    batch_index: int | None = None,
+    batch_count: int | None = None,
+) -> ProviderCallContext | None:
+    if hosted_context is None:
+        return None
+    first_sequence = batch[0].sequence if batch else None
+    last_sequence = batch[-1].sequence if batch else None
+    batch_label = str(batch_index) if batch_index is not None else f"{first_sequence}-{last_sequence}"
+    metadata = {
+        **dict(hosted_context.metadata),
+        "parent_idempotency_key": hosted_context.idempotency_key,
+        "gemini_call_kind": "cleanup_batch",
+        "batch_first_sequence": first_sequence,
+        "batch_last_sequence": last_sequence,
+        "batch_segments": len(batch),
+    }
+    if batch_index is not None:
+        metadata["batch_index"] = batch_index
+    if batch_count is not None:
+        metadata["batch_count"] = batch_count
+    return replace(
+        hosted_context,
+        idempotency_key=(
+            f"{hosted_context.idempotency_key}:batch:{batch_label}:seq:{first_sequence}-{last_sequence}"
+        ),
+        metadata=metadata,
+    )
+
+
+def _hosted_context_for_cleanup_attempt(
+    hosted_context: ProviderCallContext | None,
+    *,
+    attempt: int,
+) -> ProviderCallContext | None:
+    if hosted_context is None:
+        return None
+    return replace(
+        hosted_context,
+        idempotency_key=f"{hosted_context.idempotency_key}:attempt:{attempt}",
+        metadata={
+            **dict(hosted_context.metadata),
+            "gemini_call_attempt": attempt,
+        },
+    )
+
+
+def _generate_content_with_hosted_usage(
+    hosted_context: ProviderCallContext | None,
+    call: Callable[[], Any],
+) -> Any:
+    if hosted_context is None:
+        return call()
+    return execute_provider_call(
+        hosted_context,
+        call,
+        normalize_usage=lambda response: normalize_gemini_generate_content(
+            response,
+            operation=hosted_context.operation,
+        ),
+    )
+
+
+async def _generate_content_with_hosted_usage_async(
+    hosted_context: ProviderCallContext | None,
+    call: Callable[[], Awaitable[Any]],
+) -> Any:
+    if hosted_context is None:
+        return await call()
+    return await execute_provider_call_async(
+        hosted_context,
+        call,
+        normalize_usage=lambda response: normalize_gemini_generate_content(
+            response,
+            operation=hosted_context.operation,
+        ),
+    )
+
+
 def _cleanup_batch_with_generator(
     *,
     batch: list[TranscriptSegment],
-    generate_patch: Callable[[str | None], TranscriptCorrectionResponse],
+    generate_patch: Callable[..., TranscriptCorrectionResponse],
     max_change_ratio: float,
     max_patch_retries: int,
 ) -> TranscriptCorrectionResponse:
     validation_error: str | None = None
     for attempt in range(max_patch_retries + 1):
         try:
-            correction_response = generate_patch(validation_error)
+            correction_response = _call_cleanup_generator(generate_patch, validation_error, attempt)
             return _validated_correction_response(
                 correction_response,
                 batch=batch,
@@ -373,14 +496,14 @@ def _cleanup_batch_with_generator(
 async def _cleanup_batch_with_async_generator(
     *,
     batch: list[TranscriptSegment],
-    generate_patch: Callable[[str | None], Any],
+    generate_patch: Callable[..., Any],
     max_change_ratio: float,
     max_patch_retries: int,
 ) -> TranscriptCorrectionResponse:
     validation_error: str | None = None
     for attempt in range(max_patch_retries + 1):
         try:
-            correction_response = await generate_patch(validation_error)
+            correction_response = await _call_cleanup_generator_async(generate_patch, validation_error, attempt)
             return _validated_correction_response(
                 correction_response,
                 batch=batch,
@@ -391,6 +514,40 @@ async def _cleanup_batch_with_async_generator(
             if attempt >= max_patch_retries:
                 raise RuntimeError(f"LLM cleanup returned invalid patch after retries: {validation_error}") from exc
     raise RuntimeError("LLM cleanup patch validation failed unexpectedly")
+
+
+def _call_cleanup_generator(
+    generate_patch: Callable[..., TranscriptCorrectionResponse],
+    validation_error: str | None,
+    attempt: int,
+) -> TranscriptCorrectionResponse:
+    if _generator_accepts_attempt(generate_patch):
+        return generate_patch(validation_error, attempt)
+    return generate_patch(validation_error)
+
+
+async def _call_cleanup_generator_async(
+    generate_patch: Callable[..., Any],
+    validation_error: str | None,
+    attempt: int,
+) -> TranscriptCorrectionResponse:
+    if _generator_accepts_attempt(generate_patch):
+        return await generate_patch(validation_error, attempt)
+    return await generate_patch(validation_error)
+
+
+def _generator_accepts_attempt(generate_patch: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(generate_patch).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    positional_count = 0
+    for parameter in parameters:
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}:
+            positional_count += 1
+    return positional_count >= 2
 
 
 def _cleanup_prompt(

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 from requests import Session
@@ -18,6 +18,16 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
 from yutome.config import ProxyConfig, YtDlpConfig
+from yutome.hosted.models import UsageNormalization
+from yutome.hosted.normalizers import normalize_webshare_activity
+from yutome.hosted.provider_wrappers import (
+    ProviderCallContext,
+    UsageReservationDenied,
+    execute_provider_call,
+)
+
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -146,7 +156,31 @@ def _pick_from_pool(urls: list[str], *, key: str | None = None) -> str | None:
     return urls[int(digest[:12], 16) % len(urls)]
 
 
-def proxy_url_for_ytdlp(proxy: ProxyConfig | None, *, key: str | None = None) -> str | None:
+class _HostedWebshareProxyFailure(RuntimeError):
+    def __init__(self, result: subprocess.CompletedProcess[str], *, status_code: int, message: str) -> None:
+        self.result = result
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def proxy_url_for_ytdlp(
+    proxy: ProxyConfig | None,
+    *,
+    key: str | None = None,
+    hosted_context: ProviderCallContext | None = None,
+) -> str | None:
+    if _uses_hosted_webshare_proxy(proxy, hosted_context):
+        return _execute_hosted_webshare_proxy_call(
+            proxy,
+            hosted_context,
+            lambda: _proxy_url_for_ytdlp(proxy, key=key),
+            target=key,
+            source="yt-dlp.proxy_url",
+        )
+    return _proxy_url_for_ytdlp(proxy, key=key)
+
+
+def _proxy_url_for_ytdlp(proxy: ProxyConfig | None, *, key: str | None = None) -> str | None:
     if not proxy or not proxy.enabled:
         return None
     if proxy.kind == "generic":
@@ -162,6 +196,196 @@ def proxy_url_for_ytdlp(proxy: ProxyConfig | None, *, key: str | None = None) ->
         username = quote(f"{username}{location_codes}{rotate_suffix}", safe="")
         password = quote(proxy.webshare_password, safe="")
         return f"http://{username}:{password}@{proxy.webshare_domain}:{proxy.webshare_port}/"
+    return None
+
+
+def _uses_hosted_webshare_proxy(
+    proxy: ProxyConfig | None,
+    hosted_context: ProviderCallContext | None,
+) -> bool:
+    return bool(
+        hosted_context is not None
+        and proxy
+        and proxy.enabled
+        and proxy.kind == "webshare"
+        and proxy.webshare_username
+        and proxy.webshare_password
+    )
+
+
+def _execute_hosted_webshare_proxy_call(
+    proxy: ProxyConfig | None,
+    hosted_context: ProviderCallContext,
+    call: Callable[[], T],
+    *,
+    target: str | None,
+    source: str,
+) -> T:
+    activity_payload: dict[str, Any] = {}
+
+    def metered_call() -> T:
+        started_at = time.monotonic()
+        result = call()
+        activity_payload.update(
+            _webshare_proxy_activity_payload(
+                proxy,
+                result,
+                target=target,
+                source=source,
+                duration_seconds=time.monotonic() - started_at,
+            )
+        )
+        return result
+
+    def normalize_usage(_: T) -> UsageNormalization:
+        normalized = normalize_webshare_activity(activity_payload, operation=hosted_context.operation)
+        normalized.actual_units["request_count"] = 1
+        normalized.metadata = {
+            **normalized.metadata,
+            "accounting_source": source,
+            "proxy_domain": proxy.webshare_domain if proxy else None,
+            "proxy_port": proxy.webshare_port if proxy else None,
+        }
+        return normalized
+
+    return execute_provider_call(hosted_context, metered_call, normalize_usage=normalize_usage)
+
+
+def _webshare_proxy_activity_payload(
+    proxy: ProxyConfig | None,
+    result: Any,
+    *,
+    target: str | None,
+    source: str,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    hostname = _proxy_target_hostname(target)
+    byte_metrics = _locally_visible_webshare_byte_metrics(result, target=target, source=source)
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "request_duration": duration_seconds,
+        "handshake_duration": 0.0,
+        "tunnel_duration": 0.0,
+        "hostname": hostname,
+        "domain": hostname,
+        "error_reason": None,
+        "auth_username": None,
+        "accounting_source": source,
+        "provider_byte_accounting": "async_webshare_proxy_activity_or_stats",
+        "provider_bytes_exact_for_call": False,
+        "proxy_domain": proxy.webshare_domain if proxy else None,
+        "proxy_port": proxy.webshare_port if proxy else None,
+        **byte_metrics,
+    }
+
+
+def _proxy_target_hostname(target: str | None) -> str:
+    if not target:
+        return "www.youtube.com"
+    parsed = urlsplit(target if "://" in target else f"https://www.youtube.com/watch?v={target}")
+    return parsed.netloc.lower() or "www.youtube.com"
+
+
+def _locally_visible_webshare_byte_metrics(result: Any, *, target: str | None, source: str) -> dict[str, Any]:
+    response_bytes = _visible_response_bytes(result)
+    request_bytes = _request_target_bytes(target)
+    accounted_bytes = response_bytes + request_bytes
+    status = "locally_visible_transfer"
+    if source == "yt-dlp.proxy_url":
+        status = "no_proxy_transfer_initiated"
+        request_bytes = 0
+        accounted_bytes = response_bytes
+    elif response_bytes == 0 and request_bytes == 0:
+        status = "local_transfer_unavailable"
+    return {
+        "bytes": accounted_bytes,
+        "local_request_bytes": request_bytes,
+        "local_response_bytes": response_bytes,
+        "byte_accounting_status": status,
+        "byte_accounting_basis": _byte_accounting_basis(result, source=source),
+    }
+
+
+def _visible_response_bytes(result: Any) -> int:
+    if isinstance(result, subprocess.CompletedProcess):
+        return _byte_len(result.stdout) + int(getattr(result, "yutome_output_file_bytes", 0) or 0)
+    if isinstance(result, TranscriptFetchResult):
+        return _json_byte_len(
+            {
+                "raw_snippets": result.raw_snippets,
+                "source": result.source,
+                "language": result.language,
+                "is_generated": result.is_generated,
+            }
+        )
+    if isinstance(result, list) and all(isinstance(item, AvailableTranscript) for item in result):
+        return _json_byte_len([asdict(item) for item in result])
+    if isinstance(result, str):
+        return 0
+    if is_dataclass(result):
+        return _json_byte_len(asdict(result))
+    if isinstance(result, (dict, list, tuple)):
+        return _json_byte_len(result)
+    return 0
+
+
+def _request_target_bytes(target: str | None) -> int:
+    if not target:
+        return 0
+    url = _proxy_accounting_target_url(target)
+    parsed = urlsplit(url)
+    if not parsed.netloc:
+        return 0
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    request_line = f"GET {path} HTTP/1.1\r\nHost: {parsed.netloc}\r\n\r\n"
+    return len(request_line.encode("utf-8"))
+
+
+def _proxy_accounting_target_url(target: str) -> str:
+    if "://" in target:
+        return target
+    if re.fullmatch(YOUTUBE_VIDEO_ID_RE, target):
+        return canonical_video_url(target)
+    return f"https://www.youtube.com/{target.lstrip('/')}"
+
+
+def _byte_accounting_basis(result: Any, *, source: str) -> str:
+    if source == "yt-dlp.proxy_url":
+        return "proxy_url_generation_only"
+    if isinstance(result, subprocess.CompletedProcess):
+        return "yt_dlp_stdout_plus_target_request_estimate"
+    if isinstance(result, TranscriptFetchResult):
+        return "transcript_result_json_plus_target_request_estimate"
+    if isinstance(result, list) and all(isinstance(item, AvailableTranscript) for item in result):
+        return "transcript_list_json_plus_target_request_estimate"
+    return "target_request_estimate"
+
+
+def _byte_len(value: str | bytes | None) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    return len(value.encode("utf-8"))
+
+
+def _json_byte_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+def _webshare_proxy_failure_status_code(result: subprocess.CompletedProcess[str]) -> int | None:
+    detail = (result.stderr or "") + "\n" + (result.stdout or "")
+    text = detail.lower()
+    if is_proxy_payment_error(detail):
+        return 402
+    if "407 proxy authentication required" in text or "proxy authentication required" in text:
+        return 407
+    if "webshare" in text and "unauthorized" in text:
+        return 401
+    if "webshare" in text and "forbidden" in text:
+        return 403
     return None
 
 
@@ -262,7 +486,55 @@ def _run_ytdlp(
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
     proxy_key: str | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    def run() -> subprocess.CompletedProcess[str]:
+        result = _run_ytdlp_unwrapped(
+            args,
+            cwd=cwd,
+            proxy=proxy,
+            ytdlp_config=ytdlp_config,
+            proxy_key=proxy_key,
+        )
+        if result.returncode != 0 and _uses_hosted_webshare_proxy(proxy, hosted_context):
+            status_code = _webshare_proxy_failure_status_code(result)
+            if status_code is not None:
+                raise _HostedWebshareProxyFailure(
+                    result,
+                    status_code=status_code,
+                    message=format_ytdlp_failure(
+                        result,
+                        operation="proxy request",
+                        proxy=proxy,
+                        proxy_key=proxy_key,
+                    ),
+                )
+        return result
+
+    if _uses_hosted_webshare_proxy(proxy, hosted_context):
+        try:
+            return _execute_hosted_webshare_proxy_call(
+                proxy,
+                hosted_context,
+                run,
+                target=proxy_key,
+                source="yt-dlp",
+            )
+        except _HostedWebshareProxyFailure as exc:
+            return exc.result
+
+    return run()
+
+
+def _run_ytdlp_unwrapped(
+    args: Iterable[str],
+    *,
+    cwd: Path,
+    proxy: ProxyConfig | None = None,
+    ytdlp_config: YtDlpConfig | None = None,
+    proxy_key: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    arg_list = list(args)
     extra_args: list[str] = []
     proxy_url = proxy_url_for_ytdlp(proxy, key=proxy_key)
     if proxy_url:
@@ -284,11 +556,11 @@ def _run_ytdlp(
         "--ignore-config",
         "--no-warnings",
         *extra_args,
-        *args,
+        *arg_list,
     ]
     timeout_seconds = ytdlp_config.subprocess_timeout_seconds if ytdlp_config else 300.0
     try:
-        return subprocess.run(
+        result = subprocess.run(
             command,
             cwd=cwd,
             check=False,
@@ -296,16 +568,40 @@ def _run_ytdlp(
             text=True,
             timeout=timeout_seconds,
         )
+        return _with_ytdlp_output_file_bytes(result, arg_list)
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
         timeout_message = f"yt-dlp timed out after {timeout_seconds:.1f}s"
-        return subprocess.CompletedProcess(
+        result = subprocess.CompletedProcess(
             command,
             124,
             stdout or "",
             f"{stderr or ''}\n{timeout_message}".strip(),
         )
+        return _with_ytdlp_output_file_bytes(result, arg_list)
+
+
+def _with_ytdlp_output_file_bytes(
+    result: subprocess.CompletedProcess[str],
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    paths_dir = _ytdlp_paths_dir(args)
+    if paths_dir is None:
+        return result
+    try:
+        output_bytes = sum(path.stat().st_size for path in paths_dir.rglob("*") if path.is_file())
+    except OSError:
+        output_bytes = 0
+    result.yutome_output_file_bytes = output_bytes
+    return result
+
+
+def _ytdlp_paths_dir(args: list[str]) -> Path | None:
+    for index, arg in enumerate(args):
+        if arg == "--paths" and index + 1 < len(args):
+            return Path(args[index + 1])
+    return None
 
 
 def _parse_json_lines(stdout: str) -> list[dict[str, Any]]:
@@ -325,6 +621,7 @@ def discover_videos(
     limit: int | None = None,
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> list[DiscoveredVideo]:
     discovered: dict[str, DiscoveredVideo] = {}
     for tab_name, tab_url in canonical_channel_tabs(target):
@@ -346,6 +643,7 @@ def discover_videos(
             proxy=proxy,
             ytdlp_config=ytdlp_config,
             proxy_key=tab_url,
+            hosted_context=hosted_context,
         )
         if result.returncode != 0:
             if tab_name == "streams":
@@ -407,6 +705,7 @@ def fetch_video_metadata(
     cwd: Path,
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> dict[str, Any]:
     # Tempting optimisation we tried and reverted: `--extractor-args youtube:player_skip=js`
     # skips the player-JS download and signature decryption that yt-dlp does even
@@ -430,6 +729,7 @@ def fetch_video_metadata(
         proxy=proxy,
         ytdlp_config=ytdlp_config,
         proxy_key=video_id,
+        hosted_context=hosted_context,
     )
     if result.returncode != 0:
         detail = format_ytdlp_failure(
@@ -453,6 +753,7 @@ def discover_video(
     cwd: Path,
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> DiscoveredVideo:
     video_id = extract_video_id(target)
     if video_id is None:
@@ -462,6 +763,7 @@ def discover_video(
         cwd=cwd,
         proxy=proxy,
         ytdlp_config=ytdlp_config,
+        hosted_context=hosted_context,
     )
     channel_handle = metadata.get("uploader_id") or metadata.get("channel")
     if isinstance(channel_handle, str) and channel_handle.startswith("@"):
@@ -485,18 +787,30 @@ def fetch_transcript(
     languages: Iterable[str],
     proxy: ProxyConfig | None = None,
     timeout_seconds: float | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> TranscriptFetchResult:
-    api = YouTubeTranscriptApi(
-        proxy_config=_transcript_proxy_config(proxy, video_id=video_id),
-        http_client=_transcript_http_client(timeout_seconds),
-    )
-    transcript = api.fetch(video_id, languages=languages, preserve_formatting=False)
-    return TranscriptFetchResult(
-        raw_snippets=transcript.to_raw_data(),
-        source="youtube-transcript-api",
-        language=transcript.language_code,
-        is_generated=bool(transcript.is_generated),
-    )
+    def call() -> TranscriptFetchResult:
+        api = YouTubeTranscriptApi(
+            proxy_config=_transcript_proxy_config(proxy, video_id=video_id),
+            http_client=_transcript_http_client(timeout_seconds),
+        )
+        transcript = api.fetch(video_id, languages=languages, preserve_formatting=False)
+        return TranscriptFetchResult(
+            raw_snippets=transcript.to_raw_data(),
+            source="youtube-transcript-api",
+            language=transcript.language_code,
+            is_generated=bool(transcript.is_generated),
+        )
+
+    if _uses_hosted_webshare_proxy(proxy, hosted_context):
+        return _execute_hosted_webshare_proxy_call(
+            proxy,
+            hosted_context,
+            call,
+            target=video_id,
+            source="youtube-transcript-api.fetch",
+        )
+    return call()
 
 
 def _transcript_proxy_config(proxy: ProxyConfig | None, *, video_id: str):
@@ -531,20 +845,32 @@ def list_available_transcripts(
     video_id: str,
     proxy: ProxyConfig | None = None,
     timeout_seconds: float | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> list[AvailableTranscript]:
-    api = YouTubeTranscriptApi(
-        proxy_config=_transcript_proxy_config(proxy, video_id=video_id),
-        http_client=_transcript_http_client(timeout_seconds),
-    )
-    return [
-        AvailableTranscript(
-            language_code=transcript.language_code,
-            language=transcript.language,
-            is_generated=bool(transcript.is_generated),
-            is_translatable=bool(transcript.is_translatable),
+    def call() -> list[AvailableTranscript]:
+        api = YouTubeTranscriptApi(
+            proxy_config=_transcript_proxy_config(proxy, video_id=video_id),
+            http_client=_transcript_http_client(timeout_seconds),
         )
-        for transcript in api.list(video_id)
-    ]
+        return [
+            AvailableTranscript(
+                language_code=transcript.language_code,
+                language=transcript.language,
+                is_generated=bool(transcript.is_generated),
+                is_translatable=bool(transcript.is_translatable),
+            )
+            for transcript in api.list(video_id)
+        ]
+
+    if _uses_hosted_webshare_proxy(proxy, hosted_context):
+        return _execute_hosted_webshare_proxy_call(
+            proxy,
+            hosted_context,
+            call,
+            target=video_id,
+            source="youtube-transcript-api.list",
+        )
+    return call()
 
 
 def non_preferred_generated_transcripts(
@@ -553,6 +879,7 @@ def non_preferred_generated_transcripts(
     preferred_languages: Iterable[str],
     proxy: ProxyConfig | None = None,
     timeout_seconds: float | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> list[AvailableTranscript]:
     preferred = set(preferred_languages)
     return [
@@ -561,6 +888,7 @@ def non_preferred_generated_transcripts(
             video_id=video_id,
             proxy=proxy,
             timeout_seconds=timeout_seconds,
+            hosted_context=hosted_context,
         )
         if transcript.is_generated and transcript.language_code not in preferred
     ]
@@ -574,6 +902,7 @@ def fetch_subtitle_transcript_with_ytdlp(
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
     allow_translated_captions: bool = False,
+    hosted_context: ProviderCallContext | None = None,
 ) -> TranscriptFetchResult:
     language_candidates = [language]
     if language == "en":
@@ -591,7 +920,10 @@ def fetch_subtitle_transcript_with_ytdlp(
                     language=candidate,
                     proxy=proxy,
                     ytdlp_config=ytdlp_config,
+                    hosted_context=hosted_context,
                 )
+            except UsageReservationDenied:
+                raise
             except RuntimeError as exc:
                 last_error = str(exc)
                 if not is_youtube_block_error(last_error):
@@ -609,6 +941,7 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
     language: str,
     proxy: ProxyConfig | None,
     ytdlp_config: YtDlpConfig | None,
+    hosted_context: ProviderCallContext | None,
 ) -> TranscriptFetchResult:
     with tempfile.TemporaryDirectory(prefix="yutome-subs-") as temp_dir:
         # Mirror the proxy-aware sleep policy from _run_ytdlp: per-IP rate
@@ -643,6 +976,7 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
             proxy=proxy,
             ytdlp_config=ytdlp_config,
             proxy_key=video_id,
+            hosted_context=hosted_context,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -688,6 +1022,7 @@ def download_audio_for_asr(
     output_dir: Path,
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
+    hosted_context: ProviderCallContext | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     result = _run_ytdlp(
@@ -704,6 +1039,7 @@ def download_audio_for_asr(
         proxy=proxy,
         ytdlp_config=ytdlp_config,
         proxy_key=video_id,
+        hosted_context=hosted_context,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())

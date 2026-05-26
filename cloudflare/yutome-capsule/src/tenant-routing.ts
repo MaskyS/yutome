@@ -5,6 +5,7 @@
  * integration layer can call these helpers before `idFromName(...)`, before
  * relay dispatch, and before returning offline structured content.
  */
+import type { YutomeAuthProps } from "./env";
 
 export type TenantIdentityField =
   | "workspace_id"
@@ -85,6 +86,28 @@ export interface OfflineResponseMetadata {
   reason: string;
 }
 
+export interface HostedMcpAuthContext {
+  workspace_id: string;
+  scopes: string[];
+  user_id?: string;
+  grant_id?: string;
+  client_id?: string;
+  session_id?: string;
+  audience?: string;
+  expires_at?: string;
+  token_version?: string;
+}
+
+export interface ResolveHostedMcpAuthOptions {
+  requiredScope: string;
+  sessionId?: string;
+}
+
+interface HostedMcpApiEnv {
+  YUTOME_HOSTED_API_URL?: string;
+  YUTOME_HOSTED_API_TOKEN?: string;
+}
+
 export class TenantRoutingError extends Error {
   readonly code:
     | "tenant_id_missing"
@@ -98,6 +121,32 @@ export class TenantRoutingError extends Error {
     this.name = "TenantRoutingError";
     this.code = code;
     this.details = details;
+  }
+}
+
+export class HostedMcpAuthError extends Error {
+  readonly code: "hosted_auth_missing" | "insufficient_scope";
+  readonly status: number;
+
+  constructor(code: HostedMcpAuthError["code"], message: string, status: number) {
+    super(message);
+    this.name = "HostedMcpAuthError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+export class HostedMcpApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly data?: unknown;
+
+  constructor(options: { code: string; message: string; status: number; data?: unknown }) {
+    super(options.message);
+    this.name = "HostedMcpApiError";
+    this.code = options.code;
+    this.status = options.status;
+    this.data = options.data;
   }
 }
 
@@ -134,6 +183,95 @@ const DEFAULT_FORBIDDEN_TOOL_ARGUMENT_KEYS = new Set([
 
 export function isHostedWorkerMode(mode: unknown): boolean {
   return typeof mode === "string" && mode.trim().toLowerCase() === "hosted";
+}
+
+export function shouldServeConnectorRelayRoutes(mode: unknown): boolean {
+  return !isHostedWorkerMode(mode);
+}
+
+export class HostedMcpApiClient {
+  private readonly env: HostedMcpApiEnv;
+  private readonly fetcher: typeof fetch;
+
+  constructor(env: HostedMcpApiEnv, fetcher: typeof fetch = fetch) {
+    this.env = env;
+    this.fetcher = fetcher;
+  }
+
+  async callTool(auth: HostedMcpAuthContext, name: string, args: Record<string, unknown>): Promise<unknown> {
+    return this.post("tools/call", { name, arguments: args }, auth);
+  }
+
+  async readResource(auth: HostedMcpAuthContext, uri: string): Promise<unknown> {
+    return this.post("resources/read", { uri }, auth);
+  }
+
+  private async post(path: "tools/call" | "resources/read", body: unknown, auth: HostedMcpAuthContext): Promise<unknown> {
+    const response = await this.fetcher(hostedApiEndpoint(this.env, path), {
+      method: "POST",
+      headers: buildHostedMcpHeaders(auth, requireHostedApiToken(this.env)),
+      body: JSON.stringify(body),
+    });
+    const payload = await responseJsonObject(response);
+    if (!response.ok) {
+      throw hostedApiErrorFromPayload(response.status, payload);
+    }
+    if (payload.ok === false) {
+      throw hostedApiErrorFromPayload(response.status, payload);
+    }
+    if ("result" in payload) {
+      return payload.result;
+    }
+    throw new HostedMcpApiError({
+      code: "invalid_hosted_api_response",
+      message: "Hosted Yutome API response did not include a result.",
+      status: 502,
+      data: payload,
+    });
+  }
+}
+
+export function resolveHostedMcpAuthContext(
+  props: Partial<YutomeAuthProps> | null | undefined,
+  options: ResolveHostedMcpAuthOptions,
+): HostedMcpAuthContext {
+  const rawProps = recordFromUnknown(props);
+  const workspace_id = normalizeTenantId(rawProps.workspace_id, "workspace_id");
+  const scopes = normalizeScopes(rawProps.scopes ?? rawProps.scope);
+  if (!scopes.includes(options.requiredScope)) {
+    throw new HostedMcpAuthError(
+      "insufficient_scope",
+      `Hosted MCP requests require the ${options.requiredScope} scope.`,
+      403,
+    );
+  }
+
+  return withoutUndefined({
+    workspace_id,
+    scopes,
+    user_id: optionalHeaderValue(rawProps.user_id, "user_id"),
+    grant_id: optionalHeaderValue(rawProps.grant_id ?? rawProps.connector_grant_id, "grant_id"),
+    client_id: optionalHeaderValue(rawProps.client_id, "client_id"),
+    session_id: optionalHeaderValue(options.sessionId ?? rawProps.session_id, "session_id"),
+    audience: optionalHeaderValue(rawProps.audience, "audience"),
+    expires_at: optionalHeaderValue(rawProps.expires_at, "expires_at"),
+    token_version: optionalHeaderValue(rawProps.token_version, "token_version"),
+  });
+}
+
+export function buildHostedMcpHeaders(auth: HostedMcpAuthContext, apiToken: string): Headers {
+  const headers = new Headers({
+    accept: "application/json",
+    "content-type": "application/json",
+    "x-yutome-workspace-id": auth.workspace_id,
+    "x-yutome-scopes": auth.scopes.join(" "),
+    authorization: `Bearer ${apiToken}`,
+  });
+  setOptionalHeader(headers, "x-yutome-user-id", auth.user_id);
+  setOptionalHeader(headers, "x-yutome-grant-id", auth.grant_id);
+  setOptionalHeader(headers, "x-yutome-client-id", auth.client_id);
+  setOptionalHeader(headers, "x-yutome-session-id", auth.session_id);
+  return headers;
 }
 
 export function resolveMcpBridgeIdentity(
@@ -431,4 +569,127 @@ function normalizeOptionalTimestamp(value: Date | string | null | undefined): st
     return trimmed || null;
   }
   return null;
+}
+
+function hostedApiEndpoint(env: HostedMcpApiEnv, path: "tools/call" | "resources/read"): string {
+  const rawUrl = env.YUTOME_HOSTED_API_URL;
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    throw new HostedMcpApiError({
+      code: "hosted_api_url_missing",
+      message: "YUTOME_HOSTED_API_URL is required in hosted worker mode.",
+      status: 500,
+    });
+  }
+  const base = rawUrl.trim().replace(/\/+$/g, "");
+  try {
+    new URL(base);
+  } catch (err) {
+    throw new HostedMcpApiError({
+      code: "hosted_api_url_invalid",
+      message: "YUTOME_HOSTED_API_URL must be an absolute URL.",
+      status: 500,
+      data: { error: String(err) },
+    });
+  }
+  return `${base}/${path}`;
+}
+
+function requireHostedApiToken(env: HostedMcpApiEnv): string {
+  const token = env.YUTOME_HOSTED_API_TOKEN;
+  if (typeof token !== "string" || !token.trim()) {
+    throw new HostedMcpApiError({
+      code: "hosted_api_token_missing",
+      message: "YUTOME_HOSTED_API_TOKEN is required in hosted worker mode.",
+      status: 500,
+    });
+  }
+  return token.trim();
+}
+
+async function responseJsonObject(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  if (!text.trim()) {
+    return {};
+  }
+  try {
+    return recordFromUnknown(JSON.parse(text));
+  } catch {
+    throw new HostedMcpApiError({
+      code: "invalid_hosted_api_json",
+      message: "Hosted Yutome API returned invalid JSON.",
+      status: 502,
+      data: { status: response.status, body: text.slice(0, 1000) },
+    });
+  }
+}
+
+function hostedApiErrorFromPayload(status: number, payload: Record<string, unknown>): HostedMcpApiError {
+  const error = recordFromUnknown(payload.error);
+  const detail = recordFromUnknown(payload.detail);
+  const body = Object.keys(error).length > 0 ? error : detail;
+  const code = stringValue(body.code) ?? stringValue(payload.code) ?? `hosted_api_http_${status}`;
+  const message =
+    stringValue(body.message) ??
+    stringValue(payload.message) ??
+    `Hosted Yutome API returned HTTP ${status}.`;
+  return new HostedMcpApiError({
+    code,
+    message,
+    status,
+    data: Object.keys(body).length > 0 ? body : payload,
+  });
+}
+
+function normalizeScopes(value: unknown): string[] {
+  const rawScopes = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.replace(",", " ").split(/\s+/)
+      : [];
+  return [...new Set(rawScopes.map((scope) => optionalHeaderValue(scope, "scope")).filter(isString))];
+}
+
+function optionalHeaderValue(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const normalized = String(value).trim();
+  if (!normalized) {
+    return undefined;
+  }
+  if (/[\r\n]/.test(normalized) || normalized.length > 512) {
+    throw new HostedMcpAuthError(
+      "hosted_auth_missing",
+      `${name} is not a valid hosted auth header value.`,
+      401,
+    );
+  }
+  return normalized;
+}
+
+function setOptionalHeader(headers: Headers, name: string, value: string | undefined): void {
+  if (value) {
+    headers.set(name, value);
+  }
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function withoutUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as T;
 }

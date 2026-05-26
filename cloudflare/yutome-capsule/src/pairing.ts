@@ -9,7 +9,14 @@
  */
 import type { Env, YutomeAuthProps } from "./env";
 import type { AuthRequest, ClientInfo, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import { resolveConfiguredBridgeIdentity, TenantRoutingError } from "./tenant-routing.ts";
+import {
+  assertAuthRequestTargetsMcpAudience,
+  configuredMcpAudience,
+  HostedAccountGrantError,
+  hostedGrantProps,
+  issueHostedAccountGrant,
+} from "./account-grants.ts";
+import { isHostedWorkerMode, resolveConfiguredBridgeIdentity, TenantRoutingError } from "./tenant-routing.ts";
 
 interface PairingContext {
   request: Request;
@@ -41,6 +48,7 @@ interface RenderAuthorizationState {
 
 const AUTH_STATE_TTL_SECONDS = 10 * 60;
 const COMPLETED_AUTH_STATE_TTL_SECONDS = 60;
+const DEFAULT_OAUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const AUTH_STATE_PREFIX = "yutome:pairing:auth:";
 const CSRF_COOKIE_PREFIX = "__Host-yutome_pairing_";
 const AUTH_REQUEST_ID_PATTERN = /^[0-9a-f-]{36}$/;
@@ -102,25 +110,27 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
     throw err;
   }
 
-  const props: YutomeAuthProps = {
-    capsule: "owner",
-    workspace_id: bridgeIdentity.workspace_id,
-    install_id: bridgeIdentity.install_id,
-    connector_grant_id: authRequestId,
-    paired_at: new Date().toISOString(),
-  };
+  let grant;
+  try {
+    grant = await resolveOAuthGrant({
+      authRequestId,
+      authRequest: state.authRequest,
+      bridgeIdentity,
+      env,
+    });
+  } catch (err) {
+    if (err instanceof HostedAccountGrantError) {
+      return errorResponse(err.message, authRequestId, err.status);
+    }
+    throw err;
+  }
 
   const { redirectTo } = await oauthHelpers.completeAuthorization({
     request: state.authRequest,
-    userId: "yutome-owner",
-    metadata: {
-      workspace_id: props.workspace_id,
-      install_id: props.install_id,
-      connector_grant_id: props.connector_grant_id,
-      paired_at: props.paired_at,
-    },
+    userId: grant.userId,
+    metadata: oauthGrantMetadata(grant.props),
     scope: state.authRequest.scope,
-    props,
+    props: grant.props,
   });
 
   await env.OAUTH_KV.put(
@@ -134,6 +144,113 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
   );
 
   return redirectResponse(redirectTo);
+}
+
+async function resolveOAuthGrant({
+  authRequestId,
+  authRequest,
+  bridgeIdentity,
+  env,
+}: {
+  authRequestId: string;
+  authRequest: AuthRequest;
+  bridgeIdentity: { workspace_id: string; install_id: string };
+  env: Env;
+}): Promise<{ userId: string; props: YutomeAuthProps }> {
+  if (isHostedWorkerMode(env.YUTOME_WORKER_MODE)) {
+    const pairedAt = new Date();
+    const audience = configuredMcpAudience(env);
+    assertAuthRequestTargetsMcpAudience(authRequest, audience);
+    const accountGrant = await issueHostedAccountGrant(env, {
+      grantId: authRequestId,
+      authRequest,
+      workspaceId: bridgeIdentity.workspace_id,
+      audience,
+      tokenVersion: configuredTokenVersion(env),
+      expiresAt: new Date(pairedAt.getTime() + configuredTokenTtlSeconds(env) * 1000).toISOString(),
+      now: pairedAt,
+    });
+    return {
+      userId: accountGrant.user_id,
+      props: hostedGrantProps(accountGrant, bridgeIdentity.install_id),
+    };
+  }
+
+  return {
+    userId: "yutome-owner",
+    props: buildConnectorOAuthGrantProps({
+      authRequestId,
+      authRequest,
+      bridgeIdentity,
+      env,
+    }),
+  };
+}
+
+function buildConnectorOAuthGrantProps({
+  authRequestId,
+  authRequest,
+  bridgeIdentity,
+  env,
+}: {
+  authRequestId: string;
+  authRequest: AuthRequest;
+  bridgeIdentity: { workspace_id: string; install_id: string };
+  env: Env;
+}): YutomeAuthProps {
+  const pairedAt = new Date();
+  const tokenTtlSeconds = configuredTokenTtlSeconds(env);
+  return {
+    capsule: "owner",
+    workspace_id: bridgeIdentity.workspace_id,
+    install_id: bridgeIdentity.install_id,
+    connector_grant_id: authRequestId,
+    grant_id: authRequestId,
+    client_id: authRequest.clientId,
+    scopes: [...authRequest.scope],
+    audience: configuredMcpAudience(env),
+    token_version: configuredTokenVersion(env),
+    paired_at: pairedAt.toISOString(),
+    expires_at: new Date(pairedAt.getTime() + tokenTtlSeconds * 1000).toISOString(),
+  };
+}
+
+function oauthGrantMetadata(props: YutomeAuthProps): Record<string, unknown> {
+  return withoutUndefined({
+    workspace_id: props.workspace_id,
+    install_id: props.install_id,
+    connector_grant_id: props.connector_grant_id,
+    grant_id: props.grant_id,
+    user_id: props.user_id,
+    client_id: props.client_id,
+    scopes: props.scopes,
+    audience: props.audience,
+    token_version: props.token_version,
+    paired_at: props.paired_at,
+    expires_at: props.expires_at,
+  });
+}
+
+function configuredTokenVersion(env: Env): string {
+  return env.YUTOME_TOKEN_VERSION?.trim() || "v1";
+}
+
+function configuredTokenTtlSeconds(env: Env): number {
+  const configured = env.YUTOME_TOKEN_TTL_SECONDS?.trim();
+  if (!configured) {
+    return DEFAULT_OAUTH_TOKEN_TTL_SECONDS;
+  }
+  const parsed = Number(configured);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_OAUTH_TOKEN_TTL_SECONDS;
+  }
+  return Math.floor(parsed);
+}
+
+function withoutUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as T;
 }
 
 /**
@@ -222,9 +339,9 @@ export function renderForm(url: URL, error: string, authState?: RenderAuthorizat
   });
 }
 
-function errorResponse(message: string, authRequestId?: string): Response {
+function errorResponse(message: string, authRequestId?: string, status = 400): Response {
   const response = new Response(message, {
-    status: 400,
+    status,
     headers: securityHeaders("text/plain; charset=utf-8"),
   });
   if (authRequestId) {
