@@ -7,13 +7,27 @@ import json
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import case, func, literal_column, text
+from sqlalchemy.dialects.postgresql import insert
 
 from yutome.hosted.migrations import HOSTED_DEFAULT_EMBEDDING_MODEL, HOSTED_VECTOR_BACKEND
 from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import (
+    account_sessions,
+    entitlement_policies,
+    price_books,
+    provider_allocations,
+    service_allocations,
+    users,
+    workspace_balances,
+    workspace_members,
+    workspaces,
+)
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 STARTER_PRICE_BOOK_ID = "price_book_starter_v1"
@@ -68,6 +82,7 @@ STARTER_HARD_LIMITS: dict[str, Any] = {
 }
 
 _CREDENTIAL_KEY_FRAGMENTS = ("api_key", "access_token", "refresh_token", "secret", "password", "credential")
+_NON_SECRET_CREDENTIAL_KEYS = frozenset({"credential_mode"})
 
 
 class AccountModel(BaseModel):
@@ -206,6 +221,126 @@ def sign_account_session_token(
     return f"{signed}.{_base64url(signature)}"
 
 
+class AccountSessionError(Exception):
+    """Raised when an account session token fails verification.
+
+    Carries a stable ``code`` and ``status_code`` so the HTTP layer can map it
+    to a sanitized response without leaking why verification failed.
+    """
+
+    def __init__(self, code: str, message: str, *, status_code: int = 401) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class AccountSessionClaims:
+    user_id: str
+    workspace_id: str
+    workspace_ids: tuple[str, ...]
+    audience: str
+    issued_at: datetime
+    expires_at: datetime
+    replay_id: str | None = None
+    session_id: str | None = None
+
+
+def verify_account_session_token(
+    token: str,
+    *,
+    secret: str,
+    audience: str = DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    now: datetime | None = None,
+    clock_skew_seconds: int = 60,
+    max_age_seconds: int | None = None,
+) -> AccountSessionClaims:
+    """Verify a ``v1`` account session token and return its claims.
+
+    Counterpart to :func:`sign_account_session_token`. Mirrors the worker-side
+    TypeScript verifier in ``cloudflare/yutome-capsule/src/account-grants.ts`` so
+    the hosted API can derive tenant identity from a forwarded session token
+    instead of trusting a client-supplied workspace header. Raises
+    :class:`AccountSessionError` (never returns a partial result) on any failure.
+    """
+
+    if not secret or not secret.strip():
+        raise AccountSessionError(
+            "account_session_signing_unconfigured",
+            "Account session signing secret is required.",
+            status_code=503,
+        )
+    parts = token.split(".") if token else []
+    if len(parts) != 3 or parts[0] != "v1" or not parts[1] or not parts[2]:
+        raise AccountSessionError("account_session_malformed", "Account session was not a signed v1 token.")
+    signed = f"{parts[0]}.{parts[1]}"
+    expected = hmac.new(secret.encode("utf-8"), signed.encode("utf-8"), hashlib.sha256).digest()
+    try:
+        actual = _base64url_decode(parts[2])
+    except (ValueError, TypeError) as exc:
+        raise AccountSessionError("account_session_malformed", "Account session signature was not valid base64url.") from exc
+    if not hmac.compare_digest(actual, expected):
+        raise AccountSessionError("account_session_invalid", "Account session signature was invalid.")
+    try:
+        payload = json.loads(_base64url_decode(parts[1]).decode("utf-8"))
+    except (ValueError, TypeError) as exc:
+        raise AccountSessionError("account_session_malformed", "Account session payload was not valid JSON.") from exc
+    if not isinstance(payload, Mapping):
+        raise AccountSessionError("account_session_malformed", "Account session payload was not an object.")
+
+    if payload.get("aud") != audience:
+        raise AccountSessionError("account_session_audience_mismatch", "Account session audience is not accepted.")
+
+    now = now or datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    exp = _int_claim(payload, "exp")
+    iat = _int_claim(payload, "iat")
+    if exp is None or iat is None:
+        raise AccountSessionError("account_session_malformed", "Account session is missing exp/iat.")
+    if now_ts > exp + clock_skew_seconds:
+        raise AccountSessionError("account_session_expired", "Account session has expired.")
+    if iat > now_ts + clock_skew_seconds:
+        raise AccountSessionError("account_session_not_yet_valid", "Account session was issued in the future.")
+    if max_age_seconds is not None and now_ts - iat > max_age_seconds + clock_skew_seconds:
+        raise AccountSessionError("account_session_expired", "Account session exceeded its maximum age.")
+
+    user_id = _str_claim(payload, "user_id")
+    workspace_id = _str_claim(payload, "workspace_id")
+    if not user_id or not workspace_id:
+        raise AccountSessionError("account_session_malformed", "Account session is missing user/workspace.")
+    raw_ids = payload.get("workspace_ids")
+    extra_ids = [str(item) for item in raw_ids] if isinstance(raw_ids, list) else []
+    workspace_ids = tuple(dict.fromkeys([workspace_id, *extra_ids]))
+    return AccountSessionClaims(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        workspace_ids=workspace_ids,
+        audience=audience,
+        issued_at=datetime.fromtimestamp(iat, tz=timezone.utc),
+        expires_at=datetime.fromtimestamp(exp, tz=timezone.utc),
+        replay_id=_str_claim(payload, "jti"),
+        session_id=_str_claim(payload, "session_id"),
+    )
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _int_claim(payload: Mapping[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def _str_claim(payload: Mapping[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def bootstrap_hosted_account(
     connection: AccountSqlConnection,
     account: AccountBootstrapInput,
@@ -318,175 +453,99 @@ def account_bootstrap_sql(account: AccountBootstrapInput) -> list[tuple[str, Sql
 
 
 def upsert_user_sql(account: AccountBootstrapInput) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO users (
-    id,
-    email,
-    normalized_email,
-    name,
-    status,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(email)s,
-    %(normalized_email)s,
-    %(name)s,
-    'active',
-    now()
-)
-ON CONFLICT (normalized_email) DO UPDATE
-SET email = users.email,
-    name = COALESCE(users.name, EXCLUDED.name),
-    status = CASE WHEN users.status = 'disabled' THEN users.status ELSE 'active' END
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(users).values(
+        **{
             "id": account.user_id,
             "email": account.email.strip(),
             "normalized_email": account.normalized_email,
             "name": account.name,
-        },
+            "status": "active",
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[users.c.normalized_email],
+        set_={
+            "email": users.c.email,
+            "name": func.coalesce(users.c.name, statement.excluded.name),
+            "status": case((users.c.status == "disabled", users.c.status), else_="active"),
+        },
+    ).returning(users)
+    return _sql_statement(statement)
+
+
+def _sql_statement(statement: Any) -> SqlStatement:
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def upsert_personal_workspace_sql(account: AccountBootstrapInput) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO workspaces (
-    id,
-    owner_user_id,
-    name,
-    status,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(owner_user_id)s,
-    %(name)s,
-    'active',
-    now()
-)
-ON CONFLICT (id) DO UPDATE
-SET owner_user_id = workspaces.owner_user_id,
-    name = workspaces.name,
-    status = CASE WHEN workspaces.status = 'disabled' THEN workspaces.status ELSE 'active' END
-RETURNING *;
-""".strip(),
-        params={
-            "id": account.workspace_id,
-            "owner_user_id": account.user_id,
-            "name": account.workspace_name or _default_workspace_name(account.normalized_email),
-        },
+    statement = insert(workspaces).values(
+        id=account.workspace_id,
+        owner_user_id=account.user_id,
+        name=account.workspace_name or _default_workspace_name(account.normalized_email),
+        status="active",
+        created_at=func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[workspaces.c.id],
+        set_={
+            "owner_user_id": workspaces.c.owner_user_id,
+            "name": workspaces.c.name,
+            "status": case((workspaces.c.status == "disabled", workspaces.c.status), else_="active"),
+        },
+    ).returning(workspaces)
+    return _sql_statement(statement)
 
 
 def upsert_workspace_member_sql(account: AccountBootstrapInput) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO workspace_members (
-    workspace_id,
-    user_id,
-    role,
-    status,
-    created_at
-)
-VALUES (
-    %(workspace_id)s,
-    %(user_id)s,
-    'owner',
-    'active',
-    now()
-)
-ON CONFLICT (workspace_id, user_id) DO UPDATE
-SET role = 'owner',
-    status = CASE WHEN workspace_members.status = 'disabled' THEN workspace_members.status ELSE 'active' END
-RETURNING *;
-""".strip(),
-        params={"workspace_id": account.workspace_id, "user_id": account.user_id},
+    statement = insert(workspace_members).values(
+        workspace_id=account.workspace_id,
+        user_id=account.user_id,
+        role="owner",
+        status="active",
+        created_at=func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[workspace_members.c.workspace_id, workspace_members.c.user_id],
+        set_={
+            "role": literal_column("'owner'"),
+            "status": case(
+                (workspace_members.c.status == "disabled", workspace_members.c.status),
+                else_="active",
+            ),
+        },
+    ).returning(workspace_members)
+    return _sql_statement(statement)
 
 
 def upsert_starter_price_book_sql() -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO price_books (
-    id,
-    version,
-    currency,
-    products_jsonb,
-    unit_mapping_jsonb,
-    status,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(version)s,
-    'usd',
-    %(products_jsonb)s::jsonb,
-    %(unit_mapping_jsonb)s::jsonb,
-    'active',
-    %(metadata_json)s::jsonb,
-    now()
-)
-ON CONFLICT (version) DO UPDATE
-SET status = 'active',
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(price_books).values(
+        **{
             "id": STARTER_PRICE_BOOK_ID,
             "version": STARTER_PRICE_BOOK_VERSION,
+            "currency": "usd",
             "products_jsonb": _json_param([{"plan_key": STARTER_PLAN_KEY, "label": "Starter"}]),
             "unit_mapping_jsonb": _json_param({"source": "account_bootstrap"}),
+            "status": "active",
             "metadata_json": _json_param({"managed_by": "yutome_account_core"}),
-        },
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[price_books.c.version],
+        set_={
+            "status": literal_column("'active'"),
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(price_books)
+    return _sql_statement(statement)
 
 
 def upsert_starter_entitlement_policy_sql(workspace_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO entitlement_policies (
-    id,
-    workspace_id,
-    plan_key,
-    price_book_id,
-    allowed_operations,
-    included_units_jsonb,
-    hard_limits_jsonb,
-    soft_limits_jsonb,
-    grace_policy_jsonb,
-    status,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(plan_key)s,
-    %(price_book_id)s,
-    %(allowed_operations)s,
-    %(included_units_jsonb)s::jsonb,
-    %(hard_limits_jsonb)s::jsonb,
-    %(soft_limits_jsonb)s::jsonb,
-    '{}'::jsonb,
-    'active',
-    %(metadata_json)s::jsonb,
-    now()
-)
-ON CONFLICT (workspace_id, plan_key, price_book_id) DO UPDATE
-SET allowed_operations = EXCLUDED.allowed_operations,
-    included_units_jsonb = EXCLUDED.included_units_jsonb,
-    hard_limits_jsonb = EXCLUDED.hard_limits_jsonb,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(entitlement_policies).values(
+        **{
             "id": starter_entitlement_policy_id(workspace_id),
             "workspace_id": workspace_id,
             "plan_key": STARTER_PLAN_KEY,
@@ -495,99 +554,86 @@ RETURNING *;
             "included_units_jsonb": _json_param(STARTER_INCLUDED_UNITS),
             "hard_limits_jsonb": _json_param(STARTER_HARD_LIMITS),
             "soft_limits_jsonb": _json_param({}),
+            "grace_policy_jsonb": _json_param({}),
+            "status": "active",
             "metadata_json": _json_param({"source": "account_bootstrap"}),
-        },
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[
+            entitlement_policies.c.workspace_id,
+            entitlement_policies.c.plan_key,
+            entitlement_policies.c.price_book_id,
+        ],
+        set_={
+            "allowed_operations": statement.excluded.allowed_operations,
+            "included_units_jsonb": statement.excluded.included_units_jsonb,
+            "hard_limits_jsonb": statement.excluded.hard_limits_jsonb,
+            "soft_limits_jsonb": statement.excluded.soft_limits_jsonb,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(entitlement_policies)
+    return _sql_statement(statement)
 
 
 def upsert_starter_workspace_balance_sql(workspace_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO workspace_balances (
-    workspace_id,
-    entitlement_policy_id,
-    period_start_at,
-    period_end_at,
-    used_units_jsonb,
-    reserved_units_jsonb,
-    remaining_units_jsonb,
-    unlimited_units,
-    metadata_json,
-    updated_at
-)
-VALUES (
-    %(workspace_id)s,
-    %(entitlement_policy_id)s,
-    date_trunc('month', now()),
-    date_trunc('month', now()) + interval '1 month',
-    '{}'::jsonb,
-    '{}'::jsonb,
-    %(remaining_units_jsonb)s::jsonb,
-    ARRAY[]::text[],
-    %(metadata_json)s::jsonb,
-    now()
-)
-ON CONFLICT (workspace_id) DO UPDATE
-SET entitlement_policy_id = EXCLUDED.entitlement_policy_id,
-    remaining_units_jsonb = workspace_balances.remaining_units_jsonb,
-    metadata_json = workspace_balances.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(workspace_balances).values(
+        **{
             "workspace_id": workspace_id,
             "entitlement_policy_id": starter_entitlement_policy_id(workspace_id),
+            "period_start_at": text("date_trunc('month', now())"),
+            "period_end_at": text("date_trunc('month', now()) + interval '1 month'"),
+            "used_units_jsonb": _json_param({}),
+            "reserved_units_jsonb": _json_param({}),
             "remaining_units_jsonb": _json_param(STARTER_INCLUDED_UNITS),
+            "unlimited_units": [],
             "metadata_json": _json_param({"source": "account_bootstrap"}),
-        },
+            "updated_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[workspace_balances.c.workspace_id],
+        set_={
+            "entitlement_policy_id": statement.excluded.entitlement_policy_id,
+            "remaining_units_jsonb": workspace_balances.c.remaining_units_jsonb,
+            "metadata_json": workspace_balances.c.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(workspace_balances)
+    return _sql_statement(statement)
 
 
 def upsert_starter_provider_allocation_sql(workspace_id: str, *, provider: str, operation: str) -> SqlStatement:
     model_or_plan = HOSTED_DEFAULT_EMBEDDING_MODEL if provider == "voyage" else None
     external_allocation_id = f"webshare_subuser_pending:{workspace_id}" if provider == "webshare" else None
-    return SqlStatement(
-        sql="""
-INSERT INTO provider_allocations (
-    id,
-    workspace_id,
-    provider,
-    operation,
-    credential_mode,
-    status,
-    model_or_plan,
-    external_allocation_id,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(provider)s,
-    %(operation)s,
-    'hosted',
-    'active',
-    %(model_or_plan)s,
-    %(external_allocation_id)s,
-    %(metadata_json)s::jsonb,
-    now()
-)
-ON CONFLICT (id) DO UPDATE
-SET status = CASE WHEN provider_allocations.status = 'disabled' THEN provider_allocations.status ELSE 'active' END,
-    model_or_plan = EXCLUDED.model_or_plan,
-    metadata_json = EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(provider_allocations).values(
+        **{
             "id": starter_provider_allocation_id(workspace_id, provider, operation),
             "workspace_id": workspace_id,
             "provider": provider,
             "operation": operation,
+            "credential_mode": "hosted",
+            "status": "active",
             "model_or_plan": model_or_plan,
             "external_allocation_id": external_allocation_id,
             "metadata_json": _json_param({"source": "account_bootstrap", "allocation_mode": "hosted"}),
-        },
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[provider_allocations.c.id],
+        set_={
+            "status": case(
+                (provider_allocations.c.status == "disabled", provider_allocations.c.status),
+                else_="active",
+            ),
+            "model_or_plan": statement.excluded.model_or_plan,
+            "metadata_json": statement.excluded.metadata_json,
+        },
+    ).returning(provider_allocations)
+    return _sql_statement(statement)
 
 
 def upsert_starter_service_allocation_sql(
@@ -598,103 +644,65 @@ def upsert_starter_service_allocation_sql(
 ) -> SqlStatement:
     if service != "search_store":
         raise ValueError("starter account bootstrap only supports search_store service allocations")
-    return SqlStatement(
-        sql="""
-INSERT INTO service_allocations (
-    id,
-    workspace_id,
-    service,
-    operation,
-    credential_mode,
-    status,
-    backend,
-    index_profile_ref,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(service)s,
-    %(operation)s,
-    'service_internal',
-    'active',
-    %(backend)s,
-    %(index_profile_ref)s,
-    %(metadata_json)s::jsonb,
-    now()
-)
-ON CONFLICT (id) DO UPDATE
-SET status = CASE WHEN service_allocations.status = 'disabled' THEN service_allocations.status ELSE 'active' END,
-    backend = EXCLUDED.backend,
-    index_profile_ref = EXCLUDED.index_profile_ref,
-    metadata_json = EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(service_allocations).values(
+        **{
             "id": starter_service_allocation_id(workspace_id, service, operation),
             "workspace_id": workspace_id,
             "service": service,
             "operation": operation,
+            "credential_mode": "service_internal",
+            "status": "active",
             "backend": HOSTED_VECTOR_BACKEND,
             "index_profile_ref": None,
             "metadata_json": _json_param({"source": "account_bootstrap"}),
-        },
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[service_allocations.c.id],
+        set_={
+            "status": case(
+                (service_allocations.c.status == "disabled", service_allocations.c.status),
+                else_="active",
+            ),
+            "backend": statement.excluded.backend,
+            "index_profile_ref": statement.excluded.index_profile_ref,
+            "metadata_json": statement.excluded.metadata_json,
+        },
+    ).returning(service_allocations)
+    return _sql_statement(statement)
 
 
 def upsert_account_session_sql(account: AccountBootstrapInput) -> SqlStatement:
     if account.session_token is None:
         raise ValueError("session_token is required to persist an account session.")
     token_hash = session_token_hash(account.session_token)
-    return SqlStatement(
-        sql="""
-INSERT INTO account_sessions (
-    id,
-    user_id,
-    workspace_id,
-    session_hash,
-    status,
-    scopes,
-    audience,
-    client_id,
-    metadata_json,
-    created_at,
-    expires_at
-)
-VALUES (
-    %(id)s,
-    %(user_id)s,
-    %(workspace_id)s,
-    %(session_hash)s,
-    'active',
-    %(scopes)s,
-    %(audience)s,
-    %(client_id)s,
-    %(metadata_json)s::jsonb,
-    now(),
-    %(expires_at)s
-)
-ON CONFLICT (session_hash) DO UPDATE
-SET last_used_at = now(),
-    scopes = EXCLUDED.scopes,
-    audience = EXCLUDED.audience,
-    client_id = EXCLUDED.client_id,
-    expires_at = EXCLUDED.expires_at
-RETURNING *;
-""".strip(),
-        params={
+    statement = insert(account_sessions).values(
+        **{
             "id": deterministic_account_session_id(token_hash),
             "user_id": account.user_id,
             "workspace_id": account.workspace_id,
             "session_hash": token_hash,
+            "status": "active",
             "scopes": list(account.session_scopes),
             "audience": account.session_audience,
             "client_id": account.session_client_id,
             "expires_at": account.session_expires_at,
             "metadata_json": _json_param({"source": "account_bootstrap"}),
-        },
+            "created_at": func.now(),
+        }
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[account_sessions.c.session_hash],
+        set_={
+            "last_used_at": func.now(),
+            "scopes": statement.excluded.scopes,
+            "audience": statement.excluded.audience,
+            "client_id": statement.excluded.client_id,
+            "expires_at": statement.excluded.expires_at,
+        },
+    ).returning(account_sessions)
+    return _sql_statement(statement)
 
 
 def starter_entitlement_policy_id(workspace_id: str) -> str:
@@ -717,7 +725,9 @@ def _contains_credential_shape(value: Any) -> bool:
     if isinstance(value, Mapping):
         for key, item in value.items():
             lowered = str(key).lower()
-            if any(fragment in lowered for fragment in _CREDENTIAL_KEY_FRAGMENTS):
+            if lowered not in _NON_SECRET_CREDENTIAL_KEYS and any(
+                fragment in lowered for fragment in _CREDENTIAL_KEY_FRAGMENTS
+            ):
                 return True
             if _contains_credential_shape(item):
                 return True
@@ -773,6 +783,8 @@ __all__ = [
     "AccountBootstrapResult",
     "AccountPrincipal",
     "AccountSession",
+    "AccountSessionClaims",
+    "AccountSessionError",
     "DEFAULT_ACCOUNT_SESSION_AUDIENCE",
     "STARTER_ALLOWED_OPERATIONS",
     "STARTER_HARD_LIMITS",
@@ -803,4 +815,5 @@ __all__ = [
     "upsert_starter_workspace_balance_sql",
     "upsert_user_sql",
     "upsert_workspace_member_sql",
+    "verify_account_session_token",
 ]

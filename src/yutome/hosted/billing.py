@@ -12,6 +12,8 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert
 
 from yutome.hosted.errors import redact_sensitive_failure_text
 from yutome.hosted.ids import input_hash
@@ -28,6 +30,16 @@ from yutome.hosted.models import (
     normalize_usage_units,
     unit_quantity_decimal,
 )
+from yutome.hosted.schema import (
+    billing_customers,
+    billing_exports,
+    credit_ledger_entries,
+    entitlement_policies,
+    polar_webhook_snapshots,
+    price_books,
+    workspace_balances,
+)
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 BillingProvider = Literal["polar"]
@@ -949,277 +961,197 @@ def billing_schema_statements(sql: str = POSTGRES_BILLING_SCHEMA_SQL) -> list[st
     return statements
 
 
+def _billing_sql_statement(statement: Any) -> BillingSqlStatement:
+    sql, params = compile_postgres_statement(statement)
+    return BillingSqlStatement(sql=sql + ";", params=params)
+
+
 def upsert_price_book_sql(price_book: PriceBook) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO price_books (
-    id,
-    version,
-    effective_at,
-    currency,
-    products_jsonb,
-    unit_mapping_jsonb,
-    status,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(version)s,
-    %(effective_at)s,
-    %(currency)s,
-    %(products_jsonb)s::jsonb,
-    %(unit_mapping_jsonb)s::jsonb,
-    %(status)s,
-    %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s::timestamptz, now())
-)
-ON CONFLICT (version) DO UPDATE
-SET effective_at = EXCLUDED.effective_at,
-    currency = EXCLUDED.currency,
-    products_jsonb = EXCLUDED.products_jsonb,
-    unit_mapping_jsonb = EXCLUDED.unit_mapping_jsonb,
-    status = EXCLUDED.status,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params=price_book_params(price_book),
+    params = price_book_params(price_book)
+    statement = insert(price_books).values(
+        id=params["id"],
+        version=params["version"],
+        effective_at=params["effective_at"],
+        currency=params["currency"],
+        products_jsonb=params["products_jsonb"],
+        unit_mapping_jsonb=params["unit_mapping_jsonb"],
+        status=params["status"],
+        metadata_json=params["metadata_json"],
+        created_at=params["created_at"] or func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[price_books.c.version],
+        set_={
+            "effective_at": statement.excluded.effective_at,
+            "currency": statement.excluded.currency,
+            "products_jsonb": statement.excluded.products_jsonb,
+            "unit_mapping_jsonb": statement.excluded.unit_mapping_jsonb,
+            "status": statement.excluded.status,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(price_books)
+    return _billing_sql_statement(statement)
 
 
 def upsert_entitlement_policy_sql(policy: EntitlementPolicyRecord) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO entitlement_policies (
-    id,
-    workspace_id,
-    plan_key,
-    price_book_id,
-    allowed_operations,
-    included_units_jsonb,
-    hard_limits_jsonb,
-    soft_limits_jsonb,
-    grace_policy_jsonb,
-    status,
-    metadata_json,
-    created_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(plan_key)s,
-    %(price_book_id)s,
-    %(allowed_operations)s::text[],
-    %(included_units_jsonb)s::jsonb,
-    %(hard_limits_jsonb)s::jsonb,
-    %(soft_limits_jsonb)s::jsonb,
-    %(grace_policy_jsonb)s::jsonb,
-    %(status)s,
-    %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s::timestamptz, now())
-)
-ON CONFLICT (workspace_id, plan_key, price_book_id) DO UPDATE
-SET allowed_operations = EXCLUDED.allowed_operations,
-    included_units_jsonb = EXCLUDED.included_units_jsonb,
-    hard_limits_jsonb = EXCLUDED.hard_limits_jsonb,
-    soft_limits_jsonb = EXCLUDED.soft_limits_jsonb,
-    grace_policy_jsonb = EXCLUDED.grace_policy_jsonb,
-    status = EXCLUDED.status,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params=entitlement_policy_params(policy),
+    params = entitlement_policy_params(policy)
+    statement = insert(entitlement_policies).values(
+        id=params["id"],
+        workspace_id=params["workspace_id"],
+        plan_key=params["plan_key"],
+        price_book_id=params["price_book_id"],
+        allowed_operations=params["allowed_operations"],
+        included_units_jsonb=params["included_units_jsonb"],
+        hard_limits_jsonb=params["hard_limits_jsonb"],
+        soft_limits_jsonb=params["soft_limits_jsonb"],
+        grace_policy_jsonb=params["grace_policy_jsonb"],
+        status=params["status"],
+        metadata_json=params["metadata_json"],
+        created_at=params["created_at"] or func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[
+            entitlement_policies.c.workspace_id,
+            entitlement_policies.c.plan_key,
+            entitlement_policies.c.price_book_id,
+        ],
+        set_={
+            "allowed_operations": statement.excluded.allowed_operations,
+            "included_units_jsonb": statement.excluded.included_units_jsonb,
+            "hard_limits_jsonb": statement.excluded.hard_limits_jsonb,
+            "soft_limits_jsonb": statement.excluded.soft_limits_jsonb,
+            "grace_policy_jsonb": statement.excluded.grace_policy_jsonb,
+            "status": statement.excluded.status,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(entitlement_policies)
+    return _billing_sql_statement(statement)
 
 
 def upsert_workspace_balance_sql(balance: WorkspaceBalanceSnapshot) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO workspace_balances (
-    workspace_id,
-    entitlement_policy_id,
-    period_start_at,
-    period_end_at,
-    used_units_jsonb,
-    reserved_units_jsonb,
-    remaining_units_jsonb,
-    unlimited_units,
-    metadata_json,
-    updated_at
-)
-VALUES (
-    %(workspace_id)s,
-    %(entitlement_policy_id)s,
-    %(period_start_at)s,
-    %(period_end_at)s,
-    %(used_units_jsonb)s::jsonb,
-    %(reserved_units_jsonb)s::jsonb,
-    %(remaining_units_jsonb)s::jsonb,
-    %(unlimited_units)s::text[],
-    %(metadata_json)s::jsonb,
-    COALESCE(%(updated_at)s::timestamptz, now())
-)
-ON CONFLICT (workspace_id) DO UPDATE
-SET entitlement_policy_id = EXCLUDED.entitlement_policy_id,
-    period_start_at = EXCLUDED.period_start_at,
-    period_end_at = EXCLUDED.period_end_at,
-    used_units_jsonb = EXCLUDED.used_units_jsonb,
-    reserved_units_jsonb = EXCLUDED.reserved_units_jsonb,
-    remaining_units_jsonb = EXCLUDED.remaining_units_jsonb,
-    unlimited_units = EXCLUDED.unlimited_units,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = EXCLUDED.updated_at
-RETURNING *;
-""".strip(),
-        params=workspace_balance_params(balance),
+    params = workspace_balance_params(balance)
+    statement = insert(workspace_balances).values(
+        workspace_id=params["workspace_id"],
+        entitlement_policy_id=params["entitlement_policy_id"],
+        period_start_at=params["period_start_at"],
+        period_end_at=params["period_end_at"],
+        used_units_jsonb=params["used_units_jsonb"],
+        reserved_units_jsonb=params["reserved_units_jsonb"],
+        remaining_units_jsonb=params["remaining_units_jsonb"],
+        unlimited_units=params["unlimited_units"],
+        metadata_json=params["metadata_json"],
+        updated_at=params["updated_at"] or func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[workspace_balances.c.workspace_id],
+        set_={
+            "entitlement_policy_id": statement.excluded.entitlement_policy_id,
+            "period_start_at": statement.excluded.period_start_at,
+            "period_end_at": statement.excluded.period_end_at,
+            "used_units_jsonb": statement.excluded.used_units_jsonb,
+            "reserved_units_jsonb": statement.excluded.reserved_units_jsonb,
+            "remaining_units_jsonb": statement.excluded.remaining_units_jsonb,
+            "unlimited_units": statement.excluded.unlimited_units,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": statement.excluded.updated_at,
+        },
+    ).returning(workspace_balances)
+    return _billing_sql_statement(statement)
 
 
 def upsert_billing_customer_sql(customer: BillingCustomer) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO billing_customers (
-    id,
-    workspace_id,
-    provider,
-    external_customer_id,
-    external_subscription_id,
-    subscription_status_snapshot_jsonb,
-    last_webhook_at,
-    status,
-    metadata_json,
-    created_at,
-    updated_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(provider)s,
-    %(external_customer_id)s,
-    %(external_subscription_id)s,
-    %(subscription_status_snapshot_jsonb)s::jsonb,
-    %(last_webhook_at)s,
-    %(status)s,
-    %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s::timestamptz, now()),
-    COALESCE(%(updated_at)s::timestamptz, now())
-)
-ON CONFLICT (workspace_id, provider) DO UPDATE
-SET external_customer_id = EXCLUDED.external_customer_id,
-    external_subscription_id = EXCLUDED.external_subscription_id,
-    subscription_status_snapshot_jsonb = EXCLUDED.subscription_status_snapshot_jsonb,
-    last_webhook_at = EXCLUDED.last_webhook_at,
-    status = EXCLUDED.status,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params=billing_customer_params(customer),
+    params = billing_customer_params(customer)
+    statement = insert(billing_customers).values(
+        id=params["id"],
+        workspace_id=params["workspace_id"],
+        provider=params["provider"],
+        external_customer_id=params["external_customer_id"],
+        external_subscription_id=params["external_subscription_id"],
+        subscription_status_snapshot_jsonb=params["subscription_status_snapshot_jsonb"],
+        last_webhook_at=params["last_webhook_at"],
+        status=params["status"],
+        metadata_json=params["metadata_json"],
+        created_at=params["created_at"] or func.now(),
+        updated_at=params["updated_at"] or func.now(),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[billing_customers.c.workspace_id, billing_customers.c.provider],
+        set_={
+            "external_customer_id": statement.excluded.external_customer_id,
+            "external_subscription_id": statement.excluded.external_subscription_id,
+            "subscription_status_snapshot_jsonb": statement.excluded.subscription_status_snapshot_jsonb,
+            "last_webhook_at": statement.excluded.last_webhook_at,
+            "status": statement.excluded.status,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(billing_customers)
+    return _billing_sql_statement(statement)
 
 
 def upsert_credit_ledger_entry_sql(entry: CreditLedgerEntry) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO credit_ledger_entries (
-    id,
-    workspace_id,
-    idempotency_key,
-    provider,
-    external_order_id,
-    external_customer_id,
-    direction,
-    unit,
-    quantity_text,
-    reason,
-    metadata_json,
-    occurred_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(idempotency_key)s,
-    %(provider)s,
-    %(external_order_id)s,
-    %(external_customer_id)s,
-    %(direction)s,
-    %(unit)s,
-    %(quantity_text)s,
-    %(reason)s,
-    %(metadata_json)s::jsonb,
-    %(occurred_at)s
-)
-ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET idempotency_key = credit_ledger_entries.idempotency_key
-RETURNING *;
-""".strip(),
-        params=credit_ledger_entry_params(entry),
+    params = credit_ledger_entry_params(entry)
+    statement = insert(credit_ledger_entries).values(
+        id=params["id"],
+        workspace_id=params["workspace_id"],
+        idempotency_key=params["idempotency_key"],
+        provider=params["provider"],
+        external_order_id=params["external_order_id"],
+        external_customer_id=params["external_customer_id"],
+        direction=params["direction"],
+        unit=params["unit"],
+        quantity_text=params["quantity_text"],
+        reason=params["reason"],
+        metadata_json=params["metadata_json"],
+        occurred_at=params["occurred_at"],
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[credit_ledger_entries.c.workspace_id, credit_ledger_entries.c.idempotency_key],
+        set_={"idempotency_key": credit_ledger_entries.c.idempotency_key},
+    ).returning(credit_ledger_entries)
+    return _billing_sql_statement(statement)
 
 
 def upsert_billing_export_sql(export: BillingExportEvent) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO billing_exports (
-    id,
-    workspace_id,
-    usage_event_id,
-    reservation_id,
-    billing_customer_id,
-    price_book_id,
-    provider,
-    external_customer_id,
-    customer_id,
-    external_meter_key,
-    external_event_id,
-    event_name,
-    export_units_jsonb,
-    source_event_dedupe_key,
-    status,
-    authorization_effect,
-    attempt_count,
-    last_error_jsonb,
-    metadata_json,
-    event_timestamp,
-    exported_at
-)
-VALUES (
-    %(id)s,
-    %(workspace_id)s,
-    %(usage_event_id)s,
-    %(reservation_id)s,
-    %(billing_customer_id)s,
-    %(price_book_id)s,
-    %(provider)s,
-    %(external_customer_id)s,
-    %(customer_id)s,
-    %(external_meter_key)s,
-    %(external_event_id)s,
-    %(event_name)s,
-    %(export_units_jsonb)s::jsonb,
-    %(source_event_dedupe_key)s,
-    %(status)s,
-    %(authorization_effect)s,
-    %(attempt_count)s,
-    %(last_error_jsonb)s::jsonb,
-    %(metadata_json)s::jsonb,
-    %(event_timestamp)s,
-    %(exported_at)s
-)
-ON CONFLICT (provider, source_event_dedupe_key) DO UPDATE
-SET external_event_id = COALESCE(EXCLUDED.external_event_id, billing_exports.external_event_id),
-    status = EXCLUDED.status,
-    attempt_count = GREATEST(EXCLUDED.attempt_count, billing_exports.attempt_count),
-    last_error_jsonb = EXCLUDED.last_error_jsonb,
-    metadata_json = EXCLUDED.metadata_json,
-    exported_at = COALESCE(EXCLUDED.exported_at, billing_exports.exported_at),
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params=billing_export_params(export),
+    params = billing_export_params(export)
+    statement = insert(billing_exports).values(
+        id=params["id"],
+        workspace_id=params["workspace_id"],
+        usage_event_id=params["usage_event_id"],
+        reservation_id=params["reservation_id"],
+        billing_customer_id=params["billing_customer_id"],
+        price_book_id=params["price_book_id"],
+        provider=params["provider"],
+        external_customer_id=params["external_customer_id"],
+        customer_id=params["customer_id"],
+        external_meter_key=params["external_meter_key"],
+        external_event_id=params["external_event_id"],
+        event_name=params["event_name"],
+        export_units_jsonb=params["export_units_jsonb"],
+        source_event_dedupe_key=params["source_event_dedupe_key"],
+        status=params["status"],
+        authorization_effect=params["authorization_effect"],
+        attempt_count=params["attempt_count"],
+        last_error_jsonb=params["last_error_jsonb"],
+        metadata_json=params["metadata_json"],
+        event_timestamp=params["event_timestamp"],
+        exported_at=params["exported_at"],
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[billing_exports.c.provider, billing_exports.c.source_event_dedupe_key],
+        set_={
+            "external_event_id": func.coalesce(statement.excluded.external_event_id, billing_exports.c.external_event_id),
+            "status": statement.excluded.status,
+            "attempt_count": func.greatest(statement.excluded.attempt_count, billing_exports.c.attempt_count),
+            "last_error_jsonb": statement.excluded.last_error_jsonb,
+            "metadata_json": statement.excluded.metadata_json,
+            "exported_at": func.coalesce(statement.excluded.exported_at, billing_exports.c.exported_at),
+            "updated_at": func.now(),
+        },
+    ).returning(billing_exports)
+    return _billing_sql_statement(statement)
 
 
 def claim_billing_exports_sql(
@@ -1317,47 +1249,32 @@ def billing_export_event_from_row(row: Mapping[str, Any]) -> BillingExportEvent:
 
 
 def upsert_polar_webhook_snapshot_sql(snapshot: PolarWebhookSnapshot) -> BillingSqlStatement:
-    return BillingSqlStatement(
-        sql="""
-INSERT INTO polar_webhook_snapshots (
-    id,
-    webhook_event_id,
-    payload_hash,
-    event_type,
-    workspace_id,
-    external_customer_id,
-    external_subscription_id,
-    customer_state_snapshot_jsonb,
-    payload_jsonb,
-    replay_status,
-    received_at,
-    processed_at,
-    last_error_jsonb
-)
-VALUES (
-    %(id)s,
-    %(webhook_event_id)s,
-    %(payload_hash)s,
-    %(event_type)s,
-    %(workspace_id)s,
-    %(external_customer_id)s,
-    %(external_subscription_id)s,
-    %(customer_state_snapshot_jsonb)s::jsonb,
-    %(payload_jsonb)s::jsonb,
-    %(replay_status)s,
-    %(received_at)s,
-    %(processed_at)s,
-    %(last_error_jsonb)s::jsonb
-)
-ON CONFLICT (id) DO UPDATE
-SET replay_status = EXCLUDED.replay_status,
-    payload_hash = EXCLUDED.payload_hash,
-    processed_at = COALESCE(EXCLUDED.processed_at, polar_webhook_snapshots.processed_at),
-    last_error_jsonb = EXCLUDED.last_error_jsonb
-RETURNING *;
-""".strip(),
-        params=polar_webhook_snapshot_params(snapshot),
+    params = polar_webhook_snapshot_params(snapshot)
+    statement = insert(polar_webhook_snapshots).values(
+        id=params["id"],
+        webhook_event_id=params["webhook_event_id"],
+        payload_hash=params["payload_hash"],
+        event_type=params["event_type"],
+        workspace_id=params["workspace_id"],
+        external_customer_id=params["external_customer_id"],
+        external_subscription_id=params["external_subscription_id"],
+        customer_state_snapshot_jsonb=params["customer_state_snapshot_jsonb"],
+        payload_jsonb=params["payload_jsonb"],
+        replay_status=params["replay_status"],
+        received_at=params["received_at"],
+        processed_at=params["processed_at"],
+        last_error_jsonb=params["last_error_jsonb"],
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[polar_webhook_snapshots.c.id],
+        set_={
+            "replay_status": statement.excluded.replay_status,
+            "payload_hash": statement.excluded.payload_hash,
+            "processed_at": func.coalesce(statement.excluded.processed_at, polar_webhook_snapshots.c.processed_at),
+            "last_error_jsonb": statement.excluded.last_error_jsonb,
+        },
+    ).returning(polar_webhook_snapshots)
+    return _billing_sql_statement(statement)
 
 
 def billing_debug_snapshot_sql(

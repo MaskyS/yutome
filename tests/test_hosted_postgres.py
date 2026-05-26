@@ -8,9 +8,26 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
+from yutome.hosted.billing import (
+    BillingCustomer,
+    BillingExportEvent,
+    CreditLedgerEntry,
+    EntitlementPolicyRecord,
+    PolarWebhookSnapshot,
+    PriceBook,
+    WorkspaceBalanceSnapshot,
+    upsert_billing_customer_sql,
+    upsert_billing_export_sql,
+    upsert_credit_ledger_entry_sql,
+    upsert_entitlement_policy_sql,
+    upsert_polar_webhook_snapshot_sql,
+    upsert_price_book_sql,
+    upsert_workspace_balance_sql,
+)
 from yutome.hosted.indexing import complete_job_operation_success_sql, enqueue_index_video_job_sql
 from yutome.hosted.jobs import (
     active_job_lease_sql,
@@ -288,6 +305,243 @@ def test_live_postgres_executes_core_built_usage_repository_upserts(live_postgre
             assert first_event["actual_units_json"] == {"total_tokens": 1900, "vectors": 2}
             assert duplicate_event["id"] == "evt_1"
             assert duplicate_event["actual_units_json"] == {"total_tokens": 1900, "vectors": 2}
+
+        connection.rollback()
+
+
+def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: str) -> None:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    with psycopg.connect(live_postgres_dsn, autocommit=False, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TEMP TABLE workspaces (id text PRIMARY KEY, name text NOT NULL) ON COMMIT DROP;")
+            cursor.execute("CREATE TEMP TABLE usage_reservations (id text PRIMARY KEY) ON COMMIT DROP;")
+            cursor.execute("CREATE TEMP TABLE usage_events (id text PRIMARY KEY) ON COMMIT DROP;")
+            cursor.execute(
+                """
+                CREATE TEMP TABLE price_books (
+                    id text PRIMARY KEY,
+                    version text NOT NULL UNIQUE,
+                    effective_at timestamptz,
+                    currency text NOT NULL DEFAULT 'usd',
+                    products_jsonb jsonb NOT NULL DEFAULT '[]'::jsonb,
+                    unit_mapping_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    status text NOT NULL DEFAULT 'draft',
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE entitlement_policies (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    plan_key text NOT NULL,
+                    price_book_id text NOT NULL,
+                    allowed_operations text[] NOT NULL DEFAULT ARRAY[]::text[],
+                    included_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    hard_limits_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    soft_limits_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    grace_policy_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    status text NOT NULL DEFAULT 'active',
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    UNIQUE(workspace_id, plan_key, price_book_id)
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE workspace_balances (
+                    workspace_id text PRIMARY KEY,
+                    entitlement_policy_id text NOT NULL,
+                    period_start_at timestamptz NOT NULL,
+                    period_end_at timestamptz NOT NULL,
+                    used_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    reserved_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    remaining_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    unlimited_units text[] NOT NULL DEFAULT ARRAY[]::text[],
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE billing_customers (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    provider text NOT NULL,
+                    external_customer_id text NOT NULL,
+                    external_subscription_id text,
+                    subscription_status_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    last_webhook_at timestamptz,
+                    status text NOT NULL DEFAULT 'active',
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    UNIQUE(workspace_id, provider),
+                    UNIQUE(provider, external_customer_id)
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE credit_ledger_entries (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    idempotency_key text NOT NULL,
+                    provider text NOT NULL,
+                    external_order_id text,
+                    external_customer_id text,
+                    direction text NOT NULL,
+                    unit text NOT NULL,
+                    quantity_text text NOT NULL,
+                    reason text NOT NULL,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    occurred_at timestamptz NOT NULL,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    UNIQUE(workspace_id, idempotency_key)
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE billing_exports (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    usage_event_id text NOT NULL,
+                    reservation_id text,
+                    billing_customer_id text,
+                    price_book_id text,
+                    provider text NOT NULL,
+                    external_customer_id text,
+                    customer_id text,
+                    external_meter_key text,
+                    external_event_id text,
+                    event_name text NOT NULL,
+                    export_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    source_event_dedupe_key text NOT NULL,
+                    status text NOT NULL DEFAULT 'pending',
+                    authorization_effect text NOT NULL DEFAULT 'none',
+                    attempt_count integer NOT NULL DEFAULT 0,
+                    last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    event_timestamp timestamptz NOT NULL,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    exported_at timestamptz,
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    UNIQUE(provider, source_event_dedupe_key),
+                    UNIQUE(provider, external_event_id)
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE polar_webhook_snapshots (
+                    id text PRIMARY KEY,
+                    webhook_event_id text UNIQUE,
+                    payload_hash text NOT NULL,
+                    event_type text NOT NULL,
+                    workspace_id text,
+                    external_customer_id text,
+                    external_subscription_id text,
+                    customer_state_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    payload_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    replay_status text NOT NULL DEFAULT 'pending',
+                    received_at timestamptz NOT NULL,
+                    processed_at timestamptz,
+                    last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+
+            cursor.execute("INSERT INTO workspaces (id, name) VALUES ('ws_1', 'Workspace');")
+            cursor.execute("INSERT INTO usage_reservations (id) VALUES ('res_1');")
+            cursor.execute("INSERT INTO usage_events (id) VALUES ('evt_1');")
+
+            price_book_statement = upsert_price_book_sql(PriceBook(id="pb_1", version="starter-v1", status="active"))
+            price_book = cursor.execute(price_book_statement.sql, price_book_statement.params).fetchone()
+            assert price_book["version"] == "starter-v1"
+
+            policy = EntitlementPolicyRecord(
+                id="pol_1",
+                workspace_id="ws_1",
+                plan_key="starter",
+                price_book_id="pb_1",
+                allowed_operations=("voyage.embed_documents",),
+                hard_limits={"voyage.embed_documents": {"vectors": 10}},
+            )
+            policy_statement = upsert_entitlement_policy_sql(policy)
+            policy_row = cursor.execute(policy_statement.sql, policy_statement.params).fetchone()
+            assert policy_row["hard_limits_jsonb"]["voyage.embed_documents"]["vectors"] == 10
+
+            balance_statement = upsert_workspace_balance_sql(
+                WorkspaceBalanceSnapshot(
+                    workspace_id="ws_1",
+                    entitlement_policy_id="pol_1",
+                    period_start_at=now,
+                    period_end_at=now + timedelta(days=30),
+                    remaining_units={"vectors": 10},
+                    updated_at=now,
+                )
+            )
+            assert cursor.execute(balance_statement.sql, balance_statement.params).fetchone()["remaining_units_jsonb"] == {
+                "vectors": 10
+            }
+
+            customer_statement = upsert_billing_customer_sql(
+                BillingCustomer(id="bc_1", workspace_id="ws_1", external_customer_id="cus_1", last_webhook_at=now)
+            )
+            assert cursor.execute(customer_statement.sql, customer_statement.params).fetchone()["external_customer_id"] == "cus_1"
+
+            credit_statement = upsert_credit_ledger_entry_sql(
+                CreditLedgerEntry(
+                    id="cred_1",
+                    workspace_id="ws_1",
+                    idempotency_key="order_1:vectors:0",
+                    unit="vectors",
+                    quantity=Decimal("10"),
+                    external_order_id="order_1",
+                    reason="order_grant",
+                    occurred_at=now,
+                )
+            )
+            assert cursor.execute(credit_statement.sql, credit_statement.params).fetchone()["quantity_text"] == "10"
+
+            export_statement = upsert_billing_export_sql(
+                BillingExportEvent(
+                    idempotency_key="bill_1",
+                    usage_event_id="evt_1",
+                    reservation_id="res_1",
+                    workspace_id="ws_1",
+                    operation_key="voyage.embed_documents",
+                    event_name="yutome.voyage.embed_documents",
+                    actual_units={"vectors": 2},
+                    timestamp=now,
+                    external_customer_id="cus_1",
+                )
+            )
+            assert cursor.execute(export_statement.sql, export_statement.params).fetchone()["export_units_jsonb"] == {"vectors": 2}
+
+            snapshot_statement = upsert_polar_webhook_snapshot_sql(
+                PolarWebhookSnapshot(
+                    id="snap_1",
+                    webhook_event_id="evt_polar_1",
+                    payload_hash="sha256:abc",
+                    event_type="order.paid",
+                    workspace_id="ws_1",
+                    payload={"id": "evt_polar_1"},
+                    received_at=now,
+                )
+            )
+            assert cursor.execute(snapshot_statement.sql, snapshot_statement.params).fetchone()["payload_hash"] == "sha256:abc"
 
         connection.rollback()
 

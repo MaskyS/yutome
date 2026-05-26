@@ -1341,12 +1341,25 @@ def test_q_rejects_unsupported_shapes_and_nested_workspace_injection() -> None:
             name="q",
             arguments={"request": {"entity": "video"}, "limit": 3},
         )
+    with pytest.raises(HostedMcpError) as grouping_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="q",
+            arguments={
+                "request": {
+                    "entity": "chunk",
+                    "search": {"mode": "lexical", "over": "chunk_text", "text": "Crohn"},
+                    "per_group_limit": 3,
+                }
+            },
+        )
 
     assert unsupported_exc.value.code == "unsupported_q_shape"
     assert unsupported_exc.value.status_code == 501
     assert workspace_exc.value.code == "workspace_argument_not_allowed"
     assert workspace_exc.value.to_dict()["error"]["data"]["arguments"] == ["request.workspace_id"]
     assert mixed_exc.value.code == "invalid_arguments"
+    assert grouping_exc.value.code == "unsupported_q_shape"
 
 
 def _usage_context_provider(

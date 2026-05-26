@@ -15,8 +15,16 @@ from yutome import contract
 from yutome.hosted.account import (
     DEFAULT_ACCOUNT_SESSION_AUDIENCE,
     AccountBootstrapInput,
+    AccountSessionError,
     bootstrap_hosted_account,
     sign_account_session_token,
+    verify_account_session_token,
+)
+from yutome.hosted.account_read import (
+    load_active_workspace,
+    read_active_account_grants,
+    read_library_overview,
+    read_workspace_summary,
 )
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpError, HostedMcpQueryAdapter
 
@@ -27,7 +35,9 @@ USER_HEADER = "X-Yutome-User-Id"
 GRANT_HEADER = "X-Yutome-Grant-Id"
 CLIENT_HEADER = "X-Yutome-Client-Id"
 SESSION_HEADER = "X-Yutome-Session-Id"
+ACCOUNT_SESSION_TOKEN_HEADER = "X-Yutome-Account-Session"
 TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
+DASHBOARD_TOKEN_ENV_VAR = "YUTOME_DASHBOARD_API_TOKEN"
 POLAR_WEBHOOK_SECRET_ENV_VAR = "POLAR_WEBHOOK_SECRET"
 ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR = "YUTOME_ACCOUNT_SESSION_HMAC_SECRET"
 ACCOUNT_SESSION_AUDIENCE_ENV_VAR = "YUTOME_ACCOUNT_SESSION_AUDIENCE"
@@ -59,6 +69,15 @@ class AccountBootstrapRequest(BaseModel):
     workspace_name: str | None = None
 
 
+class AccountApiContext(BaseModel):
+    """Authenticated dashboard caller. workspace_id is derived from the verified
+    session token, never from a client-supplied header."""
+
+    workspace_id: str
+    user_id: str
+    workspace_name: str | None = None
+
+
 AuthDependency = Callable[..., HostedMcpAuthContext]
 ReadinessCheck = Callable[[], Any]
 
@@ -73,6 +92,7 @@ def build_postgres_app(
     voyage_usage_context_provider: Any | None = None,
     index_profile_ref: str | None = None,
     expected_api_token: str | None = None,
+    expected_account_api_token: str | None = None,
     polar_webhook_secret: str | None = None,
     account_session_secret: str | None = None,
     account_session_audience: str | None = None,
@@ -94,6 +114,7 @@ def build_postgres_app(
         adapter=adapter,
         readiness_check=readiness_check,
         expected_api_token=_normalize_api_token(expected_api_token) or _api_token_from_env(),
+        expected_account_api_token=_normalize_api_token(expected_account_api_token) or _dashboard_api_token_from_env(),
         billing_connection=connection,
         polar_webhook_secret=_normalize_api_token(polar_webhook_secret) or _polar_webhook_secret_from_env(),
         account_session_secret=_normalize_api_token(account_session_secret) or _account_session_secret_from_env(),
@@ -112,6 +133,7 @@ def build_app(
     auth_dependency: AuthDependency | None = None,
     readiness_check: ReadinessCheck | None = None,
     expected_api_token: str | None = None,
+    expected_account_api_token: str | None = None,
     billing_connection: Any | None = None,
     polar_webhook_secret: str | None = None,
     account_session_secret: str | None = None,
@@ -135,6 +157,7 @@ def build_app(
     app.state.hosted_adapter = adapter
     app.state.hosted_billing_connection = billing_connection
     normalized_api_token = _normalize_api_token(expected_api_token)
+    normalized_account_api_token = _normalize_api_token(expected_account_api_token)
     normalized_polar_webhook_secret = _normalize_api_token(polar_webhook_secret)
     normalized_account_session_secret = _normalize_api_token(account_session_secret)
     normalized_account_session_audience = _normalize_api_token(account_session_audience) or DEFAULT_ACCOUNT_SESSION_AUDIENCE
@@ -143,6 +166,7 @@ def build_app(
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
     app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
     app.state.account_session_signing_configured = bool(normalized_account_session_secret)
+    app.state.hosted_account_api_configured = bool(normalized_account_api_token)
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -372,6 +396,81 @@ def build_app(
             "ignored": result.ignored,
         }
 
+    def account_auth_dependency(
+        authorization: str | None = Header(default=None),
+        account_session: str | None = Header(default=None, alias=ACCOUNT_SESSION_TOKEN_HEADER),
+    ) -> AccountApiContext:
+        # Dashboard reads use a SEPARATE narrow credential (not the MCP query
+        # token) and derive the tenant from the verified session token the BFF
+        # forwards, never from a client-supplied workspace header.
+        if not normalized_account_api_token:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_api_token_unconfigured",
+                    message=f"Set {DASHBOARD_TOKEN_ENV_VAR} before serving hosted account reads.",
+                    status_code=503,
+                )
+            )
+        _verify_bearer_token(authorization=authorization, expected_api_token=normalized_account_api_token)
+        if not normalized_account_session_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_signing_unconfigured",
+                    message=f"Set {ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR} before reading hosted account state.",
+                    status_code=503,
+                )
+            )
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_read_connection_unconfigured",
+                    message="Hosted account reads require a database connection.",
+                    status_code=503,
+                )
+            )
+        if account_session is None or not account_session.strip():
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_required",
+                    message=f"Missing required {ACCOUNT_SESSION_TOKEN_HEADER} token.",
+                    status_code=401,
+                )
+            )
+        try:
+            claims = verify_account_session_token(
+                account_session.strip(),
+                secret=normalized_account_session_secret,
+                audience=normalized_account_session_audience,
+                max_age_seconds=account_session_ttl,
+            )
+        except AccountSessionError as exc:
+            raise _http_error(HostedMcpError(code=exc.code, message=exc.message, status_code=exc.status_code)) from exc
+        workspace = load_active_workspace(billing_connection, workspace_id=claims.workspace_id)
+        if workspace is None:
+            raise _http_error(
+                HostedMcpError(code="workspace_not_found", message="Workspace not found.", status_code=404)
+            )
+        return AccountApiContext(
+            workspace_id=claims.workspace_id,
+            user_id=claims.user_id,
+            workspace_name=_optional_text(workspace.get("name")),
+        )
+
+    @app.get("/account/summary")
+    def account_summary(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        summary = read_workspace_summary(billing_connection, workspace_id=context.workspace_id)
+        return {"ok": True, **summary.model_dump(mode="json")}
+
+    @app.get("/account/library")
+    def account_library(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        overview = read_library_overview(billing_connection, workspace_id=context.workspace_id)
+        return {"ok": True, **overview.model_dump(mode="json")}
+
+    @app.get("/account/assistants")
+    def account_assistants(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        assistants = read_active_account_grants(billing_connection, workspace_id=context.workspace_id)
+        return {"ok": True, "assistants": [item.model_dump(mode="json") for item in assistants]}
+
     return app
 
 
@@ -384,6 +483,11 @@ def _parse_scopes(scopes_header: str | None) -> set[str]:
 def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     return _normalize_api_token(env.get(TOKEN_ENV_VAR))
+
+
+def _dashboard_api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return _normalize_api_token(env.get(DASHBOARD_TOKEN_ENV_VAR))
 
 
 def _polar_webhook_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:

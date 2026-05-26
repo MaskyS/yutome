@@ -20,8 +20,6 @@ from yutome.hosted.indexing import (
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
-    enqueue_index_video_job_sql,
-    finish_source_discovery_sql,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
     plan_real_hosted_public_indexing,
@@ -594,7 +592,7 @@ def test_real_hosted_executor_orders_provider_calls_before_transactional_writes(
     assert output_reservation_ids == [None, None]
     assert embedding_metadata[0]["usage_reservation_id"].startswith("res_")
     assert chunk_params[0]["tokenizer"] == "yutome_llmlingua2"
-    assert connection.transaction_events == ["begin", "commit"]
+    assert connection.transaction_events == ["begin", "commit", "begin", "commit", "begin", "commit"]
     assert "INSERT INTO videos" in "\n".join(transaction_sql)
     assert "INSERT INTO chunks" in "\n".join(transaction_sql)
     assert "INSERT INTO chunk_embeddings" in "\n".join(transaction_sql)
@@ -673,7 +671,8 @@ def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
     assert result.status == "denied"
     assert result.denied_operation == "search_store.index_write"
     assert provider_calls == ["gemini", "voyage"]
-    assert connection.transaction_events == []
+    assert connection.transaction_events == ["begin", "commit", "begin", "commit"]
+    assert all(not statement.startswith("INSERT INTO videos") for statement, _params in connection.calls)
 
 
 def test_real_hosted_executor_reuses_persisted_provider_outputs() -> None:
@@ -817,6 +816,48 @@ def test_hosted_metadata_fetch_reserves_youtube_operation_without_webshare(monke
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
 
 
+def test_hosted_transcript_fetch_reserves_youtube_operation_without_webshare(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = RecordingGate()
+    ledger = RecordingLedger()
+
+    class AllowYouTubeUsage:
+        def for_subject(self, *, auth, subject, operation, estimated_units):  # noqa: ANN001, ANN202
+            return HostedMcpUsageContext(
+                allocation=ProviderAllocation(
+                    id=f"alloc_{subject}_{operation}",
+                    workspace_id=auth.workspace_id,
+                    provider=subject,
+                    operation=operation,
+                ),
+                policy=EntitlementPolicy(id="policy", workspace_id=auth.workspace_id, allowed_operations={f"{subject}.{operation}"}),
+                balance=WorkspaceBalance(workspace_id=auth.workspace_id, remaining_units={"request_count": 10}),
+            )
+
+    def fake_fetch_transcript(**kwargs):  # noqa: ANN003, ANN202
+        assert kwargs["hosted_context"] is None
+        return TranscriptFetchResult(
+            raw_snippets=[{"start": 0.0, "duration": 4.0, "text": "Metered transcript fetch."}],
+            source="youtube-transcript-api",
+            language="en",
+            is_generated=True,
+        )
+
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fake_fetch_transcript)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=AppConfig(),
+        gate=gate,
+        ledger=ledger,
+        usage_context_provider=AllowYouTubeUsage(),
+    )
+
+    result = executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert result.raw_snippets[0]["text"] == "Metered transcript fetch."
+    assert [(call["subject"], call["operation"]) for call in gate.calls] == [("youtube", "transcript_fetch")]
+    assert [event.status for event in ledger.events] == ["started", "succeeded"]
+
+
 def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     class DiscoveryConnection:
         def __init__(self) -> None:
@@ -931,7 +972,20 @@ def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
 
     assert results[0].hosted_video_id == results[1].hosted_video_id
     assert results[0].transcript_version_id == results[1].transcript_version_id
-    assert connection.transaction_events == ["begin", "commit", "begin", "commit"]
+    assert connection.transaction_events == [
+        "begin",
+        "commit",
+        "begin",
+        "commit",
+        "begin",
+        "commit",
+        "begin",
+        "commit",
+        "begin",
+        "commit",
+        "begin",
+        "commit",
+    ]
 
 
 def test_real_hosted_executor_redacts_provider_errors_before_persisting_job_failure() -> None:

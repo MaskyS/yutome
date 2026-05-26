@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from yutome import contract
 from yutome.hosted.allocation_policy import (
-    default_search_store_allocation,
     estimate_search_store_query,
     estimate_voyage_embeddings,
 )
@@ -23,7 +22,6 @@ from yutome.hosted.ids import idempotency_key, input_hash
 from yutome.hosted.migrations import HOSTED_DEFAULT_EMBEDDING_DIMENSION, HOSTED_DEFAULT_EMBEDDING_MODEL
 from yutome.hosted.models import (
     EntitlementPolicy,
-    ProviderAllocation,
     UnitQuantity,
     UsageEvent,
     UsageReservation,
@@ -644,8 +642,8 @@ class HostedMcpQueryAdapter:
             metadata={
                 "estimated_units": dict(reservation.estimated_units),
                 "exception_type": type(exc).__name__,
-                "message": redact_sensitive_failure_text(str(exc)),
                 **dict(metadata),
+                "message": redact_sensitive_failure_text(str(exc)),
             },
         )
         self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
@@ -1294,8 +1292,7 @@ class HostedQRequest:
                 raise HostedMcpError(code="invalid_arguments", message="q chunk lexical search requires search.text.", status_code=400)
             if offset != 0:
                 raise _unsupported_q("Hosted MCP q chunk lexical search does not support offset yet.")
-            per_group_limit = raw_request.get("per_group_limit")
-            if raw_request.get("group_by") is not None or per_group_limit is not None and per_group_limit != 3:
+            if raw_request.get("group_by") is not None or raw_request.get("per_group_limit") is not None:
                 raise _unsupported_q("Hosted MCP q chunk grouping is not implemented yet.")
             if _nonempty_filter_keys(filter_obj):
                 raise _unsupported_q("Hosted MCP q chunk filters are not implemented yet.")

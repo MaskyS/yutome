@@ -120,6 +120,30 @@ def test_provider_wrapper_records_started_and_succeeded_events() -> None:
     assert ledger.events[1].metadata["job_id"] == "job_1"
 
 
+def test_provider_wrapper_can_defer_success_event_for_atomic_caller_commit() -> None:
+    ledger = RecordingLedger()
+    deferred: list[UsageEvent] = []
+
+    def call() -> dict[str, int | str]:
+        return {"request_id": "resp_1", "tokens": 91}
+
+    def normalize(result: dict[str, int | str]) -> UsageNormalization:
+        return UsageNormalization(
+            subject="gemini",
+            operation="cleanup_transcript",
+            actual_units={"total_tokens": result["tokens"]},
+            provider_request_id=str(result["request_id"]),
+        )
+
+    context = replace(_context(ledger), success_event_sink=deferred.append)
+    result = execute_provider_call(context, call, normalize_usage=normalize)
+
+    assert result["request_id"] == "resp_1"
+    assert [event.event_type for event in ledger.events] == ["provider_attempt_started"]
+    assert [event.event_type for event in deferred] == ["provider_attempt_succeeded"]
+    assert deferred[0].metadata["job_id"] == "job_1"
+
+
 def test_provider_wrapper_denies_before_calling_provider() -> None:
     ledger = RecordingLedger()
     called = False

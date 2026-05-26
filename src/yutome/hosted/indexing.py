@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
+from sqlalchemy import case, func, literal_column
+from sqlalchemy.dialects.postgresql import insert
+
 from yutome.chunking import CHUNKER_VERSION, build_chunks
 from yutome.config import AppConfig
 from yutome.gemini import transcribe_youtube_url_with_gemini
@@ -46,12 +49,14 @@ from yutome.hosted.models import (
 )
 from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied, execute_provider_call
 from yutome.hosted.repositories import SqlStatement, upsert_usage_reservation_sql
+from yutome.hosted.schema import job_operations, jobs, search_index_profiles, transcript_versions, videos
 from yutome.hosted.search_store import (
     SearchStoreQueryPlan,
     hybrid_query_plan,
     replace_active_transcript_sql,
     validate_supported_embedding_profile,
 )
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 from yutome.quality_llm import TranscriptCleanupContext, cleanup_transcript_with_gemini
 from yutome.transcripts import NormalizedTranscript, TranscriptSegment, normalize_transcript
 from yutome.youtube import (
@@ -719,6 +724,7 @@ class HostedIndexingExecutor:
 
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="cleaning", now=clock))
+            gemini_success_events: list[UsageEvent] = []
             gemini_context = self._provider_context(
                 workspace_id=job.workspace_id,
                 subject="gemini",
@@ -727,6 +733,7 @@ class HostedIndexingExecutor:
                 subject_id=video.youtube_video_id,
                 input_payload={"transcript_version_id": transcript.version_id, "source": transcript.source},
                 metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
+                success_event_sink=gemini_success_events.append,
             )
             current_operation_name = "gemini.cleanup_transcript"
             current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, gemini_context)
@@ -742,7 +749,7 @@ class HostedIndexingExecutor:
                 transcript = self.gemini_cleaner(transcript, video, gemini_context)
                 cached_transcript = {"transcript": _transcript_to_output(transcript)}
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
-            self._execute_required_statement(
+            self._complete_provider_operation_success(
                 complete_job_operation_success_sql(
                     workspace_id=job.workspace_id,
                     operation_id=current_operation_id,
@@ -751,6 +758,7 @@ class HostedIndexingExecutor:
                     job_id=job.id,
                     lease_owner=lease_owner,
                 ),
+                success_events=gemini_success_events,
                 lost_lease_message="job lease expired before recording Gemini cleanup success",
             )
             current_operation_id = None
@@ -761,6 +769,7 @@ class HostedIndexingExecutor:
                 raise HostedIndexingError("chunking produced no indexable chunks")
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="embedding", now=clock))
+            voyage_success_events: list[UsageEvent] = []
             voyage_context = self._provider_context(
                 workspace_id=job.workspace_id,
                 subject="voyage",
@@ -772,6 +781,7 @@ class HostedIndexingExecutor:
                 subject_id=video.youtube_video_id,
                 input_payload={"transcript_version_id": transcript.version_id, "chunks": [_chunk_hash_payload(chunk) for chunk in chunks]},
                 metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
+                success_event_sink=voyage_success_events.append,
             )
             current_operation_name = "voyage.embed_documents"
             current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, voyage_context)
@@ -787,7 +797,7 @@ class HostedIndexingExecutor:
                 vectors = self.voyage_embedder(chunks, video, voyage_context)
                 cached_vectors = {"vectors": vectors, "chunk_hashes": [_chunk_hash_payload(chunk) for chunk in chunks]}
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
-            self._execute_required_statement(
+            self._complete_provider_operation_success(
                 complete_job_operation_success_sql(
                     workspace_id=job.workspace_id,
                     operation_id=current_operation_id,
@@ -796,6 +806,7 @@ class HostedIndexingExecutor:
                     job_id=job.id,
                     lease_owner=lease_owner,
                 ),
+                success_events=voyage_success_events,
                 lost_lease_message="job lease expired before recording Voyage embedding success",
             )
             current_operation_id = None
@@ -1197,6 +1208,7 @@ class HostedIndexingExecutor:
         subject_id: str,
         input_payload: Mapping[str, Any],
         metadata: Mapping[str, Any],
+        success_event_sink: Callable[[UsageEvent], None] | None = None,
     ) -> ProviderCallContext:
         usage_context = self._usage_context(
             workspace_id=workspace_id,
@@ -1224,6 +1236,7 @@ class HostedIndexingExecutor:
             balance=usage_context.balance,
             idempotency_key=reservation_key,
             metadata={**dict(metadata), "input_hash": operation_input_hash},
+            success_event_sink=success_event_sink,
         )
 
     def _usage_context(
@@ -1414,6 +1427,21 @@ class HostedIndexingExecutor:
         if not rows:
             raise HostedIndexingLostLease(lost_lease_message)
         return rows
+
+    def _complete_provider_operation_success(
+        self,
+        statement: SqlStatement,
+        *,
+        success_events: Sequence[UsageEvent],
+        lost_lease_message: str,
+    ) -> list[dict[str, Any]]:
+        if not success_events:
+            return self._execute_required_statement(statement, lost_lease_message=lost_lease_message)
+        with self._transaction():
+            rows = self._execute_required_statement(statement, lost_lease_message=lost_lease_message)
+            for event in success_events:
+                self.ledger.append(event)
+            return rows
 
     def _raise_if_provider_success_without_output(self, *, workspace_id: str, idempotency_key: str) -> None:
         row = _execute_one(
@@ -1847,75 +1875,57 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
 
 
 def upsert_video_sql(source: Source, video: HostedVideoInput, *, hosted_video_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO videos (
-    id, workspace_id, source_id, youtube_video_id, channel_id, title,
-    description, published_at, duration_seconds, metadata_json
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_id)s, %(youtube_video_id)s, %(channel_id)s,
-    %(title)s, %(description)s, %(published_at)s, %(duration_seconds)s,
-    %(metadata_json)s::jsonb
-)
-ON CONFLICT (workspace_id, youtube_video_id) DO UPDATE
-SET source_id = EXCLUDED.source_id,
-    channel_id = EXCLUDED.channel_id,
-    title = EXCLUDED.title,
-    description = EXCLUDED.description,
-    published_at = EXCLUDED.published_at,
-    duration_seconds = EXCLUDED.duration_seconds,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
-            "id": hosted_video_id,
-            "workspace_id": source.workspace_id,
-            "source_id": source.id,
-            "youtube_video_id": video.youtube_video_id,
-            "channel_id": video.channel_id,
-            "title": video.title,
-            "description": video.description,
-            "published_at": video.published_at,
-            "duration_seconds": video.duration_seconds,
-            "metadata_json": _json_param(video.metadata or {}),
-        },
+    statement = insert(videos).values(
+        id=hosted_video_id,
+        workspace_id=source.workspace_id,
+        source_id=source.id,
+        youtube_video_id=video.youtube_video_id,
+        channel_id=video.channel_id,
+        title=video.title,
+        description=video.description,
+        published_at=video.published_at,
+        duration_seconds=video.duration_seconds,
+        metadata_json=_json_param(video.metadata or {}),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[videos.c.workspace_id, videos.c.youtube_video_id],
+        set_={
+            "source_id": statement.excluded.source_id,
+            "channel_id": statement.excluded.channel_id,
+            "title": statement.excluded.title,
+            "description": statement.excluded.description,
+            "published_at": statement.excluded.published_at,
+            "duration_seconds": statement.excluded.duration_seconds,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(videos)
+    return _sql_statement(statement)
 
 
 def upsert_index_profile_sql(workspace_id: str, profile: IndexProfileInput) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO search_index_profiles (
-    id, workspace_id, backend, embedding_model, embedding_dimension,
-    chunking_version, tokenizer, metadata_json
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(backend)s, %(embedding_model)s,
-    %(embedding_dimension)s, %(chunking_version)s, %(tokenizer)s,
-    %(metadata_json)s::jsonb
-)
-ON CONFLICT (id) DO UPDATE
-SET backend = EXCLUDED.backend,
-    embedding_model = EXCLUDED.embedding_model,
-    embedding_dimension = EXCLUDED.embedding_dimension,
-    chunking_version = EXCLUDED.chunking_version,
-    tokenizer = EXCLUDED.tokenizer,
-    metadata_json = EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-        params={
-            "id": profile.id,
-            "workspace_id": workspace_id,
-            "backend": profile.backend,
-            "embedding_model": profile.embedding_model,
-            "embedding_dimension": profile.embedding_dimension,
-            "chunking_version": profile.chunking_version,
-            "tokenizer": profile.tokenizer,
-            "metadata_json": _json_param(profile.metadata or {}),
-        },
+    statement = insert(search_index_profiles).values(
+        id=profile.id,
+        workspace_id=workspace_id,
+        backend=profile.backend,
+        embedding_model=profile.embedding_model,
+        embedding_dimension=profile.embedding_dimension,
+        chunking_version=profile.chunking_version,
+        tokenizer=profile.tokenizer,
+        metadata_json=_json_param(profile.metadata or {}),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[search_index_profiles.c.id],
+        set_={
+            "backend": statement.excluded.backend,
+            "embedding_model": statement.excluded.embedding_model,
+            "embedding_dimension": statement.excluded.embedding_dimension,
+            "chunking_version": statement.excluded.chunking_version,
+            "tokenizer": statement.excluded.tokenizer,
+            "metadata_json": statement.excluded.metadata_json,
+        },
+    ).returning(search_index_profiles)
+    return _sql_statement(statement)
 
 
 def upsert_transcript_version_sql(
@@ -1928,33 +1938,25 @@ def upsert_transcript_version_sql(
     content_hash: str,
     metadata: Mapping[str, Any] | None = None,
 ) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO transcript_versions (
-    id, workspace_id, video_id, source, language_code,
-    content_hash, metadata_json
-)
-VALUES (
-    %(transcript_version_id)s, %(workspace_id)s, %(video_id)s, %(source)s,
-    %(language_code)s, %(content_hash)s, %(metadata_json)s::jsonb
-)
-ON CONFLICT (id) DO UPDATE
-SET source = EXCLUDED.source,
-    language_code = EXCLUDED.language_code,
-    content_hash = EXCLUDED.content_hash,
-    metadata_json = EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-        params={
-            "workspace_id": workspace_id,
-            "video_id": video_id,
-            "transcript_version_id": transcript_version_id,
-            "source": source,
-            "language_code": language_code,
-            "content_hash": content_hash,
-            "metadata_json": _json_param(metadata or {}),
-        },
+    statement = insert(transcript_versions).values(
+        id=transcript_version_id,
+        workspace_id=workspace_id,
+        video_id=video_id,
+        source=source,
+        language_code=language_code,
+        content_hash=content_hash,
+        metadata_json=_json_param(metadata or {}),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[transcript_versions.c.id],
+        set_={
+            "source": statement.excluded.source,
+            "language_code": statement.excluded.language_code,
+            "content_hash": statement.excluded.content_hash,
+            "metadata_json": statement.excluded.metadata_json,
+        },
+    ).returning(transcript_versions)
+    return _sql_statement(statement)
 
 
 def upsert_chunk_sql(
@@ -2037,45 +2039,40 @@ RETURNING *;
 
 
 def upsert_job_operation_sql(operation: JobOperation) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO job_operations (
-    id, workspace_id, job_id, operation, source_id, video_id, input_hash,
-    idempotency_key, status, attempt_count, usage_reservation_id, metadata_json
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(job_id)s, %(operation)s, %(source_id)s,
-    %(video_id)s, %(input_hash)s, %(idempotency_key)s, %(status)s,
-    %(attempt_count)s, %(usage_reservation_id)s, %(metadata_json)s::jsonb
-)
-ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET status = CASE
-        WHEN job_operations.status IN ('denied', 'succeeded', 'failed_final', 'reconciled', 'released')
-         AND EXCLUDED.status IN ('planned', 'reserved', 'started')
-        THEN job_operations.status
-        ELSE EXCLUDED.status
-    END,
-    attempt_count = job_operations.attempt_count,
-    usage_reservation_id = EXCLUDED.usage_reservation_id,
-    metadata_json = EXCLUDED.metadata_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
-            "id": operation.id,
-            "workspace_id": operation.workspace_id,
-            "job_id": operation.job_id,
-            "operation": operation.operation,
-            "source_id": operation.source_id,
-            "video_id": operation.video_id,
-            "input_hash": operation.input_hash,
-            "idempotency_key": operation.idempotency_key,
-            "status": operation.status,
-            "attempt_count": operation.attempt_count,
-            "usage_reservation_id": operation.metadata_jsonb.get("usage_reservation_id") or None,
-            "metadata_json": _json_param(operation.metadata_jsonb),
-        },
+    statement = insert(job_operations).values(
+        id=operation.id,
+        workspace_id=operation.workspace_id,
+        job_id=operation.job_id,
+        operation=operation.operation,
+        source_id=operation.source_id,
+        video_id=operation.video_id,
+        input_hash=operation.input_hash,
+        idempotency_key=operation.idempotency_key,
+        status=operation.status,
+        attempt_count=operation.attempt_count,
+        usage_reservation_id=operation.metadata_jsonb.get("usage_reservation_id") or None,
+        metadata_json=_json_param(operation.metadata_jsonb),
     )
+    terminal_statuses = ("denied", "succeeded", "failed_final", "reconciled", "released")
+    early_statuses = ("planned", "reserved", "started")
+    statement = statement.on_conflict_do_update(
+        index_elements=[job_operations.c.workspace_id, job_operations.c.idempotency_key],
+        set_={
+            "status": case(
+                (
+                    job_operations.c.status.in_(terminal_statuses)
+                    & statement.excluded.status.in_(early_statuses),
+                    job_operations.c.status,
+                ),
+                else_=statement.excluded.status,
+            ),
+            "attempt_count": job_operations.c.attempt_count,
+            "usage_reservation_id": statement.excluded.usage_reservation_id,
+            "metadata_json": statement.excluded.metadata_json,
+            "updated_at": func.now(),
+        },
+    ).returning(job_operations)
+    return _sql_statement(statement)
 
 
 def job_operation_output_sql(*, workspace_id: str, operation_id: str) -> SqlStatement:
@@ -2208,39 +2205,36 @@ def enqueue_index_video_job_sql(
         video_id=video_id,
         extras=_real_index_profile_extras(workspace_id),
     )
-    return SqlStatement(
-        sql="""
-INSERT INTO jobs (
-    id, workspace_id, source_id, job_type, status, priority,
-    idempotency_key, run_after, executor_kind, executor_ref, metadata_json, created_at
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_id)s, 'index_video', 'queued',
-    %(priority)s, %(idempotency_key)s, %(run_after)s, 'railway',
-    %(executor_ref)s, %(metadata_json)s::jsonb, %(created_at)s
-)
-ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET source_id = EXCLUDED.source_id,
-    status = CASE
-        WHEN jobs.status IN ('denied', 'failed', 'succeeded', 'cancelled') THEN jobs.status
-        ELSE 'queued'
-    END,
-    priority = LEAST(jobs.priority, EXCLUDED.priority),
-    metadata_json = jobs.metadata_json || EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-        params={
-            "id": f"job_{job_hash}",
-            "workspace_id": workspace_id,
-            "source_id": source_id,
-            "priority": priority,
-            "idempotency_key": idempotency,
-            "run_after": now,
-            "executor_ref": "source_discovery",
-            "metadata_json": _json_param({"youtube_video_id": video_id, **dict(metadata or {})}),
-            "created_at": now,
-        },
+    statement = insert(jobs).values(
+        id=f"job_{job_hash}",
+        workspace_id=workspace_id,
+        source_id=source_id,
+        job_type="index_video",
+        status="queued",
+        priority=priority,
+        idempotency_key=idempotency,
+        run_after=now,
+        executor_kind="railway",
+        executor_ref="source_discovery",
+        metadata_json=_json_param({"youtube_video_id": video_id, **dict(metadata or {})}),
+        created_at=now,
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[jobs.c.workspace_id, jobs.c.idempotency_key],
+        set_={
+            "source_id": statement.excluded.source_id,
+            "status": case(
+                (
+                    jobs.c.status.in_(("denied", "failed", "succeeded", "cancelled")),
+                    jobs.c.status,
+                ),
+                else_=literal_column("'queued'"),
+            ),
+            "priority": func.least(jobs.c.priority, statement.excluded.priority),
+            "metadata_json": jobs.c.metadata_json.op("||")(statement.excluded.metadata_json),
+        },
+    ).returning(jobs)
+    return _sql_statement(statement)
 
 
 def finish_source_discovery_sql(
@@ -2683,6 +2677,11 @@ def _positive_int_or_none(value: Any) -> int | None:
 
 def _vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(f"{float(value):.12g}" for value in vector) + "]"
+
+
+def _sql_statement(statement: Any) -> SqlStatement:
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def _json_param(value: Any) -> str:

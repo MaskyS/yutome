@@ -66,6 +66,7 @@ yutome = "yutome.cli:app"
 [dependency-groups]
 dev = [
     "pytest>=8.2,<9",
+    "ruff>=0.12,<1",
 ]
 
 [build-system]
@@ -107,3 +108,10 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]

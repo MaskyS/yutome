@@ -42,6 +42,7 @@ class ProviderCallContext:
     balance: WorkspaceBalance
     idempotency_key: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    success_event_sink: Callable[[UsageEvent], None] | None = None
 
 
 class UsageReservationDenied(RuntimeError):
@@ -77,7 +78,7 @@ class HostedProviderWrapper:
             reservation=reservation,
             event_type="provider_attempt_succeeded",
         )
-        self.context.ledger.append(_with_context_metadata(event, self.context, reservation))
+        self._record_success_event(_with_context_metadata(event, self.context, reservation))
         return result
 
     async def arun(
@@ -106,7 +107,7 @@ class HostedProviderWrapper:
             reservation=reservation,
             event_type="provider_attempt_succeeded",
         )
-        self.context.ledger.append(_with_context_metadata(event, self.context, reservation))
+        self._record_success_event(_with_context_metadata(event, self.context, reservation))
         return result
 
     def _reserve(self) -> UsageReservation:
@@ -120,6 +121,12 @@ class HostedProviderWrapper:
             balance=self.context.balance,
             idempotency_key=self.context.idempotency_key,
         )
+
+    def _record_success_event(self, event: UsageEvent) -> None:
+        if self.context.success_event_sink is not None:
+            self.context.success_event_sink(event)
+            return
+        self.context.ledger.append(event)
 
 
 def execute_provider_call(
