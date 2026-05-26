@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Literal
 
-from yutome.hosted.control_plane import CLAIMABLE_JOB_STATUSES, TERMINAL_JOB_STATUSES, Job
+from yutome.hosted.control_plane import CLAIMABLE_JOB_STATUSES, TERMINAL_JOB_STATUSES, Job, JobOperationStatus, JobStatus
 from yutome.hosted.repositories import SqlStatement
 
 
@@ -174,6 +174,88 @@ RETURNING *;
     )
 
 
+def update_job_status_sql(
+    *,
+    job_id: str,
+    lease_owner: str,
+    status: JobStatus,
+    now: datetime,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> SqlStatement:
+    terminal = status in TERMINAL_JOB_STATUSES
+    return SqlStatement(
+        sql="""
+UPDATE jobs
+SET status = %(status)s,
+    started_at = CASE
+        WHEN started_at IS NULL AND %(status)s <> 'queued' THEN %(now)s
+        ELSE started_at
+    END,
+    finished_at = CASE
+        WHEN %(terminal)s THEN %(now)s
+        ELSE finished_at
+    END,
+    cancelled_at = CASE
+        WHEN %(status)s = 'cancelled' THEN %(now)s
+        ELSE cancelled_at
+    END,
+    error_code = %(error_code)s,
+    error_message = %(error_message)s,
+    lease_owner = CASE WHEN %(terminal)s THEN NULL ELSE lease_owner END,
+    leased_at = CASE WHEN %(terminal)s THEN NULL ELSE leased_at END,
+    lease_expires_at = CASE WHEN %(terminal)s THEN NULL ELSE lease_expires_at END
+WHERE id = %(job_id)s
+  AND lease_owner = %(lease_owner)s
+  AND status <> ALL(%(terminal_statuses)s)
+RETURNING *;
+""".strip(),
+        params={
+            "job_id": job_id,
+            "lease_owner": lease_owner,
+            "status": status,
+            "now": now,
+            "terminal": terminal,
+            "error_code": error_code,
+            "error_message": error_message,
+            "terminal_statuses": sorted(TERMINAL_JOB_STATUSES),
+        },
+    )
+
+
+def update_job_operation_status_sql(
+    *,
+    operation_id: str,
+    workspace_id: str,
+    status: JobOperationStatus,
+    now: datetime,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+UPDATE job_operations
+SET status = %(status)s,
+    attempt_count = CASE
+        WHEN %(status)s IN ('started', 'failed_retryable', 'failed_final') THEN attempt_count + 1
+        ELSE attempt_count
+    END,
+    metadata_json = metadata_json || %(status_metadata_json)s::jsonb,
+    updated_at = %(now)s
+WHERE id = %(operation_id)s
+  AND workspace_id = %(workspace_id)s
+RETURNING *;
+""".strip(),
+        params={
+            "operation_id": operation_id,
+            "workspace_id": workspace_id,
+            "status": status,
+            "now": now,
+            "status_metadata_json": _json_param({"error_code": error_code, "error_message": error_message}),
+        },
+    )
+
+
 def renew_job_lease(
     job: Job,
     *,
@@ -229,6 +311,12 @@ def _validate_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be positive")
 
 
+def _json_param(value: object) -> str:
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 __all__: Sequence[str] = [
     "JOB_CLAIMABLE_INDEX_SQL",
     "JOB_IDEMPOTENCY_CONSTRAINT_SQL",
@@ -240,4 +328,6 @@ __all__: Sequence[str] = [
     "renew_job_lease_sql",
     "retry_job_after",
     "retry_job_sql",
+    "update_job_operation_status_sql",
+    "update_job_status_sql",
 ]

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
+from yutome.chunking import CHUNKER_VERSION, build_chunks
+from yutome.config import AppConfig
+from yutome.gemini import transcribe_youtube_url_with_gemini
 from yutome.hosted.allocations import Allocation, resolve_allocation
 from yutome.hosted.allocation_policy import default_search_store_allocation
 from yutome.hosted.control_plane import (
@@ -18,12 +23,14 @@ from yutome.hosted.control_plane import (
 )
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.ids import input_hash
+from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger
 from yutome.hosted.migrations import (
     HOSTED_DEFAULT_EMBEDDING_DIMENSION,
     HOSTED_DEFAULT_EMBEDDING_MODEL,
     HOSTED_VECTOR_BACKEND,
 )
-from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageReservation, UsageSubject, WorkspaceBalance
+from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageNormalization, UsageReservation, UsageSubject, WorkspaceBalance
+from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied, execute_provider_call
 from yutome.hosted.repositories import SqlStatement, upsert_usage_reservation_sql
 from yutome.hosted.search_store import (
     SearchStoreQueryPlan,
@@ -31,12 +38,21 @@ from yutome.hosted.search_store import (
     replace_active_transcript_sql,
     validate_supported_embedding_profile,
 )
+from yutome.quality_llm import TranscriptCleanupContext, cleanup_transcript_with_gemini
+from yutome.transcripts import NormalizedTranscript, normalize_transcript
+from yutome.youtube import (
+    TranscriptFetchResult,
+    discover_video,
+    fetch_subtitle_transcript_with_ytdlp,
+    fetch_transcript,
+)
 
 
 DEFAULT_INDEX_PROFILE_ID = "sip_voyage4lite_bm25_default"
 DEFAULT_EMBEDDING_MODEL = HOSTED_DEFAULT_EMBEDDING_MODEL
 DEFAULT_EMBEDDING_DIMENSION = HOSTED_DEFAULT_EMBEDDING_DIMENSION
 DEFAULT_CHUNKING_VERSION = "hosted_mock_chunker_v1"
+REAL_HOSTED_CHUNKING_VERSION = CHUNKER_VERSION
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -97,6 +113,41 @@ class HostedIndexingPlan:
     @property
     def operation_ids(self) -> tuple[str, ...]:
         return tuple(operation.id for operation in self.job_operations)
+
+
+@dataclass(frozen=True)
+class HostedIndexingExecutionResult:
+    job_id: str
+    workspace_id: str
+    source_id: str
+    youtube_video_id: str | None
+    status: Literal["succeeded", "denied", "failed", "cancelled"]
+    hosted_video_id: str | None = None
+    transcript_version_id: str | None = None
+    chunks_written: int = 0
+    embeddings_written: int = 0
+    denied_operation: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class HostedIndexingError(RuntimeError):
+    code = "hosted_indexing_failed"
+
+
+class HostedIndexingDenied(HostedIndexingError):
+    code = "usage_denied"
+
+    def __init__(self, *, operation: str, reservation: UsageReservation) -> None:
+        self.operation = operation
+        self.reservation = reservation
+        super().__init__(reservation.decision.message or reservation.decision.reason)
+
+
+TranscriptFetcher = Callable[[str, Source, Job], TranscriptFetchResult]
+VideoMetadataFetcher = Callable[[str, Source, Job], HostedVideoInput]
+GeminiCleaner = Callable[[NormalizedTranscript, HostedVideoInput, ProviderCallContext], NormalizedTranscript]
+VoyageEmbedder = Callable[[Sequence[TranscriptChunkInput], HostedVideoInput, ProviderCallContext], list[list[float]]]
 
 
 def source_from_public_youtube_input(
@@ -395,6 +446,710 @@ def plan_mock_hosted_public_indexing(
     )
 
 
+def plan_real_hosted_public_indexing(
+    *,
+    source: Source,
+    job: Job,
+    video: HostedVideoInput,
+    chunks: Sequence[TranscriptChunkInput],
+    embedding_vectors: Sequence[Sequence[float]],
+    index_profile: IndexProfileInput | None = None,
+    transcript_source: str,
+    language_code: str | None,
+    transcript_metadata: Mapping[str, Any] | None = None,
+) -> HostedIndexingPlan:
+    """Build replay-safe hosted write operations for a real transcript and embeddings."""
+
+    _validate_public_indexing_inputs(source=source, job=job, video=video, chunks=chunks)
+    profile = index_profile or IndexProfileInput(chunking_version=REAL_HOSTED_CHUNKING_VERSION)
+    validate_supported_embedding_profile(
+        backend=profile.backend,
+        embedding_model=profile.embedding_model,
+        embedding_dimension=profile.embedding_dimension,
+    )
+    normalized_chunks = tuple(sorted(chunks, key=lambda chunk: chunk.chunk_index))
+    if len(normalized_chunks) != len(embedding_vectors):
+        raise ValueError("embedding vector count must match chunk count")
+    for vector in embedding_vectors:
+        if len(vector) != profile.embedding_dimension:
+            raise ValueError(f"embedding vector dimension must be {profile.embedding_dimension}")
+
+    hosted_video_id = _stable_id("vid", source.workspace_id, video.youtube_video_id)
+    content_hash = input_hash(
+        {
+            "video": video.youtube_video_id,
+            "language_code": language_code,
+            "source": transcript_source,
+            "chunks": [_chunk_hash_payload(chunk) for chunk in normalized_chunks],
+        }
+    )
+    transcript_version_id = _stable_id("tx", source.workspace_id, video.youtube_video_id, content_hash)
+    metadata = {
+        "job_id": job.id,
+        "source_id": source.id,
+        "youtube_video_id": video.youtube_video_id,
+        "chunking_version": profile.chunking_version,
+        **dict(transcript_metadata or {}),
+    }
+
+    sql_operations: list[PlannedSqlOperation] = [
+        PlannedSqlOperation(name="videos.upsert", statement=upsert_video_sql(source, video, hosted_video_id=hosted_video_id)),
+        PlannedSqlOperation(name="search_index_profiles.upsert", statement=upsert_index_profile_sql(source.workspace_id, profile)),
+        PlannedSqlOperation(
+            name="transcript_versions.upsert_replacement",
+            statement=upsert_transcript_version_sql(
+                workspace_id=source.workspace_id,
+                video_id=hosted_video_id,
+                transcript_version_id=transcript_version_id,
+                source=transcript_source,
+                language_code=language_code,
+                content_hash=content_hash,
+                metadata=metadata,
+            ),
+        ),
+    ]
+    for chunk, vector in zip(normalized_chunks, embedding_vectors, strict=True):
+        chunk_id = _stable_id("chk", source.workspace_id, transcript_version_id, str(chunk.chunk_index))
+        sql_operations.append(
+            PlannedSqlOperation(
+                name="chunks.upsert",
+                statement=upsert_chunk_sql(
+                    workspace_id=source.workspace_id,
+                    hosted_video_id=hosted_video_id,
+                    transcript_version_id=transcript_version_id,
+                    index_profile_id=profile.id,
+                    chunk=chunk,
+                    chunk_id=chunk_id,
+                ),
+            )
+        )
+        sql_operations.append(
+            PlannedSqlOperation(
+                name="chunk_embeddings.upsert",
+                statement=upsert_chunk_embedding_sql(
+                    workspace_id=source.workspace_id,
+                    chunk_id=chunk_id,
+                    index_profile_id=profile.id,
+                    embedding=vector,
+                    embedding_id=_stable_id("emb", source.workspace_id, chunk_id, profile.id),
+                    usage_reservation_id="",
+                ),
+            )
+        )
+    sql_operations.append(
+        PlannedSqlOperation(
+            name="search_store.replace_active_transcript",
+            statement=replace_active_transcript_sql(
+                workspace_id=source.workspace_id,
+                video_id=hosted_video_id,
+                transcript_version_id=transcript_version_id,
+                source=transcript_source,
+                language_code=language_code,
+                content_hash=content_hash,
+                metadata=metadata,
+            ),
+        )
+    )
+
+    return HostedIndexingPlan(
+        source=source,
+        job=job,
+        video=video,
+        hosted_video_id=hosted_video_id,
+        transcript_version_id=transcript_version_id,
+        transcript_content_hash=content_hash,
+        index_profile=profile,
+        job_operations=(),
+        usage_reservations=(),
+        sql_operations=tuple(sql_operations),
+        search_operations=(),
+    )
+
+
+class HostedIndexingExecutor:
+    """Execute hosted public YouTube ingest jobs against hosted providers and Postgres."""
+
+    def __init__(
+        self,
+        *,
+        connection: Any,
+        config: AppConfig,
+        gate: UsageGate | None = None,
+        ledger: Any | None = None,
+        metadata_fetcher: VideoMetadataFetcher | None = None,
+        transcript_fetcher: TranscriptFetcher | None = None,
+        gemini_cleaner: GeminiCleaner | None = None,
+        voyage_embedder: VoyageEmbedder | None = None,
+        cwd: Path | None = None,
+    ) -> None:
+        self.connection = connection
+        self.config = config
+        self.gate = gate or PostgresUsageGate(connection)
+        self.ledger = ledger or PostgresUsageLedger(connection)
+        self.metadata_fetcher = metadata_fetcher or self._fetch_video_metadata
+        self.transcript_fetcher = transcript_fetcher or self._fetch_transcript
+        self.gemini_cleaner = gemini_cleaner or self._clean_with_gemini
+        self.voyage_embedder = voyage_embedder or self._embed_with_voyage
+        self.cwd = cwd or Path.cwd()
+
+    def execute(self, job: Job, *, lease_owner: str, now: Any | None = None) -> HostedIndexingExecutionResult:
+        from datetime import datetime, timezone
+        from yutome.hosted.jobs import update_job_operation_status_sql, update_job_status_sql
+
+        clock = now or datetime.now(timezone.utc)
+        source_id = job.source_id or ""
+        video_id: str | None = None
+        current_operation_id: str | None = None
+        current_operation_name: str | None = None
+        try:
+            self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="preparing", now=clock))
+            source = self._load_source(job)
+            video_id = source.canonical_video_id or extract_public_youtube_video_id(source.source_url)
+            if not video_id:
+                raise HostedIndexingError("index_video jobs require a concrete public YouTube video id")
+            video = self.metadata_fetcher(video_id, source, job)
+            transcript_result = self.transcript_fetcher(video.youtube_video_id, source, job)
+            transcript = normalize_transcript(
+                video_id=video.youtube_video_id,
+                raw_snippets=transcript_result.raw_snippets,
+                source=transcript_result.source,
+                language=transcript_result.language,
+                is_generated=transcript_result.is_generated,
+            )
+            if not transcript.segments:
+                raise HostedIndexingError("transcript had no usable text segments")
+
+            self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="cleaning", now=clock))
+            gemini_context = self._provider_context(
+                workspace_id=job.workspace_id,
+                subject="gemini",
+                operation="cleanup_transcript",
+                estimated_units={"total_tokens": float(_token_estimate(" ".join(segment.text for segment in transcript.segments)))},
+                subject_id=video.youtube_video_id,
+                input_payload={"transcript_version_id": transcript.version_id, "source": transcript.source},
+                metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
+            )
+            current_operation_name = "gemini.cleanup_transcript"
+            current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, gemini_context)
+            transcript = self.gemini_cleaner(transcript, video, gemini_context)
+            self._execute_statement(
+                update_job_operation_status_sql(
+                    operation_id=current_operation_id,
+                    workspace_id=job.workspace_id,
+                    status="succeeded",
+                    now=clock,
+                )
+            )
+            current_operation_id = None
+            current_operation_name = None
+
+            chunks = _chunks_from_normalized_transcript(transcript)
+            if not chunks:
+                raise HostedIndexingError("chunking produced no indexable chunks")
+            self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="embedding", now=clock))
+            voyage_context = self._provider_context(
+                workspace_id=job.workspace_id,
+                subject="voyage",
+                operation="embed_documents",
+                estimated_units={
+                    "total_tokens": float(sum(_token_estimate(chunk.text) for chunk in chunks)),
+                    "vectors": float(len(chunks)),
+                },
+                subject_id=video.youtube_video_id,
+                input_payload={"transcript_version_id": transcript.version_id, "chunks": [_chunk_hash_payload(chunk) for chunk in chunks]},
+                metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
+            )
+            current_operation_name = "voyage.embed_documents"
+            current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, voyage_context)
+            vectors = self.voyage_embedder(chunks, video, voyage_context)
+            self._execute_statement(
+                update_job_operation_status_sql(
+                    operation_id=current_operation_id,
+                    workspace_id=job.workspace_id,
+                    status="succeeded",
+                    now=clock,
+                )
+            )
+            current_operation_id = None
+            current_operation_name = None
+
+            self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="writing_index", now=clock))
+            current_operation_name = "search_store.index_write"
+            current_operation_id = self._upsert_raw_operation(
+                job,
+                source,
+                video.youtube_video_id,
+                current_operation_name,
+                {"chunks": [_chunk_hash_payload(chunk) for chunk in chunks], "vectors": len(vectors)},
+            )
+            search_reservation = self._reserve_search_write(job=job, source=source, video=video, chunks=chunks, vectors=vectors)
+            if not search_reservation.decision.allowed:
+                raise HostedIndexingDenied(operation="search_store.index_write", reservation=search_reservation)
+            plan = plan_real_hosted_public_indexing(
+                source=source,
+                job=job,
+                video=video,
+                chunks=chunks,
+                embedding_vectors=vectors,
+                transcript_source=transcript.source,
+                language_code=transcript.language,
+                transcript_metadata={
+                    "is_generated": transcript.is_generated,
+                    "text_hash": transcript.text_hash,
+                    "raw_source": transcript_result.source,
+                },
+            )
+            with self._transaction():
+                for operation in plan.sql_operations:
+                    self._execute_statement(operation.statement)
+            self._execute_statement(
+                update_job_operation_status_sql(
+                    operation_id=current_operation_id,
+                    workspace_id=job.workspace_id,
+                    status="succeeded",
+                    now=clock,
+                )
+            )
+            current_operation_id = None
+            current_operation_name = None
+            self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="succeeded", now=clock))
+            return HostedIndexingExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source.id,
+                youtube_video_id=video.youtube_video_id,
+                status="succeeded",
+                hosted_video_id=plan.hosted_video_id,
+                transcript_version_id=plan.transcript_version_id,
+                chunks_written=len(chunks),
+                embeddings_written=len(vectors),
+            )
+        except UsageReservationDenied as exc:
+            if current_operation_id is not None:
+                self._execute_statement(
+                    update_job_operation_status_sql(
+                        operation_id=current_operation_id,
+                        workspace_id=job.workspace_id,
+                        status="denied",
+                        now=clock,
+                        error_code=exc.reservation.decision.reason,
+                        error_message=exc.reservation.decision.message,
+                    )
+                )
+            self._execute_statement(
+                update_job_status_sql(
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                    status="denied",
+                    now=clock,
+                    error_code=exc.reservation.decision.reason,
+                    error_message=exc.reservation.decision.message,
+                )
+            )
+            return HostedIndexingExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source_id,
+                youtube_video_id=video_id,
+                status="denied",
+                denied_operation=current_operation_name,
+                error_code=exc.reservation.decision.reason,
+                error_message=exc.reservation.decision.message,
+            )
+        except HostedIndexingDenied as exc:
+            if current_operation_id is not None:
+                self._execute_statement(
+                    update_job_operation_status_sql(
+                        operation_id=current_operation_id,
+                        workspace_id=job.workspace_id,
+                        status="denied",
+                        now=clock,
+                        error_code=exc.reservation.decision.reason,
+                        error_message=exc.reservation.decision.message,
+                    )
+                )
+            self._execute_statement(
+                update_job_status_sql(
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                    status="denied",
+                    now=clock,
+                    error_code=exc.reservation.decision.reason,
+                    error_message=exc.reservation.decision.message,
+                )
+            )
+            return HostedIndexingExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source_id,
+                youtube_video_id=video_id,
+                status="denied",
+                denied_operation=exc.operation,
+                error_code=exc.reservation.decision.reason,
+                error_message=exc.reservation.decision.message,
+            )
+        except Exception as exc:
+            if current_operation_id is not None:
+                self._execute_statement(
+                    update_job_operation_status_sql(
+                        operation_id=current_operation_id,
+                        workspace_id=job.workspace_id,
+                        status="failed_final",
+                        now=clock,
+                        error_code=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                )
+            self._execute_statement(
+                update_job_status_sql(
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                    status="failed",
+                    now=clock,
+                    error_code=getattr(exc, "code", type(exc).__name__),
+                    error_message=str(exc),
+                )
+            )
+            return HostedIndexingExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source_id,
+                youtube_video_id=video_id,
+                status="failed",
+                error_code=getattr(exc, "code", type(exc).__name__),
+                error_message=str(exc),
+            )
+
+    def _fetch_video_metadata(self, video_id: str, source: Source, job: Job) -> HostedVideoInput:
+        discovered = discover_video(
+            target=video_id,
+            cwd=self.cwd,
+            proxy=self.config.proxy if self.config.proxy.use_for_metadata else None,
+            ytdlp_config=self.config.yt_dlp,
+        )
+        return HostedVideoInput(
+            youtube_video_id=discovered.video_id,
+            title=discovered.title or source.display_name or discovered.video_id,
+            url=discovered.url,
+            channel_id=discovered.channel_id,
+            duration_seconds=discovered.duration_seconds,
+            metadata={
+                "channel_title": discovered.channel_title,
+                "channel_handle": discovered.channel_handle,
+                "playlist_tab": discovered.playlist_tab,
+                "source": "yt_dlp",
+            },
+        )
+
+    def _fetch_transcript(self, video_id: str, source: Source, job: Job) -> TranscriptFetchResult:
+        proxy = self.config.proxy if self.config.proxy.enabled else None
+        try:
+            if self.config.transcripts.prefer_ytdlp_subtitles:
+                return fetch_subtitle_transcript_with_ytdlp(
+                    video_id=video_id,
+                    cwd=self.cwd,
+                    language=self.config.transcripts.preferred_languages[0],
+                    proxy=proxy,
+                    ytdlp_config=self.config.yt_dlp,
+                    allow_translated_captions=self.config.transcripts.allow_translated_captions,
+                )
+            return fetch_transcript(
+                video_id=video_id,
+                languages=self.config.transcripts.preferred_languages,
+                proxy=proxy,
+                timeout_seconds=self.config.transcripts.request_timeout_seconds,
+            )
+        except Exception:
+            if not self.config.gemini.fallback_enabled:
+                raise
+            return transcribe_youtube_url_with_gemini(video_id=video_id, config=self.config.gemini)
+
+    def _clean_with_gemini(
+        self,
+        transcript: NormalizedTranscript,
+        video: HostedVideoInput,
+        context: ProviderCallContext,
+    ) -> NormalizedTranscript:
+        cleaned, _stats = cleanup_transcript_with_gemini(
+            transcript,
+            config=self.config.gemini,
+            context=TranscriptCleanupContext(
+                video_title=video.title,
+                video_description=video.description,
+                channel_title=str((video.metadata or {}).get("channel_title") or "") or None,
+                channel_handle=str((video.metadata or {}).get("channel_handle") or "") or None,
+            ),
+            batch_segments=self.config.transcript_cleanup.batch_segments,
+            concurrency=self.config.transcript_cleanup.concurrency,
+            max_change_ratio=self.config.transcript_cleanup.max_change_ratio,
+            max_patch_retries=self.config.transcript_cleanup.max_patch_retries,
+            hosted_context=context,
+        )
+        return cleaned
+
+    def _embed_with_voyage(
+        self,
+        chunks: Sequence[TranscriptChunkInput],
+        video: HostedVideoInput,
+        context: ProviderCallContext,
+    ) -> list[list[float]]:
+        def call() -> Any:
+            import voyageai
+
+            return voyageai.Client().embed(
+                [chunk.text for chunk in chunks],
+                model=DEFAULT_EMBEDDING_MODEL,
+                input_type="document",
+                output_dimension=DEFAULT_EMBEDDING_DIMENSION,
+            )
+
+        response = execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda result: UsageNormalization(
+                subject="voyage",
+                operation="embed_documents",
+                actual_units=dict(getattr(result, "usage", {}) or {}),
+                raw_usage={"usage": dict(getattr(result, "usage", {}) or {})},
+            ),
+        )
+        return [list(vector) for vector in response.embeddings]
+
+    def _provider_context(
+        self,
+        *,
+        workspace_id: str,
+        subject: UsageSubject,
+        operation: str,
+        estimated_units: Mapping[str, float],
+        subject_id: str,
+        input_payload: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> ProviderCallContext:
+        allocations = self._load_allocations(workspace_id)
+        resolution = resolve_allocation(allocations, workspace_id=workspace_id, subject=subject, operation=operation)
+        operation_input_hash = input_hash({"subject": subject, "operation": operation, "input": input_payload})
+        reservation_key = job_operation_idempotency_key(
+            workspace_id=workspace_id,
+            operation=f"{subject}.{operation}",
+            input_hash_value=operation_input_hash,
+            video_id=subject_id,
+            extras=[DEFAULT_INDEX_PROFILE_ID],
+        )
+        return ProviderCallContext(
+            gate=self.gate,
+            ledger=self.ledger,
+            workspace_id=workspace_id,
+            subject=subject,
+            operation=operation,
+            estimated_units=dict(estimated_units),
+            allocation=resolution.allocation,
+            policy=self._load_policy(workspace_id),
+            balance=self._load_balance(workspace_id),
+            idempotency_key=reservation_key,
+            metadata={**dict(metadata), "input_hash": operation_input_hash, "allocation_resolution": resolution.reason},
+        )
+
+    def _reserve_search_write(
+        self,
+        *,
+        job: Job,
+        source: Source,
+        video: HostedVideoInput,
+        chunks: Sequence[TranscriptChunkInput],
+        vectors: Sequence[Sequence[float]],
+    ) -> UsageReservation:
+        reservation = _reserve_usage(
+            workspace_id=job.workspace_id,
+            subject="search_store",
+            operation="index_write",
+            estimated_units={
+                "transcript_versions": 1.0,
+                "chunks": float(len(chunks)),
+                "embeddings": float(len(vectors)),
+            },
+            allocations=self._load_allocations(job.workspace_id),
+            policy=self._load_policy(job.workspace_id),
+            balance=self._load_balance(job.workspace_id),
+            gate=self.gate,
+            subject_id=video.youtube_video_id,
+            input_payload={"job_id": job.id, "chunks": [_chunk_hash_payload(chunk) for chunk in chunks]},
+            extras=[DEFAULT_INDEX_PROFILE_ID],
+            created_at=job.created_at,
+        )
+        self._execute_statement(upsert_usage_reservation_sql(reservation))
+        return reservation
+
+    def _upsert_operation(
+        self,
+        job: Job,
+        source: Source,
+        video_id: str,
+        operation_name: str,
+        context: ProviderCallContext,
+    ) -> str:
+        operation = _job_operation(
+            workspace_id=job.workspace_id,
+            job_id=job.id,
+            source_id=source.id,
+            video_id=video_id,
+            operation=operation_name,
+            input_payload={"idempotency_key": context.idempotency_key, "input_hash": context.metadata.get("input_hash")},
+            idempotency_extras=[DEFAULT_INDEX_PROFILE_ID],
+            usage_reservation_id="",
+            created_at=job.created_at,
+        )
+        self._execute_statement(upsert_job_operation_sql(operation))
+        return operation.id
+
+    def _upsert_raw_operation(
+        self,
+        job: Job,
+        source: Source,
+        video_id: str,
+        operation_name: str,
+        input_payload: Mapping[str, Any],
+    ) -> str:
+        operation = _job_operation(
+            workspace_id=job.workspace_id,
+            job_id=job.id,
+            source_id=source.id,
+            video_id=video_id,
+            operation=operation_name,
+            input_payload=input_payload,
+            idempotency_extras=[DEFAULT_INDEX_PROFILE_ID],
+            usage_reservation_id="",
+            created_at=job.created_at,
+        )
+        self._execute_statement(upsert_job_operation_sql(operation))
+        return operation.id
+
+    def _load_source(self, job: Job) -> Source:
+        if not job.source_id:
+            raise HostedIndexingError("index_video job is missing source_id")
+        row = _execute_one(
+            self.connection,
+            SqlStatement(
+                sql="""
+SELECT *
+FROM sources
+WHERE id = %(source_id)s
+  AND workspace_id = %(workspace_id)s;
+""".strip(),
+                params={"source_id": job.source_id, "workspace_id": job.workspace_id},
+            ),
+        )
+        if row is None:
+            raise HostedIndexingError(f"source not found for job: {job.source_id}")
+        return _source_from_row(row)
+
+    def _load_allocations(self, workspace_id: str) -> tuple[Allocation, ...]:
+        provider_rows = _execute_rows(
+            self.connection,
+            SqlStatement(
+                sql="SELECT * FROM provider_allocations WHERE workspace_id = %(workspace_id)s AND status <> 'invalid';",
+                params={"workspace_id": workspace_id},
+            ),
+        )
+        service_rows = _execute_rows(
+            self.connection,
+            SqlStatement(
+                sql="SELECT * FROM service_allocations WHERE workspace_id = %(workspace_id)s AND status <> 'invalid';",
+                params={"workspace_id": workspace_id},
+            ),
+        )
+        allocations: list[Allocation] = []
+        for row in provider_rows:
+            allocations.append(
+                ProviderAllocation(
+                    id=str(row["id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    provider=row["provider"],
+                    operation=str(row["operation"]),
+                    mode=row["mode"],
+                    status=row.get("status", "active"),
+                    model_or_plan=row.get("model_or_plan"),
+                    external_allocation_id=row.get("external_allocation_id"),
+                    metadata=dict(_json_value(row.get("metadata_json"))),
+                )
+            )
+        for row in service_rows:
+            from yutome.hosted.models import ServiceAllocation
+
+            allocations.append(
+                ServiceAllocation(
+                    id=str(row["id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    service=row["service"],
+                    operation=str(row["operation"]),
+                    mode=row.get("mode", "service_internal"),
+                    status=row.get("status", "active"),
+                    backend=str(row["backend"]),
+                    index_profile_ref=row.get("index_profile_ref"),
+                    metadata=dict(_json_value(row.get("metadata_json"))),
+                )
+            )
+        return tuple(allocations)
+
+    def _load_policy(self, workspace_id: str) -> EntitlementPolicy:
+        row = _execute_one(
+            self.connection,
+            SqlStatement(
+                sql="""
+SELECT *
+FROM entitlement_policies
+WHERE workspace_id = %(workspace_id)s
+  AND status = 'active'
+ORDER BY updated_at DESC
+LIMIT 1;
+""".strip(),
+                params={"workspace_id": workspace_id},
+            ),
+        )
+        if row is None:
+            return EntitlementPolicy(id=f"policy_missing_{workspace_id}", workspace_id=workspace_id)
+        return EntitlementPolicy(
+            id=str(row["id"]),
+            workspace_id=str(row["workspace_id"]),
+            allowed_operations=set(row.get("allowed_operations") or ()),
+            max_units_by_operation=dict(_json_value(row.get("hard_limits_jsonb"))),
+        )
+
+    def _load_balance(self, workspace_id: str) -> WorkspaceBalance:
+        row = _execute_one(
+            self.connection,
+            SqlStatement(
+                sql="SELECT * FROM workspace_balances WHERE workspace_id = %(workspace_id)s;",
+                params={"workspace_id": workspace_id},
+            ),
+        )
+        if row is None:
+            return WorkspaceBalance(workspace_id=workspace_id)
+        return WorkspaceBalance(
+            workspace_id=str(row["workspace_id"]),
+            remaining_units=dict(_json_value(row.get("remaining_units_jsonb"))),
+            unlimited_units=set(row.get("unlimited_units") or ()),
+        )
+
+    def _execute_statement(self, statement: SqlStatement) -> list[dict[str, Any]]:
+        return _rows_from_result(self.connection.execute(statement.sql, statement.params))
+
+    @contextmanager
+    def _transaction(self):
+        transaction = getattr(self.connection, "transaction", None)
+        if callable(transaction):
+            with transaction():
+                yield
+            return
+        self.connection.execute("BEGIN", {})
+        try:
+            yield
+        except Exception:
+            self.connection.execute("ROLLBACK", {})
+            raise
+        self.connection.execute("COMMIT", {})
+
+
 def upsert_video_sql(source: Source, video: HostedVideoInput, *, hosted_video_id: str) -> SqlStatement:
     return SqlStatement(
         sql="""
@@ -595,7 +1350,12 @@ VALUES (
     %(attempt_count)s, %(usage_reservation_id)s, %(metadata_json)s::jsonb
 )
 ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET status = EXCLUDED.status,
+SET status = CASE
+        WHEN job_operations.status IN ('denied', 'succeeded', 'failed_final', 'reconciled', 'released')
+         AND EXCLUDED.status IN ('planned', 'reserved', 'started')
+        THEN job_operations.status
+        ELSE EXCLUDED.status
+    END,
     attempt_count = job_operations.attempt_count,
     usage_reservation_id = EXCLUDED.usage_reservation_id,
     metadata_json = EXCLUDED.metadata_json,
@@ -613,7 +1373,7 @@ RETURNING *;
             "idempotency_key": operation.idempotency_key,
             "status": operation.status,
             "attempt_count": operation.attempt_count,
-            "usage_reservation_id": operation.metadata_jsonb.get("usage_reservation_id"),
+            "usage_reservation_id": operation.metadata_jsonb.get("usage_reservation_id") or None,
             "metadata_json": _json_param(operation.metadata_jsonb),
         },
     )
@@ -792,6 +1552,90 @@ def _stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{input_hash(list(parts), prefix='').lstrip('_')[:24]}"
 
 
+def _chunks_from_normalized_transcript(transcript: NormalizedTranscript) -> list[TranscriptChunkInput]:
+    return [
+        TranscriptChunkInput(
+            chunk_index=chunk.sequence,
+            start_seconds=chunk.start_ms / 1000,
+            end_seconds=chunk.end_ms / 1000,
+            text=chunk.text,
+            metadata={
+                "token_count": chunk.token_count,
+                "text_hash": chunk.text_hash,
+                "segment_ids": chunk.segment_ids,
+                "forced_split": chunk.forced_split,
+                "chunker_version": REAL_HOSTED_CHUNKING_VERSION,
+            },
+        )
+        for chunk in build_chunks(
+            video_id=transcript.video_id,
+            transcript_version_id=transcript.version_id,
+            segments=transcript.segments,
+        )
+    ]
+
+
+def _source_from_row(row: Mapping[str, Any]) -> Source:
+    return Source(
+        id=str(row["id"]),
+        workspace_id=str(row["workspace_id"]),
+        source_type=row["source_type"],
+        source_url=str(row["source_url"]),
+        canonical_channel_id=_optional_str(row.get("canonical_channel_id")),
+        canonical_playlist_id=_optional_str(row.get("canonical_playlist_id")),
+        canonical_video_id=_optional_str(row.get("canonical_video_id")),
+        display_name=_optional_str(row.get("display_name")),
+        selected=bool(row.get("selected", True)),
+        auto_index_allowed=bool(row.get("auto_index_allowed", True)),
+        import_source=row["import_source"],
+        auth_grant_id=_optional_str(row.get("auth_grant_id")),
+        metadata_jsonb=dict(_json_value(row.get("metadata_json"))),
+        status=row.get("status", "active"),
+        last_discovered_at=row.get("last_discovered_at"),
+        last_indexed_at=row.get("last_indexed_at"),
+    )
+
+
+def _execute_one(connection: Any, statement: SqlStatement) -> Mapping[str, Any] | None:
+    rows = _execute_rows(connection, statement)
+    return rows[0] if rows else None
+
+
+def _execute_rows(connection: Any, statement: SqlStatement) -> list[dict[str, Any]]:
+    return _rows_from_result(connection.execute(statement.sql, statement.params))
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [dict(row) for row in result]
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        return [dict(row) for row in result.fetchall()]
+    try:
+        return [dict(row) for row in result]
+    except TypeError:
+        return []
+
+
+def _json_value(value: Any) -> Any:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, bytes):
+        return json.loads(value.decode("utf-8"))
+    return value
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
 def _vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(f"{float(value):.12g}" for value in vector) + "]"
 
@@ -824,13 +1668,17 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "DEFAULT_INDEX_PROFILE_ID",
     "HostedIndexingPlan",
+    "HostedIndexingExecutionResult",
+    "HostedIndexingExecutor",
     "HostedVideoInput",
     "IndexProfileInput",
     "PlannedSqlOperation",
+    "REAL_HOSTED_CHUNKING_VERSION",
     "TranscriptChunkInput",
     "extract_public_youtube_video_id",
     "mock_embedding_vector",
     "plan_mock_hosted_public_indexing",
+    "plan_real_hosted_public_indexing",
     "source_from_public_youtube_input",
     "upsert_chunk_embedding_sql",
     "upsert_chunk_sql",

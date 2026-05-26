@@ -6,11 +6,14 @@ from typing import Any
 
 import pytest
 
+from yutome.config import AppConfig
 from yutome.hosted.control_plane import Job, Source
 from yutome.hosted.gate import UsageGate
-from yutome.hosted.models import EntitlementPolicy, WorkspaceBalance
+from yutome.hosted.models import EntitlementPolicy, UsageEvent, UsageNormalization, WorkspaceBalance
+from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
+    HostedIndexingExecutor,
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
@@ -18,6 +21,7 @@ from yutome.hosted.indexing import (
     plan_mock_hosted_public_indexing,
     source_from_public_youtube_input,
 )
+from yutome.youtube import TranscriptFetchResult
 
 
 NOW = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
@@ -30,6 +34,202 @@ class RecordingGate(UsageGate):
     def reserve(self, **kwargs):  # noqa: ANN003, ANN201
         self.calls.append(dict(kwargs))
         return super().reserve(**kwargs)
+
+
+class RecordingLedger:
+    def __init__(self) -> None:
+        self.events: list[UsageEvent] = []
+
+    def append(self, event: UsageEvent) -> None:
+        self.events.append(event)
+
+
+class HostedExecutorConnection:
+    def __init__(self, *, policy: EntitlementPolicy, balance: WorkspaceBalance | None = None) -> None:
+        self.policy = policy
+        self.balance = balance or WorkspaceBalance(
+            workspace_id="ws_alice",
+            remaining_units={
+                "total_tokens": 100_000,
+                "vectors": 100,
+                "transcript_versions": 10,
+                "chunks": 100,
+                "embeddings": 100,
+            },
+        )
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.transaction_events: list[str] = []
+
+    def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self.calls.append((statement, dict(params or {})))
+        if "FROM sources" in statement:
+            return [
+                {
+                    "id": "src_oedo",
+                    "workspace_id": "ws_alice",
+                    "source_type": "video",
+                    "source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+                    "canonical_video_id": "OEDoJyhQhXs",
+                    "display_name": "Real-world smoke video",
+                    "selected": True,
+                    "auto_index_allowed": True,
+                    "import_source": "manual_url",
+                    "metadata_json": {},
+                    "status": "active",
+                }
+            ]
+        if "FROM provider_allocations" in statement:
+            return [
+                {
+                    "id": "alloc_gemini",
+                    "workspace_id": "ws_alice",
+                    "provider": "gemini",
+                    "operation": "cleanup_transcript",
+                    "mode": "hosted",
+                    "status": "active",
+                    "model_or_plan": "gemini-3.1-flash-lite",
+                    "metadata_json": {},
+                },
+                {
+                    "id": "alloc_voyage",
+                    "workspace_id": "ws_alice",
+                    "provider": "voyage",
+                    "operation": "embed_documents",
+                    "mode": "hosted",
+                    "status": "active",
+                    "model_or_plan": "voyage-4-lite",
+                    "metadata_json": {},
+                },
+            ]
+        if "FROM service_allocations" in statement:
+            return [
+                {
+                    "id": "svc_search",
+                    "workspace_id": "ws_alice",
+                    "service": "search_store",
+                    "operation": "index_write",
+                    "mode": "service_internal",
+                    "status": "active",
+                    "backend": "postgres_vectorchord",
+                    "index_profile_ref": "sip_voyage4lite_bm25_default",
+                    "metadata_json": {},
+                }
+            ]
+        if "FROM entitlement_policies" in statement:
+            return [
+                {
+                    "id": self.policy.id,
+                    "workspace_id": self.policy.workspace_id,
+                    "allowed_operations": list(self.policy.allowed_operations),
+                    "hard_limits_jsonb": self.policy.max_units_by_operation,
+                }
+            ]
+        if "FROM workspace_balances" in statement:
+            return [
+                {
+                    "workspace_id": self.balance.workspace_id,
+                    "remaining_units_jsonb": self.balance.remaining_units,
+                    "unlimited_units": list(self.balance.unlimited_units),
+                }
+            ]
+        return []
+
+    def transaction(self):
+        connection = self
+
+        class Tx:
+            def __enter__(self) -> None:
+                connection.transaction_events.append("begin")
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+                connection.transaction_events.append("rollback" if exc_type else "commit")
+
+        return Tx()
+
+
+def _executor_job() -> Job:
+    return Job(
+        id="job_oedo_index",
+        workspace_id="ws_alice",
+        source_id="src_oedo",
+        job_type="index_video",
+        status="queued",
+        idempotency_key="ws_alice:src_oedo:index_video:real",
+        lease_owner="worker-1",
+        created_at=NOW,
+    )
+
+
+def _executor_policy(limits: dict[str, dict[str, float]] | None = None) -> EntitlementPolicy:
+    return EntitlementPolicy(
+        id="policy_ws_alice",
+        workspace_id="ws_alice",
+        allowed_operations={"gemini.cleanup_transcript", "voyage.embed_documents", "search_store.index_write"},
+        max_units_by_operation=limits or {},
+    )
+
+
+def _metadata_fetcher(video_id: str, _source: Source, _job: Job) -> HostedVideoInput:
+    return HostedVideoInput(
+        youtube_video_id=video_id,
+        title="Real hosted executor video",
+        url=f"https://www.youtube.com/watch?v={video_id}",
+        channel_id="UCleoandlongevity",
+        duration_seconds=60,
+        metadata={"channel_title": "Leo and Longevity"},
+    )
+
+
+def _transcript_fetcher(_video_id: str, _source: Source, _job: Job) -> TranscriptFetchResult:
+    return TranscriptFetchResult(
+        raw_snippets=[
+            {"start": 0.0, "duration": 4.0, "text": "Hosted indexing fetches a real YouTube transcript."},
+            {"start": 4.0, "duration": 5.0, "text": "Gemini cleanup and Voyage embeddings are metered before writes."},
+        ],
+        source="youtube-transcript-api",
+        language="en",
+        is_generated=False,
+    )
+
+
+def _fake_gemini_cleaner(calls: list[str]):
+    def clean(transcript, _video: HostedVideoInput, context: ProviderCallContext):  # noqa: ANN001, ANN202
+        def call():
+            calls.append("gemini")
+            return transcript
+
+        return execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda _result: UsageNormalization(
+                subject="gemini",
+                operation="cleanup_transcript",
+                actual_units={"total_tokens": 8},
+                provider_request_id="gemini_req_1",
+            ),
+        )
+
+    return clean
+
+
+def _fake_voyage_embedder(calls: list[str]):
+    def embed(chunks: list[TranscriptChunkInput], _video: HostedVideoInput, context: ProviderCallContext) -> list[list[float]]:
+        def call():
+            calls.append("voyage")
+            return [[0.001 * (index + 1)] * DEFAULT_EMBEDDING_DIMENSION for index, _chunk in enumerate(chunks)]
+
+        return execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda result: UsageNormalization(
+                subject="voyage",
+                operation="embed_documents",
+                actual_units={"total_tokens": 12, "vectors": len(result)},
+                provider_request_id="voyage_req_1",
+            ),
+        )
+
+    return embed
 
 
 def _source() -> Source:
@@ -270,6 +470,115 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     assert "FULL OUTER JOIN semantic USING (chunk_id)" in search_plan.statement.sql
     assert search_plan.statement.params["workspace_id"] == "ws_alice"
     assert search_plan.usage.operation == "hybrid_query"
+
+
+def test_real_hosted_executor_orders_provider_calls_before_transactional_writes() -> None:
+    provider_calls: list[str] = []
+    connection = HostedExecutorConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+    statements = [sql for sql, _params in connection.calls]
+    first_write_index = next(index for index, statement in enumerate(statements) if statement.startswith("INSERT INTO videos"))
+    transaction_sql = statements[first_write_index:]
+
+    assert result.status == "succeeded"
+    assert result.chunks_written == 1
+    assert result.embeddings_written == 1
+    assert provider_calls == ["gemini", "voyage"]
+    assert connection.transaction_events == ["begin", "commit"]
+    assert "INSERT INTO videos" in "\n".join(transaction_sql)
+    assert "INSERT INTO chunks" in "\n".join(transaction_sql)
+    assert "INSERT INTO chunk_embeddings" in "\n".join(transaction_sql)
+    assert any(params.get("status") == "succeeded" for _sql, params in connection.calls)
+
+
+def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() -> None:
+    provider_calls: list[str] = []
+    policy = _executor_policy({"gemini.cleanup_transcript": {"total_tokens": 1}})
+    connection = HostedExecutorConnection(policy=policy)
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+    sql = "\n".join(statement for statement, _params in connection.calls)
+
+    assert result.status == "denied"
+    assert result.denied_operation == "gemini.cleanup_transcript"
+    assert result.error_code == "usage_limit_exceeded"
+    assert provider_calls == []
+    assert connection.transaction_events == []
+    assert "INSERT INTO videos" not in sql
+    assert any(params.get("status") == "denied" for _statement, params in connection.calls)
+
+
+def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
+    provider_calls: list[str] = []
+    policy = _executor_policy({"search_store.index_write": {"chunks": 0}})
+    connection = HostedExecutorConnection(policy=policy)
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+    sql = "\n".join(statement for statement, _params in connection.calls)
+
+    assert result.status == "denied"
+    assert result.denied_operation == "search_store.index_write"
+    assert provider_calls == ["gemini", "voyage"]
+    assert connection.transaction_events == []
+    assert "INSERT INTO videos" not in sql
+
+
+def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
+    connection = HostedExecutorConnection(policy=_executor_policy())
+    results = []
+    for _ in range(2):
+        provider_calls: list[str] = []
+        executor = HostedIndexingExecutor(
+            connection=connection,
+            config=AppConfig(),
+            gate=UsageGate(),
+            ledger=RecordingLedger(),
+            metadata_fetcher=_metadata_fetcher,
+            transcript_fetcher=_transcript_fetcher,
+            gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+            voyage_embedder=_fake_voyage_embedder(provider_calls),
+        )
+        results.append(executor.execute(_executor_job(), lease_owner="worker-1", now=NOW))
+
+    sql = "\n".join(statement for statement, _params in connection.calls)
+
+    assert results[0].hosted_video_id == results[1].hosted_video_id
+    assert results[0].transcript_version_id == results[1].transcript_version_id
+    assert connection.transaction_events == ["begin", "commit", "begin", "commit"]
+    assert "ON CONFLICT (workspace_id, youtube_video_id) DO UPDATE" in sql
+    assert "ON CONFLICT (workspace_id, transcript_version_id, index_profile_id, chunk_index) DO UPDATE" in sql
+    assert "ON CONFLICT (workspace_id, chunk_id, index_profile_id) DO UPDATE" in sql
 
 
 def test_hosted_indexing_module_has_no_local_store_backend_references() -> None:

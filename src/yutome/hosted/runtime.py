@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -14,6 +14,7 @@ from yutome.hosted.control_plane import Job, Source, TERMINAL_JOB_STATUSES
 from yutome.hosted.ids import input_hash
 from yutome.hosted.billing import billing_debug_snapshot_from_rows, billing_debug_snapshot_sql
 from yutome.hosted.indexing import (
+    HostedIndexingExecutor,
     HostedVideoInput,
     TranscriptChunkInput,
     mock_embedding_vector,
@@ -54,6 +55,7 @@ class HostedTickResult(BaseModel):
 
 class HostedIndexingSmokeResult(BaseModel):
     ok: bool
+    dev_only: bool = True
     migrated: bool
     migration_phase: MigrationPhase | None = None
     applied_migrations: int = 0
@@ -144,6 +146,7 @@ class HostedCommandRunner:
         limit: int = 3,
         source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
     ) -> HostedIndexingSmokeResult:
+        """Development-only smoke that writes deterministic fake transcript rows."""
         _validate_positive("limit", limit)
         connection = self.connect()
         applied_migrations = self.migrate(phase=migration_phase) if migrate else 0
@@ -193,17 +196,25 @@ class HostedCommandRunner:
             lease_seconds=lease_seconds,
             limit=limit,
             workspace_id=workspace_id,
+            job_types=["index_video"],
             executor_kind="railway",
             executor_ref=lease_owner,
         )
         result = self.connect().execute(statement.sql, statement.params)
         rows = _rows_from_result(result)
+        executor = HostedIndexingExecutor(connection=self.connect(), config=self.config, gate=self.usage_gate(), ledger=self.usage_ledger())
+        executions = []
+        for row in rows:
+            job = _job_from_row(row)
+            if job.job_type != "index_video":
+                continue
+            executions.append(_execution_result_dict(executor.execute(job, lease_owner=lease_owner)))
         return HostedTickResult(
             tick="worker_once",
             attempted=True,
             affected_rows=len(rows),
             sql=statement.sql,
-            params=statement.params,
+            params={**statement.params, "executions": executions},
         )
 
     def source_refresh_tick(
@@ -566,6 +577,40 @@ def _rows_from_result(result: Any) -> list[dict[str, Any]]:
         return []
 
 
+def _job_from_row(row: Mapping[str, Any]) -> Job:
+    return Job(
+        id=str(row["id"]),
+        workspace_id=str(row["workspace_id"]),
+        source_id=str(row["source_id"]) if row.get("source_id") is not None else None,
+        job_type=row["job_type"],
+        status=row.get("status", "queued"),
+        priority=int(row.get("priority", 100)),
+        idempotency_key=str(row["idempotency_key"]),
+        run_after=row.get("run_after"),
+        executor_kind=row.get("executor_kind"),
+        executor_ref=row.get("executor_ref"),
+        lease_owner=row.get("lease_owner"),
+        leased_at=row.get("leased_at"),
+        lease_expires_at=row.get("lease_expires_at"),
+        retry_after=row.get("retry_after"),
+        created_at=row.get("created_at") or datetime.now(timezone.utc),
+        started_at=row.get("started_at"),
+        finished_at=row.get("finished_at"),
+        cancelled_at=row.get("cancelled_at"),
+        error_code=row.get("error_code"),
+        error_message=row.get("error_message"),
+        metadata_jsonb=dict(_json_value(row.get("metadata_json"))),
+    )
+
+
+def _execution_result_dict(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return dict(getattr(value, "__dict__", {}))
+
+
 def _validate_positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
@@ -573,6 +618,16 @@ def _validate_positive(name: str, value: int) -> None:
 
 def _json_param(value: Mapping[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _json_value(value: Any) -> Any:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, bytes):
+        return json.loads(value.decode("utf-8"))
+    return value
 
 
 __all__ = [

@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from yutome.cli import app
 from yutome.config import AppConfig, HostedConfig, write_default_config
+from yutome.hosted.control_plane import Job
 from yutome.hosted.http_api import TOKEN_ENV_VAR
 from yutome.hosted.runtime import (
     HostedCommandRunner,
@@ -295,6 +296,62 @@ def test_runner_tick_methods_return_affected_rows() -> None:
     assert maintenance_result.tick == "maintenance_tick"
     assert maintenance_result.affected_rows == 2
     assert len(connection.calls) == 2
+
+
+def test_worker_once_claims_and_executes_index_video_jobs(monkeypatch) -> None:
+    created_at = datetime(2026, 5, 26, 4, 0, tzinfo=timezone.utc)
+    connection = RecordingConnection(
+        rows=[
+            {
+                "id": "job_1",
+                "workspace_id": "ws_cli",
+                "source_id": "src_1",
+                "job_type": "index_video",
+                "status": "queued",
+                "priority": 100,
+                "idempotency_key": "ws_cli:src_1:index_video:h1",
+                "lease_owner": "worker-1",
+                "created_at": created_at,
+                "metadata_json": {},
+            }
+        ]
+    )
+    executions: list[dict[str, Any]] = []
+
+    class FakeExecutor:
+        def __init__(self, **kwargs: Any) -> None:
+            executions.append({"init": kwargs})
+
+        def execute(self, job: Job, *, lease_owner: str):
+            assert job.id == "job_1"
+            assert lease_owner == "worker-1"
+
+            class Result:
+                def __init__(self) -> None:
+                    self.job_id = job.id
+                    self.workspace_id = job.workspace_id
+                    self.source_id = job.source_id
+                    self.youtube_video_id = "OEDoJyhQhXs"
+                    self.status = "succeeded"
+                    self.hosted_video_id = "vid_1"
+                    self.transcript_version_id = "tx_1"
+                    self.chunks_written = 1
+                    self.embeddings_written = 1
+                    self.denied_operation = None
+                    self.error_code = None
+                    self.error_message = None
+
+            return Result()
+
+    monkeypatch.setattr("yutome.hosted.runtime.HostedIndexingExecutor", FakeExecutor)
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.worker_once(lease_owner="worker-1", workspace_id="ws_cli")
+
+    assert result.affected_rows == 1
+    assert result.params["executions"][0]["status"] == "succeeded"
+    assert executions[0]["init"]["connection"] is connection
+    assert "job_type = ANY(%(job_types)s)" in connection.calls[0][0]
 
 
 def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None:
