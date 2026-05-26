@@ -4,10 +4,13 @@ import test from "node:test";
 import { handlePairingRequest } from "../src/pairing.ts";
 import type { Env } from "../src/env.ts";
 import {
+  ACCOUNT_SESSION_COOKIE_NAME,
+  ACCOUNT_SESSION_HEADER,
   accountGrantKey,
   handleRevokeRequest,
   HostedAccountGrantError,
   readHostedAccountGrant,
+  resolveHostedAccountSessionFromRequest,
   revokeHostedAccountGrant,
   resolveActiveHostedAccountGrantFromProps,
   resolveHostedMcpAuthContextFromStoredGrant,
@@ -540,6 +543,77 @@ test("hosted OAuth pairing rejects missing account session", async () => {
   assert.match(await response.text(), /Sign in to Yutome/);
 });
 
+test("hosted account session resolver rejects invalid cookie tokens", async () => {
+  const env = {
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
+  };
+  let caught: unknown;
+  try {
+    await resolveHostedAccountSessionFromRequest(
+      new Request("https://mcp.yutome.com/authorize", {
+        headers: {
+          cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=not-a-signed-token`,
+        },
+      }),
+      env,
+    );
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.equal(caught instanceof HostedAccountGrantError, true);
+  assert.equal((caught as HostedAccountGrantError).code, "hosted_account_session_invalid");
+  assert.equal((caught as HostedAccountGrantError).status, 401);
+});
+
+test("hosted account session resolver keeps header fallback for dev and tests", async () => {
+  const headerToken = await signedAccountSession({
+    user_id: "user_header",
+    workspace_id: "ws_header",
+    workspace_ids: ["ws_header"],
+  });
+  const session = await resolveHostedAccountSessionFromRequest(
+    new Request("https://mcp.yutome.com/authorize", {
+      headers: {
+        [ACCOUNT_SESSION_HEADER]: headerToken,
+      },
+    }),
+    { YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret" },
+  );
+
+  assert.deepEqual(session, {
+    user_id: "user_header",
+    workspace_id: "ws_header",
+    workspace_ids: ["ws_header"],
+    session_id: "acct_session_1",
+  });
+});
+
+test("hosted account session resolver prefers cookie over header when both are present", async () => {
+  const cookieToken = await signedAccountSession({
+    user_id: "user_cookie",
+    workspace_id: "ws_cookie",
+    workspace_ids: ["ws_cookie"],
+  });
+  const headerToken = await signedAccountSession({
+    user_id: "user_header",
+    workspace_id: "ws_header",
+    workspace_ids: ["ws_header"],
+  });
+  const session = await resolveHostedAccountSessionFromRequest(
+    new Request("https://mcp.yutome.com/authorize", {
+      headers: {
+        cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(cookieToken)}`,
+        [ACCOUNT_SESSION_HEADER]: headerToken,
+      },
+    }),
+    { YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret" },
+  );
+
+  assert.equal(session.user_id, "user_cookie");
+  assert.equal(session.workspace_id, "ws_cookie");
+});
+
 test("hosted OAuth pairing rejects workspace selection outside account session", async () => {
   const grantId = "22222222-3333-4444-8555-666666666667";
   const csrfToken = "csrf-token";
@@ -802,7 +876,12 @@ test("revoke endpoint keeps connector-only behavior explicit", async () => {
 function pairingPostRequest(
   authRequestId: string,
   csrfToken: string,
-  options: { pairingCode?: string; accountSessionToken?: string; workspaceId?: string } = {},
+  options: {
+    pairingCode?: string;
+    accountSessionToken?: string;
+    accountSessionTransport?: "cookie" | "header";
+    workspaceId?: string;
+  } = {},
 ): Request {
   const form = new URLSearchParams({
     auth_request_id: authRequestId,
@@ -819,7 +898,14 @@ function pairingPostRequest(
     cookie: `__Host-yutome_pairing_${authRequestId}=${csrfToken}`,
   });
   if (options.accountSessionToken) {
-    headers.set("x-yutome-account-session", options.accountSessionToken);
+    if (options.accountSessionTransport === "header") {
+      headers.set(ACCOUNT_SESSION_HEADER, options.accountSessionToken);
+    } else {
+      headers.set(
+        "cookie",
+        `${headers.get("cookie")}; ${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(options.accountSessionToken)}`,
+      );
+    }
   }
   return new Request("https://mcp.yutome.com/pair", {
     method: "POST",

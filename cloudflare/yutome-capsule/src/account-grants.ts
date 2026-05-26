@@ -69,7 +69,8 @@ const ACCOUNT_GRANT_PREFIX = "yutome:account-grant:";
 export const YUTOME_MCP_SCOPE = "yutome.search.read";
 export const DEFAULT_MCP_AUDIENCE = "https://mcp.yutome.com/mcp";
 export const DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth";
-const ACCOUNT_SESSION_HEADER = "x-yutome-account-session";
+export const ACCOUNT_SESSION_COOKIE_NAME = "yutome_account_session";
+export const ACCOUNT_SESSION_HEADER = "x-yutome-account-session";
 
 export function accountGrantKey(grantId: string): string {
   return `${ACCOUNT_GRANT_PREFIX}${normalizeGrantId(grantId)}`;
@@ -129,7 +130,7 @@ export async function resolveHostedAccountSessionFromRequest(
     );
   }
 
-  const token = request.headers.get(ACCOUNT_SESSION_HEADER)?.trim();
+  const token = accountSessionTokenFromRequest(request);
   if (!token) {
     throw new HostedAccountGrantError(
       "hosted_account_session_missing",
@@ -155,6 +156,46 @@ export async function resolveHostedAccountSessionFromRequest(
     workspace_ids: workspaceIds,
     session_id,
   });
+}
+
+export function accountSessionTokenFromRequest(request: Request): string | null {
+  // Browser OAuth redirects can only carry the hosted account session via cookie.
+  // The explicit header remains a dev/test adapter and is used only when the cookie is absent.
+  const cookieToken = readCookieValue(request.headers.get("cookie"), ACCOUNT_SESSION_COOKIE_NAME);
+  if (cookieToken) {
+    return cookieToken;
+  }
+  const headerToken = request.headers.get(ACCOUNT_SESSION_HEADER)?.trim();
+  return headerToken || null;
+}
+
+export function readCookieValue(cookieHeader: string | null | undefined, name: string): string | null {
+  if (!cookieHeader || !isCookieName(name)) {
+    return null;
+  }
+  for (const part of cookieHeader.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const separatorIndex = trimmed.indexOf("=");
+    const rawName = separatorIndex >= 0 ? trimmed.slice(0, separatorIndex).trim() : trimmed;
+    if (rawName !== name) {
+      continue;
+    }
+    const rawValue = separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1).trim() : "";
+    if (!rawValue || /[\r\n;]/.test(rawValue) || rawValue.length > 4096) {
+      return null;
+    }
+    let decoded = rawValue;
+    try {
+      decoded = decodeURIComponent(rawValue);
+    } catch {
+      decoded = rawValue;
+    }
+    return decoded && !/[\r\n;]/.test(decoded) && decoded.length <= 4096 ? decoded : null;
+  }
+  return null;
 }
 
 export async function resolveActiveHostedAccountGrantFromProps(
@@ -853,6 +894,10 @@ function headerQuoted(value: string): string {
 
 function isString(value: unknown): value is string {
   return typeof value === "string";
+}
+
+function isCookieName(value: string): boolean {
+  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(value);
 }
 
 function withoutUndefined<T extends Record<string, unknown>>(value: T): T {

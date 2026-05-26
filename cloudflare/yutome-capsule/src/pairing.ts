@@ -4,7 +4,7 @@
  * When Claude/ChatGPT redirects the browser to /authorize, the OAuth provider
  * routes the unauthenticated request here. Connector-only deployments ask for
  * the pairing code that `yutome connect` printed. Hosted deployments require
- * the account app to attach a signed account-session header and then approve a
+ * the account app to set a signed account-session cookie and then approve a
  * selected workspace. A valid approval calls `OAuthHelpers.completeAuthorization()`,
  * which finalizes the grant and redirects the browser back to the MCP client
  * with the auth code.
