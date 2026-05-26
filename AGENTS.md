@@ -47,6 +47,18 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Postgres Diagnostics
+
+For hosted Postgres/psycopg bugs, prefer a local disposable Postgres before Railway.
+Start OrbStack when needed and use a throwaway container for parser/type-inference
+checks around nullable placeholders, explicit casts, `COALESCE`, `ANY`/`ALL`, list
+binding, and schema-drift behavior. Railway is the final parity check for VectorChord
+Suite extensions, private networking, deployed variables, provider credentials, and
+hosted end-to-end smokes.
+
+If a real parser check is needed in tests, set `YUTOME_TEST_POSTGRES_DSN` to the local
+Postgres DSN and run `tests/test_hosted_postgres.py`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 

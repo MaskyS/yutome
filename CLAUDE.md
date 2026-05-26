@@ -50,6 +50,23 @@ messages, and docstrings — including how agents write:
 Both are also stored as bd memories (`design-ontology-glossary`, `writing-and-ontology-standard`)
 so they surface in `bd` sessions.
 
+## Postgres diagnostics
+
+For hosted Postgres/psycopg bugs, use a local disposable Postgres first. Start OrbStack
+when needed and run parser/type-inference checks against a throwaway container before
+spending Railway cycles. This is the right loop for nullable parameter casts, `ANY`/`ALL`
+array parameters, `COALESCE` type resolution, `IN` binding mistakes, and
+`CREATE TABLE IF NOT EXISTS` schema-drift checks.
+
+Use Railway after the local loop for environment parity: VectorChord Suite extensions,
+private networking, deployed service variables, provider credentials, and full hosted
+end-to-end smokes. Do not use Railway as the first REPL for generic PostgreSQL syntax or
+psycopg parameter adaptation bugs.
+
+The optional live test hook is `YUTOME_TEST_POSTGRES_DSN`; with a local disposable
+Postgres running, `tests/test_hosted_postgres.py` exercises representative generated SQL
+against a real parser instead of only fake connections.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
