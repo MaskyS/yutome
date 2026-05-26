@@ -5,9 +5,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from yutome.hosted.allocation_policy import default_search_store_allocation
 from yutome.hosted.http_api import TOKEN_ENV_VAR, WORKSPACE_HEADER, build_app, build_postgres_app, error_body
-from yutome.hosted.mcp_query import HostedMcpQueryAdapter
-from yutome.hosted.models import UsageEvent
+from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpQueryAdapter, HostedMcpUsageContext
+from yutome.hosted.models import EntitlementPolicy, UsageEvent, WorkspaceBalance
 from yutome.hosted.search_store import SearchStoreUsage
 
 
@@ -16,6 +17,22 @@ TEST_API_TOKEN = "hosted-test-token"
 
 def auth_headers(workspace_id: str, *, token: str = TEST_API_TOKEN) -> dict[str, str]:
     return {WORKSPACE_HEADER: workspace_id, "Authorization": f"Bearer {token}"}
+
+
+def _allow_search_usage_context(
+    auth: HostedMcpAuthContext,
+    operation: str,
+    estimated_units: dict[str, Any],
+) -> HostedMcpUsageContext:
+    return HostedMcpUsageContext(
+        allocation=default_search_store_allocation(workspace_id=auth.workspace_id, operation=operation),
+        policy=EntitlementPolicy(
+            id="policy_http",
+            workspace_id=auth.workspace_id,
+            allowed_operations={f"search_store.{operation}"},
+        ),
+        balance=WorkspaceBalance(workspace_id=auth.workspace_id, unlimited_units=set(estimated_units)),
+    )
 
 
 class RecordingSearchStore:
@@ -182,7 +199,11 @@ def hosted_http_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Rec
     monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
     store = RecordingSearchStore()
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
     return TestClient(build_app(adapter=adapter, expected_api_token=TEST_API_TOKEN)), store, ledger
 
 
@@ -277,7 +298,11 @@ def test_postgres_app_builder_wires_connection_search_store_and_adapter() -> Non
             }
         ]
     )
-    app = build_postgres_app(connection=connection, expected_api_token=TEST_API_TOKEN)
+    app = build_postgres_app(
+        connection=connection,
+        expected_api_token=TEST_API_TOKEN,
+        usage_context_provider=_allow_search_usage_context,
+    )
     client = TestClient(app)
 
     response = client.post(
@@ -295,6 +320,25 @@ def test_postgres_app_builder_wires_connection_search_store_and_adapter() -> Non
     assert "websearch_to_tsquery" in connection.calls[0][0]
     assert connection.calls[0][1]["workspace_id"] == "ws_pg"
     assert connection.calls[0][1]["limit"] == 2
+
+
+def test_postgres_app_builder_default_usage_context_denies_without_entitlement() -> None:
+    connection = RecordingConnection()
+    app = build_postgres_app(connection=connection, expected_api_token=TEST_API_TOKEN)
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp/tools/call",
+        json={"name": "find", "arguments": {"text": "Postgres", "mode": "lexical", "limit": 2}},
+        headers=auth_headers("ws_pg"),
+    )
+
+    assert response.status_code == 403
+    body = error_body(response.json())
+    assert body["code"] == "usage_denied"
+    assert body["data"]["operation"] == "search_store.lexical_query"
+    assert all("websearch_to_tsquery" not in statement for statement, _params in connection.calls)
+    assert any("FROM entitlement_policies" in statement for statement, _params in connection.calls)
 
 
 def test_tool_call_endpoint_uses_workspace_from_auth_header(
@@ -356,7 +400,11 @@ def test_tool_call_endpoint_accepts_contract_list_and_q_tools(
 def test_configured_api_token_rejects_missing_authorization_before_workspace_dispatch() -> None:
     store = RecordingSearchStore()
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
     client = TestClient(build_app(adapter=adapter, expected_api_token="hosted-secret"))
 
     response = client.post(
@@ -373,7 +421,11 @@ def test_configured_api_token_rejects_missing_authorization_before_workspace_dis
 def test_unconfigured_api_token_rejects_tool_and_resource_before_adapter_dispatch() -> None:
     store = RecordingSearchStore()
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
     client = TestClient(build_app(adapter=adapter))
 
     tool_response = client.post(
@@ -437,7 +489,11 @@ def test_configured_api_token_rejects_invalid_authorization_before_store_or_ledg
 def test_configured_api_token_allows_valid_tool_call() -> None:
     store = RecordingSearchStore()
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
     client = TestClient(build_app(adapter=adapter, expected_api_token="hosted-secret"))
 
     response = client.post(

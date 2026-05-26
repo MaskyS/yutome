@@ -21,7 +21,14 @@ from yutome.hosted.events import denied_usage_event, usage_event_from_normalizat
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.ids import idempotency_key, input_hash
 from yutome.hosted.migrations import HOSTED_DEFAULT_EMBEDDING_DIMENSION, HOSTED_DEFAULT_EMBEDDING_MODEL
-from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, UsageReservation, WorkspaceBalance
+from yutome.hosted.models import (
+    EntitlementPolicy,
+    ProviderAllocation,
+    UnitQuantity,
+    UsageEvent,
+    UsageReservation,
+    WorkspaceBalance,
+)
 from yutome.hosted.normalizers import normalize_search_store_usage
 from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied
 from yutome.hosted.resources import HostedResourceNotFound
@@ -54,7 +61,7 @@ class UsageGateLike(Protocol):
         workspace_id: str,
         subject: str,
         operation: str,
-        estimated_units: dict[str, float],
+        estimated_units: dict[str, UnitQuantity],
         allocation: Allocation | None,
         policy: EntitlementPolicy,
         balance: WorkspaceBalance,
@@ -116,7 +123,7 @@ class HostedMcpUsageContext:
     balance: WorkspaceBalance
 
 
-UsageContextProvider = Callable[[HostedMcpAuthContext, str, Mapping[str, float]], HostedMcpUsageContext]
+UsageContextProvider = Callable[[HostedMcpAuthContext, str, Mapping[str, UnitQuantity]], HostedMcpUsageContext]
 QueryEmbeddingCallable = Callable[[str, ProviderCallContext], list[float]]
 
 
@@ -238,7 +245,21 @@ class HostedMcpQueryAdapter:
             candidate_limit=request.limit,
             query_vector_dimensions=self.embedding_dimension,
         )
-        search_reservation = self._reserve_search_store(auth=auth, request=request, estimate=search_estimate)
+        try:
+            search_reservation = self._reserve_search_store(auth=auth, request=request, estimate=search_estimate)
+        except HostedMcpError as exc:
+            if request.mode == "hybrid" and _usage_error_allows_lexical_fallback(exc):
+                fallback_metadata = _usage_denial_fallback_metadata(
+                    request=request,
+                    operation=f"search_store.{search_operation}",
+                    error=exc,
+                )
+                return self._find_lexical_fallback(
+                    auth=auth,
+                    request=request,
+                    fallback_metadata=fallback_metadata,
+                )
+            raise
         vector_context = self._voyage_query_context(auth=auth, request=request)
         try:
             query_vector = self.query_embedder(request.text, vector_context)
@@ -253,12 +274,24 @@ class HostedMcpQueryAdapter:
                     "provider_reservation_id": exc.reservation.id,
                 },
             )
+            if request.mode == "hybrid" and _reservation_denial_allows_lexical_fallback(exc.reservation):
+                fallback_metadata = _usage_denial_fallback_metadata(
+                    request=request,
+                    operation="voyage.embed_query",
+                    reservation=exc.reservation,
+                )
+                return self._find_lexical_fallback(
+                    auth=auth,
+                    request=request,
+                    fallback_metadata=fallback_metadata,
+                )
             raise HostedMcpError(
                 code="usage_denied",
                 message=exc.reservation.decision.message or exc.reservation.decision.reason,
                 status_code=403,
                 data={
                     "reason": exc.reservation.decision.reason,
+                    "denial_effect": exc.reservation.decision.denial_effect,
                     "operation": exc.reservation.operation_key,
                     "reservation_id": exc.reservation.id,
                 },
@@ -396,6 +429,13 @@ class HostedMcpQueryAdapter:
             balance=usage_context.balance,
             idempotency_key=_query_idempotency_key(auth=auth, request=request),
         )
+        reservation.metadata.update(
+            {
+                "mcp_tool": SUPPORTED_TOOL,
+                "mcp_search_mode": request.mode,
+                "estimate_method": estimate.method,
+            }
+        )
         if not reservation.decision.allowed:
             event = denied_usage_event(reservation)
             self.ledger.append(_with_mcp_metadata(event, auth=auth, reservation=reservation))
@@ -405,6 +445,7 @@ class HostedMcpQueryAdapter:
                 status_code=403,
                 data={
                     "reason": reservation.decision.reason,
+                    "denial_effect": reservation.decision.denial_effect,
                     "operation": reservation.operation_key,
                     "reservation_id": reservation.id,
                 },
@@ -963,47 +1004,30 @@ class NoopUsageLedger:
 def default_usage_context(
     auth: HostedMcpAuthContext,
     operation: str,
-    estimated_units: Mapping[str, float],
+    estimated_units: Mapping[str, UnitQuantity],
 ) -> HostedMcpUsageContext:
     return HostedMcpUsageContext(
-        allocation=default_search_store_allocation(
-            workspace_id=auth.workspace_id,
-            operation=operation,
-        ),
+        allocation=None,
         policy=EntitlementPolicy(
-            id=f"policy_{auth.workspace_id}_hosted_mcp",
+            id=f"policy_{auth.workspace_id}_unconfigured_search_store",
             workspace_id=auth.workspace_id,
-            allowed_operations={f"search_store.{operation}"},
         ),
-        balance=WorkspaceBalance(
-            workspace_id=auth.workspace_id,
-            unlimited_units=set(estimated_units),
-        ),
+        balance=WorkspaceBalance(workspace_id=auth.workspace_id),
     )
 
 
 def default_voyage_usage_context(
     auth: HostedMcpAuthContext,
     operation: str,
-    estimated_units: Mapping[str, float],
+    estimated_units: Mapping[str, UnitQuantity],
 ) -> HostedMcpUsageContext:
     return HostedMcpUsageContext(
-        allocation=ProviderAllocation(
-            id=f"alloc_{auth.workspace_id}_voyage",
-            workspace_id=auth.workspace_id,
-            provider="voyage",
-            operation=operation,
-            model_or_plan=HOSTED_DEFAULT_EMBEDDING_MODEL,
-        ),
+        allocation=None,
         policy=EntitlementPolicy(
-            id=f"policy_{auth.workspace_id}_hosted_mcp_voyage",
+            id=f"policy_{auth.workspace_id}_unconfigured_voyage",
             workspace_id=auth.workspace_id,
-            allowed_operations={f"voyage.{operation}"},
         ),
-        balance=WorkspaceBalance(
-            workspace_id=auth.workspace_id,
-            unlimited_units=set(estimated_units),
-        ),
+        balance=WorkspaceBalance(workspace_id=auth.workspace_id),
     )
 
 
@@ -1153,6 +1177,7 @@ def _with_mcp_metadata(
     reservation: UsageReservation,
 ) -> UsageEvent:
     event.metadata = {
+        **reservation.metadata,
         **event.metadata,
         "idempotency_key": reservation.idempotency_key,
         "allocation_id": reservation.allocation_id,
@@ -1296,6 +1321,41 @@ def _search_store_exception_allows_lexical_fallback(exc: BaseException) -> bool:
     if status_code in {408, 429, 500, 502, 503, 504}:
         return True
     return _looks_like_vector_availability_error(exc) or _looks_like_availability_error(exc)
+
+
+def _reservation_denial_allows_lexical_fallback(reservation: UsageReservation) -> bool:
+    return reservation.decision.denial_effect == "soft"
+
+
+def _usage_error_allows_lexical_fallback(error: HostedMcpError) -> bool:
+    return error.code == "usage_denied" and error.data.get("denial_effect") == "soft"
+
+
+def _usage_denial_fallback_metadata(
+    *,
+    request: HostedFindRequest,
+    operation: str,
+    error: HostedMcpError | None = None,
+    reservation: UsageReservation | None = None,
+) -> dict[str, Any]:
+    reason = reservation.decision.reason if reservation is not None else str(error.data.get("reason") if error else "usage_denied")
+    denial_effect = (
+        reservation.decision.denial_effect
+        if reservation is not None
+        else str(error.data.get("denial_effect") if error else "soft")
+    )
+    reservation_id = reservation.id if reservation is not None else (error.data.get("reservation_id") if error else None)
+    return {
+        "fallback": True,
+        "fallback_from": request.mode,
+        "fallback_to": "lexical",
+        "fallback_reason": "soft_usage_denial",
+        "fallback_subject": operation.partition(".")[0],
+        "fallback_operation": operation,
+        "fallback_denial_reason": reason,
+        "fallback_denial_effect": denial_effect,
+        "fallback_reservation_id": reservation_id,
+    }
 
 
 def _provider_fallback_metadata(

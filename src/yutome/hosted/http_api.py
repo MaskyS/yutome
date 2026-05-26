@@ -46,13 +46,23 @@ def build_postgres_app(
     readiness_check: ReadinessCheck | None = None,
     gate: Any | None = None,
     ledger: Any | None = None,
+    usage_context_provider: Any | None = None,
+    voyage_usage_context_provider: Any | None = None,
     index_profile_ref: str | None = None,
     expected_api_token: str | None = None,
 ) -> Any:
+    from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
 
     search_store = PostgresVectorChordSearchStore(connection, index_profile_ref=index_profile_ref)
-    adapter = HostedMcpQueryAdapter(search_store=search_store, gate=gate, ledger=ledger)
+    entitlement_provider = PostgresUsageContextProvider(connection)
+    adapter = HostedMcpQueryAdapter(
+        search_store=search_store,
+        gate=gate,
+        ledger=ledger,
+        usage_context_provider=usage_context_provider or entitlement_provider,
+        voyage_usage_context_provider=voyage_usage_context_provider or entitlement_provider.voyage,
+    )
     app = build_app(
         adapter=adapter,
         readiness_check=readiness_check,

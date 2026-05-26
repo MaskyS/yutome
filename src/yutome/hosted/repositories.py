@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from yutome.hosted.models import ReservationStatus, UsageDecision, UsageEvent, UsageReservation
+from yutome.hosted.models import ReservationStatus, UsageDecision, UsageEvent, UsageReservation, jsonable_exact
 
 
 JsonParam = str
@@ -245,7 +245,7 @@ MappingRow = dict[str, Any]
 
 
 def _json_param(value: Any) -> JsonParam:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
 
 
 def _json_value(value: Any) -> Any:

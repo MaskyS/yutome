@@ -4,9 +4,12 @@ from yutome.hosted.models import (
     EntitlementPolicy,
     ProviderAllocation,
     ServiceAllocation,
+    UnitQuantity,
     UsageDecision,
     UsageReservation,
     WorkspaceBalance,
+    normalize_unit_map,
+    unit_quantity_decimal,
 )
 
 
@@ -22,17 +25,18 @@ class UsageGate:
         workspace_id: str,
         subject: str,
         operation: str,
-        estimated_units: dict[str, float],
+        estimated_units: dict[str, UnitQuantity],
         allocation: Allocation | None,
         policy: EntitlementPolicy,
         balance: WorkspaceBalance,
         idempotency_key: str,
     ) -> UsageReservation:
         operation_key = f"{subject}.{operation}"
+        exact_estimate = normalize_unit_map(estimated_units)
         decision = self._decide(
             workspace_id=workspace_id,
             operation_key=operation_key,
-            estimated_units=estimated_units,
+            estimated_units=exact_estimate,
             allocation=allocation,
             policy=policy,
             balance=balance,
@@ -43,7 +47,7 @@ class UsageGate:
             operation=operation,
             allocation_id=allocation.id if allocation else None,
             allocation_kind=allocation.mode if allocation else "disabled",
-            estimated_units=estimated_units,
+            estimated_units=exact_estimate,
             idempotency_key=idempotency_key,
             status="reserved" if decision.allowed else "denied",
             decision=decision,
@@ -54,7 +58,7 @@ class UsageGate:
         *,
         workspace_id: str,
         operation_key: str,
-        estimated_units: dict[str, float],
+        estimated_units: dict[str, UnitQuantity],
         allocation: Allocation | None,
         policy: EntitlementPolicy,
         balance: WorkspaceBalance,
@@ -71,11 +75,22 @@ class UsageGate:
         maxima = policy.max_units_by_operation.get(operation_key, {})
         for unit, maximum in maxima.items():
             quantity = estimated_units.get(unit)
-            if quantity is not None and quantity > maximum:
+            if quantity is not None and unit_quantity_decimal(quantity) > unit_quantity_decimal(maximum):
                 return UsageDecision(
                     allowed=False,
                     reason="usage_limit_exceeded",
                     message=f"Estimated {unit} exceeds the operation limit.",
+                )
+
+        soft_maxima = policy.soft_units_by_operation.get(operation_key, {})
+        for unit, maximum in soft_maxima.items():
+            quantity = estimated_units.get(unit)
+            if quantity is not None and unit_quantity_decimal(quantity) > unit_quantity_decimal(maximum):
+                return UsageDecision(
+                    allowed=False,
+                    reason="soft_limit_exceeded",
+                    message=f"Estimated {unit} exceeds the soft operation limit.",
+                    denial_effect="soft",
                 )
 
         has_balance, unit = balance.has_units(estimated_units)
@@ -84,6 +99,7 @@ class UsageGate:
                 allowed=False,
                 reason="insufficient_balance",
                 message=f"Workspace does not have enough {unit}.",
+                denial_effect="soft",
             )
 
         return UsageDecision(allowed=True)

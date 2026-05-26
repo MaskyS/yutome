@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -10,7 +11,7 @@ from yutome.hosted.gate import UsageGate
 from yutome.hosted.errors import classify_provider_http_error
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.ids import idempotency_key, input_hash
-from yutome.hosted.ledger import JsonlUsageLedger
+from yutome.hosted.ledger import JsonlUsageLedger, reconcile_reservation_usage
 from yutome.hosted.models import (
     EntitlementPolicy,
     ProviderAllocation,
@@ -152,6 +153,33 @@ def test_usage_gate_allows_explicit_unlimited_balance_unit() -> None:
     assert reservation.decision.allowed is True
 
 
+def test_usage_gate_uses_decimal_quantities_without_float_rounding_denial() -> None:
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+
+    reservation = UsageGate().reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"credits": Decimal("0.10") + Decimal("0.20")},
+        allocation=allocation,
+        policy=EntitlementPolicy(
+            id="policy",
+            workspace_id="ws_alice",
+            allowed_operations={"voyage.embed_documents"},
+        ),
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"credits": Decimal("0.30")}),
+        idempotency_key="idem",
+    )
+
+    assert reservation.status == "reserved"
+    assert reservation.estimated_units["credits"] == Decimal("0.30")
+
+
 def test_usage_gate_denies_before_call_when_limit_exceeded() -> None:
     allocation = ProviderAllocation(
         id="alloc_gemini_fallback",
@@ -276,6 +304,46 @@ def test_usage_event_from_normalization_links_to_reservation() -> None:
     assert event.workspace_id == "ws_alice"
     assert event.actual_units["total_tokens"] == 91
     assert event.event_type == "provider_attempt_succeeded"
+
+
+def test_reservation_reconciliation_derives_release_and_overage_units() -> None:
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+    reservation = UsageGate().reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100, "credits": Decimal("0.30")},
+        allocation=allocation,
+        policy=EntitlementPolicy(
+            id="policy",
+            workspace_id="ws_alice",
+            allowed_operations={"voyage.embed_documents"},
+        ),
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 500, "credits": 1}),
+        idempotency_key="idem",
+    )
+    event = UsageEvent(
+        id="evt_usage_1",
+        reservation_id=reservation.id,
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        event_type="provider_attempt_succeeded",
+        status="succeeded",
+        actual_units={"total_tokens": 91, "credits": Decimal("0.35")},
+    )
+
+    reconciliation = reconcile_reservation_usage(reservation, event)
+    repeat = reconcile_reservation_usage(reservation, event)
+
+    assert reconciliation.id == repeat.id
+    assert reconciliation.released_units == {"total_tokens": 9}
+    assert reconciliation.overage_units == {"credits": Decimal("0.05")}
 
 
 def test_voyage_usage_normalizer_accepts_rest_shape() -> None:

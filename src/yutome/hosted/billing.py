@@ -3,17 +3,31 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from yutome.hosted.ids import input_hash
-from yutome.hosted.models import EntitlementPolicy, UsageEvent, WorkspaceBalance
+from yutome.hosted.models import (
+    EntitlementPolicy,
+    UnitMap,
+    UnitQuantity,
+    UsageEvent,
+    WorkspaceBalance,
+    add_unit_maps,
+    jsonable_exact,
+    normalize_unit_quantity,
+    normalize_unit_map,
+    normalize_usage_units,
+    unit_quantity_decimal,
+)
 
 
 BillingProvider = Literal["polar"]
 BillingReplayStatus = Literal["pending", "succeeded", "failed", "skipped"]
 BillingRecordStatus = Literal["draft", "active", "paused", "archived"]
+CreditLedgerDirection = Literal["grant", "debit", "refund", "reversal"]
 
 
 @dataclass(frozen=True)
@@ -26,8 +40,8 @@ class ProductLimit(BaseModel):
     product_code: str
     operation_key: str
     unit: str
-    included_quantity: float | None = None
-    hard_limit: float | None = None
+    included_quantity: UnitQuantity | None = None
+    hard_limit: UnitQuantity | None = None
     polar_meter_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -65,13 +79,20 @@ class EntitlementPolicyRecord(BaseModel):
     plan_key: str
     price_book_id: str
     allowed_operations: tuple[str, ...] = ()
-    included_units: dict[str, dict[str, float]] = Field(default_factory=dict)
-    hard_limits: dict[str, dict[str, float]] = Field(default_factory=dict)
-    soft_limits: dict[str, dict[str, float]] = Field(default_factory=dict)
+    included_units: dict[str, UnitMap] = Field(default_factory=dict)
+    hard_limits: dict[str, UnitMap] = Field(default_factory=dict)
+    soft_limits: dict[str, UnitMap] = Field(default_factory=dict)
     grace_policy: dict[str, Any] = Field(default_factory=dict)
     status: BillingRecordStatus = "active"
     created_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("included_units", "hard_limits", "soft_limits", mode="before")
+    @classmethod
+    def _normalize_nested_units(cls, value: Any) -> dict[str, UnitMap]:
+        if value is None:
+            return {}
+        return {str(operation): normalize_unit_map(units) for operation, units in dict(value).items()}
 
     def to_runtime_policy(self) -> EntitlementPolicy:
         return EntitlementPolicy(
@@ -80,6 +101,7 @@ class EntitlementPolicyRecord(BaseModel):
             allow_all_operations=False,
             allowed_operations=set(self.allowed_operations),
             max_units_by_operation=dict(self.hard_limits),
+            soft_units_by_operation=dict(self.soft_limits),
         )
 
 
@@ -88,12 +110,17 @@ class WorkspaceBalanceSnapshot(BaseModel):
     entitlement_policy_id: str
     period_start_at: datetime
     period_end_at: datetime
-    used_units: dict[str, float] = Field(default_factory=dict)
-    reserved_units: dict[str, float] = Field(default_factory=dict)
-    remaining_units: dict[str, float] = Field(default_factory=dict)
+    used_units: UnitMap = Field(default_factory=dict)
+    reserved_units: UnitMap = Field(default_factory=dict)
+    remaining_units: UnitMap = Field(default_factory=dict)
     unlimited_units: tuple[str, ...] = ()
     updated_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("used_units", "reserved_units", "remaining_units", mode="before")
+    @classmethod
+    def _normalize_units(cls, value: Any) -> UnitMap:
+        return normalize_unit_map(value)
 
     def to_runtime_balance(self) -> WorkspaceBalance:
         return WorkspaceBalance(
@@ -115,6 +142,34 @@ class BillingCustomer(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreditLedgerEntry(BaseModel):
+    id: str
+    workspace_id: str
+    idempotency_key: str
+    direction: CreditLedgerDirection = "grant"
+    unit: str
+    quantity: UnitQuantity
+    provider: BillingProvider = "polar"
+    external_order_id: str | None = None
+    external_customer_id: str | None = None
+    reason: str
+    occurred_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _normalize_quantity(cls, value: Any) -> UnitQuantity:
+        quantity = normalize_unit_quantity(value)
+        if unit_quantity_decimal(quantity) <= 0:
+            raise ValueError("Credit ledger quantities must be positive; use direction to model reversals or debits.")
+        return quantity
+
+    @property
+    def signed_units(self) -> UnitMap:
+        sign = Decimal("-1") if self.direction in {"debit", "reversal"} else Decimal("1")
+        return {self.unit: sign * unit_quantity_decimal(self.quantity)}
 
 
 class PolarEventIngestionEvent(BaseModel):
@@ -168,7 +223,7 @@ class BillingExportEvent(BaseModel):
     external_meter_key: str | None = None
     replay_status: BillingReplayStatus = "pending"
     authorization_effect: Literal["none"] = "none"
-    actual_units: dict[str, float] = Field(default_factory=dict)
+    actual_units: UnitMap = Field(default_factory=dict)
     external_customer_id: str | None = None
     customer_id: str | None = None
     timestamp: datetime
@@ -179,6 +234,11 @@ class BillingExportEvent(BaseModel):
     last_error_message: str | None = None
     exported_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("actual_units", mode="before")
+    @classmethod
+    def _normalize_actual_units(cls, value: Any) -> UnitMap:
+        return normalize_unit_map(value)
 
     def to_polar_event(self) -> PolarEventIngestionEvent:
         metadata = dict(self.metadata)
@@ -326,6 +386,23 @@ CREATE TABLE IF NOT EXISTS billing_customers (
     UNIQUE(provider, external_customer_id)
 );
 
+CREATE TABLE IF NOT EXISTS credit_ledger_entries (
+    id text PRIMARY KEY,
+    workspace_id text NOT NULL REFERENCES workspaces(id),
+    idempotency_key text NOT NULL,
+    provider text NOT NULL,
+    external_order_id text,
+    external_customer_id text,
+    direction text NOT NULL,
+    unit text NOT NULL,
+    quantity_text text NOT NULL,
+    reason text NOT NULL,
+    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(workspace_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS billing_exports (
     id text PRIMARY KEY,
     workspace_id text NOT NULL REFERENCES workspaces(id),
@@ -437,11 +514,109 @@ def billing_export_event_from_usage_event(
         event_name=event_name or f"yutome.{event.operation_key}",
         external_meter_key=external_meter_key,
         replay_status=replay_status,
-        actual_units=_numeric_units(event.actual_units),
+        actual_units=_billable_units(event.actual_units),
         external_customer_id=external_customer_id or event.workspace_id,
         customer_id=customer_id,
         timestamp=event.created_at,
         metadata={key: value for key, value in metadata.items() if value is not None},
+    )
+
+
+def credit_order_idempotency_key(
+    *,
+    workspace_id: str,
+    provider: BillingProvider,
+    external_order_id: str,
+    unit: str,
+    reason: str = "order_grant",
+) -> str:
+    return input_hash(
+        {
+            "workspace_id": workspace_id,
+            "provider": provider,
+            "external_order_id": external_order_id,
+            "unit": unit,
+            "reason": reason,
+        },
+        prefix="cred",
+    )
+
+
+def credit_ledger_entry_from_order(
+    *,
+    workspace_id: str,
+    external_order_id: str,
+    unit: str,
+    quantity: UnitQuantity,
+    occurred_at: datetime,
+    provider: BillingProvider = "polar",
+    external_customer_id: str | None = None,
+    reason: str = "order_grant",
+    metadata: dict[str, Any] | None = None,
+) -> CreditLedgerEntry:
+    idempotency_key = credit_order_idempotency_key(
+        workspace_id=workspace_id,
+        provider=provider,
+        external_order_id=external_order_id,
+        unit=unit,
+        reason=reason,
+    )
+    return CreditLedgerEntry(
+        id=idempotency_key,
+        workspace_id=workspace_id,
+        idempotency_key=idempotency_key,
+        direction="grant",
+        unit=unit,
+        quantity=quantity,
+        provider=provider,
+        external_order_id=external_order_id,
+        external_customer_id=external_customer_id,
+        reason=reason,
+        occurred_at=occurred_at,
+        metadata=dict(metadata or {}),
+    )
+
+
+def derive_workspace_balance_snapshot(
+    *,
+    workspace_id: str,
+    entitlement_policy_id: str,
+    period_start_at: datetime,
+    period_end_at: datetime,
+    starting_units: dict[str, UnitQuantity] | None = None,
+    credit_entries: tuple[CreditLedgerEntry, ...] = (),
+    used_units: dict[str, UnitQuantity] | None = None,
+    reserved_units: dict[str, UnitQuantity] | None = None,
+    unlimited_units: tuple[str, ...] = (),
+    updated_at: datetime | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> WorkspaceBalanceSnapshot:
+    opening = normalize_unit_map(starting_units or {})
+    credits = add_unit_maps(*(entry.signed_units for entry in credit_entries)) if credit_entries else {}
+    used = normalize_unit_map(used_units or {})
+    reserved = normalize_unit_map(reserved_units or {})
+    available = add_unit_maps(opening, credits)
+    remaining = {
+        unit: quantity
+        for unit, quantity in add_unit_maps(available, _negated_units(used), _negated_units(reserved)).items()
+        if unit not in unlimited_units
+    }
+    snapshot_metadata = dict(metadata or {})
+    snapshot_metadata["derived_from"] = {
+        "credit_entry_ids": [entry.id for entry in credit_entries],
+        "starting_units": opening,
+    }
+    return WorkspaceBalanceSnapshot(
+        workspace_id=workspace_id,
+        entitlement_policy_id=entitlement_policy_id,
+        period_start_at=period_start_at,
+        period_end_at=period_end_at,
+        used_units=used,
+        reserved_units=reserved,
+        remaining_units=remaining,
+        unlimited_units=unlimited_units,
+        updated_at=updated_at,
+        metadata=snapshot_metadata,
     )
 
 
@@ -690,6 +865,45 @@ SET external_customer_id = EXCLUDED.external_customer_id,
 RETURNING *;
 """.strip(),
         params=billing_customer_params(customer),
+    )
+
+
+def upsert_credit_ledger_entry_sql(entry: CreditLedgerEntry) -> BillingSqlStatement:
+    return BillingSqlStatement(
+        sql="""
+INSERT INTO credit_ledger_entries (
+    id,
+    workspace_id,
+    idempotency_key,
+    provider,
+    external_order_id,
+    external_customer_id,
+    direction,
+    unit,
+    quantity_text,
+    reason,
+    metadata_json,
+    occurred_at
+)
+VALUES (
+    %(id)s,
+    %(workspace_id)s,
+    %(idempotency_key)s,
+    %(provider)s,
+    %(external_order_id)s,
+    %(external_customer_id)s,
+    %(direction)s,
+    %(unit)s,
+    %(quantity_text)s,
+    %(reason)s,
+    %(metadata_json)s::jsonb,
+    %(occurred_at)s
+)
+ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
+SET idempotency_key = credit_ledger_entries.idempotency_key
+RETURNING *;
+""".strip(),
+        params=credit_ledger_entry_params(entry),
     )
 
 
@@ -964,8 +1178,22 @@ def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReser
     )
 
 
-def _numeric_units(units: dict[str, float | int | str | bool | None]) -> dict[str, float]:
-    return {unit: float(quantity) for unit, quantity in units.items() if isinstance(quantity, (int, float)) and not isinstance(quantity, bool)}
+def _billable_units(units: dict[str, Any]) -> UnitMap:
+    numeric: dict[str, UnitQuantity] = {}
+    normalized = normalize_usage_units(units)
+    for unit, quantity in normalized.items():
+        if isinstance(quantity, bool) or quantity is None or isinstance(quantity, str):
+            continue
+        if unit_quantity_decimal(quantity) < 0:
+            raise ValueError(
+                f"Negative billing unit {unit} must be modeled through reconciliation or credit ledger entries."
+            )
+        numeric[unit] = quantity
+    return numeric
+
+
+def _negated_units(units: dict[str, UnitQuantity]) -> UnitMap:
+    return {unit: -unit_quantity_decimal(quantity) for unit, quantity in units.items()}
 
 
 def price_book_params(price_book: PriceBook) -> dict[str, Any]:
@@ -1030,6 +1258,23 @@ def billing_customer_params(customer: BillingCustomer) -> dict[str, Any]:
     }
 
 
+def credit_ledger_entry_params(entry: CreditLedgerEntry) -> dict[str, Any]:
+    return {
+        "id": entry.id,
+        "workspace_id": entry.workspace_id,
+        "idempotency_key": entry.idempotency_key,
+        "provider": entry.provider,
+        "external_order_id": entry.external_order_id,
+        "external_customer_id": entry.external_customer_id,
+        "direction": entry.direction,
+        "unit": entry.unit,
+        "quantity_text": str(entry.quantity),
+        "reason": entry.reason,
+        "metadata_json": _json_param(entry.metadata),
+        "occurred_at": entry.occurred_at,
+    }
+
+
 def billing_export_params(export: BillingExportEvent) -> dict[str, Any]:
     return {
         "id": export.idempotency_key,
@@ -1074,7 +1319,7 @@ def polar_webhook_snapshot_params(snapshot: PolarWebhookSnapshot) -> dict[str, A
 
 
 def _json_param(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
 
 
 def _json_value(value: Any, *, default: Any | None = None) -> Any:
@@ -1121,6 +1366,8 @@ __all__ = [
     "BillingRecordStatus",
     "BillingReplayStatus",
     "BillingSqlStatement",
+    "CreditLedgerDirection",
+    "CreditLedgerEntry",
     "EntitlementPolicyRecord",
     "POSTGRES_BILLING_SCHEMA_SQL",
     "PolarEventIngestionEvent",
@@ -1139,6 +1386,10 @@ __all__ = [
     "billing_export_idempotency_key",
     "billing_export_params",
     "billing_schema_statements",
+    "credit_ledger_entry_from_order",
+    "credit_ledger_entry_params",
+    "credit_order_idempotency_key",
+    "derive_workspace_balance_snapshot",
     "entitlement_policy_params",
     "mark_billing_export_replay",
     "polar_webhook_event_from_payload",
@@ -1147,6 +1398,7 @@ __all__ = [
     "polar_webhook_snapshot_params",
     "price_book_params",
     "upsert_billing_customer_sql",
+    "upsert_credit_ledger_entry_sql",
     "upsert_billing_export_sql",
     "upsert_entitlement_policy_sql",
     "upsert_polar_webhook_snapshot_sql",

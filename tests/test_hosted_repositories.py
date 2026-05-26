@@ -36,7 +36,12 @@ def test_usage_reservation_upsert_preserves_idempotency_boundary() -> None:
     assert "SET idempotency_key = usage_reservations.idempotency_key" in statement.sql
     assert statement.params["workspace_id"] == "ws_alice"
     assert json.loads(statement.params["estimated_units_json"]) == {"total_tokens": 2000}
-    assert json.loads(statement.params["decision_json"]) == {"allowed": True, "message": None, "reason": "allowed"}
+    assert json.loads(statement.params["decision_json"]) == {
+        "allowed": True,
+        "denial_effect": "hard",
+        "message": None,
+        "reason": "allowed",
+    }
 
 
 def test_usage_event_insert_supports_event_id_and_provider_request_idempotency() -> None:

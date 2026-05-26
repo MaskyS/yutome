@@ -192,6 +192,26 @@ class FakeVoyageResponse:
     model: str = "voyage-4-lite"
 
 
+def _allowing_adapter(
+    *,
+    search_store: RecordingSearchStore,
+    ledger: RecordingLedger | None = None,
+    usage_context_provider=None,
+    voyage_usage_context_provider=None,
+    query_embedder=None,
+) -> HostedMcpQueryAdapter:
+    kwargs: dict[str, Any] = {
+        "search_store": search_store,
+        "usage_context_provider": usage_context_provider or _usage_context_provider(),
+        "voyage_usage_context_provider": voyage_usage_context_provider or _voyage_usage_context_provider(),
+    }
+    if ledger is not None:
+        kwargs["ledger"] = ledger
+    if query_embedder is not None:
+        kwargs["query_embedder"] = query_embedder
+    return HostedMcpQueryAdapter(**kwargs)
+
+
 def test_lexical_find_maps_search_rows_to_contract_response_and_records_usage() -> None:
     store = RecordingSearchStore(
         rows=[
@@ -212,7 +232,7 @@ def test_lexical_find_maps_search_rows_to_contract_response_and_records_usage() 
         ]
     )
     ledger = RecordingLedger()
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    adapter = _allowing_adapter(search_store=store, ledger=ledger)
 
     payload = adapter.call_tool(
         auth=HostedMcpAuthContext(workspace_id="ws_alice", client_id="mcp_client"),
@@ -341,6 +361,7 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
         voyage_usage_context_provider=_voyage_usage_context_provider(
             policy=EntitlementPolicy(
                 id="policy",
@@ -371,6 +392,148 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
     assert release.operation == "semantic_query"
     assert release.metadata["release_reason"] == "provider_usage_denied"
     assert release.metadata["provider_operation"] == "voyage.embed_query"
+
+
+def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding() -> None:
+    store = RecordingSearchStore(
+        rows=[
+            {
+                "chunk_id": "chunk_soft_search",
+                "video_id": "vid_1",
+                "youtube_video_id": "dQw4w9WgXcQ",
+                "transcript_version_id": "tx_1",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "text": "Lexical fallback after search-store soft denial.",
+                "score": 0.4,
+                "match_type": "lexical",
+            }
+        ]
+    )
+    ledger = RecordingLedger()
+    embedded = False
+
+    def usage_provider(
+        auth: HostedMcpAuthContext,
+        operation: str,
+        estimated_units: dict[str, float],
+    ) -> HostedMcpUsageContext:
+        policy = EntitlementPolicy(
+            id="policy",
+            workspace_id=auth.workspace_id,
+            allowed_operations={"search_store.hybrid_query", "search_store.lexical_query"},
+        )
+        balance = (
+            WorkspaceBalance(workspace_id=auth.workspace_id)
+            if operation == "hybrid_query"
+            else WorkspaceBalance(workspace_id=auth.workspace_id, unlimited_units=set(estimated_units))
+        )
+        return HostedMcpUsageContext(
+            allocation=default_search_store_allocation(workspace_id=auth.workspace_id, operation=operation),
+            policy=policy,
+            balance=balance,
+        )
+
+    def embedder(_query: str, _context: ProviderCallContext) -> list[float]:
+        nonlocal embedded
+        embedded = True
+        return [0.1, 0.2]
+
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=usage_provider,
+        query_embedder=embedder,
+    )
+
+    result = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+    )
+
+    assert embedded is False
+    assert [call["mode"] for call in store.calls] == ["lexical"]
+    assert result["rows"][0]["chunk_id"] == "chunk_soft_search"
+    assert "hosted_find_fallback_to_lexical" in result["notes"]
+    assert [event.status for event in ledger.events] == ["denied", "succeeded"]
+    assert ledger.events[0].error_code == "insufficient_balance"
+    assert ledger.events[0].metadata["mcp_search_mode"] == "hybrid"
+
+
+def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
+    store = RecordingSearchStore(
+        rows=[
+            {
+                "chunk_id": "chunk_soft_voyage",
+                "video_id": "vid_1",
+                "youtube_video_id": "dQw4w9WgXcQ",
+                "transcript_version_id": "tx_1",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "text": "Lexical fallback after Voyage soft denial.",
+                "score": 0.4,
+                "match_type": "lexical",
+            }
+        ]
+    )
+    ledger = RecordingLedger()
+    provider_called = False
+
+    def embedder(_query: str, context: ProviderCallContext) -> list[float]:
+        def call() -> FakeVoyageResponse:
+            nonlocal provider_called
+            provider_called = True
+            return FakeVoyageResponse(embeddings=[[0.1, 0.2]], usage={"total_tokens": 6})
+
+        result = execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda response: UsageNormalization(
+                subject="voyage",
+                operation="embed_query",
+                actual_units={"total_tokens": response.usage["total_tokens"], "vectors": len(response.embeddings)},
+                metadata={"input_type": "query", "output_dimension": 2},
+            ),
+        )
+        return result.embeddings[0]
+
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_usage_context_provider(
+            policy=EntitlementPolicy(
+                id="policy_search",
+                workspace_id="ws_alice",
+                allowed_operations={"search_store.hybrid_query", "search_store.lexical_query"},
+            ),
+        ),
+        voyage_usage_context_provider=_voyage_usage_context_provider(
+            policy=EntitlementPolicy(
+                id="policy_voyage",
+                workspace_id="ws_alice",
+                allowed_operations={"voyage.embed_query"},
+            ),
+            balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 0, "vectors": 1}),
+        ),
+        query_embedder=embedder,
+    )
+
+    result = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+    )
+
+    assert provider_called is False
+    assert [call["mode"] for call in store.calls] == ["lexical"]
+    assert result["rows"][0]["chunk_id"] == "chunk_soft_voyage"
+    assert "hosted_find_fallback_to_lexical" in result["notes"]
+    assert [event.subject for event in ledger.events] == ["voyage", "search_store", "search_store"]
+    assert ledger.events[0].status == "denied"
+    assert ledger.events[0].error_code == "insufficient_balance"
+    assert ledger.events[1].event_type == "usage_reservation_released"
+    assert ledger.events[1].metadata["release_reason"] == "provider_usage_denied"
 
 
 @pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
@@ -406,7 +569,7 @@ def test_hybrid_voyage_provider_availability_failure_falls_back_to_lexical(
         execute_provider_call(context, call)
         raise AssertionError("unreachable")
 
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
+    adapter = _allowing_adapter(search_store=store, ledger=ledger, query_embedder=embedder)
 
     payload = adapter.call_tool(
         auth=HostedMcpAuthContext(workspace_id="ws_alice"),
@@ -462,7 +625,7 @@ def test_semantic_voyage_provider_availability_failure_does_not_fall_back_to_lex
         execute_provider_call(context, call)
         raise AssertionError("unreachable")
 
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
+    adapter = _allowing_adapter(search_store=store, ledger=ledger, query_embedder=embedder)
 
     with pytest.raises(HostedMcpError) as exc_info:
         adapter.call_tool(
@@ -500,7 +663,7 @@ def test_voyage_auth_failure_does_not_fall_back_to_lexical() -> None:
         execute_provider_call(context, call)
         raise AssertionError("unreachable")
 
-    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
+    adapter = _allowing_adapter(search_store=store, ledger=ledger, query_embedder=embedder)
 
     with pytest.raises(HostedMcpError) as exc_info:
         adapter.call_tool(
@@ -557,6 +720,8 @@ def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> Non
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
         query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
     )
 
@@ -613,6 +778,8 @@ def test_semantic_vector_store_availability_failure_does_not_fall_back_to_lexica
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
         query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
     )
 
@@ -653,6 +820,8 @@ def test_vector_store_tenant_error_does_not_fall_back_to_lexical() -> None:
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
         query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
     )
 
@@ -695,6 +864,8 @@ def test_semantic_success_records_voyage_then_search_store_events_and_metadata()
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
         query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
     )
 
@@ -748,6 +919,8 @@ def test_hybrid_success_calls_hybrid_search_and_records_search_store_metadata() 
     adapter = HostedMcpQueryAdapter(
         search_store=store,
         ledger=ledger,
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
         query_embedder=_recording_embedder(vector=[0.1, 0.2, 0.3], total_tokens=8),
     )
 
@@ -778,6 +951,7 @@ def test_lexical_mode_does_not_construct_provider_context_or_call_embedder() -> 
     store = RecordingSearchStore()
     adapter = HostedMcpQueryAdapter(
         search_store=store,
+        usage_context_provider=_usage_context_provider(),
         voyage_usage_context_provider=lambda _auth, _operation, _estimated: pytest.fail("lexical must not need Voyage"),
         query_embedder=lambda _query, _context: pytest.fail("lexical must not embed"),
     )
@@ -794,7 +968,7 @@ def test_lexical_mode_does_not_construct_provider_context_or_call_embedder() -> 
 
 def test_workspace_arg_injection_is_rejected_before_search() -> None:
     store = RecordingSearchStore()
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    adapter = _allowing_adapter(search_store=store)
 
     with pytest.raises(HostedMcpError) as exc_info:
         adapter.call_tool(
@@ -809,7 +983,7 @@ def test_workspace_arg_injection_is_rejected_before_search() -> None:
 
 def test_unsupported_tool_and_resource_return_clear_errors() -> None:
     store = RecordingSearchStore()
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    adapter = _allowing_adapter(search_store=store)
     auth = HostedMcpAuthContext(workspace_id="ws_alice")
 
     with pytest.raises(HostedMcpError) as tool_exc:
@@ -990,7 +1164,7 @@ def test_q_accepts_safe_status_video_channel_and_chunk_shapes() -> None:
             }
         ]
     )
-    adapter = HostedMcpQueryAdapter(search_store=store)
+    adapter = _allowing_adapter(search_store=store)
     auth = HostedMcpAuthContext(workspace_id="ws_alice")
 
     status = adapter.call_tool(auth=auth, name="q", arguments={"request": {"project": "status_breakdown"}})

@@ -9,6 +9,7 @@ from yutome.hosted.events import denied_usage_event, usage_event_from_normalizat
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.models import (
     EntitlementPolicy,
+    UnitQuantity,
     UsageEvent,
     UsageNormalization,
     UsageReservation,
@@ -35,7 +36,7 @@ class ProviderCallContext:
     workspace_id: str
     subject: UsageSubject
     operation: str
-    estimated_units: Mapping[str, float]
+    estimated_units: Mapping[str, UnitQuantity]
     allocation: Allocation | None
     policy: EntitlementPolicy
     balance: WorkspaceBalance

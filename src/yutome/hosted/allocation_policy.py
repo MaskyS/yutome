@@ -212,6 +212,8 @@ def user_facing_denial_message(reservation: UsageReservation) -> str:
         return "This workspace plan does not allow this hosted operation."
     if reason == "usage_limit_exceeded":
         return "This hosted operation is above the per-operation limit."
+    if reason == "soft_limit_exceeded":
+        return "This hosted operation is above the soft operation limit."
     if reason == "insufficient_balance":
         return "This workspace does not have enough remaining usage balance."
     if reason == "workspace_mismatch":

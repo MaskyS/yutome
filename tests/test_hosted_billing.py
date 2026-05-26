@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 
+import pytest
 from yutome.hosted.billing import (
     BillingCustomer,
+    CreditLedgerEntry,
     EntitlementPolicyRecord,
     PriceBook,
     PriceBookProduct,
@@ -16,10 +19,13 @@ from yutome.hosted.billing import (
     billing_export_event_from_usage_event,
     billing_export_idempotency_key,
     billing_schema_statements,
+    credit_ledger_entry_from_order,
+    derive_workspace_balance_snapshot,
     mark_billing_export_replay,
     polar_webhook_event_from_payload,
     polar_webhook_snapshot_from_payload,
     upsert_billing_customer_sql,
+    upsert_credit_ledger_entry_sql,
     upsert_billing_export_sql,
     upsert_entitlement_policy_sql,
     upsert_polar_webhook_snapshot_sql,
@@ -80,14 +86,25 @@ def test_billing_export_key_is_stable_for_usage_event_replay() -> None:
     assert polar.name == "yutome.voyage.embed_documents"
     assert polar.external_customer_id == "ws_alice"
     assert polar.external_id == "polar:evt_usage_1:voyage.embed_documents"
-    assert polar.metadata["total_tokens"] == 91.0
-    assert polar.metadata["vectors"] == 2.0
+    assert polar.metadata["total_tokens"] == 91
+    assert polar.metadata["vectors"] == 2
     assert polar.metadata["usage_event_id"] == "evt_usage_1"
     assert polar.metadata["price_book_version"] == "2026-05"
     assert "ignored_label" not in polar.metadata
 
 
-def test_billing_export_preserves_negative_credit_usage_units() -> None:
+def test_billing_export_preserves_large_integer_units_without_float_rounding() -> None:
+    huge = 9_007_199_254_740_993
+    event = _usage_event(actual_units={"total_tokens": huge})
+
+    export = billing_export_event_from_usage_event(event)
+    polar = export.to_polar_event()
+
+    assert export.actual_units["total_tokens"] == huge
+    assert polar.metadata["total_tokens"] == huge
+
+
+def test_billing_export_rejects_negative_usage_units_for_explicit_reconciliation() -> None:
     event = _usage_event(
         id="evt_credit_1",
         event_type="usage_credit_released",
@@ -95,14 +112,48 @@ def test_billing_export_preserves_negative_credit_usage_units() -> None:
         actual_units={"total_tokens": -25, "credits": -1.5, "human_note": "retry credit"},
     )
 
-    export = billing_export_event_from_usage_event(event, event_name="yutome.usage_credit")
-    polar = export.to_polar_export()
+    with pytest.raises(ValueError, match="Negative billing unit"):
+        billing_export_event_from_usage_event(event, event_name="yutome.usage_credit")
 
-    assert export.replay_status == "pending"
-    assert export.actual_units == {"total_tokens": -25.0, "credits": -1.5}
-    assert polar.idempotency_key == export.idempotency_key
-    assert polar.events[0].metadata["total_tokens"] == -25.0
-    assert polar.events[0].metadata["credits"] == -1.5
+
+def test_credit_order_grants_are_positive_and_idempotent() -> None:
+    occurred_at = datetime(2026, 5, 26, 4, 30, tzinfo=timezone.utc)
+
+    left = credit_ledger_entry_from_order(
+        workspace_id="ws_alice",
+        external_order_id="ord_123",
+        external_customer_id="cus_123",
+        unit="credits",
+        quantity=Decimal("12.50"),
+        occurred_at=occurred_at,
+    )
+    right = credit_ledger_entry_from_order(
+        workspace_id="ws_alice",
+        external_order_id="ord_123",
+        external_customer_id="cus_123",
+        unit="credits",
+        quantity=Decimal("12.50"),
+        occurred_at=occurred_at,
+    )
+    statement = upsert_credit_ledger_entry_sql(left)
+
+    assert left.idempotency_key == right.idempotency_key
+    assert left.quantity == Decimal("12.50")
+    assert left.signed_units == {"credits": Decimal("12.50")}
+    assert "ON CONFLICT (workspace_id, idempotency_key) DO UPDATE" in statement.sql
+    assert statement.params["id"] == left.idempotency_key
+    assert statement.params["quantity_text"] == "12.50"
+
+    with pytest.raises(ValueError, match="must be positive"):
+        CreditLedgerEntry(
+            id="cred_bad",
+            workspace_id="ws_alice",
+            idempotency_key="ord_bad",
+            unit="credits",
+            quantity=Decimal("-1"),
+            reason="order_grant",
+            occurred_at=occurred_at,
+        )
 
 
 def test_failed_polar_replay_does_not_change_usage_gate_decision() -> None:
@@ -197,6 +248,7 @@ def test_billing_schema_statements_cover_durable_phase6_tables() -> None:
     assert "CREATE TABLE IF NOT EXISTS price_books" in joined
     assert "CREATE TABLE IF NOT EXISTS entitlement_policies" in joined
     assert "CREATE TABLE IF NOT EXISTS workspace_balances" in joined
+    assert "CREATE TABLE IF NOT EXISTS credit_ledger_entries" in joined
     assert "CREATE TABLE IF NOT EXISTS billing_customers" in joined
     assert "CREATE TABLE IF NOT EXISTS billing_exports" in joined
     assert "CREATE TABLE IF NOT EXISTS polar_webhook_snapshots" in joined
@@ -266,6 +318,43 @@ def test_entitlement_policy_and_balance_records_feed_usage_gate_without_polar() 
     }
     assert runtime_policy.operation_allowed("voyage.embed_documents")
     assert runtime_balance.has_units({"total_tokens": 900}) == (True, None)
+
+
+def test_decimal_balance_comparison_does_not_deny_exact_decimal_estimate() -> None:
+    balance = WorkspaceBalance(workspace_id="ws_alice", remaining_units={"credits": Decimal("0.30")})
+
+    assert balance.has_units({"credits": Decimal("0.10") + Decimal("0.20")}) == (True, None)
+
+
+def test_workspace_balance_derives_from_starting_units_credits_usage_and_reservations() -> None:
+    occurred_at = datetime(2026, 5, 26, 4, 30, tzinfo=timezone.utc)
+    credit = credit_ledger_entry_from_order(
+        workspace_id="ws_alice",
+        external_order_id="ord_123",
+        unit="credits",
+        quantity=Decimal("0.30"),
+        occurred_at=occurred_at,
+    )
+
+    snapshot = derive_workspace_balance_snapshot(
+        workspace_id="ws_alice",
+        entitlement_policy_id="policy_pro",
+        period_start_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        period_end_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        starting_units={"credits": Decimal("0.70"), "total_tokens": 1_000},
+        credit_entries=(credit,),
+        used_units={"credits": Decimal("0.40"), "total_tokens": 200},
+        reserved_units={"credits": Decimal("0.10"), "total_tokens": 50},
+    )
+
+    statement = upsert_workspace_balance_sql(snapshot)
+
+    assert snapshot.remaining_units == {"credits": Decimal("0.50"), "total_tokens": 750}
+    assert snapshot.metadata["derived_from"]["credit_entry_ids"] == [credit.id]
+    assert json.loads(statement.params["remaining_units_jsonb"]) == {
+        "credits": "0.50",
+        "total_tokens": 750,
+    }
 
 
 def test_billing_customer_and_export_sql_preserve_local_replay_keys() -> None:
