@@ -1,8 +1,9 @@
 import { useState, type ReactNode } from "react";
-import { Braces, Check, Copy, Monitor, MessageSquare, SquareTerminal } from "lucide-react";
+import { Check, Copy } from "lucide-react";
 
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
+import { ClaudeLogo, McpLogo, OpenAiLogo } from "~/components/brand-logos";
 
 // Per-assistant connect instructions, hidden behind a button per client. The
 // `icon` slot is a placeholder for each brand's real logo SVG — swap in later.
@@ -62,7 +63,7 @@ const CLIENTS: ClientGuide[] = [
     id: "chatgpt",
     label: "ChatGPT",
     sub: "Developer mode",
-    icon: <MessageSquare className="size-5" />,
+    icon: <OpenAiLogo />,
     render: (mcpUrl) => (
       <div className="grid gap-3">
         <Note>
@@ -96,7 +97,7 @@ const CLIENTS: ClientGuide[] = [
     id: "claude-desktop",
     label: "Claude Desktop",
     sub: "& claude.ai",
-    icon: <Monitor className="size-5" />,
+    icon: <ClaudeLogo />,
     render: (mcpUrl) => (
       <div className="grid gap-3">
         <Note>
@@ -128,7 +129,7 @@ const CLIENTS: ClientGuide[] = [
     id: "claude-code",
     label: "Claude Code",
     sub: "terminal",
-    icon: <SquareTerminal className="size-5" />,
+    icon: <ClaudeLogo />,
     render: (mcpUrl) => (
       <div className="grid gap-3">
         <Note>Run in your terminal, then approve the browser login.</Note>
@@ -148,7 +149,7 @@ const CLIENTS: ClientGuide[] = [
     id: "mcp-json",
     label: "mcp.json",
     sub: "Cursor, others",
-    icon: <Braces className="size-5" />,
+    icon: <McpLogo />,
     render: (mcpUrl) => (
       <div className="grid gap-3">
         <Note>

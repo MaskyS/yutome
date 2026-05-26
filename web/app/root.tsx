@@ -11,6 +11,9 @@ import type { Route } from "./+types/root";
 import "./app.css";
 
 export const links: Route.LinksFunction = () => [
+  { rel: "icon", type: "image/png", sizes: "256x256", href: "/yutome-icon-256.png" },
+  { rel: "icon", type: "image/png", sizes: "48x48", href: "/yutome-icon-48.png" },
+  { rel: "apple-touch-icon", href: "/yutome-icon-256.png" },
   { rel: "preconnect", href: "https://fonts.googleapis.com" },
   {
     rel: "preconnect",

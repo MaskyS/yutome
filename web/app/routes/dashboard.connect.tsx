@@ -6,6 +6,10 @@ import { Card, CardDescription, CardHeader, CardTitle } from "~/components/ui/ca
 import { ConnectGuides } from "~/components/connect-guides";
 import { CopyField } from "~/components/copy-field";
 
+export function meta(_: Route.MetaArgs) {
+  return [{ title: "Connect an assistant · Yutome" }];
+}
+
 export async function loader({ request, context }: Route.LoaderArgs) {
   const env = getEnv(context);
   const token = requireSessionToken(request);

@@ -8,6 +8,10 @@ import { Badge } from "~/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/components/ui/table";
 
+export function meta(_: Route.MetaArgs) {
+  return [{ title: "Dashboard · Yutome" }];
+}
+
 export async function loader({ request, context }: Route.LoaderArgs) {
   const env = getEnv(context);
   const token = requireSessionToken(request);
