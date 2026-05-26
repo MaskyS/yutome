@@ -373,3 +373,38 @@ def test_verify_account_session_token_roundtrip_and_rejections() -> None:
         verify_account_session_token(token, secret=HMAC_SECRET, now=now + timedelta(hours=2))
     with pytest.raises(AccountSessionError):
         verify_account_session_token("not.a.token", secret=HMAC_SECRET, now=now)
+
+
+def test_account_bootstrap_accepts_dashboard_token() -> None:
+    client = build_account_app(RoutingConnection())
+    response = client.post(
+        "/account/bootstrap",
+        json={"email": "new@example.com", "name": "New", "workspace_name": "New Workspace"},
+        headers={"Authorization": f"Bearer {DASHBOARD_TOKEN}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["session"]["token"]
+    assert body["session"]["cookie_name"] == "yutome_account_session"
+
+
+def test_account_bootstrap_also_accepts_mcp_token() -> None:
+    client = build_account_app(RoutingConnection())
+    response = client.post(
+        "/account/bootstrap",
+        json={"email": "edge@example.com"},
+        headers={"Authorization": f"Bearer {MCP_TOKEN}"},
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_account_bootstrap_rejects_unknown_token() -> None:
+    client = build_account_app(RoutingConnection())
+    response = client.post(
+        "/account/bootstrap",
+        json={"email": "x@example.com"},
+        headers={"Authorization": "Bearer not-a-real-token"},
+    )
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_invalid"

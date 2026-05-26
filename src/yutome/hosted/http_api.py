@@ -276,7 +276,12 @@ def build_app(
         request: AccountBootstrapRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _verify_bearer_token(authorization=authorization, expected_api_token=normalized_api_token)
+        # Account creation is performed by either the MCP edge worker (MCP token)
+        # or the dashboard BFF (separate dashboard token); accept either.
+        _verify_bearer_token_any(
+            authorization=authorization,
+            expected_tokens=(normalized_api_token, normalized_account_api_token),
+        )
         if billing_connection is None:
             raise _http_error(
                 HostedMcpError(
@@ -554,6 +559,34 @@ def _verify_bearer_token(*, authorization: str | None, expected_api_token: str |
                 status_code=401,
             )
         )
+
+
+def _verify_bearer_token_any(*, authorization: str | None, expected_tokens: tuple[str | None, ...]) -> None:
+    """Accept the bearer token if it matches ANY configured token (constant-time)."""
+    configured = [token for token in expected_tokens if token]
+    if not configured:
+        raise _http_error(
+            HostedMcpError(
+                code="api_token_unconfigured",
+                message=f"Set {TOKEN_ENV_VAR} or {DASHBOARD_TOKEN_ENV_VAR} before serving this endpoint.",
+                status_code=503,
+            )
+        )
+    if authorization is None or not authorization.strip():
+        raise _http_error(
+            HostedMcpError(code="api_token_required", message="Missing required Authorization bearer token.", status_code=401)
+        )
+    scheme, _, token = authorization.partition(" ")
+    candidate = token.strip()
+    if scheme.lower() != "bearer" or not candidate:
+        raise _http_error(
+            HostedMcpError(code="api_token_required", message="Missing required Authorization bearer token.", status_code=401)
+        )
+    if any(secrets.compare_digest(candidate, expected) for expected in configured):
+        return
+    raise _http_error(
+        HostedMcpError(code="api_token_invalid", message="Invalid Authorization bearer token.", status_code=401)
+    )
 
 
 def _http_error(error: HostedMcpError) -> Exception:
