@@ -197,7 +197,8 @@ def test_lexical_find_maps_search_rows_to_contract_response_and_records_usage() 
         rows=[
             {
                 "chunk_id": "chunk_1",
-                "video_id": "vid_1",
+                "video_id": "video_internal_1",
+                "youtube_video_id": "dQw4w9WgXcQ",
                 "transcript_version_id": "tx_1",
                 "chunk_index": 4,
                 "start_seconds": 12.2,
@@ -224,8 +225,8 @@ def test_lexical_find_maps_search_rows_to_contract_response_and_records_usage() 
     row = payload["rows"][0]
     assert row["chunk_id"] == "chunk_1"
     assert row["resource_uri"] == "yutome://chunk/chunk_1"
-    assert row["video_id"] == "vid_1"
-    assert row["youtube_url"] == "https://youtube.com/watch?v=vid_1&t=12s"
+    assert row["video_id"] == "video_internal_1"
+    assert row["youtube_url"] == "https://youtube.com/watch?v=dQw4w9WgXcQ&t=12s"
     assert row["start_ms"] == 12200
     assert row["end_ms"] == 19000
     assert row["snippet"].startswith("Crohn disease research")
@@ -372,10 +373,8 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
     assert release.metadata["provider_operation"] == "voyage.embed_query"
 
 
-@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
 @pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
-def test_voyage_provider_availability_failure_falls_back_to_lexical(
-    mode: str,
+def test_hybrid_voyage_provider_availability_failure_falls_back_to_lexical(
     status_code: int,
     failure_kind: str,
 ) -> None:
@@ -412,14 +411,14 @@ def test_voyage_provider_availability_failure_falls_back_to_lexical(
     payload = adapter.call_tool(
         auth=HostedMcpAuthContext(workspace_id="ws_alice"),
         name="find",
-        arguments={"text": "Crohn probiotics", "mode": mode, "limit": 5},
+        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
     )
 
     assert store.calls == [{"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5}]
     assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
     assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
     note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
-    assert note_metadata["fallback_from"] == mode
+    assert note_metadata["fallback_from"] == "hybrid"
     assert note_metadata["fallback_reason"] == "provider_availability"
     assert note_metadata["fallback_failure_kind"] == failure_kind
     assert [event.event_type for event in ledger.events] == [
@@ -431,16 +430,60 @@ def test_voyage_provider_availability_failure_falls_back_to_lexical(
     failed = ledger.events[1]
     assert failed.metadata["failure_kind"] == failure_kind
     assert failed.metadata["retryable"] is True
-    assert failed.metadata["mcp_search_mode"] == mode
+    assert failed.metadata["mcp_search_mode"] == "hybrid"
     release = ledger.events[2]
     assert release.status == "released"
-    assert release.operation == f"{mode}_query"
+    assert release.operation == "hybrid_query"
     assert release.metadata["fallback_reason"] == "provider_availability"
     fallback_event = ledger.events[3]
     assert fallback_event.operation == "lexical_query"
     assert fallback_event.metadata["fallback"] is True
-    assert fallback_event.metadata["fallback_from"] == mode
+    assert fallback_event.metadata["fallback_from"] == "hybrid"
     assert fallback_event.metadata["fallback_to"] == "lexical"
+
+
+@pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
+def test_semantic_voyage_provider_availability_failure_does_not_fall_back_to_lexical(
+    status_code: int,
+    failure_kind: str,
+) -> None:
+    store = RecordingSearchStore()
+    ledger = RecordingLedger()
+
+    class FakeProviderError(RuntimeError):
+        def __init__(self) -> None:
+            self.status_code = status_code
+            super().__init__("provider unavailable")
+
+    def embedder(_query: str, context: ProviderCallContext) -> list[float]:
+        def call() -> FakeVoyageResponse:
+            raise FakeProviderError()
+
+        execute_provider_call(context, call)
+        raise AssertionError("unreachable")
+
+    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger, query_embedder=embedder)
+
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "semantic", "limit": 5},
+        )
+
+    assert exc_info.value.code == "provider_call_failed"
+    assert exc_info.value.to_dict()["error"]["data"]["failure_kind"] == failure_kind
+    assert store.calls == []
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_failed",
+        "usage_reservation_released",
+    ]
+    release = ledger.events[2]
+    assert release.operation == "semantic_query"
+    assert release.status == "released"
+    assert release.metadata["release_reason"] == "provider_failure"
+    assert release.metadata["failure_kind"] == failure_kind
 
 
 def test_voyage_auth_failure_does_not_fall_back_to_lexical() -> None:
@@ -481,16 +524,19 @@ def test_voyage_auth_failure_does_not_fall_back_to_lexical() -> None:
     assert release.metadata["failure_kind"] == "auth"
 
 
-def test_vector_store_availability_failure_falls_back_to_lexical() -> None:
+def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> None:
     class VectorUnavailableStore(RecordingSearchStore):
-        def semantic_search(
+        def hybrid_search(
             self,
             *,
             workspace_id: str,
+            query: str,
             query_vector: list[float],
             limit: int,
         ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            self.calls.append(
+                {"mode": "hybrid", "workspace_id": workspace_id, "query": query, "query_vector": query_vector, "limit": limit}
+            )
             raise RuntimeError("vector extension unavailable")
 
     store = VectorUnavailableStore(
@@ -517,18 +563,24 @@ def test_vector_store_availability_failure_falls_back_to_lexical() -> None:
     payload = adapter.call_tool(
         auth=HostedMcpAuthContext(workspace_id="ws_alice"),
         name="find",
-        arguments={"text": "Crohn probiotics", "mode": "semantic", "limit": 5},
+        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
     )
 
     assert store.calls == [
-        {"mode": "semantic", "workspace_id": "ws_alice", "query_vector": [0.1, 0.2], "limit": 5},
+        {
+            "mode": "hybrid",
+            "workspace_id": "ws_alice",
+            "query": "Crohn probiotics",
+            "query_vector": [0.1, 0.2],
+            "limit": 5,
+        },
         {"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5},
     ]
     assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
     assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
     note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
     assert note_metadata["fallback_reason"] == "vector_store_availability"
-    assert note_metadata["fallback_operation"] == "search_store.semantic_query"
+    assert note_metadata["fallback_operation"] == "search_store.hybrid_query"
     assert [event.event_type for event in ledger.events] == [
         "provider_attempt_started",
         "provider_attempt_succeeded",
@@ -536,12 +588,52 @@ def test_vector_store_availability_failure_falls_back_to_lexical() -> None:
         "service_operation_succeeded",
     ]
     failed = ledger.events[2]
-    assert failed.operation == "semantic_query"
+    assert failed.operation == "hybrid_query"
     assert failed.status == "failed"
     assert failed.metadata["fallback_reason"] == "vector_store_availability"
     fallback_event = ledger.events[3]
     assert fallback_event.operation == "lexical_query"
     assert fallback_event.metadata["fallback_reason"] == "vector_store_availability"
+
+
+def test_semantic_vector_store_availability_failure_does_not_fall_back_to_lexical() -> None:
+    class VectorUnavailableStore(RecordingSearchStore):
+        def semantic_search(
+            self,
+            *,
+            workspace_id: str,
+            query_vector: list[float],
+            limit: int,
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            raise RuntimeError("vector extension unavailable")
+
+    store = VectorUnavailableStore()
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
+    )
+
+    with pytest.raises(RuntimeError, match="vector extension unavailable"):
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "semantic", "limit": 5},
+        )
+
+    assert store.calls == [{"mode": "semantic", "workspace_id": "ws_alice", "query_vector": [0.1, 0.2], "limit": 5}]
+    assert [event.event_type for event in ledger.events] == [
+        "provider_attempt_started",
+        "provider_attempt_succeeded",
+        "service_operation_failed",
+    ]
+    failed = ledger.events[2]
+    assert failed.operation == "semantic_query"
+    assert failed.status == "failed"
+    assert failed.metadata["failure_kind"] == "unknown"
+    assert failed.metadata["message"] == "vector extension unavailable"
 
 
 def test_vector_store_tenant_error_does_not_fall_back_to_lexical() -> None:

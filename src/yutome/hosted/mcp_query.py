@@ -265,7 +265,7 @@ class HostedMcpQueryAdapter:
             ) from exc
         except Exception as exc:
             failure = classify_provider_http_error(provider="voyage", status_code=_status_code_from_exception(exc), message=str(exc))
-            if _provider_failure_allows_lexical_fallback(failure=failure, exc=exc):
+            if request.mode == "hybrid" and _provider_failure_allows_lexical_fallback(failure=failure, exc=exc):
                 fallback_metadata = _provider_fallback_metadata(
                     request=request,
                     failure=failure,
@@ -318,7 +318,7 @@ class HostedMcpQueryAdapter:
                     limit=request.limit,
                 )
         except Exception as exc:
-            if _search_store_exception_allows_lexical_fallback(exc):
+            if request.mode == "hybrid" and _search_store_exception_allows_lexical_fallback(exc):
                 fallback_metadata = _search_store_fallback_metadata(
                     request=request,
                     exc=exc,
@@ -1166,13 +1166,14 @@ def _with_mcp_metadata(
 def _contract_find_row(row: Mapping[str, Any], *, project: str | None) -> dict[str, Any]:
     chunk_id = _required_str(row, "chunk_id")
     video_id = _required_str(row, "video_id")
+    youtube_video_id = _optional_str(row.get("youtube_video_id")) or video_id
     start_ms = _time_ms(row, "start")
     end_ms = _time_ms(row, "end")
     hit: dict[str, Any] = {
         "chunk_id": chunk_id,
         "resource_uri": f"yutome://chunk/{chunk_id}",
         "video_id": video_id,
-        "youtube_url": _youtube_url(video_id, start_ms),
+        "youtube_url": _youtube_url(youtube_video_id, start_ms),
         "start_ms": start_ms,
         "end_ms": end_ms,
         "snippet": _snippet(str(row.get("snippet") or row.get("text") or "")),
