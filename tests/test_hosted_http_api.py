@@ -14,6 +14,21 @@ from yutome.hosted.search_store import SearchStoreUsage
 class RecordingSearchStore:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.resources: dict[tuple[str, str, str], dict[str, Any]] = {
+            (
+                "ws_http",
+                "chunk",
+                "chunk_http",
+            ): {
+                "chunk_id": "chunk_http",
+                "resource_uri": "yutome://chunk/chunk_http",
+                "video_id": "vid_http",
+                "youtube_url": "https://youtube.com/watch?v=vid_http&t=3s",
+                "start_ms": 3000,
+                "end_ms": 8000,
+                "text": "Hosted Crohn query result",
+            }
+        }
 
     def lexical_search(self, *, workspace_id: str, query: str, limit: int) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
         self.calls.append({"workspace_id": workspace_id, "query": query, "limit": limit})
@@ -35,6 +50,49 @@ class RecordingSearchStore:
             index_profile_ref="sip_default",
             units={"queries": 1, "candidate_limit": limit, "result_count": 1, "latency_ms": 1.2},
         )
+
+    def resource_chunk(self, *, workspace_id: str, chunk_id: str) -> dict[str, Any]:
+        self.calls.append({"resource": "chunk", "workspace_id": workspace_id, "id": chunk_id})
+        return self._resource(workspace_id, "chunk", chunk_id)
+
+    def resource_video(self, *, workspace_id: str, video_id: str) -> dict[str, Any]:
+        self.calls.append({"resource": "video", "workspace_id": workspace_id, "id": video_id})
+        return self._resource(workspace_id, "video", video_id)
+
+    def resource_channel(self, *, workspace_id: str, channel_id: str) -> dict[str, Any]:
+        self.calls.append({"resource": "channel", "workspace_id": workspace_id, "id": channel_id})
+        return self._resource(workspace_id, "channel", channel_id)
+
+    def resource_transcript(
+        self,
+        *,
+        workspace_id: str,
+        transcript_version_id: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "resource": "transcript",
+                "workspace_id": workspace_id,
+                "id": transcript_version_id,
+                "offset": offset,
+                "limit": limit,
+            }
+        )
+        return self._resource(workspace_id, "transcript", transcript_version_id)
+
+    def resource_source(self, *, workspace_id: str, source_id: str) -> dict[str, Any]:
+        self.calls.append({"resource": "source", "workspace_id": workspace_id, "id": source_id})
+        return self._resource(workspace_id, "source", source_id)
+
+    def _resource(self, workspace_id: str, kind: str, id_: str) -> dict[str, Any]:
+        from yutome.hosted.resources import HostedResourceNotFound
+
+        try:
+            return self.resources[(workspace_id, kind, id_)]
+        except KeyError as exc:
+            raise HostedResourceNotFound(kind=kind, id_=id_) from exc
 
 
 class RecordingConnection:
@@ -278,13 +336,13 @@ def test_configured_api_token_protects_resource_read_before_adapter_dispatch() -
     assert error_body(missing.json())["code"] == "api_token_required"
     assert invalid.status_code == 401
     assert error_body(invalid.json())["code"] == "api_token_invalid"
-    assert valid.status_code == 501
-    assert error_body(valid.json())["code"] == "unsupported_resource"
-    assert store.calls == []
+    assert valid.status_code == 200
+    assert valid.json()["result"]["chunk_id"] == "chunk_http"
+    assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]
     assert ledger.events == []
 
 
-def test_unsupported_resource_read_response(
+def test_resource_read_endpoint_returns_payload(
     hosted_http_client: tuple[TestClient, RecordingSearchStore, RecordingLedger],
 ) -> None:
     client, store, _ = hosted_http_client
@@ -295,8 +353,27 @@ def test_unsupported_resource_read_response(
         headers={WORKSPACE_HEADER: "ws_http"},
     )
 
-    assert response.status_code == 501
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["resource_uri"] == "yutome://chunk/chunk_http"
+    assert body["result"]["text"] == "Hosted Crohn query result"
+    assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]
+
+
+def test_resource_read_endpoint_hides_cross_workspace_resources_as_missing(
+    hosted_http_client: tuple[TestClient, RecordingSearchStore, RecordingLedger],
+) -> None:
+    client, store, _ = hosted_http_client
+
+    response = client.post(
+        "/resources/read",
+        json={"uri": "yutome://chunk/chunk_http"},
+        headers={WORKSPACE_HEADER: "ws_bob"},
+    )
+
+    assert response.status_code == 404
     detail = error_body(response.json())
-    assert detail["code"] == "unsupported_resource"
-    assert detail["data"]["uri"] == "yutome://chunk/chunk_http"
-    assert store.calls == []
+    assert detail["code"] == "resource_not_found"
+    assert detail["data"]["kind"] == "chunk"
+    assert store.calls == [{"resource": "chunk", "workspace_id": "ws_bob", "id": "chunk_http"}]
