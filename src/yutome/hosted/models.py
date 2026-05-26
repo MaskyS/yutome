@@ -8,7 +8,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
 
-UsageSubject = Literal["gemini", "voyage", "webshare", "search_store"]
+UsageSubject = Literal["gemini", "voyage", "webshare", "youtube", "search_store"]
 CredentialMode = Literal["hosted", "byo_hosted", "disabled", "service_internal"]
 AllocationStatus = Literal["active", "limited", "disabled", "invalid"]
 ReservationStatus = Literal["reserved", "denied", "released", "reconciled"]
@@ -115,7 +115,7 @@ def _canonical_quantity(value: Decimal) -> UnitQuantity:
 class ProviderAllocation(BaseModel):
     id: str
     workspace_id: str
-    provider: Literal["gemini", "voyage", "webshare"]
+    provider: Literal["gemini", "voyage", "webshare", "youtube"]
     operation: str
     mode: CredentialMode = "hosted"
     status: AllocationStatus = "active"

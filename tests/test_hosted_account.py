@@ -7,6 +7,8 @@ from typing import Any
 from yutome.hosted.account import (
     STARTER_ALLOWED_OPERATIONS,
     AccountBootstrapInput,
+    STARTER_PROVIDER_OPERATIONS,
+    STARTER_SERVICE_OPERATIONS,
     account_bootstrap_sql,
     bootstrap_hosted_account,
     deterministic_user_id,
@@ -86,29 +88,26 @@ def test_account_bootstrap_sql_creates_owner_membership_starter_entitlements_and
     policy_params = statements["entitlement_policy"].params
     balance_params = statements["workspace_balance"].params
     assert policy_params["allowed_operations"] == list(STARTER_ALLOWED_OPERATIONS)
+    assert "search_store.lexical_query" in policy_params["allowed_operations"]
+    assert "search_store.resource_read" in policy_params["allowed_operations"]
+    assert "voyage.embed_query" in policy_params["allowed_operations"]
     assert json.loads(balance_params["remaining_units_jsonb"])["total_tokens"] > 0
+    assert json.loads(balance_params["remaining_units_jsonb"])["queries"] > 0
+    assert json.loads(balance_params["remaining_units_jsonb"])["resource_reads"] > 0
     assert "ON CONFLICT (workspace_id) DO UPDATE" in statements["workspace_balance"].sql
 
     provider_ids = {
         statements[f"provider_allocation_{provider}_{operation}"].params["id"]
-        for provider, operation in (
-            ("gemini", "cleanup_transcript"),
-            ("gemini", "transcribe_media"),
-            ("voyage", "embed_documents"),
-            ("webshare", "proxy_fetch"),
-        )
+        for provider, operation in STARTER_PROVIDER_OPERATIONS
     }
     assert provider_ids == {
-        starter_provider_allocation_id(account.workspace_id, "gemini", "cleanup_transcript"),
-        starter_provider_allocation_id(account.workspace_id, "gemini", "transcribe_media"),
-        starter_provider_allocation_id(account.workspace_id, "voyage", "embed_documents"),
-        starter_provider_allocation_id(account.workspace_id, "webshare", "proxy_fetch"),
+        starter_provider_allocation_id(account.workspace_id, provider, operation)
+        for provider, operation in STARTER_PROVIDER_OPERATIONS
     }
-    assert statements["service_allocation_search_store_index_write"].params["id"] == starter_service_allocation_id(
-        account.workspace_id,
-        "search_store",
-        "index_write",
-    )
+    for service, operation in STARTER_SERVICE_OPERATIONS:
+        statement = statements[f"service_allocation_{service}_{operation}"]
+        assert statement.params["id"] == starter_service_allocation_id(account.workspace_id, service, operation)
+        assert statement.params["index_profile_ref"] is None
 
 
 def test_bootstrap_helper_is_idempotent_and_persists_hashed_session_only() -> None:

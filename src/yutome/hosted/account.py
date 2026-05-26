@@ -18,26 +18,49 @@ STARTER_PRICE_BOOK_VERSION = "starter-v1"
 STARTER_PLAN_KEY = "starter"
 
 STARTER_ALLOWED_OPERATIONS: tuple[str, ...] = (
+    "youtube.metadata_fetch",
+    "youtube.transcript_fetch",
     "gemini.cleanup_transcript",
     "gemini.transcribe_media",
     "voyage.embed_documents",
+    "voyage.embed_query",
     "webshare.proxy_fetch",
     "search_store.index_write",
+    "search_store.lexical_query",
+    "search_store.semantic_query",
+    "search_store.hybrid_query",
+    "search_store.list_read",
+    "search_store.resource_read",
 )
 STARTER_INCLUDED_UNITS: dict[str, Any] = {
     "total_tokens": 250_000,
     "media_seconds": 3_600,
     "vectors": 10_000,
+    "queries": 10_000,
+    "candidate_limit": 100_000,
+    "query_vector_dimensions": 10_240_000,
+    "resource_reads": 10_000,
+    "result_count": 100_000,
     "request_count": 1_000,
     "bytes": 1_073_741_824,
-    "index_writes": 10_000,
+    "transcript_versions": 10_000,
+    "chunks": 100_000,
+    "embeddings": 100_000,
 }
 STARTER_HARD_LIMITS: dict[str, Any] = {
+    "youtube.metadata_fetch": {"request_count": 500},
+    "youtube.transcript_fetch": {"request_count": 500},
     "gemini.cleanup_transcript": {"total_tokens": 50_000},
     "gemini.transcribe_media": {"media_seconds": 1_800},
     "voyage.embed_documents": {"total_tokens": 100_000, "vectors": 5_000},
+    "voyage.embed_query": {"total_tokens": 25_000, "vectors": 5_000},
     "webshare.proxy_fetch": {"request_count": 500, "bytes": 536_870_912},
-    "search_store.index_write": {"index_writes": 5_000},
+    "search_store.index_write": {"transcript_versions": 1_000, "chunks": 10_000, "embeddings": 10_000},
+    "search_store.lexical_query": {"queries": 5_000, "candidate_limit": 50_000},
+    "search_store.semantic_query": {"queries": 5_000, "candidate_limit": 50_000, "query_vector_dimensions": 5_120_000},
+    "search_store.hybrid_query": {"queries": 5_000, "candidate_limit": 50_000, "query_vector_dimensions": 5_120_000},
+    "search_store.list_read": {"queries": 5_000, "candidate_limit": 50_000},
+    "search_store.resource_read": {"queries": 5_000, "resource_reads": 5_000},
 }
 
 _CREDENTIAL_KEY_FRAGMENTS = ("api_key", "access_token", "refresh_token", "secret", "password", "credential")
@@ -171,7 +194,10 @@ def bootstrap_hosted_account(
         starter_provider_allocation_id(workspace_id, provider, operation)
         for provider, operation in STARTER_PROVIDER_OPERATIONS
     )
-    service_ids = (starter_service_allocation_id(workspace_id, "search_store", "index_write"),)
+    service_ids = tuple(
+        starter_service_allocation_id(workspace_id, service, operation)
+        for service, operation in STARTER_SERVICE_OPERATIONS
+    )
 
     session = None
     if account.session_token is not None:
@@ -205,10 +231,22 @@ def bootstrap_hosted_account(
 
 
 STARTER_PROVIDER_OPERATIONS: tuple[tuple[str, str], ...] = (
+    ("youtube", "metadata_fetch"),
+    ("youtube", "transcript_fetch"),
     ("gemini", "cleanup_transcript"),
     ("gemini", "transcribe_media"),
     ("voyage", "embed_documents"),
+    ("voyage", "embed_query"),
     ("webshare", "proxy_fetch"),
+)
+
+STARTER_SERVICE_OPERATIONS: tuple[tuple[str, str], ...] = (
+    ("search_store", "index_write"),
+    ("search_store", "lexical_query"),
+    ("search_store", "semantic_query"),
+    ("search_store", "hybrid_query"),
+    ("search_store", "list_read"),
+    ("search_store", "resource_read"),
 )
 
 
@@ -228,8 +266,12 @@ def account_bootstrap_sql(account: AccountBootstrapInput) -> list[tuple[str, Sql
         )
         for provider, operation in STARTER_PROVIDER_OPERATIONS
     )
-    statements.append(
-        ("service_allocation_search_store_index_write", upsert_starter_service_allocation_sql(account.workspace_id))
+    statements.extend(
+        (
+            f"service_allocation_{service}_{operation}",
+            upsert_starter_service_allocation_sql(account.workspace_id, service=service, operation=operation),
+        )
+        for service, operation in STARTER_SERVICE_OPERATIONS
     )
     if account.session_token is not None:
         statements.append(("account_session", upsert_account_session_sql(account)))
@@ -509,7 +551,14 @@ RETURNING *;
     )
 
 
-def upsert_starter_service_allocation_sql(workspace_id: str) -> SqlStatement:
+def upsert_starter_service_allocation_sql(
+    workspace_id: str,
+    *,
+    service: str = "search_store",
+    operation: str = "index_write",
+) -> SqlStatement:
+    if service != "search_store":
+        raise ValueError("starter account bootstrap only supports search_store service allocations")
     return SqlStatement(
         sql="""
 INSERT INTO service_allocations (
@@ -527,8 +576,8 @@ INSERT INTO service_allocations (
 VALUES (
     %(id)s,
     %(workspace_id)s,
-    'search_store',
-    'index_write',
+    %(service)s,
+    %(operation)s,
     'service_internal',
     'active',
     %(backend)s,
@@ -544,10 +593,12 @@ SET status = CASE WHEN service_allocations.status = 'disabled' THEN service_allo
 RETURNING *;
 """.strip(),
         params={
-            "id": starter_service_allocation_id(workspace_id, "search_store", "index_write"),
+            "id": starter_service_allocation_id(workspace_id, service, operation),
             "workspace_id": workspace_id,
+            "service": service,
+            "operation": operation,
             "backend": HOSTED_VECTOR_BACKEND,
-            "index_profile_ref": "sip_default_voyage_4_lite",
+            "index_profile_ref": None,
             "metadata_json": _json_param({"source": "account_bootstrap"}),
         },
     )
@@ -668,6 +719,8 @@ __all__ = [
     "STARTER_PLAN_KEY",
     "STARTER_PRICE_BOOK_ID",
     "STARTER_PRICE_BOOK_VERSION",
+    "STARTER_PROVIDER_OPERATIONS",
+    "STARTER_SERVICE_OPERATIONS",
     "account_bootstrap_sql",
     "bootstrap_hosted_account",
     "deterministic_account_session_id",
