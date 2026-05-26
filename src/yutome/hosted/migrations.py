@@ -12,10 +12,22 @@ POSTGRES_PHASE1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id text PRIMARY KEY,
     email text,
+    normalized_email text,
     name text,
     status text NOT NULL DEFAULT 'active',
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS normalized_email text;
+
+UPDATE users
+SET normalized_email = lower(btrim(email))
+WHERE normalized_email IS NULL
+  AND email IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_normalized_email
+    ON users(normalized_email);
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id text PRIMARY KEY,
@@ -24,6 +36,34 @@ CREATE TABLE IF NOT EXISTS workspaces (
     status text NOT NULL DEFAULT 'active',
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id text NOT NULL REFERENCES workspaces(id),
+    user_id text NOT NULL REFERENCES users(id),
+    role text NOT NULL,
+    status text NOT NULL DEFAULT 'active',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS account_sessions (
+    id text PRIMARY KEY,
+    user_id text NOT NULL REFERENCES users(id),
+    workspace_id text NOT NULL REFERENCES workspaces(id),
+    session_hash text NOT NULL,
+    status text NOT NULL DEFAULT 'active',
+    scopes text[] NOT NULL DEFAULT ARRAY[]::text[],
+    audience text,
+    client_id text,
+    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    expires_at timestamptz,
+    revoked_at timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_sessions_session_hash
+    ON account_sessions(session_hash);
 
 CREATE TABLE IF NOT EXISTS provider_allocations (
     id text PRIMARY KEY,
