@@ -34,6 +34,6 @@ export function getEnv(context: CloudflareContext): YutomeWebEnv {
     YUTOME_DASHBOARD_API_TOKEN: required(env, "YUTOME_DASHBOARD_API_TOKEN"),
     YUTOME_ACCOUNT_SESSION_AUDIENCE: optional(env, "YUTOME_ACCOUNT_SESSION_AUDIENCE", "yutome:hosted-oauth"),
     YUTOME_COOKIE_DOMAIN: optional(env, "YUTOME_COOKIE_DOMAIN", ""),
-    YUTOME_MCP_URL: optional(env, "YUTOME_MCP_URL", "https://mcp.yutome.com/mcp"),
+    YUTOME_MCP_URL: optional(env, "YUTOME_MCP_URL", "https://mcp.getyutome.com/mcp"),
   };
 }

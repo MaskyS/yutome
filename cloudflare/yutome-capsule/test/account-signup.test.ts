@@ -7,7 +7,7 @@ import type { Env } from "../src/env.ts";
 
 test("hosted signup GET renders the account bootstrap form with safe return_to", async () => {
   const response = await handleAccountSignupRequest(
-    new Request("https://mcp.yutome.com/account/signup?return_to=%2Fauthorize%3Fclient_id%3Dabc"),
+    new Request("https://mcp.getyutome.com/account/signup?return_to=%2Fauthorize%3Fclient_id%3Dabc"),
     hostedEnv(),
   );
 
@@ -68,14 +68,14 @@ test("hosted signup POST bootstraps account session, sets cookie, and redirects"
 
 test("hosted authorize redirects missing account sessions to signup", async () => {
   const response = await handleAuthorizeRequest({
-    request: new Request("https://mcp.yutome.com/authorize?client_id=client_1&state=abc"),
+    request: new Request("https://mcp.getyutome.com/authorize?client_id=client_1&state=abc"),
     env: hostedEnv({ YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret" }),
     oauthHelpers: {
       parseAuthRequest: async () => ({
         clientId: "client_1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       }),
       lookupClient: async () => null,
     } as never,
@@ -131,7 +131,7 @@ test("hosted signup surfaces hosted API errors cleanly", async () => {
 
 test("connector-only deployments do not expose account signup", async () => {
   const response = await handleAccountSignupRequest(
-    new Request("https://mcp.yutome.com/account/signup"),
+    new Request("https://mcp.getyutome.com/account/signup"),
     hostedEnv({ YUTOME_WORKER_MODE: "connector_only" }),
   );
 
@@ -146,7 +146,7 @@ test("hosted signup scopes the cookie to YUTOME_COOKIE_DOMAIN when set", async (
       workspace_name: "Carol Research",
       return_to: "/authorize?client_id=c&state=s",
     }),
-    hostedEnv({ YUTOME_COOKIE_DOMAIN: "yutome.com" }),
+    hostedEnv({ YUTOME_COOKIE_DOMAIN: "getyutome.com" }),
     (async () =>
       Response.json({
         ok: true,
@@ -162,7 +162,7 @@ test("hosted signup scopes the cookie to YUTOME_COOKIE_DOMAIN when set", async (
 
   assert.equal(response.status, 302);
   const setCookie = response.headers.get("set-cookie") || "";
-  assert.match(setCookie, /Domain=yutome\.com/);
+  assert.match(setCookie, /Domain=getyutome\.com/);
   assert.match(setCookie, /HttpOnly/);
   assert.match(setCookie, /Secure/);
   assert.match(setCookie, /SameSite=Lax/);
@@ -182,7 +182,7 @@ function hostedEnv(overrides: Partial<Env> = {}): Env {
 }
 
 function signupPostRequest(values: Record<string, string>): Request {
-  return new Request("https://mcp.yutome.com/account/signup", {
+  return new Request("https://mcp.getyutome.com/account/signup", {
     method: "POST",
     body: new URLSearchParams(values),
   });

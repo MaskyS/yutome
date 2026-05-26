@@ -82,7 +82,7 @@ export class HostedAccountGrantError extends Error {
 
 const ACCOUNT_GRANT_PREFIX = "yutome:account-grant:";
 export const YUTOME_MCP_SCOPE = "yutome.search.read";
-export const DEFAULT_MCP_AUDIENCE = "https://mcp.yutome.com/mcp";
+export const DEFAULT_MCP_AUDIENCE = "https://mcp.getyutome.com/mcp";
 export const DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth";
 export const DEFAULT_ACCOUNT_SESSION_MAX_AGE_SECONDS = 60 * 60;
 export const DEFAULT_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS = 60;

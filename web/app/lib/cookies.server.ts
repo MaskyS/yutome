@@ -1,5 +1,5 @@
 // The account session cookie is shared with the existing OAuth worker on
-// mcp.yutome.com (same registrable domain). Keep this NAME in lockstep with
+// mcp.getyutome.com (same registrable domain). Keep this NAME in lockstep with
 // ACCOUNT_SESSION_COOKIE_NAME in the Python API (http_api.py) and the worker
 // (cloudflare/yutome-capsule/src/account-grants.ts).
 export const SESSION_COOKIE_NAME = "yutome_account_session";
@@ -28,8 +28,8 @@ interface CookieOptions {
   maxAgeSeconds: number;
 }
 
-// In production `domain` is "yutome.com" so app.yutome.com sets a cookie that
-// mcp.yutome.com can read for the connect handoff (app<->mcp is same-site).
+// In production `domain` is "getyutome.com" so app.getyutome.com sets a cookie
+// that mcp.getyutome.com can read for the connect handoff (app<->mcp is same-site).
 // Secure is paired with Domain; omitted in local dev (host-only, http://localhost),
 // where a Domain attribute would otherwise be rejected by the browser.
 export function buildSessionCookie(token: string, { domain, maxAgeSeconds }: CookieOptions): string {

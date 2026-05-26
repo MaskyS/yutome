@@ -26,5 +26,34 @@ tag = "v1"
 new_sqlite_classes = ["YutomeRelay", "YutomeMcpAgent"]
 
 # KV namespace for workers-oauth-provider state (clients, codes, refresh tokens).
-# `yutome connect --deploy` creates a per-account namespace and writes an
-# ignored generated Wrangler config under data/remote/cloudflare/.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "bf7ec1f1c6bc4df580fb213cedb621b6"
+
+# Hosted-mode deployment. The top-level worker remains the laptop-backed bridge
+# endpoint; this env is the account-backed hosted MCP endpoint for getyutome.com.
+[env.hosted]
+name = "yutome-remote-mcp-hosted"
+workers_dev = true
+
+[env.hosted.vars]
+YUTOME_WORKER_MODE = "hosted"
+YUTOME_HOSTED_API_URL = "https://api-production-e072.up.railway.app"
+YUTOME_MCP_AUDIENCE = "https://mcp.getyutome.com/mcp"
+YUTOME_COOKIE_DOMAIN = "getyutome.com"
+
+[[env.hosted.routes]]
+pattern = "mcp.getyutome.com"
+custom_domain = true
+
+[[env.hosted.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "bf7ec1f1c6bc4df580fb213cedb621b6"
+
+[[env.hosted.durable_objects.bindings]]
+name = "RELAY"
+class_name = "YutomeRelay"
+
+[[env.hosted.durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "YutomeMcpAgent"

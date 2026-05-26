@@ -30,7 +30,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
         clientId: "client-1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       },
       redirectUri: "https://assistant.example/callback",
       scope: ["yutome.search.read"],
@@ -45,7 +45,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
     YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
-    YUTOME_MCP_AUDIENCE: "https://mcp.yutome.com/mcp",
+    YUTOME_MCP_AUDIENCE: "https://mcp.getyutome.com/mcp",
     YUTOME_TOKEN_VERSION: "v2",
     YUTOME_TOKEN_TTL_SECONDS: "3600",
     RELAY: {} as DurableObjectNamespace,
@@ -91,7 +91,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     client_id: "client-1",
     session_id: "acct_session_alice",
     scopes: ["yutome.search.read"],
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     paired_at: authorization.props.paired_at,
     expires_at: authorization.props.expires_at,
@@ -109,7 +109,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     client_id: "client-1",
     session_id: "acct_session_alice",
     scopes: ["yutome.search.read"],
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     paired_at: authorization.props.paired_at,
     expires_at: authorization.props.expires_at,
@@ -122,7 +122,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     grant_id: grantId,
     client_id: "client-1",
     session_id: "acct_session_alice",
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     expires_at: authorization.props.expires_at,
     token_version: "v2",
   });
@@ -135,7 +135,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     workspace_id: "ws_alice",
     client_id: "client-1",
     scopes: ["yutome.search.read"],
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     status: "active",
     created_at: authorization.props.paired_at,
@@ -178,7 +178,7 @@ test("hosted OAuth pairing rejects revoked staged account grant", async () => {
         clientId: "client-1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       },
       redirectUri: "https://assistant.example/callback",
       scope: ["yutome.search.read"],
@@ -194,7 +194,7 @@ test("hosted OAuth pairing rejects revoked staged account grant", async () => {
       workspace_id: "ws_alice",
       client_id: "client-1",
       scopes: ["yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v1",
       status: "revoked",
       created_at: "2026-05-26T10:00:00.000Z",
@@ -241,7 +241,7 @@ test("hosted OAuth pairing rejects expired staged account grant", async () => {
         clientId: "client-1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       },
       redirectUri: "https://assistant.example/callback",
       scope: ["yutome.search.read"],
@@ -257,7 +257,7 @@ test("hosted OAuth pairing rejects expired staged account grant", async () => {
       workspace_id: "ws_alice",
       client_id: "client-1",
       scopes: ["yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v1",
       status: "active",
       created_at: "2000-01-01T00:00:00.000Z",
@@ -313,7 +313,7 @@ test("hosted account grant resolver rejects expired stored grants and accepts fu
       workspace_id: "ws_alice",
       client_id: "client-1",
       scopes: ["yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v1",
       status: "active",
       created_at: "2000-01-01T00:00:00.000Z",
@@ -329,7 +329,7 @@ test("hosted account grant resolver rejects expired stored grants and accepts fu
       workspace_id: "ws_alice",
       client_id: "client-1",
       scopes: ["yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v1",
       status: "active",
       created_at: "2999-01-01T00:00:00.000Z",
@@ -383,7 +383,7 @@ test("hosted grant auth rejects token prop mismatches before hosted routing", as
       workspace_id: "ws_stored",
       client_id: "client_stored",
       scopes: ["profile", "yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v2",
       status: "active",
       created_at: "2999-01-01T00:00:00.000Z",
@@ -453,7 +453,7 @@ test("hosted grant auth derives routing from stored grant when token only identi
       workspace_id: "ws_stored",
       client_id: "client_stored",
       scopes: ["profile", "yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v2",
       status: "active",
       created_at: "2999-01-01T00:00:00.000Z",
@@ -474,7 +474,7 @@ test("hosted grant auth derives routing from stored grant when token only identi
     grant_id: grantId,
     client_id: "client_stored",
     session_id: "session_stored",
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     expires_at: "2999-01-02T00:00:00.000Z",
     token_version: "v2",
   });
@@ -511,7 +511,7 @@ test("hosted OAuth pairing rejects missing account session", async () => {
         clientId: "client-1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       },
       redirectUri: "https://assistant.example/callback",
       scope: ["yutome.search.read"],
@@ -553,7 +553,7 @@ test("hosted account session resolver rejects invalid cookie tokens", async () =
   let caught: unknown;
   try {
     await resolveHostedAccountSessionFromRequest(
-      new Request("https://mcp.yutome.com/authorize", {
+      new Request("https://mcp.getyutome.com/authorize", {
         headers: {
           cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=not-a-signed-token`,
         },
@@ -576,7 +576,7 @@ test("hosted account session resolver keeps header fallback for dev and tests", 
     workspace_ids: ["ws_header"],
   });
   const session = await resolveHostedAccountSessionFromRequest(
-    new Request("https://mcp.yutome.com/authorize", {
+    new Request("https://mcp.getyutome.com/authorize", {
       headers: {
         [ACCOUNT_SESSION_HEADER]: headerToken,
       },
@@ -603,7 +603,7 @@ test("hosted account session resolver ignores header fallback unless explicitly 
   let caught: unknown;
   try {
     await resolveHostedAccountSessionFromRequest(
-      new Request("https://mcp.yutome.com/authorize", {
+      new Request("https://mcp.getyutome.com/authorize", {
         headers: {
           [ACCOUNT_SESSION_HEADER]: headerToken,
         },
@@ -631,7 +631,7 @@ test("hosted account session resolver prefers cookie over header when both are p
     workspace_ids: ["ws_header"],
   });
   const session = await resolveHostedAccountSessionFromRequest(
-    new Request("https://mcp.yutome.com/authorize", {
+    new Request("https://mcp.getyutome.com/authorize", {
       headers: {
         cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(cookieToken)}`,
         [ACCOUNT_SESSION_HEADER]: headerToken,
@@ -669,7 +669,7 @@ test("hosted account session resolver enforces issued-at freshness", async () =>
     let caught: unknown;
     try {
       await resolveHostedAccountSessionFromRequest(
-        new Request("https://mcp.yutome.com/authorize", {
+        new Request("https://mcp.getyutome.com/authorize", {
           headers: {
             cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(await signedAccountSession(entry.payload))}`,
           },
@@ -698,7 +698,7 @@ test("hosted account session replay id is consumed for approval posts", async ()
     exp: nowSeconds + 300,
     jti: "acct_session_replay_1",
   });
-  const request = new Request("https://mcp.yutome.com/pair", {
+  const request = new Request("https://mcp.getyutome.com/pair", {
     method: "POST",
     headers: {
       cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
@@ -746,7 +746,7 @@ test("hosted account session replay accepts nonce fallback and rejects missing r
   });
 
   await resolveHostedAccountSessionFromRequest(
-    new Request("https://mcp.yutome.com/pair", {
+    new Request("https://mcp.getyutome.com/pair", {
       headers: { cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(nonceToken)}` },
     }),
     env,
@@ -757,7 +757,7 @@ test("hosted account session replay accepts nonce fallback and rejects missing r
   let caught: unknown;
   try {
     await resolveHostedAccountSessionFromRequest(
-      new Request("https://mcp.yutome.com/pair", {
+      new Request("https://mcp.getyutome.com/pair", {
         headers: {
           cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(
             await signedAccountSession({
@@ -790,7 +790,7 @@ test("hosted OAuth pairing rejects workspace selection outside account session",
         clientId: "client-1",
         redirectUri: "https://assistant.example/callback",
         scope: ["yutome.search.read"],
-        resource: "https://mcp.yutome.com/mcp",
+        resource: "https://mcp.getyutome.com/mcp",
       },
       redirectUri: "https://assistant.example/callback",
       scope: ["yutome.search.read"],
@@ -883,7 +883,7 @@ test("connector-only OAuth pairing keeps local defaults explicit", async () => {
   assert.equal(authorization.props.grant_id, grantId);
   assert.equal(authorization.props.client_id, "client-1");
   assert.deepEqual(authorization.props.scopes, ["yutome.search.read"]);
-  assert.equal(authorization.props.audience, "https://mcp.yutome.com/mcp");
+  assert.equal(authorization.props.audience, "https://mcp.getyutome.com/mcp");
   assert.equal(authorization.props.token_version, "v1");
   assert.equal(typeof authorization.props.expires_at, "string");
 });
@@ -897,7 +897,7 @@ test("OAuth metadata advertises canonical MCP resource, scope, DCR, S256 PKCE, a
   assert.match(source, /scopesSupported:\s*\[YUTOME_MCP_SCOPE\]/);
   assert.match(source, /resourceMetadata:\s*{/);
   assert.match(source, /resource:\s*DEFAULT_MCP_AUDIENCE/);
-  assert.match(source, /authorization_servers:\s*\["https:\/\/mcp\.yutome\.com"\]/);
+  assert.match(source, /authorization_servers:\s*\[defaultAuthorizationServer\]/);
   assert.match(source, /scopes_supported:\s*\[YUTOME_MCP_SCOPE\]/);
   assert.match(source, /bearer_methods_supported:\s*\["header"\]/);
   assert.match(source, /resource_name:\s*"Yutome MCP"/);
@@ -947,7 +947,7 @@ test("hosted OAuth pairing rejects authorization requests missing canonical MCP 
 
   assert.equal(response.status, 400);
   assert.equal(completed, false);
-  assert.match(await response.text(), /resource=https:\/\/mcp\.yutome\.com\/mcp/);
+  assert.match(await response.text(), /resource=https:\/\/mcp\.getyutome\.com\/mcp/);
 });
 
 test("hosted revoke endpoint revokes current staged grant and OAuth grant", async () => {
@@ -968,7 +968,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
       workspace_id: "ws_alice",
       client_id: "client-1",
       scopes: ["yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       token_version: "v1",
       status: "active",
       created_at: "2026-05-26T10:00:00.000Z",
@@ -978,7 +978,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
 
   const revokedOAuthGrants: Array<{ grantId: string; userId: string }> = [];
   const response = await handleRevokeRequest({
-    request: new Request("https://mcp.yutome.com/revoke", {
+    request: new Request("https://mcp.getyutome.com/revoke", {
       method: "POST",
       headers: { authorization: "Bearer current-token" },
     }),
@@ -989,7 +989,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
         return {
           userId: "user_alice",
           grantId: "oauth-grant-1",
-          audience: "https://mcp.yutome.com/mcp",
+          audience: "https://mcp.getyutome.com/mcp",
           grant: {
             props: {
               capsule: "hosted",
@@ -998,7 +998,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
               user_id: "user_alice",
               client_id: "client-1",
               scopes: ["yutome.search.read"],
-              audience: "https://mcp.yutome.com/mcp",
+              audience: "https://mcp.getyutome.com/mcp",
               token_version: "v1",
             },
           },
@@ -1020,7 +1020,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
 
 test("revoke endpoint keeps connector-only behavior explicit", async () => {
   const response = await handleRevokeRequest({
-    request: new Request("https://mcp.yutome.com/revoke", {
+    request: new Request("https://mcp.getyutome.com/revoke", {
       method: "POST",
       headers: { authorization: "Bearer current-token" },
     }),
@@ -1072,7 +1072,7 @@ function pairingPostRequest(
       );
     }
   }
-  return new Request("https://mcp.yutome.com/pair", {
+  return new Request("https://mcp.getyutome.com/pair", {
     method: "POST",
     headers,
     body: form,

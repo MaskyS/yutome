@@ -126,6 +126,7 @@ type FetchHandler = { fetch: NonNullable<ExportedHandler<DefaultHandlerEnv>["fet
 
 const apiHandler = YutomeMcpAgent.serve("/mcp") as unknown as FetchHandler;
 const defaultHandlerForProvider = defaultHandler as unknown as FetchHandler;
+const defaultAuthorizationServer = new URL(DEFAULT_MCP_AUDIENCE).origin;
 
 const provider = new OAuthProvider<DefaultHandlerEnv>({
   apiRoute: "/mcp",
@@ -139,7 +140,7 @@ const provider = new OAuthProvider<DefaultHandlerEnv>({
   clientIdMetadataDocumentEnabled: true,
   resourceMetadata: {
     resource: DEFAULT_MCP_AUDIENCE,
-    authorization_servers: ["https://mcp.yutome.com"],
+    authorization_servers: [defaultAuthorizationServer],
     scopes_supported: [YUTOME_MCP_SCOPE],
     bearer_methods_supported: ["header"],
     resource_name: "Yutome MCP",

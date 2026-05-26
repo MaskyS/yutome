@@ -8,11 +8,16 @@
 	"compatibility_date": "2025-04-04",
 	"main": "./workers/app.ts",
 	"vars": {
-		"YUTOME_HOSTED_API_URL": "https://api.yutome.com",
+		"YUTOME_HOSTED_API_URL": "https://api-production-e072.up.railway.app",
 		"YUTOME_ACCOUNT_SESSION_AUDIENCE": "yutome:hosted-oauth",
-		"YUTOME_MCP_URL": "https://mcp.yutome.com/mcp",
-		"YUTOME_COOKIE_DOMAIN": "yutome.com"
+		"YUTOME_MCP_URL": "https://mcp.getyutome.com/mcp",
+		"YUTOME_COOKIE_DOMAIN": "getyutome.com"
 	},
+	"routes": [
+		{ "pattern": "getyutome.com/*", "zone_name": "getyutome.com" },
+		{ "pattern": "www.getyutome.com/*", "zone_name": "getyutome.com" },
+		{ "pattern": "app.getyutome.com/*", "zone_name": "getyutome.com" }
+	],
 	"observability": {
 		"enabled": true
 	},

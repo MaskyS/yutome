@@ -244,7 +244,7 @@ test("hosted auth context comes from OAuth props and requires search scope", () 
       client_id: "client_chatgpt",
       user_id: "user_alice",
       scopes: ["profile", "yutome.search.read"],
-      audience: "https://mcp.yutome.com/mcp",
+      audience: "https://mcp.getyutome.com/mcp",
       expires_at: "2026-05-26T12:00:00.000Z",
       token_version: "v1",
     },
@@ -258,7 +258,7 @@ test("hosted auth context comes from OAuth props and requires search scope", () 
     grant_id: "grant_claude",
     client_id: "client_chatgpt",
     session_id: "session_123",
-    audience: "https://mcp.yutome.com/mcp",
+    audience: "https://mcp.getyutome.com/mcp",
     expires_at: "2026-05-26T12:00:00.000Z",
     token_version: "v1",
   });
