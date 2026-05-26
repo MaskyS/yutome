@@ -17,6 +17,7 @@ import type { Env } from "./env.ts";
 import { YutomeMcpAgent } from "./yutome-mcp-agent.ts";
 import { YutomeRelay } from "./yutome-relay.ts";
 import { handleAuthorizeRequest, handlePairingRequest } from "./pairing.ts";
+import { handleAccountSignupRequest } from "./account-signup.ts";
 import { iconResponse } from "./icon-asset.ts";
 import {
   DEFAULT_MCP_AUDIENCE,
@@ -74,6 +75,10 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
 
     if (url.pathname === "/authorize") {
       return handleAuthorize(request, env);
+    }
+
+    if (url.pathname === "/account/signup") {
+      return handleAccountSignupRequest(request, env);
     }
 
     if (url.pathname === "/pair") {
@@ -142,4 +147,4 @@ const provider = new OAuthProvider<DefaultHandlerEnv>({
 });
 
 export default provider;
-export { YutomeMcpAgent, YutomeRelay };
+export { defaultHandler, YutomeMcpAgent, YutomeRelay };

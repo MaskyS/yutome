@@ -20,6 +20,7 @@ import {
   issueHostedAccountGrant,
   resolveHostedAccountSessionFromRequest,
 } from "./account-grants.ts";
+import { signupRedirectResponse } from "./account-signup.ts";
 import { isHostedWorkerMode, resolveConfiguredBridgeIdentity, TenantRoutingError } from "./tenant-routing.ts";
 
 interface PairingContext {
@@ -70,6 +71,9 @@ export async function handleAuthorizeRequest(ctx: PairingContext): Promise<Respo
       });
     } catch (err) {
       if (err instanceof HostedAccountGrantError) {
+        if (err.code === "hosted_account_session_missing" && err.status === 401) {
+          return signupRedirectResponse(request);
+        }
         return errorResponse(err.message, undefined, err.status);
       }
       throw err;
