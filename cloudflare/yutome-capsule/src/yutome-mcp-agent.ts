@@ -24,6 +24,13 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Env, YutomeAuthProps } from "./env";
 import type { YutomeRelay } from "./yutome-relay";
+import {
+  buildOfflineResponseMetadata,
+  deriveBridgeRelayObjectName,
+  resolveMcpBridgeIdentity,
+  validateTenantIdsNotInToolArguments,
+  type BridgeInstallIdentity,
+} from "./tenant-routing";
 import contractData from "./contract.json" with { type: "json" };
 
 interface ToolEntry {
@@ -55,6 +62,7 @@ const TEST_VIDEO_ICON =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjgiIGhlaWdodD0iMTI4IiB2aWV3Qm94PSIwIDAgMTI4IDEyOCI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIHJ4PSIyNCIgZmlsbD0iIzExMTExMSIvPjx0ZXh0IHg9IjY0IiB5PSI4MyIgZm9udC1zaXplPSI2NCIgdGV4dC1hbmNob3I9Im1pZGRsZSI+8J+OpTwvdGV4dD48L3N2Zz4=";
 
 type DispatchResult = { result?: unknown; error?: { code?: number; message?: string; data?: unknown } };
+type DispatchError = NonNullable<DispatchResult["error"]>;
 
 export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
   server = new Server(
@@ -86,6 +94,14 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+      const tenantValidation = validateTenantIdsNotInToolArguments(args ?? {});
+      if (!tenantValidation.ok) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          tenantValidation.message ?? "Tool arguments include hosted tenant identity fields.",
+          { violations: tenantValidation.violations },
+        );
+      }
       const dispatch = (await this.relay().dispatch("tool", "tools/call", {
         name,
         arguments: args ?? {},
@@ -116,15 +132,14 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
       if (dispatch.error) {
         const err = dispatch.error;
         const code = err.code === -32002 ? ErrorCode.InvalidParams : ErrorCode.InternalError;
+        const errorData = this.errorDataWithOfflineMetadata(err);
         const isOffline =
           err.code === -32002 ||
-          (typeof err.data === "object" &&
-            err.data !== null &&
-            (err.data as { desktop_offline?: unknown }).desktop_offline === true);
+          errorData.desktop_offline === true;
         const fallback = isOffline
           ? "Yutome Desktop bridge is offline."
           : "Yutome resource unavailable.";
-        throw new McpError(code, err.message ?? fallback, err.data);
+        throw new McpError(code, err.message ?? fallback, errorData);
       }
       const wrapped = (dispatch.result ?? {}) as {
         contents?: Array<{ uri: string; mimeType: string; text: string }>;
@@ -153,7 +168,7 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
         structuredContent: {
           ok: false,
           error: err.message ?? "unknown",
-          ...((err.data ?? {}) as Record<string, unknown>),
+          ...this.errorDataWithOfflineMetadata(err),
         },
       };
     }
@@ -170,7 +185,38 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
   }
 
   private relay(): DurableObjectStub<YutomeRelay> {
-    const id = this.env.RELAY.idFromName("default");
+    const id = this.env.RELAY.idFromName(this.relayObjectName());
     return this.env.RELAY.get(id) as unknown as DurableObjectStub<YutomeRelay>;
   }
+
+  private relayObjectName(): string {
+    return deriveBridgeRelayObjectName(this.bridgeIdentity());
+  }
+
+  private bridgeIdentity(): BridgeInstallIdentity {
+    const props = (this.props ?? {}) as Partial<YutomeAuthProps>;
+    return resolveMcpBridgeIdentity(props, this.env);
+  }
+
+  private errorDataWithOfflineMetadata(err: DispatchError): Record<string, unknown> {
+    const data = recordFromUnknown(err.data);
+    if (err.code !== -32002 && data.desktop_offline !== true) {
+      return data;
+    }
+    return {
+      ...data,
+      ...buildOfflineResponseMetadata(this.bridgeIdentity(), {
+        attempted_served_from: "bridge",
+        durable_object_name: this.relayObjectName(),
+        reason: "bridge_offline",
+      }),
+    };
+  }
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
 }

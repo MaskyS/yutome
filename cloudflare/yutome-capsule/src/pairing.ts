@@ -9,6 +9,7 @@
  */
 import type { Env, YutomeAuthProps } from "./env";
 import type { AuthRequest, ClientInfo, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { resolveConfiguredBridgeIdentity, TenantRoutingError } from "./tenant-routing.ts";
 
 interface PairingContext {
   request: Request;
@@ -91,15 +92,33 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
     );
   }
 
+  let bridgeIdentity;
+  try {
+    bridgeIdentity = resolveConfiguredBridgeIdentity(env);
+  } catch (err) {
+    if (err instanceof TenantRoutingError) {
+      return errorResponse(`Missing hosted tenant identity: ${err.message}`, authRequestId);
+    }
+    throw err;
+  }
+
   const props: YutomeAuthProps = {
     capsule: "owner",
+    workspace_id: bridgeIdentity.workspace_id,
+    install_id: bridgeIdentity.install_id,
+    connector_grant_id: authRequestId,
     paired_at: new Date().toISOString(),
   };
 
   const { redirectTo } = await oauthHelpers.completeAuthorization({
     request: state.authRequest,
     userId: "yutome-owner",
-    metadata: { paired_at: props.paired_at },
+    metadata: {
+      workspace_id: props.workspace_id,
+      install_id: props.install_id,
+      connector_grant_id: props.connector_grant_id,
+      paired_at: props.paired_at,
+    },
     scope: state.authRequest.scope,
     props,
   });

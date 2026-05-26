@@ -10,6 +10,7 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
+    "test:ts": "tsc -p tsconfig.test.json --noEmit && node --test --experimental-strip-types --experimental-specifier-resolution=node test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

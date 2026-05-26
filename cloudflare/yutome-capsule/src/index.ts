@@ -18,6 +18,11 @@ import { YutomeMcpAgent } from "./yutome-mcp-agent";
 import { YutomeRelay } from "./yutome-relay";
 import { handleAuthorizeRequest, handlePairingRequest } from "./pairing";
 import { iconResponse } from "./icon-asset";
+import {
+  deriveBridgeRelayObjectName,
+  resolveBridgeRelayIdentityFromHeaders,
+  TenantRoutingError,
+} from "./tenant-routing";
 
 interface DefaultHandlerEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -46,7 +51,11 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
     }
 
     if (url.pathname === "/relay/connect" || url.pathname === "/relay/status") {
-      const id = env.RELAY.idFromName("default");
+      const identity = bridgeIdentityFromRequest(request, env);
+      if (identity instanceof Response) {
+        return identity;
+      }
+      const id = env.RELAY.idFromName(deriveBridgeRelayObjectName(identity));
       const stub = env.RELAY.get(id);
       return stub.fetch(request);
     }
@@ -73,6 +82,20 @@ const defaultHandler: ExportedHandler<DefaultHandlerEnv> = {
 
 async function handleAuthorize(request: Request, env: DefaultHandlerEnv): Promise<Response> {
   return handleAuthorizeRequest({ request, env, oauthHelpers: env.OAUTH_PROVIDER });
+}
+
+export function bridgeIdentityFromRequest(request: Request, env: Env): ReturnType<typeof resolveBridgeRelayIdentityFromHeaders> | Response {
+  try {
+    return resolveBridgeRelayIdentityFromHeaders(request.headers, env);
+  } catch (err) {
+    if (err instanceof TenantRoutingError) {
+      return Response.json(
+        { error: err.code, message: err.message },
+        { status: err.code === "tenant_id_missing" ? 401 : 400 },
+      );
+    }
+    throw err;
+  }
 }
 
 // OAuthProvider expects handlers whose `fetch` property is non-optional.
