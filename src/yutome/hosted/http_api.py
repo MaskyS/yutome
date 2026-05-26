@@ -5,12 +5,19 @@ import re
 import secrets
 import json
 from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
 
 from yutome import contract
+from yutome.hosted.account import (
+    DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    AccountBootstrapInput,
+    bootstrap_hosted_account,
+    sign_account_session_token,
+)
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpError, HostedMcpQueryAdapter
 
 
@@ -22,6 +29,11 @@ CLIENT_HEADER = "X-Yutome-Client-Id"
 SESSION_HEADER = "X-Yutome-Session-Id"
 TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
 POLAR_WEBHOOK_SECRET_ENV_VAR = "POLAR_WEBHOOK_SECRET"
+ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR = "YUTOME_ACCOUNT_SESSION_HMAC_SECRET"
+ACCOUNT_SESSION_AUDIENCE_ENV_VAR = "YUTOME_ACCOUNT_SESSION_AUDIENCE"
+ACCOUNT_SESSION_MAX_AGE_SECONDS_ENV_VAR = "YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS"
+ACCOUNT_SESSION_COOKIE_NAME = "yutome_account_session"
+ACCOUNT_SESSION_TTL_SECONDS = 60 * 60
 _SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
 
@@ -39,6 +51,14 @@ class ResourceReadRequest(BaseModel):
     uri: str
 
 
+class AccountBootstrapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    name: str | None = None
+    workspace_name: str | None = None
+
+
 AuthDependency = Callable[..., HostedMcpAuthContext]
 ReadinessCheck = Callable[[], Any]
 
@@ -54,6 +74,9 @@ def build_postgres_app(
     index_profile_ref: str | None = None,
     expected_api_token: str | None = None,
     polar_webhook_secret: str | None = None,
+    account_session_secret: str | None = None,
+    account_session_audience: str | None = None,
+    account_session_ttl_seconds: int | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -73,6 +96,9 @@ def build_postgres_app(
         expected_api_token=_normalize_api_token(expected_api_token) or _api_token_from_env(),
         billing_connection=connection,
         polar_webhook_secret=_normalize_api_token(polar_webhook_secret) or _polar_webhook_secret_from_env(),
+        account_session_secret=_normalize_api_token(account_session_secret) or _account_session_secret_from_env(),
+        account_session_audience=_normalize_api_token(account_session_audience) or _account_session_audience_from_env(),
+        account_session_ttl_seconds=account_session_ttl_seconds or _account_session_ttl_seconds_from_env(),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -88,6 +114,9 @@ def build_app(
     expected_api_token: str | None = None,
     billing_connection: Any | None = None,
     polar_webhook_secret: str | None = None,
+    account_session_secret: str | None = None,
+    account_session_audience: str | None = None,
+    account_session_ttl_seconds: int | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
@@ -107,9 +136,13 @@ def build_app(
     app.state.hosted_billing_connection = billing_connection
     normalized_api_token = _normalize_api_token(expected_api_token)
     normalized_polar_webhook_secret = _normalize_api_token(polar_webhook_secret)
+    normalized_account_session_secret = _normalize_api_token(account_session_secret)
+    normalized_account_session_audience = _normalize_api_token(account_session_audience) or DEFAULT_ACCOUNT_SESSION_AUDIENCE
+    account_session_ttl = _positive_int(account_session_ttl_seconds, ACCOUNT_SESSION_TTL_SECONDS)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
     app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
+    app.state.account_session_signing_configured = bool(normalized_account_session_secret)
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -214,6 +247,75 @@ def build_app(
             raise _http_error(exc) from exc
         return {"ok": True, "result": result}
 
+    @app.post("/account/bootstrap")
+    def account_bootstrap(
+        request: AccountBootstrapRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _verify_bearer_token(authorization=authorization, expected_api_token=normalized_api_token)
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_bootstrap_connection_unconfigured",
+                    message="Hosted account bootstrap requires a database connection.",
+                    status_code=503,
+                )
+            )
+        if not normalized_account_session_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_signing_unconfigured",
+                    message=f"Set {ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR} before creating hosted account sessions.",
+                    status_code=503,
+                )
+            )
+
+        try:
+            issued_at = datetime.now(timezone.utc)
+            expires_at = issued_at + timedelta(seconds=account_session_ttl)
+            bootstrap_input = AccountBootstrapInput(
+                email=request.email,
+                name=_optional_text(request.name),
+                workspace_name=_optional_text(request.workspace_name),
+            )
+            session_token = sign_account_session_token(
+                user_id=bootstrap_input.user_id,
+                workspace_id=bootstrap_input.workspace_id,
+                secret=normalized_account_session_secret,
+                expires_at=expires_at,
+                issued_at=issued_at,
+                audience=normalized_account_session_audience,
+            )
+            session_input = AccountBootstrapInput(
+                email=bootstrap_input.email,
+                name=bootstrap_input.name,
+                workspace_name=bootstrap_input.workspace_name,
+                session_token=session_token,
+                session_scopes=(contract.AUTH_SCOPE,),
+                session_audience=normalized_account_session_audience,
+                session_expires_at=expires_at,
+            )
+            result = _bootstrap_account_in_transaction(billing_connection, session_input)
+        except ValueError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_bootstrap_invalid",
+                    message=str(exc),
+                    status_code=400,
+                )
+            ) from exc
+        return {
+            "ok": True,
+            "principal": result.principal.model_dump(mode="json"),
+            "session": {
+                "token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "audience": normalized_account_session_audience,
+                "cookie_name": ACCOUNT_SESSION_COOKIE_NAME,
+                "max_age_seconds": account_session_ttl,
+            },
+        }
+
     @app.post("/billing/polar/webhook")
     @app.post("/webhooks/polar")
     async def polar_webhook(request: Request) -> dict[str, Any]:
@@ -287,6 +389,27 @@ def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
 def _polar_webhook_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     return _normalize_api_token(env.get(POLAR_WEBHOOK_SECRET_ENV_VAR))
+
+
+def _account_session_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return _normalize_api_token(env.get(ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR))
+
+
+def _account_session_audience_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return _normalize_api_token(env.get(ACCOUNT_SESSION_AUDIENCE_ENV_VAR))
+
+
+def _account_session_ttl_seconds_from_env(environ: Mapping[str, str] | None = None) -> int | None:
+    env = os.environ if environ is None else environ
+    raw = _normalize_api_token(env.get(ACCOUNT_SESSION_MAX_AGE_SECONDS_ENV_VAR))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _normalize_api_token(token: str | None) -> str | None:
@@ -379,6 +502,25 @@ def _execute_billing_statements(connection: Any, statements: tuple[Any, ...]) ->
         return
     for statement in statements:
         connection.execute(statement.sql, statement.params)
+
+
+def _bootstrap_account_in_transaction(connection: Any, account: AccountBootstrapInput) -> Any:
+    transaction = getattr(connection, "transaction", None)
+    if callable(transaction):
+        with transaction():
+            return bootstrap_hosted_account(connection, account)
+    return bootstrap_hosted_account(connection, account)
+
+
+def _optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _positive_int(value: int | None, fallback: int) -> int:
+    return value if isinstance(value, int) and value > 0 else fallback
 
 
 def error_body(response_json: Mapping[str, Any]) -> Mapping[str, Any]:

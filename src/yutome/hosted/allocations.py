@@ -78,7 +78,7 @@ def _allocation_subject(allocation: Allocation) -> UsageSubject:
 
 def _allocation_rank(allocation: Allocation, operation: str) -> tuple[int, int, str]:
     operation_rank = 0 if allocation.operation == operation else 1
-    status_rank = 0 if allocation.status in {"active", "limited"} and allocation.mode != "disabled" else 1
+    status_rank = 0 if allocation.status in {"active", "limited"} and allocation.credential_mode != "disabled" else 1
     return operation_rank, status_rank, allocation.id
 
 

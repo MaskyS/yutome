@@ -38,7 +38,7 @@ from yutome.hosted.indexing import (
 )
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.jobs import claim_jobs_sql
-from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger
+from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger, release_stale_unknown_usage_reservations
 from yutome.hosted.postgres import apply_hosted_schema, apply_phase1_schema, apply_phase4_schema, apply_schema
 from yutome.hosted.repositories import SqlStatement, usage_repository_constraint_statements
 from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -353,9 +353,11 @@ class HostedCommandRunner:
         for row in rows:
             job = _job_from_row(row)
             if job.job_type == "index_video":
-                executions.append(_execution_result_dict(executor.execute(job, lease_owner=lease_owner)))
+                executions.append(_execution_result_dict(executor.execute(job, lease_owner=lease_owner, lease_seconds=lease_seconds)))
             elif job.job_type == "discover_source":
-                executions.append(_execution_result_dict(discovery_executor.execute(job, lease_owner=lease_owner)))
+                executions.append(
+                    _execution_result_dict(discovery_executor.execute(job, lease_owner=lease_owner, lease_seconds=lease_seconds))
+                )
         return HostedTickResult(
             tick="worker_once",
             attempted=True,
@@ -388,15 +390,18 @@ class HostedCommandRunner:
         )
 
     def maintenance_tick(self, *, limit: int = 100) -> HostedTickResult:
-        statement = maintenance_tick_sql(now=datetime.now(timezone.utc), limit=limit)
-        result = self.connect().execute(statement.sql, statement.params)
+        connection = self.connect()
+        clock = datetime.now(timezone.utc)
+        statement = maintenance_tick_sql(now=clock, limit=limit)
+        result = connection.execute(statement.sql, statement.params)
         rows = _rows_from_result(result)
+        released_unknown = release_stale_unknown_usage_reservations(connection, now=clock, limit=limit)
         return HostedTickResult(
             tick="maintenance_tick",
             attempted=True,
-            affected_rows=len(rows),
+            affected_rows=len(rows) + released_unknown,
             sql=statement.sql,
-            params=statement.params,
+            params={**statement.params, "released_unknown_usage_reservations": released_unknown},
         )
 
     def billing_status(

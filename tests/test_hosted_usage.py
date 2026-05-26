@@ -218,7 +218,7 @@ def test_usage_gate_denies_before_call_when_limit_exceeded() -> None:
             id="policy",
             workspace_id="ws_alice",
             allowed_operations={"gemini.transcribe_media"},
-            max_units_by_operation={"gemini.transcribe_media": {"media_seconds": 5_400}},
+            hard_limits_by_operation={"gemini.transcribe_media": {"media_seconds": 5_400}},
         ),
         balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"media_seconds": 20_000}),
         idempotency_key="idem",
@@ -295,7 +295,7 @@ class AtomicReservationConnection:
                 "subject": params["subject"],
                 "operation": params["operation"],
                 "allocation_id": params["allocation_id"],
-                "allocation_kind": params["allocation_kind"],
+                "credential_mode": params["credential_mode"],
                 "estimated_units_json": params["estimated_units_json"],
                 "idempotency_key": params["idempotency_key"],
                 "status": params["status"],
@@ -415,6 +415,47 @@ def test_postgres_usage_ledger_reconciles_reserved_units_once_on_success() -> No
     assert connection.balance["remaining_units_jsonb"] == {"total_tokens": 409}
     assert connection.balance["reserved_units_jsonb"] == {}
     assert next(iter(connection.reservations.values()))["status"] == "reconciled"
+
+
+def test_postgres_usage_ledger_persists_overage_as_negative_balance() -> None:
+    connection = AtomicReservationConnection()
+    connection.balance["remaining_units_jsonb"] = {"total_tokens": 100}
+    gate = PostgresUsageGate(connection)
+    ledger = PostgresUsageLedger(connection)
+    allocation = ProviderAllocation(
+        id="alloc_voyage",
+        workspace_id="ws_alice",
+        provider="voyage",
+        operation="embed_documents",
+    )
+    policy = EntitlementPolicy(id="policy", workspace_id="ws_alice", allowed_operations={"voyage.embed_documents"})
+    reservation = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"total_tokens": 100},
+        allocation=allocation,
+        policy=policy,
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units={"total_tokens": 100}),
+        idempotency_key="idem_overage",
+    )
+
+    ledger.append(
+        UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id="ws_alice",
+            subject="voyage",
+            operation="embed_documents",
+            event_type="provider_attempt_succeeded",
+            status="succeeded",
+            actual_units={"total_tokens": 150},
+            provider_request_id="req_overage",
+            metadata={"idempotency_key": "idem_overage"},
+        )
+    )
+
+    assert connection.balance["remaining_units_jsonb"] == {"total_tokens": -50}
+    assert connection.balance["reserved_units_jsonb"] == {}
 
 
 def test_gemini_usage_normalizer_preserves_raw_usage_and_core_units() -> None:

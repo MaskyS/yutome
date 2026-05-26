@@ -12,6 +12,8 @@
  *   YUTOME_INSTALL_ID   — optional desktop/install routing id
  *   YUTOME_HOSTED_API_URL — Railway/Python hosted MCP query API base URL
  *   YUTOME_ACCOUNT_SESSION_AUDIENCE — optional account-session audience, defaults to yutome:hosted-oauth
+ *   YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS — optional signed session max age, defaults to 1 hour
+ *   YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS — optional signed session clock skew, defaults to 60 seconds
  *   YUTOME_MCP_AUDIENCE — optional OAuth audience/resource for hosted MCP tokens
  *   YUTOME_TOKEN_VERSION — optional token contract version, defaults to v1
  *   YUTOME_TOKEN_TTL_SECONDS — optional token prop expiry hint, defaults to 30 days
@@ -39,6 +41,8 @@ export interface Env {
   YUTOME_INSTALL_ID?: string;
   YUTOME_HOSTED_API_URL?: string;
   YUTOME_ACCOUNT_SESSION_AUDIENCE?: string;
+  YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS?: string;
+  YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS?: string;
   YUTOME_MCP_AUDIENCE?: string;
   YUTOME_TOKEN_VERSION?: string;
   YUTOME_TOKEN_TTL_SECONDS?: string;

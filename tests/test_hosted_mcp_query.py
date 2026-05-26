@@ -367,7 +367,7 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
                 id="policy",
                 workspace_id="ws_alice",
                 allowed_operations={"voyage.embed_query"},
-                max_units_by_operation={"voyage.embed_query": {"total_tokens": 1}},
+                hard_limits_by_operation={"voyage.embed_query": {"total_tokens": 1}},
             ),
         ),
         query_embedder=embedder,
@@ -431,7 +431,7 @@ def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding
         return HostedMcpUsageContext(
             allocation=default_search_store_allocation(workspace_id=auth.workspace_id, operation=operation),
             policy=policy.model_copy(
-                update={"soft_units_by_operation": {"search_store.hybrid_query": {"candidate_limit": 1}}}
+                update={"soft_limits_by_operation": {"search_store.hybrid_query": {"candidate_limit": 1}}}
             )
             if operation == "hybrid_query"
             else policy,
@@ -517,7 +517,7 @@ def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
                 id="policy_voyage",
                 workspace_id="ws_alice",
                 allowed_operations={"voyage.embed_query"},
-                soft_units_by_operation={"voyage.embed_query": {"total_tokens": 1}},
+                soft_limits_by_operation={"voyage.embed_query": {"total_tokens": 1}},
             ),
             balance=WorkspaceBalance(workspace_id="ws_alice", unlimited_units={"total_tokens", "vectors"}),
         ),
@@ -808,6 +808,34 @@ def test_semantic_vector_store_availability_failure_does_not_fall_back_to_lexica
     assert failed.metadata["message"] == "vector extension unavailable"
 
 
+def test_search_store_failure_redacts_exception_text_before_ledger() -> None:
+    class DsnFailingStore(RecordingSearchStore):
+        def lexical_search(
+            self,
+            *,
+            workspace_id: str,
+            query: str,
+            limit: int,
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            raise RuntimeError("postgresql://dbuser:dbpass@db.internal/yutome api_key=secret-value")
+
+    ledger = RecordingLedger()
+    adapter = _allowing_adapter(search_store=DsnFailingStore(), ledger=ledger)
+
+    with pytest.raises(RuntimeError):
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn", "mode": "lexical", "limit": 5},
+        )
+
+    failed = ledger.events[-1]
+    assert failed.status == "failed"
+    assert "dbpass" not in failed.metadata["message"]
+    assert "secret-value" not in failed.metadata["message"]
+    assert "postgresql://***:***@db.internal/yutome" in failed.metadata["message"]
+
+
 def test_vector_store_tenant_error_does_not_fall_back_to_lexical() -> None:
     class TenantDeniedStore(RecordingSearchStore):
         def semantic_search(
@@ -984,6 +1012,16 @@ def test_workspace_arg_injection_is_rejected_before_search() -> None:
 
     assert exc_info.value.code == "workspace_argument_not_allowed"
     assert store.calls == []
+
+    with pytest.raises(HostedMcpError) as nested_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_real"),
+            name="find",
+            arguments={"text": "Crohn", "filter": {"connector_grant_id": "grant_evil", "client_id": "client_evil"}},
+        )
+
+    assert nested_exc.value.code == "workspace_argument_not_allowed"
+    assert nested_exc.value.to_dict()["error"]["data"]["arguments"] == ["filter.client_id", "filter.connector_grant_id"]
 
 
 def test_unsupported_tool_and_resource_return_clear_errors() -> None:
@@ -1297,11 +1335,18 @@ def test_q_rejects_unsupported_shapes_and_nested_workspace_injection() -> None:
             name="q",
             arguments={"request": {"entity": "video", "workspace_id": "ws_evil"}},
         )
+    with pytest.raises(HostedMcpError) as mixed_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="q",
+            arguments={"request": {"entity": "video"}, "limit": 3},
+        )
 
     assert unsupported_exc.value.code == "unsupported_q_shape"
     assert unsupported_exc.value.status_code == 501
     assert workspace_exc.value.code == "workspace_argument_not_allowed"
     assert workspace_exc.value.to_dict()["error"]["data"]["arguments"] == ["request.workspace_id"]
+    assert mixed_exc.value.code == "invalid_arguments"
 
 
 def _usage_context_provider(

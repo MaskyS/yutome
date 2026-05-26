@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +19,7 @@ from yutome.hosted.repositories import SqlStatement
 STARTER_PRICE_BOOK_ID = "price_book_starter_v1"
 STARTER_PRICE_BOOK_VERSION = "starter-v1"
 STARTER_PLAN_KEY = "starter"
+DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth"
 
 STARTER_ALLOWED_OPERATIONS: tuple[str, ...] = (
     "youtube.metadata_fetch",
@@ -168,6 +172,40 @@ def session_token_hash(session_token: str) -> str:
     return "sha256:" + hashlib.sha256(session_token.encode("utf-8")).hexdigest()
 
 
+def sign_account_session_token(
+    *,
+    user_id: str,
+    workspace_id: str,
+    secret: str,
+    expires_at: datetime,
+    issued_at: datetime | None = None,
+    replay_id: str | None = None,
+    audience: str = DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    workspace_ids: Sequence[str] | None = None,
+    session_id: str | None = None,
+) -> str:
+    if not secret.strip():
+        raise ValueError("account session signing secret is required.")
+    issued_at = issued_at or datetime.now(expires_at.tzinfo)
+    replay_id = replay_id or secrets.token_urlsafe(24)
+    workspace_ids = tuple(dict.fromkeys([workspace_id, *(workspace_ids or ())]))
+    payload: dict[str, Any] = {
+        "aud": audience,
+        "exp": int(expires_at.timestamp()),
+        "iat": int(issued_at.timestamp()),
+        "jti": replay_id,
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "workspace_ids": list(workspace_ids),
+    }
+    if session_id:
+        payload["session_id"] = session_id
+    encoded_payload = _base64url(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    signed = f"v1.{encoded_payload}"
+    signature = hmac.new(secret.encode("utf-8"), signed.encode("utf-8"), hashlib.sha256).digest()
+    return f"{signed}.{_base64url(signature)}"
+
+
 def bootstrap_hosted_account(
     connection: AccountSqlConnection,
     account: AccountBootstrapInput,
@@ -183,8 +221,9 @@ def bootstrap_hosted_account(
     rows: dict[str, Mapping[str, Any]] = {}
     for key, statement in statements:
         result = connection.execute(statement.sql, statement.params)
-        if result:
-            rows[key] = result[0]
+        result_rows = _rows_from_result(result)
+        if result_rows:
+            rows[key] = result_rows[0]
 
     normalized_email = account.normalized_email
     user_id = str(rows.get("user", {}).get("id") or account.user_id)
@@ -514,7 +553,7 @@ INSERT INTO provider_allocations (
     workspace_id,
     provider,
     operation,
-    mode,
+    credential_mode,
     status,
     model_or_plan,
     external_allocation_id,
@@ -566,7 +605,7 @@ INSERT INTO service_allocations (
     workspace_id,
     service,
     operation,
-    mode,
+    credential_mode,
     status,
     backend,
     index_profile_ref,
@@ -703,6 +742,27 @@ def _json_param(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [dict(row) for row in result]
+    if isinstance(result, tuple):
+        return [dict(row) for row in result]
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        return [dict(row) for row in result.fetchall()]
+    try:
+        return [dict(row) for row in result]
+    except TypeError:
+        return []
+
+
 def _default_workspace_name(normalized_email: str) -> str:
     local_part = normalized_email.partition("@")[0]
     return f"{local_part}'s workspace"
@@ -713,6 +773,7 @@ __all__ = [
     "AccountBootstrapResult",
     "AccountPrincipal",
     "AccountSession",
+    "DEFAULT_ACCOUNT_SESSION_AUDIENCE",
     "STARTER_ALLOWED_OPERATIONS",
     "STARTER_HARD_LIMITS",
     "STARTER_INCLUDED_UNITS",
@@ -728,6 +789,7 @@ __all__ = [
     "deterministic_user_id",
     "normalize_email",
     "session_token_hash",
+    "sign_account_session_token",
     "sql_params_contain_provider_credentials",
     "starter_entitlement_policy_id",
     "starter_provider_allocation_id",

@@ -184,7 +184,7 @@ class FakeHostedRunner:
                     "operation": "transcribe_media",
                     "operation_key": "gemini.transcribe_media",
                     "allocation_id": "alloc_gemini",
-                    "allocation_kind": "hosted",
+                    "credential_mode": "hosted",
                     "reservation_status": "denied",
                     "entitlement_decision": {
                         "allowed": False,
@@ -442,7 +442,7 @@ def test_runner_tick_methods_return_affected_rows() -> None:
     assert source_result.affected_rows == 2
     assert maintenance_result.tick == "maintenance_tick"
     assert maintenance_result.affected_rows == 2
-    assert len(connection.calls) == 2
+    assert len(connection.calls) == 3
 
 
 def test_worker_once_claims_and_executes_index_video_jobs(monkeypatch) -> None:
@@ -469,9 +469,10 @@ def test_worker_once_claims_and_executes_index_video_jobs(monkeypatch) -> None:
         def __init__(self, **kwargs: Any) -> None:
             executions.append({"init": kwargs})
 
-        def execute(self, job: Job, *, lease_owner: str):
+        def execute(self, job: Job, *, lease_owner: str, lease_seconds: int = 900):
             assert job.id == "job_1"
             assert lease_owner == "worker-1"
+            assert lease_seconds == 900
 
             class Result:
                 def __init__(self) -> None:
@@ -526,9 +527,10 @@ def test_worker_once_dispatches_discover_source_jobs(monkeypatch) -> None:
         def __init__(self, **kwargs: Any) -> None:
             discoveries.append({"init": kwargs})
 
-        def execute(self, job: Job, *, lease_owner: str):
+        def execute(self, job: Job, *, lease_owner: str, lease_seconds: int = 900):
             assert job.job_type == "discover_source"
             assert lease_owner == "worker-1"
+            assert lease_seconds == 900
 
             class Result:
                 def __init__(self) -> None:
@@ -599,7 +601,7 @@ def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None
                 "operation": "embed_documents",
                 "operation_key": "voyage.embed_documents",
                 "allocation_id": "alloc_voyage",
-                "allocation_kind": "hosted",
+                "credential_mode": "hosted",
                 "reservation_status": "reserved",
                 "decision_json": json.dumps({"allowed": True, "reason": "allowed"}),
                 "estimated_units_json": json.dumps({"total_tokens": 100}),

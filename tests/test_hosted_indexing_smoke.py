@@ -10,7 +10,8 @@ import pytest
 from yutome.config import AppConfig
 from yutome.hosted.control_plane import Job, Source
 from yutome.hosted.gate import UsageGate
-from yutome.hosted.models import EntitlementPolicy, UsageEvent, UsageNormalization, WorkspaceBalance
+from yutome.hosted.mcp_query import HostedMcpUsageContext
+from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, UsageNormalization, WorkspaceBalance
 from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
@@ -67,6 +68,10 @@ class HostedExecutorConnection:
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.calls.append((statement, dict(params or {})))
+        if "UPDATE jobs" in statement and "lease_expires_at = %(lease_expires_at)s" in statement:
+            return [{"id": (params or {}).get("job_id"), "lease_owner": (params or {}).get("lease_owner")}]
+        if "SELECT id" in statement and "FROM jobs" in statement and "FOR UPDATE" in statement:
+            return [{"id": (params or {}).get("job_id")}]
         if "FROM sources" in statement:
             return [
                 {
@@ -90,7 +95,7 @@ class HostedExecutorConnection:
                     "workspace_id": "ws_alice",
                     "provider": "gemini",
                     "operation": "cleanup_transcript",
-                    "mode": "hosted",
+                    "credential_mode": "hosted",
                     "status": "active",
                     "model_or_plan": "gemini-3.1-flash-lite",
                     "metadata_json": {},
@@ -100,7 +105,7 @@ class HostedExecutorConnection:
                     "workspace_id": "ws_alice",
                     "provider": "voyage",
                     "operation": "embed_documents",
-                    "mode": "hosted",
+                    "credential_mode": "hosted",
                     "status": "active",
                     "model_or_plan": "voyage-4-lite",
                     "metadata_json": {},
@@ -113,7 +118,7 @@ class HostedExecutorConnection:
                     "workspace_id": "ws_alice",
                     "service": "search_store",
                     "operation": "index_write",
-                    "mode": "service_internal",
+                    "credential_mode": "service_internal",
                     "status": "active",
                     "backend": "postgres_vectorchord",
                     "index_profile_ref": "sip_voyage4lite_bm25_default",
@@ -126,8 +131,8 @@ class HostedExecutorConnection:
                     "id": self.policy.id,
                     "workspace_id": self.policy.workspace_id,
                     "allowed_operations": list(self.policy.allowed_operations),
-                    "hard_limits_jsonb": self.policy.max_units_by_operation,
-                    "soft_limits_jsonb": self.policy.soft_units_by_operation,
+                    "hard_limits_jsonb": self.policy.hard_limits_by_operation,
+                    "soft_limits_jsonb": self.policy.soft_limits_by_operation,
                 }
             ]
         if "FROM workspace_balances" in statement:
@@ -155,6 +160,10 @@ class HostedExecutorConnection:
                     "unlimited_units": list(self.balance.unlimited_units),
                 }
             ]
+        if "UPDATE job_operations" in statement:
+            return [{"id": (params or {}).get("operation_id"), "status": (params or {}).get("status", "succeeded")}]
+        if "FROM usage_events" in statement and "provider_attempt_succeeded" in statement:
+            return []
         return []
 
     def transaction(self):
@@ -191,8 +200,8 @@ def _executor_policy(
         id="policy_ws_alice",
         workspace_id="ws_alice",
         allowed_operations={"gemini.cleanup_transcript", "voyage.embed_documents", "search_store.index_write"},
-        max_units_by_operation=limits or {},
-        soft_units_by_operation=soft_limits or {},
+        hard_limits_by_operation=limits or {},
+        soft_limits_by_operation=soft_limits or {},
     )
 
 
@@ -551,12 +560,13 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
 
 def test_real_hosted_executor_orders_provider_calls_before_transactional_writes() -> None:
     provider_calls: list[str] = []
+    ledger = RecordingLedger()
     connection = HostedExecutorConnection(policy=_executor_policy())
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
         gate=UsageGate(),
-        ledger=RecordingLedger(),
+        ledger=ledger,
         metadata_fetcher=_metadata_fetcher,
         transcript_fetcher=_transcript_fetcher,
         gemini_cleaner=_fake_gemini_cleaner(provider_calls),
@@ -599,6 +609,9 @@ def test_real_hosted_executor_orders_provider_calls_before_transactional_writes(
     assert "INSERT INTO chunks" in "\n".join(transaction_sql)
     assert "INSERT INTO chunk_embeddings" in "\n".join(transaction_sql)
     assert any(params.get("status") == "succeeded" for _sql, params in connection.calls)
+    index_events = [event for event in ledger.events if event.operation_key == "search_store.index_write"]
+    assert index_events[-1].status == "succeeded"
+    assert index_events[-1].event_type == "service_operation_succeeded"
 
 
 def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() -> None:
@@ -742,6 +755,82 @@ def test_real_hosted_executor_reuses_persisted_provider_outputs() -> None:
     assert result.chunks_written == 1
 
 
+def test_real_hosted_executor_refuses_provider_replay_after_success_event_without_output() -> None:
+    provider_calls: list[str] = []
+
+    class ProviderSucceededConnection(HostedExecutorConnection):
+        def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            if "FROM usage_events" in statement and "provider_attempt_succeeded" in statement:
+                self.calls.append((statement, dict(params or {})))
+                return [{"id": "evt_provider_success"}]
+            return super().execute(statement, params)
+
+    connection = ProviderSucceededConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_output_missing"
+    assert provider_calls == []
+
+
+def test_hosted_metadata_fetch_reserves_youtube_operation_without_webshare(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = RecordingGate()
+    ledger = RecordingLedger()
+
+    class AllowYouTubeUsage:
+        def for_subject(self, *, auth, subject, operation, estimated_units):  # noqa: ANN001, ANN202
+            return HostedMcpUsageContext(
+                allocation=ProviderAllocation(
+                    id=f"alloc_{subject}_{operation}",
+                    workspace_id=auth.workspace_id,
+                    provider=subject,
+                    operation=operation,
+                ),
+                policy=EntitlementPolicy(id="policy", workspace_id=auth.workspace_id, allowed_operations={f"{subject}.{operation}"}),
+                balance=WorkspaceBalance(workspace_id=auth.workspace_id, remaining_units={"request_count": 10}),
+            )
+
+    def fake_discover_video(**kwargs):  # noqa: ANN003, ANN202
+        assert kwargs["hosted_context"] is None
+        return DiscoveredVideo(
+            video_id="OEDoJyhQhXs",
+            title="Metered metadata",
+            url="https://www.youtube.com/watch?v=OEDoJyhQhXs",
+            channel_id="UCleo",
+            channel_title="Leo",
+            channel_handle="@leoandlongevity",
+            duration_seconds=60,
+            playlist_tab="video",
+            raw={},
+        )
+
+    monkeypatch.setattr("yutome.hosted.indexing.discover_video", fake_discover_video)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=AppConfig(),
+        gate=gate,
+        ledger=ledger,
+        usage_context_provider=AllowYouTubeUsage(),
+    )
+
+    video = executor._fetch_video_metadata("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert video.youtube_video_id == "OEDoJyhQhXs"
+    assert [(call["subject"], call["operation"]) for call in gate.calls] == [("youtube", "metadata_fetch")]
+    assert [event.status for event in ledger.events] == ["started", "succeeded"]
+
+
 def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     class DiscoveryConnection:
         def __init__(self) -> None:
@@ -750,6 +839,8 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
         def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             params = dict(params or {})
             self.calls.append((statement, params))
+            if "UPDATE jobs" in statement and "lease_expires_at = %(lease_expires_at)s" in statement:
+                return [{"id": params.get("job_id"), "lease_owner": params.get("lease_owner")}]
             if "FROM sources" in statement:
                 return [
                     {

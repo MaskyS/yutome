@@ -56,7 +56,7 @@ class WebshareSubuserAllocation(BaseModel):
             workspace_id=self.workspace_id,
             provider="webshare",
             operation=operation,
-            mode="hosted",
+            credential_mode="hosted",
             status=self.status,
             external_allocation_id=self.subuser_id,
             metadata={
@@ -233,7 +233,7 @@ def default_search_store_allocation(
         workspace_id=workspace_id,
         service="search_store",
         operation=operation,
-        mode="service_internal",
+        credential_mode="service_internal",
         status="active",
         backend=backend,
         index_profile_ref=index_profile_ref,

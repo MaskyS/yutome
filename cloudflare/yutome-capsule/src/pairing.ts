@@ -123,6 +123,7 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
     try {
       accountSession = await resolveHostedAccountSessionFromRequest(request, env, {
         selectedWorkspaceId: String(form.get("workspace_id") || "").trim(),
+        consumeReplay: true,
       });
     } catch (err) {
       if (err instanceof HostedAccountGrantError) {

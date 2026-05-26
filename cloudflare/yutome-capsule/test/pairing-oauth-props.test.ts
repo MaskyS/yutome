@@ -143,6 +143,9 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     session_id: "acct_session_alice",
     expires_at: authorization.props.expires_at,
   });
+  const grantWrite = kv.puts.find((put) => put.key === accountGrantKey(grantId));
+  assert.equal(typeof (grantWrite?.options as { expirationTtl?: unknown } | undefined)?.expirationTtl, "number");
+  assert.equal(((grantWrite?.options as { expirationTtl: number }).expirationTtl > 0), true);
 
   await revokeHostedAccountGrant(env, grantId, new Date("2026-05-26T12:00:00.000Z"));
   let revokedError: unknown;
@@ -579,6 +582,7 @@ test("hosted account session resolver keeps header fallback for dev and tests", 
       },
     }),
     { YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret" },
+    { allowHeaderFallback: true },
   );
 
   assert.deepEqual(session, {
@@ -587,6 +591,32 @@ test("hosted account session resolver keeps header fallback for dev and tests", 
     workspace_ids: ["ws_header"],
     session_id: "acct_session_1",
   });
+});
+
+test("hosted account session resolver ignores header fallback unless explicitly enabled", async () => {
+  const headerToken = await signedAccountSession({
+    user_id: "user_header",
+    workspace_id: "ws_header",
+    workspace_ids: ["ws_header"],
+  });
+
+  let caught: unknown;
+  try {
+    await resolveHostedAccountSessionFromRequest(
+      new Request("https://mcp.yutome.com/authorize", {
+        headers: {
+          [ACCOUNT_SESSION_HEADER]: headerToken,
+        },
+      }),
+      { YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret" },
+    );
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.equal(caught instanceof HostedAccountGrantError, true);
+  assert.equal((caught as HostedAccountGrantError).code, "hosted_account_session_missing");
+  assert.equal((caught as HostedAccountGrantError).status, 401);
 });
 
 test("hosted account session resolver prefers cookie over header when both are present", async () => {
@@ -612,6 +642,141 @@ test("hosted account session resolver prefers cookie over header when both are p
 
   assert.equal(session.user_id, "user_cookie");
   assert.equal(session.workspace_id, "ws_cookie");
+});
+
+test("hosted account session resolver enforces issued-at freshness", async () => {
+  const now = new Date("2026-05-26T12:00:00.000Z");
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const cases: Array<{ name: string; payload: Record<string, unknown>; expected: RegExp }> = [
+    {
+      name: "missing iat",
+      payload: { iat: undefined, exp: nowSeconds + 300 },
+      expected: /issued-at time is required/,
+    },
+    {
+      name: "future iat",
+      payload: { iat: nowSeconds + 120, exp: nowSeconds + 300 },
+      expected: /issued in the future/,
+    },
+    {
+      name: "too old",
+      payload: { iat: nowSeconds - 120, exp: nowSeconds + 300 },
+      expected: /older than the allowed max age/,
+    },
+  ];
+
+  for (const entry of cases) {
+    let caught: unknown;
+    try {
+      await resolveHostedAccountSessionFromRequest(
+        new Request("https://mcp.yutome.com/authorize", {
+          headers: {
+            cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(await signedAccountSession(entry.payload))}`,
+          },
+        }),
+        {
+          YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
+          YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS: "30",
+          YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS: "10",
+        },
+        { now },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    assert.equal(caught instanceof HostedAccountGrantError, true, entry.name);
+    assert.match((caught as Error).message, entry.expected, entry.name);
+  }
+});
+
+test("hosted account session replay id is consumed for approval posts", async () => {
+  const kv = new MemoryKv();
+  const now = new Date("2026-05-26T12:00:00.000Z");
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const token = await signedAccountSession({
+    iat: nowSeconds,
+    exp: nowSeconds + 300,
+    jti: "acct_session_replay_1",
+  });
+  const request = new Request("https://mcp.yutome.com/pair", {
+    method: "POST",
+    headers: {
+      cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    },
+  });
+  const env = {
+    OAUTH_KV: kv as unknown as KVNamespace,
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
+  };
+
+  const session = await resolveHostedAccountSessionFromRequest(request, env, {
+    consumeReplay: true,
+    now,
+  });
+  assert.equal(session.workspace_id, "ws_alice");
+  const replayWrite = kv.puts.find((put) => put.key.endsWith(":acct_session_replay_1"));
+  assert.equal(typeof (replayWrite?.options as { expirationTtl?: unknown } | undefined)?.expirationTtl, "number");
+
+  let caught: unknown;
+  try {
+    await resolveHostedAccountSessionFromRequest(request, env, {
+      consumeReplay: true,
+      now,
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.equal(caught instanceof HostedAccountGrantError, true);
+  assert.match((caught as Error).message, /already been used/);
+});
+
+test("hosted account session replay accepts nonce fallback and rejects missing replay id", async () => {
+  const kv = new MemoryKv();
+  const now = new Date("2026-05-26T12:00:00.000Z");
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const env = {
+    OAUTH_KV: kv as unknown as KVNamespace,
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
+  };
+  const nonceToken = await signedAccountSession({
+    iat: nowSeconds,
+    exp: nowSeconds + 300,
+    jti: undefined,
+    nonce: "acct_session_nonce_1",
+  });
+
+  await resolveHostedAccountSessionFromRequest(
+    new Request("https://mcp.yutome.com/pair", {
+      headers: { cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(nonceToken)}` },
+    }),
+    env,
+    { consumeReplay: true, now },
+  );
+  assert.equal(kv.puts.some((put) => put.key.endsWith(":acct_session_nonce_1")), true);
+
+  let caught: unknown;
+  try {
+    await resolveHostedAccountSessionFromRequest(
+      new Request("https://mcp.yutome.com/pair", {
+        headers: {
+          cookie: `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(
+            await signedAccountSession({
+              iat: nowSeconds,
+              exp: nowSeconds + 300,
+              jti: undefined,
+              nonce: undefined,
+            }),
+          )}`,
+        },
+      }),
+      env,
+      { consumeReplay: true, now },
+    );
+  } catch (err) {
+    caught = err;
+  }
+  assert.equal(caught instanceof HostedAccountGrantError, true);
+  assert.match((caught as Error).message, /replay id is required/);
 });
 
 test("hosted OAuth pairing rejects workspace selection outside account session", async () => {
@@ -918,9 +1083,12 @@ async function signedAccountSession(
   payload: Record<string, unknown> = {},
   secret = "account-session-secret",
 ): Promise<string> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
   const tokenPayload = {
     aud: "yutome:hosted-oauth",
-    exp: Math.floor(Date.now() / 1000) + 3600,
+    iat: nowSeconds,
+    exp: nowSeconds + 3600,
+    jti: "acct_session_jti_1",
     user_id: "user_alice",
     workspace_id: "ws_alice",
     workspace_ids: ["ws_alice"],
@@ -947,13 +1115,15 @@ function base64UrlEncode(value: Uint8Array): string {
 
 class MemoryKv {
   private readonly values = new Map<string, string>();
+  readonly puts: Array<{ key: string; value: string; options?: unknown }> = [];
 
   async get(key: string): Promise<string | null> {
     return this.values.get(key) ?? null;
   }
 
-  async put(key: string, value: string): Promise<void> {
+  async put(key: string, value: string, options?: unknown): Promise<void> {
     this.values.set(key, value);
+    this.puts.push({ key, value, options });
   }
 
   async delete(key: string): Promise<void> {

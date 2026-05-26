@@ -241,7 +241,7 @@ def test_hosted_voyage_denial_prevents_client_construction(monkeypatch: pytest.M
             id="policy",
             workspace_id="ws_alice",
             allowed_operations={"voyage.embed_documents"},
-            max_units_by_operation={"voyage.embed_documents": {"total_tokens": 500}},
+            hard_limits_by_operation={"voyage.embed_documents": {"total_tokens": 500}},
         ),
     )
 

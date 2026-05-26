@@ -6,8 +6,11 @@ import {
   HostedMcpApiClient,
   HostedMcpApiError,
   HostedMcpAuthError,
+  MAX_DURABLE_OBJECT_NAME_LENGTH,
+  MAX_TENANT_ID_LENGTH,
   deriveBridgeRelayObjectName,
   deriveConnectorMcpObjectName,
+  normalizeTenantId,
   resolveBridgeRelayIdentityFromHeaders,
   resolveHostedMcpAuthContext,
   resolveMcpBridgeIdentity,
@@ -33,6 +36,40 @@ test("hosted Durable Object routing never derives the default object name", () =
   assert.match(mcpName, /^yutome:v1:mcp-session:workspace:/);
   assert.match(mcpName, /:grant:/);
   assert.notEqual(mcpName, "default");
+});
+
+test("hosted Durable Object names stay bounded for maximum tenant ids", () => {
+  const maxWorkspaceId = `w${"a".repeat(MAX_TENANT_ID_LENGTH - 1)}`;
+  const maxInstallId = `i${"b".repeat(MAX_TENANT_ID_LENGTH - 1)}`;
+  const maxGrantId = `g${"c".repeat(MAX_TENANT_ID_LENGTH - 1)}`;
+
+  const relayName = deriveBridgeRelayObjectName({
+    workspace_id: maxWorkspaceId,
+    install_id: maxInstallId,
+  });
+  const mcpName = deriveConnectorMcpObjectName({
+    workspace_id: maxWorkspaceId,
+    connector_grant_id: maxGrantId,
+  });
+
+  assert.equal(relayName.length <= MAX_DURABLE_OBJECT_NAME_LENGTH, true);
+  assert.equal(mcpName.length <= MAX_DURABLE_OBJECT_NAME_LENGTH, true);
+  assert.notEqual(relayName, mcpName);
+});
+
+test("hosted tenant ids reject empty unsafe and overlong values", () => {
+  const overlong = `w${"a".repeat(MAX_TENANT_ID_LENGTH)}`;
+  for (const field of ["workspace_id", "install_id", "connector_grant_id"] as const) {
+    for (const value of ["", "   ", "has/slash", overlong]) {
+      assert.throws(
+        () => normalizeTenantId(value, field),
+        (err) =>
+          err instanceof TenantRoutingError &&
+          (err.code === "tenant_id_missing" || err.code === "tenant_id_invalid") &&
+          err.message.includes(field),
+      );
+    }
+  }
 });
 
 test("hosted source paths do not call idFromName with the default tenant", async () => {
@@ -134,10 +171,38 @@ test("tenant identity fields in tool arguments are rejected anywhere in the payl
   assert.match(result.message ?? "", /hosted tenant identity fields/);
 });
 
+test("ordinary hosted query fields pass tenant argument validation", () => {
+  const result = validateTenantIdsNotInToolArguments({
+    video_id: "OEDoJyhQhXs",
+    channel: "leoandlongevity",
+    source: "youtube",
+    language: "en",
+    limit: 10,
+    offset: 0,
+    request: {
+      query: "longevity",
+      filters: { tags: ["nutrition"] },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.violations, []);
+});
+
+test("tenant argument scanner fails closed when traversal limits are exceeded", () => {
+  const byDepth = validateTenantIdsNotInToolArguments({ a: { b: { c: true } } }, { maxDepth: 1 });
+  assert.equal(byDepth.ok, false);
+  assert.deepEqual(byDepth.violations, [{ path: "$.a.b", key: "<scan_limit>", reason: "scan_limit" }]);
+
+  const byNodes = validateTenantIdsNotInToolArguments([{ ok: true }, { ok: true }], { maxNodes: 1 });
+  assert.equal(byNodes.ok, false);
+  assert.equal(byNodes.violations[0].reason, "scan_limit");
+});
+
 test("offline metadata identifies attempted route, workspace, and Durable Object name", () => {
   const metadata = buildOfflineResponseMetadata(
     { workspace_id: "ws_alice", install_id: "inst_mac" },
-    { attempted_served_from: "bridge", reason: "bridge_offline" },
+    { attempted_served_from: "bridge", reason: "bridge_offline", last_seen_at: "2026-05-26T12:00:00.000Z" },
   );
 
   assert.equal(metadata.ok, false);
@@ -146,7 +211,28 @@ test("offline metadata identifies attempted route, workspace, and Durable Object
   assert.equal(metadata.attempted_served_from, "bridge");
   assert.equal(metadata.workspace_id, "ws_alice");
   assert.equal(metadata.install_id, "inst_mac");
+  assert.equal(metadata.desktop_offline, true);
+  assert.equal(metadata.hosted_replica_available, false);
+  assert.equal(metadata.last_seen_at, "2026-05-26T12:00:00.000Z");
   assert.match(metadata.durable_object_name, /^yutome:v1:relay:workspace:/);
+  assert.notEqual(metadata.durable_object_name, "default");
+});
+
+test("offline metadata can describe an unavailable search replica", () => {
+  const metadata = buildOfflineResponseMetadata(
+    { workspace_id: "ws_alice", connector_grant_id: "grant_claude" },
+    { attempted_served_from: "replica", hosted_replica_available: false },
+  );
+
+  assert.equal(metadata.ok, false);
+  assert.equal(metadata.status, "offline");
+  assert.equal(metadata.served_from, null);
+  assert.equal(metadata.attempted_served_from, "replica");
+  assert.equal(metadata.desktop_offline, false);
+  assert.equal(metadata.hosted_replica_available, false);
+  assert.equal(metadata.workspace_id, "ws_alice");
+  assert.equal(metadata.connector_grant_id, "grant_claude");
+  assert.match(metadata.durable_object_name, /^yutome:v1:mcp-session:workspace:/);
   assert.notEqual(metadata.durable_object_name, "default");
 });
 

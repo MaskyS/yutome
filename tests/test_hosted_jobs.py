@@ -6,6 +6,7 @@ import pytest
 
 from yutome.hosted.control_plane import Job
 from yutome.hosted.jobs import (
+    active_job_lease_sql,
     claim_jobs_sql,
     job_repository_constraint_statements,
     release_job_lease,
@@ -65,6 +66,7 @@ def test_renew_release_and_retry_sql_are_owner_guarded() -> None:
     retry = retry_job_sql(
         job_id="job_1",
         lease_owner="worker-1",
+        now=NOW,
         retry_after=retry_at,
         error_code="provider_rate_limited",
         error_message="try later",
@@ -76,9 +78,14 @@ def test_renew_release_and_retry_sql_are_owner_guarded() -> None:
     assert "lease_owner = NULL" in release.sql
     assert "leased_at = NULL" in release.sql
     assert "status = %(status)s" in retry.sql
+    assert "lease_expires_at > %(now)s" in retry.sql
     assert "status <> ALL(%(terminal_statuses)s)" in retry.sql
     assert retry.params["status"] == "retry_wait"
     assert retry.params["retry_after"] == retry_at
+
+    active = active_job_lease_sql(job_id="job_1", lease_owner="worker-1", now=NOW)
+    assert "FOR UPDATE" in active.sql
+    assert "lease_expires_at > %(now)s" in active.sql
 
 
 def test_job_lease_model_helpers_respect_owner_and_terminal_boundaries() -> None:

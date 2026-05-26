@@ -24,7 +24,11 @@ class SqlConnection(Protocol):
 
 @dataclass
 class PostgresUsageContextProvider:
-    """Load hosted UsageGate inputs from Postgres and deny closed on missing state."""
+    """Load hosted UsageGate inputs from Postgres, failing closed when state is missing.
+
+    A missing policy, balance, or allocation resolves to a deny rather than a permissive
+    default, so an unconfigured or partially provisioned workspace cannot spend.
+    """
 
     connection: SqlConnection
     search_store_backend: str = "postgres_vectorchord"
@@ -107,8 +111,8 @@ class PostgresUsageContextProvider:
             id=str(row["id"]),
             workspace_id=str(row["workspace_id"]),
             allowed_operations=set(_text_array(row.get("allowed_operations"))),
-            max_units_by_operation=_json_mapping(row.get("hard_limits_jsonb")),
-            soft_units_by_operation=_json_mapping(row.get("soft_limits_jsonb")),
+            hard_limits_by_operation=_json_mapping(row.get("hard_limits_jsonb")),
+            soft_limits_by_operation=_json_mapping(row.get("soft_limits_jsonb")),
         )
 
     def _active_balance(self, *, workspace_id: str, entitlement_policy_id: str | None) -> WorkspaceBalance | None:
@@ -135,7 +139,7 @@ SELECT
     workspace_id,
     provider,
     operation,
-    mode,
+    credential_mode,
     status,
     model_or_plan,
     external_allocation_id,
@@ -154,7 +158,7 @@ SELECT
     workspace_id,
     service,
     operation,
-    mode,
+    credential_mode,
     status,
     backend,
     index_profile_ref,
@@ -207,7 +211,7 @@ def _provider_allocation_from_row(row: Mapping[str, Any]) -> ProviderAllocation:
         workspace_id=str(row["workspace_id"]),
         provider=str(row["provider"]),  # type: ignore[arg-type]
         operation=str(row["operation"]),
-        mode=str(row.get("mode") or "hosted"),  # type: ignore[arg-type]
+        mode=str(row.get("credential_mode") or "hosted"),  # type: ignore[arg-type]
         status=str(row.get("status") or "active"),  # type: ignore[arg-type]
         model_or_plan=_optional_str(row.get("model_or_plan")),
         external_allocation_id=_optional_str(row.get("external_allocation_id")),
@@ -221,7 +225,7 @@ def _service_allocation_from_row(row: Mapping[str, Any]) -> ServiceAllocation:
         workspace_id=str(row["workspace_id"]),
         service=str(row["service"]),  # type: ignore[arg-type]
         operation=str(row["operation"]),
-        mode=str(row.get("mode") or "service_internal"),  # type: ignore[arg-type]
+        mode=str(row.get("credential_mode") or "service_internal"),  # type: ignore[arg-type]
         status=str(row.get("status") or "active"),  # type: ignore[arg-type]
         backend=str(row.get("backend") or "postgres_vectorchord"),
         index_profile_ref=_optional_str(row.get("index_profile_ref")),

@@ -16,7 +16,7 @@ from yutome.hosted.allocation_policy import (
     estimate_search_store_query,
     estimate_voyage_embeddings,
 )
-from yutome.hosted.errors import ProviderFailure, classify_provider_http_error
+from yutome.hosted.errors import ProviderFailure, classify_provider_http_error, redact_sensitive_failure_text
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.ids import idempotency_key, input_hash
@@ -47,6 +47,20 @@ FORBIDDEN_TOOL_ARGUMENT_KEYS = frozenset(
         "org_id",
         "owner_user_id",
         "user_id",
+        "account_id",
+        "account_session",
+        "account_session_id",
+        "auth_grant_id",
+        "connector_grant_id",
+        "grant",
+        "grant_id",
+        "client",
+        "client_id",
+        "install",
+        "install_id",
+        "installation_id",
+        "session",
+        "session_id",
     }
 )
 SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "list", "q", "show"})
@@ -152,6 +166,15 @@ class HostedMcpError(RuntimeError):
 
 
 class HostedMcpQueryAdapter:
+    """Serves hosted MCP find/list/show/q against the search store, gated by UsageGate.
+
+    Reserves usage before any paid or scarce call: the query embedding (Voyage) and the
+    search-store recall both pass through the gate first, so a denial blocks them. Tenant
+    scope comes only from the verified auth context, never from tool arguments. The default
+    usage-context providers fail closed (deny), so an adapter built without an injected
+    PostgresUsageContextProvider denies rather than serving unlimited queries.
+    """
+
     def __init__(
         self,
         *,
@@ -222,11 +245,20 @@ class HostedMcpQueryAdapter:
             candidate_limit=request.limit,
         )
         reservation = self._reserve_search_store(auth=auth, request=request, estimate=estimate)
-        rows, usage = self.search_store.lexical_search(
-            workspace_id=auth.workspace_id,
-            query=request.text,
-            limit=request.limit,
-        )
+        try:
+            rows, usage = self.search_store.lexical_search(
+                workspace_id=auth.workspace_id,
+                query=request.text,
+                limit=request.limit,
+            )
+        except Exception as exc:
+            self._record_search_store_failure(
+                auth=auth,
+                reservation=reservation,
+                metadata={"error_code": type(exc).__name__, "operation": estimate.operation_key},
+                exc=exc,
+            )
+            raise
         self._record_search_store_success(
             auth=auth,
             reservation=reservation,
@@ -394,6 +426,12 @@ class HostedMcpQueryAdapter:
         request: HostedFindRequest,
         fallback_metadata: Mapping[str, Any],
     ) -> QueryResult:
+        """Re-run a degraded hybrid query as lexical-only, tagging why it fell back.
+
+        Reached only when a hybrid find soft-denies or the vector path is unavailable;
+        semantic queries never fall back here. The fallback adds a note so the response
+        shows it was downgraded rather than silently served at lower quality.
+        """
         fallback_request = replace(
             request,
             mode="lexical",
@@ -606,7 +644,7 @@ class HostedMcpQueryAdapter:
             metadata={
                 "estimated_units": dict(reservation.estimated_units),
                 "exception_type": type(exc).__name__,
-                "message": str(exc),
+                "message": redact_sensitive_failure_text(str(exc)),
                 **dict(metadata),
             },
         )
@@ -1180,6 +1218,12 @@ class HostedQRequest:
     @classmethod
     def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedQRequest:
         _reject_workspace_argument_injection(arguments)
+        if "request" in arguments and len(arguments) > 1:
+            raise HostedMcpError(
+                code="invalid_arguments",
+                message="q accepts either top-level QueryRequest fields or a single request object, not both.",
+                status_code=400,
+            )
         raw_request = arguments.get("request", arguments)
         if not isinstance(raw_request, Mapping):
             raise HostedMcpError(
@@ -1470,7 +1514,7 @@ def _with_mcp_metadata(
         **event.metadata,
         "idempotency_key": reservation.idempotency_key,
         "allocation_id": reservation.allocation_id,
-        "allocation_kind": reservation.allocation_kind,
+        "credential_mode": reservation.credential_mode,
         "mcp_client_id": auth.client_id,
         "mcp_grant_id": auth.grant_id,
         "mcp_session_id": auth.session_id,
@@ -1497,7 +1541,7 @@ def _read_idempotency_key(
 def _search_store_reservation_metadata(allocation: Allocation | None) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "service": "search_store",
-        "credential_mode": allocation.mode if allocation else "disabled",
+        "credential_mode": allocation.credential_mode if allocation else "disabled",
     }
     if allocation is None:
         return metadata

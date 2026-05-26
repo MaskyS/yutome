@@ -504,7 +504,7 @@ def test_billing_debug_snapshot_maps_denied_decision_events_and_replay_status() 
         "operation": "transcribe_media",
         "operation_key": "gemini.transcribe_media",
         "allocation_id": "alloc_gemini_fallback",
-        "allocation_kind": "hosted",
+        "credential_mode": "hosted",
         "reservation_status": "denied",
         "decision_json": json.dumps(
             {
@@ -648,6 +648,40 @@ def test_polar_order_paid_processing_creates_customer_and_deduped_credit_entry()
         "polar_webhook_snapshots",
     ]
     assert "ON CONFLICT (workspace_id, idempotency_key) DO UPDATE" in statements[2].sql
+
+
+def test_polar_order_paid_same_unit_grants_get_distinct_idempotency_keys() -> None:
+    raw_body = json.dumps(
+        {
+            "type": "order.paid",
+            "timestamp": "2026-05-26T03:00:00Z",
+            "data": {
+                "id": "ord_same_unit",
+                "billing_reason": "purchase",
+                "customer_id": "cus_123",
+                "product_id": "prod_topup",
+                "customer": {"id": "cus_123", "external_id": "ws_alice"},
+                "metadata": {
+                    "yutome_credit_grants": [
+                        {"unit": "credits", "quantity": "10"},
+                        {"unit": "credits", "quantity": "5"},
+                    ]
+                },
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    payload = json.loads(raw_body)
+
+    first = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id="msg_same_unit")
+    second = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id="msg_same_unit")
+
+    assert [entry.signed_units for entry in first.credit_entries] == [{"credits": 10}, {"credits": 5}]
+    assert len({entry.idempotency_key for entry in first.credit_entries}) == 2
+    assert [entry.idempotency_key for entry in first.credit_entries] == [
+        entry.idempotency_key for entry in second.credit_entries
+    ]
 
 
 def test_polar_subscription_and_customer_events_upsert_billing_customer() -> None:

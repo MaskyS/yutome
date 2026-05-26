@@ -27,6 +27,29 @@ push.
 `.claude/skills/yutome-retrieval/SKILL.md` is the public skill that
 governs how agents query the yutome corpus. Edit it on `main`.
 
+## Vocabulary and writing
+
+Hosted-mode Yutome has a **canonical glossary** at `docs/hosted-glossary.md`. It is the
+single source of truth for the domain vocabulary (e.g. `credential_mode`, `subject`,
+`EntitlementPolicy` vs `WorkspaceBalance` vs `UsageGate`, connector grant, search store,
+bridge/relay/replica). Use the canonical term for every hosted concept; add new concepts
+to the glossary rather than coining a synonym.
+
+A short **writing standard** governs hosted code, docs, beads issues, code reviews, commit
+messages, and docstrings — including how agents write:
+
+1. Define a term before first use; use the canonical glossary name — one name per concept.
+2. Name things for what they do. No overselling (not "always-on" for an offline replica;
+   not "deployment verification" for a commit that only closed an issue).
+3. Prefer a precise condition over hand-waving ("deny when balance < estimated units",
+   not "block obviously unaffordable work").
+4. Expand acronyms on first use (BYO, RRF, RLS).
+5. Cut marketing prose from technical docs.
+6. Be more verbose exactly where a concept is load-bearing or non-obvious; terse elsewhere.
+
+Both are also stored as bd memories (`design-ontology-glossary`, `writing-and-ontology-standard`)
+so they surface in `bd` sessions.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker

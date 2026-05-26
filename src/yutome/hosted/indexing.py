@@ -24,6 +24,7 @@ from yutome.hosted.control_plane import (
 )
 from yutome.hosted.entitlements import PostgresUsageContextProvider
 from yutome.hosted.errors import redact_sensitive_failure_text
+from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.ids import input_hash
 from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger, stable_usage_reservation_id
@@ -37,6 +38,7 @@ from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpUsageContext
 from yutome.hosted.models import (
     EntitlementPolicy,
     ProviderAllocation,
+    UsageEvent,
     UsageNormalization,
     UsageReservation,
     UsageSubject,
@@ -137,7 +139,7 @@ class HostedIndexingExecutionResult:
     workspace_id: str
     source_id: str
     youtube_video_id: str | None
-    status: Literal["succeeded", "denied", "failed", "cancelled"]
+    status: Literal["succeeded", "denied", "failed", "retry_wait", "cancelled"]
     hosted_video_id: str | None = None
     transcript_version_id: str | None = None
     chunks_written: int = 0
@@ -162,6 +164,14 @@ class HostedSourceDiscoveryExecutionResult:
 
 class HostedIndexingError(RuntimeError):
     code = "hosted_indexing_failed"
+
+
+class HostedIndexingLostLease(HostedIndexingError):
+    code = "job_lease_lost"
+
+
+class HostedProviderOutputMissing(HostedIndexingError):
+    code = "provider_output_missing"
 
 
 class HostedIndexingDenied(HostedIndexingError):
@@ -651,17 +661,31 @@ class HostedIndexingExecutor:
         self.voyage_embedder = voyage_embedder or self._embed_with_voyage
         self.cwd = cwd or Path.cwd()
 
-    def execute(self, job: Job, *, lease_owner: str, now: Any | None = None) -> HostedIndexingExecutionResult:
+    def execute(
+        self,
+        job: Job,
+        *,
+        lease_owner: str,
+        now: Any | None = None,
+        lease_seconds: int = 900,
+    ) -> HostedIndexingExecutionResult:
         from datetime import datetime, timezone
-        from yutome.hosted.jobs import update_job_operation_status_sql, update_job_status_sql
+        from yutome.hosted.jobs import retry_job_sql, update_job_operation_status_sql, update_job_status_sql
 
-        clock = now or datetime.now(timezone.utc)
+        fixed_now = now
+
+        def current_time() -> Any:
+            return fixed_now or datetime.now(timezone.utc)
+
+        clock = current_time()
         source_id = job.source_id or ""
         video_id: str | None = None
         current_operation_id: str | None = None
         current_operation_name: str | None = None
         current_operation_reservation_id: str | None = None
+        current_operation_reservation: UsageReservation | None = None
         try:
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="preparing", now=clock))
             source = self._load_source(job)
             video_id = (
@@ -671,6 +695,7 @@ class HostedIndexingExecutor:
             )
             if not video_id:
                 raise HostedIndexingError("index_video jobs require a concrete public YouTube video id")
+            self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             video = self.metadata_fetcher(video_id, source, job)
             transcript_job = job.model_copy(
                 update={
@@ -680,6 +705,7 @@ class HostedIndexingExecutor:
                     }
                 }
             )
+            self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             transcript_result = self.transcript_fetcher(video.youtube_video_id, source, transcript_job)
             transcript = normalize_transcript(
                 video_id=video.youtube_video_id,
@@ -691,6 +717,7 @@ class HostedIndexingExecutor:
             if not transcript.segments:
                 raise HostedIndexingError("transcript had no usable text segments")
 
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="cleaning", now=clock))
             gemini_context = self._provider_context(
                 workspace_id=job.workspace_id,
@@ -707,22 +734,24 @@ class HostedIndexingExecutor:
             if cached_transcript:
                 transcript = _transcript_from_output(cached_transcript["transcript"])
             else:
-                transcript = self.gemini_cleaner(transcript, video, gemini_context)
-                self._execute_statement(
-                    update_job_operation_output_sql(
-                        workspace_id=job.workspace_id,
-                        operation_id=current_operation_id,
-                        output={"transcript": _transcript_to_output(transcript)},
-                        now=clock,
-                    )
-                )
-            self._execute_statement(
-                update_job_operation_status_sql(
-                    operation_id=current_operation_id,
+                self._raise_if_provider_success_without_output(
                     workspace_id=job.workspace_id,
-                    status="succeeded",
-                    now=clock,
+                    idempotency_key=gemini_context.idempotency_key,
                 )
+                self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+                transcript = self.gemini_cleaner(transcript, video, gemini_context)
+                cached_transcript = {"transcript": _transcript_to_output(transcript)}
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+            self._execute_required_statement(
+                complete_job_operation_success_sql(
+                    workspace_id=job.workspace_id,
+                    operation_id=current_operation_id,
+                    output=cached_transcript,
+                    now=clock,
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                ),
+                lost_lease_message="job lease expired before recording Gemini cleanup success",
             )
             current_operation_id = None
             current_operation_name = None
@@ -730,6 +759,7 @@ class HostedIndexingExecutor:
             chunks = _chunks_from_normalized_transcript(transcript)
             if not chunks:
                 raise HostedIndexingError("chunking produced no indexable chunks")
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="embedding", now=clock))
             voyage_context = self._provider_context(
                 workspace_id=job.workspace_id,
@@ -749,30 +779,34 @@ class HostedIndexingExecutor:
             if cached_vectors:
                 vectors = _vectors_from_output(cached_vectors["vectors"])
             else:
-                vectors = self.voyage_embedder(chunks, video, voyage_context)
-                self._execute_statement(
-                    update_job_operation_output_sql(
-                        workspace_id=job.workspace_id,
-                        operation_id=current_operation_id,
-                        output={"vectors": vectors, "chunk_hashes": [_chunk_hash_payload(chunk) for chunk in chunks]},
-                        now=clock,
-                    )
-                )
-            self._execute_statement(
-                update_job_operation_status_sql(
-                    operation_id=current_operation_id,
+                self._raise_if_provider_success_without_output(
                     workspace_id=job.workspace_id,
-                    status="succeeded",
-                    now=clock,
+                    idempotency_key=voyage_context.idempotency_key,
                 )
+                self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+                vectors = self.voyage_embedder(chunks, video, voyage_context)
+                cached_vectors = {"vectors": vectors, "chunk_hashes": [_chunk_hash_payload(chunk) for chunk in chunks]}
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+            self._execute_required_statement(
+                complete_job_operation_success_sql(
+                    workspace_id=job.workspace_id,
+                    operation_id=current_operation_id,
+                    output=cached_vectors,
+                    now=clock,
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                ),
+                lost_lease_message="job lease expired before recording Voyage embedding success",
             )
             current_operation_id = None
             current_operation_name = None
 
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="writing_index", now=clock))
             current_operation_name = "search_store.index_write"
             search_reservation = self._reserve_search_write(job=job, source=source, video=video, chunks=chunks, vectors=vectors)
             current_operation_reservation_id = search_reservation.id
+            current_operation_reservation = search_reservation
             current_operation_id = self._upsert_raw_operation(
                 job,
                 source,
@@ -782,6 +816,7 @@ class HostedIndexingExecutor:
                 usage_reservation_id=search_reservation.id,
             )
             if not search_reservation.decision.allowed:
+                self._append_denied_usage_event(search_reservation)
                 raise HostedIndexingDenied(operation="search_store.index_write", reservation=search_reservation)
             plan = plan_real_hosted_public_indexing(
                 source=source,
@@ -803,20 +838,28 @@ class HostedIndexingExecutor:
                 ),
             )
             with self._transaction():
+                self._assert_active_job_lease(job, lease_owner=lease_owner, now=current_time())
                 for operation in plan.sql_operations:
                     self._execute_statement(operation.statement)
-            self._execute_statement(
+            self._append_search_write_success(search_reservation, chunks=chunks, vectors=vectors, video=video)
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+            self._execute_required_statement(
                 update_job_operation_status_sql(
                     operation_id=current_operation_id,
                     workspace_id=job.workspace_id,
                     status="succeeded",
                     now=clock,
                     usage_reservation_id=current_operation_reservation_id,
-                )
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                ),
+                lost_lease_message="job lease expired before recording search-store index write success",
             )
             current_operation_id = None
             current_operation_name = None
             current_operation_reservation_id = None
+            current_operation_reservation = None
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="succeeded", now=clock))
             return HostedIndexingExecutionResult(
                 job_id=job.id,
@@ -840,6 +883,8 @@ class HostedIndexingExecutor:
                         error_code=exc.reservation.decision.reason,
                         error_message=exc.reservation.decision.message,
                         usage_reservation_id=exc.reservation.id,
+                        job_id=job.id,
+                        lease_owner=lease_owner,
                     )
                 )
             self._execute_statement(
@@ -873,6 +918,8 @@ class HostedIndexingExecutor:
                         error_code=exc.reservation.decision.reason,
                         error_message=exc.reservation.decision.message,
                         usage_reservation_id=exc.reservation.id,
+                        job_id=job.id,
+                        lease_owner=lease_owner,
                     )
                 )
             self._execute_statement(
@@ -897,51 +944,105 @@ class HostedIndexingExecutor:
             )
         except Exception as exc:
             error_message = redact_sensitive_failure_text(str(exc))
+            retryable = (
+                not isinstance(exc, (HostedIndexingLostLease, HostedProviderOutputMissing))
+                and (
+                    is_youtube_block_error(exc)
+                    or is_proxy_payment_error(exc)
+                    or _looks_retryable_discovery_error(exc)
+                    or _looks_retryable_indexing_error(exc)
+                )
+            )
+            if current_operation_reservation is not None and current_operation_reservation.decision.allowed:
+                self._append_search_write_failure(
+                    current_operation_reservation,
+                    error_code=getattr(exc, "code", type(exc).__name__),
+                    error_message=error_message,
+                )
             if current_operation_id is not None:
                 self._execute_statement(
                     update_job_operation_status_sql(
                         operation_id=current_operation_id,
                         workspace_id=job.workspace_id,
-                        status="failed_final",
+                        status="failed_retryable" if retryable else "failed_final",
                         now=clock,
                         error_code=type(exc).__name__,
                         error_message=error_message,
+                        usage_reservation_id=current_operation_reservation_id,
+                        job_id=job.id,
+                        lease_owner=lease_owner,
                     )
                 )
-            self._execute_statement(
-                update_job_status_sql(
-                    job_id=job.id,
-                    lease_owner=lease_owner,
-                    status="failed",
-                    now=clock,
-                    error_code=getattr(exc, "code", type(exc).__name__),
-                    error_message=error_message,
+            if retryable:
+                self._execute_statement(
+                    retry_job_sql(
+                        job_id=job.id,
+                        lease_owner=lease_owner,
+                        now=clock,
+                        retry_after=clock + timedelta(seconds=300),
+                        error_code=getattr(exc, "code", type(exc).__name__),
+                        error_message=error_message,
+                    )
                 )
-            )
+                result_status: Literal["failed", "retry_wait"] = "retry_wait"
+            else:
+                self._execute_statement(
+                    update_job_status_sql(
+                        job_id=job.id,
+                        lease_owner=lease_owner,
+                        status="failed",
+                        now=clock,
+                        error_code=getattr(exc, "code", type(exc).__name__),
+                        error_message=error_message,
+                    )
+                )
+                result_status = "failed"
             return HostedIndexingExecutionResult(
                 job_id=job.id,
                 workspace_id=job.workspace_id,
                 source_id=source_id,
                 youtube_video_id=video_id,
-                status="failed",
+                status=result_status,
                 error_code=getattr(exc, "code", type(exc).__name__),
                 error_message=error_message,
             )
 
     def _fetch_video_metadata(self, video_id: str, source: Source, job: Job) -> HostedVideoInput:
-        hosted_context = self._webshare_proxy_context(
+        metadata = {"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "metadata_fetch"}
+        youtube_context = self._youtube_fetch_context(
+            workspace_id=job.workspace_id,
+            subject_id=video_id,
+            operation="metadata_fetch",
+            source="yt-dlp.metadata",
+            metadata=metadata,
+        )
+        webshare_context = self._webshare_proxy_context(
             workspace_id=job.workspace_id,
             subject_id=video_id,
             source="yt-dlp.metadata",
             bytes_estimate=1_000_000,
-            metadata={"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "metadata_fetch"},
+            metadata=metadata,
         )
-        discovered = discover_video(
-            target=video_id,
-            cwd=self.cwd,
-            proxy=self.config.proxy if self.config.proxy.use_for_metadata else None,
-            ytdlp_config=self.config.yt_dlp,
-            hosted_context=hosted_context,
+
+        def call() -> DiscoveredVideo:
+            return discover_video(
+                target=video_id,
+                cwd=self.cwd,
+                proxy=self.config.proxy if self.config.proxy.use_for_metadata else None,
+                ytdlp_config=self.config.yt_dlp,
+                hosted_context=webshare_context,
+            )
+
+        discovered = execute_provider_call(
+            youtube_context,
+            call,
+            normalize_usage=lambda result: UsageNormalization(
+                subject="youtube",
+                operation="metadata_fetch",
+                actual_units={"request_count": 1},
+                raw_usage={"duration_seconds": result.duration_seconds},
+                metadata={"fetch_source": "yt-dlp.metadata"},
+            ),
         )
         return HostedVideoInput(
             youtube_video_id=discovered.video_id,
@@ -959,30 +1060,51 @@ class HostedIndexingExecutor:
 
     def _fetch_transcript(self, video_id: str, source: Source, job: Job) -> TranscriptFetchResult:
         proxy = self.config.proxy if self.config.proxy.enabled else None
-        hosted_context = self._webshare_proxy_context(
+        metadata = {"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "transcript_fetch"}
+        youtube_context = self._youtube_fetch_context(
+            workspace_id=job.workspace_id,
+            subject_id=video_id,
+            operation="transcript_fetch",
+            source="transcript.fetch",
+            metadata=metadata,
+        )
+        webshare_context = self._webshare_proxy_context(
             workspace_id=job.workspace_id,
             subject_id=video_id,
             source="transcript.fetch",
             bytes_estimate=2_000_000,
-            metadata={"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "transcript_fetch"},
+            metadata=metadata,
         )
         try:
-            if self.config.transcripts.prefer_ytdlp_subtitles:
-                return fetch_subtitle_transcript_with_ytdlp(
+            def call() -> TranscriptFetchResult:
+                if self.config.transcripts.prefer_ytdlp_subtitles:
+                    return fetch_subtitle_transcript_with_ytdlp(
+                        video_id=video_id,
+                        cwd=self.cwd,
+                        language=self.config.transcripts.preferred_languages[0],
+                        proxy=proxy,
+                        ytdlp_config=self.config.yt_dlp,
+                        allow_translated_captions=self.config.transcripts.allow_translated_captions,
+                        hosted_context=webshare_context,
+                    )
+                return fetch_transcript(
                     video_id=video_id,
-                    cwd=self.cwd,
-                    language=self.config.transcripts.preferred_languages[0],
+                    languages=self.config.transcripts.preferred_languages,
                     proxy=proxy,
-                    ytdlp_config=self.config.yt_dlp,
-                    allow_translated_captions=self.config.transcripts.allow_translated_captions,
-                    hosted_context=hosted_context,
+                    timeout_seconds=self.config.transcripts.request_timeout_seconds,
+                    hosted_context=webshare_context,
                 )
-            return fetch_transcript(
-                video_id=video_id,
-                languages=self.config.transcripts.preferred_languages,
-                proxy=proxy,
-                timeout_seconds=self.config.transcripts.request_timeout_seconds,
-                hosted_context=hosted_context,
+
+            return execute_provider_call(
+                youtube_context,
+                call,
+                normalize_usage=lambda result: UsageNormalization(
+                    subject="youtube",
+                    operation="transcript_fetch",
+                    actual_units={"request_count": 1, "transcript_segments": len(result.raw_snippets)},
+                    raw_usage={"source": result.source, "language": result.language, "is_generated": result.is_generated},
+                    metadata={"fetch_source": result.source},
+                ),
             )
         except UsageReservationDenied:
             raise
@@ -1118,6 +1240,25 @@ class HostedIndexingExecutor:
             return provider(auth=auth, subject=subject, operation=operation, estimated_units=estimated_units)
         return self.usage_context_provider(auth, operation, estimated_units)
 
+    def _youtube_fetch_context(
+        self,
+        *,
+        workspace_id: str,
+        subject_id: str,
+        operation: str,
+        source: str,
+        metadata: Mapping[str, Any],
+    ) -> ProviderCallContext:
+        return self._provider_context(
+            workspace_id=workspace_id,
+            subject="youtube",
+            operation=operation,
+            estimated_units={"request_count": 1},
+            subject_id=subject_id,
+            input_payload={"source": source, "target": subject_id},
+            metadata={**dict(metadata), "fetch_source": source},
+        )
+
     def _webshare_proxy_context(
         self,
         *,
@@ -1246,10 +1387,101 @@ class HostedIndexingExecutor:
 
     def _operation_output(self, operation_id: str, *, workspace_id: str) -> dict[str, Any] | None:
         row = _execute_one(self.connection, job_operation_output_sql(workspace_id=workspace_id, operation_id=operation_id))
-        if row is None or row.get("status") != "succeeded":
+        if row is None or row.get("status") in {"denied", "failed_final"}:
             return None
         output = dict(_json_value(row.get("output_json")))
         return output or None
+
+    def _renew_job_lease_or_raise(self, job: Job, *, lease_owner: str, now: Any, lease_seconds: int) -> Any:
+        from yutome.hosted.jobs import renew_job_lease_sql
+
+        rows = self._execute_statement(
+            renew_job_lease_sql(job_id=job.id, lease_owner=lease_owner, now=now, lease_seconds=lease_seconds)
+        )
+        if not rows:
+            raise HostedIndexingLostLease(f"job lease expired or moved before worker {lease_owner!r} could continue")
+        return now
+
+    def _assert_active_job_lease(self, job: Job, *, lease_owner: str, now: Any) -> None:
+        from yutome.hosted.jobs import active_job_lease_sql
+
+        rows = self._execute_statement(active_job_lease_sql(job_id=job.id, lease_owner=lease_owner, now=now))
+        if not rows:
+            raise HostedIndexingLostLease(f"job lease expired or moved before worker {lease_owner!r} could write index data")
+
+    def _execute_required_statement(self, statement: SqlStatement, *, lost_lease_message: str) -> list[dict[str, Any]]:
+        rows = self._execute_statement(statement)
+        if not rows:
+            raise HostedIndexingLostLease(lost_lease_message)
+        return rows
+
+    def _raise_if_provider_success_without_output(self, *, workspace_id: str, idempotency_key: str) -> None:
+        row = _execute_one(
+            self.connection,
+            provider_success_usage_event_sql(workspace_id=workspace_id, idempotency_key=idempotency_key),
+        )
+        if row is not None:
+            raise HostedProviderOutputMissing(
+                "provider response already succeeded but operation output is missing; refusing to call provider again"
+            )
+
+    def _append_denied_usage_event(self, reservation: UsageReservation) -> None:
+        event = denied_usage_event(reservation)
+        event.metadata = {
+            **event.metadata,
+            "idempotency_key": reservation.idempotency_key,
+            "allocation_id": reservation.allocation_id,
+        }
+        self.ledger.append(event)
+
+    def _append_search_write_success(
+        self,
+        reservation: UsageReservation,
+        *,
+        chunks: Sequence[TranscriptChunkInput],
+        vectors: Sequence[Sequence[float]],
+        video: HostedVideoInput,
+    ) -> None:
+        event = usage_event_from_normalization(
+            UsageNormalization(
+                subject="search_store",
+                operation="index_write",
+                actual_units={"transcript_versions": 1, "chunks": len(chunks), "embeddings": len(vectors)},
+                metadata={
+                    "idempotency_key": reservation.idempotency_key,
+                    "allocation_id": reservation.allocation_id,
+                    "video_id": video.youtube_video_id,
+                    "index_profile_id": _default_real_index_profile(reservation.workspace_id).id,
+                },
+            ),
+            reservation=reservation,
+            event_type="service_operation_succeeded",
+        )
+        self.ledger.append(event)
+
+    def _append_search_write_failure(
+        self,
+        reservation: UsageReservation,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        event = UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id=reservation.workspace_id,
+            subject=reservation.subject,
+            operation=reservation.operation,
+            event_type="service_operation_failed",
+            status="failed",
+            error_code=error_code,
+            metadata={
+                "estimated_units": dict(reservation.estimated_units),
+                "idempotency_key": reservation.idempotency_key,
+                "allocation_id": reservation.allocation_id,
+                "message": redact_sensitive_failure_text(error_message),
+            },
+        )
+        self.ledger.append(event)
 
     def _load_source(self, job: Job) -> Source:
         if not job.source_id:
@@ -1293,7 +1525,7 @@ WHERE id = %(source_id)s
                     workspace_id=str(row["workspace_id"]),
                     provider=row["provider"],
                     operation=str(row["operation"]),
-                    mode=row["mode"],
+                    credential_mode=row["credential_mode"],
                     status=row.get("status", "active"),
                     model_or_plan=row.get("model_or_plan"),
                     external_allocation_id=row.get("external_allocation_id"),
@@ -1309,7 +1541,7 @@ WHERE id = %(source_id)s
                     workspace_id=str(row["workspace_id"]),
                     service=row["service"],
                     operation=str(row["operation"]),
-                    mode=row.get("mode", "service_internal"),
+                    credential_mode=row.get("credential_mode", "service_internal"),
                     status=row.get("status", "active"),
                     backend=str(row["backend"]),
                     index_profile_ref=row.get("index_profile_ref"),
@@ -1339,7 +1571,7 @@ LIMIT 1;
             id=str(row["id"]),
             workspace_id=str(row["workspace_id"]),
             allowed_operations=set(row.get("allowed_operations") or ()),
-            max_units_by_operation=dict(_json_value(row.get("hard_limits_jsonb"))),
+            hard_limits_by_operation=dict(_json_value(row.get("hard_limits_jsonb"))),
         )
 
     def _load_balance(self, workspace_id: str) -> WorkspaceBalance:
@@ -1404,13 +1636,26 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
         )
         self.video_discoverer = video_discoverer or self._discover_public_source_videos
 
-    def execute(self, job: Job, *, lease_owner: str, now: Any | None = None) -> HostedSourceDiscoveryExecutionResult:
+    def execute(
+        self,
+        job: Job,
+        *,
+        lease_owner: str,
+        now: Any | None = None,
+        lease_seconds: int = 900,
+    ) -> HostedSourceDiscoveryExecutionResult:
         from datetime import datetime, timezone
         from yutome.hosted.jobs import retry_job_sql, update_job_status_sql
 
-        clock = now or datetime.now(timezone.utc)
+        fixed_now = now
+
+        def current_time() -> Any:
+            return fixed_now or datetime.now(timezone.utc)
+
+        clock = current_time()
         source_id = job.source_id or ""
         try:
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="discovering", now=clock))
             source = self._load_source(job)
             decision = source_discovery_decision(source)
@@ -1441,7 +1686,9 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                 bytes_estimate=2_000_000,
                 metadata={"job_id": job.id, "source_id": source.id, "source_type": source.source_type, "phase": "source_discovery"},
             )
+            self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             videos = tuple(self.video_discoverer(source, hosted_context, max_videos))
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="queued_video_jobs", now=clock))
             enqueued = 0
             video_ids: list[str] = []
@@ -1481,6 +1728,7 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                     lease_owner=lease_owner,
                 )
             )
+            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="succeeded", now=clock))
             return HostedSourceDiscoveryExecutionResult(
                 job_id=job.id,
@@ -1518,6 +1766,7 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                     retry_job_sql(
                         job_id=job.id,
                         lease_owner=lease_owner,
+                        now=clock,
                         retry_after=clock + timedelta(seconds=300),
                         error_code=getattr(exc, "code", type(exc).__name__),
                         error_message=error_message,
@@ -1869,6 +2118,71 @@ RETURNING *;
     )
 
 
+def complete_job_operation_success_sql(
+    *,
+    workspace_id: str,
+    operation_id: str,
+    output: Mapping[str, Any],
+    now: Any,
+    usage_reservation_id: str | None = None,
+    job_id: str | None = None,
+    lease_owner: str | None = None,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+UPDATE job_operations
+SET output_json = %(output_json)s::jsonb,
+    status = 'succeeded',
+    usage_reservation_id = COALESCE(%(usage_reservation_id)s, usage_reservation_id),
+    updated_at = %(now)s
+WHERE workspace_id = %(workspace_id)s
+  AND id = %(operation_id)s
+  AND (
+      %(job_id)s IS NULL
+      OR EXISTS (
+          SELECT 1
+          FROM jobs
+          WHERE jobs.id = %(job_id)s
+            AND jobs.workspace_id = job_operations.workspace_id
+            AND jobs.lease_owner = %(lease_owner)s
+            AND jobs.lease_expires_at > %(now)s
+            AND jobs.status <> ALL(%(terminal_statuses)s)
+      )
+  )
+RETURNING *;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "operation_id": operation_id,
+            "output_json": _json_param(output),
+            "usage_reservation_id": usage_reservation_id,
+            "now": now,
+            "job_id": job_id,
+            "lease_owner": lease_owner,
+            "terminal_statuses": ["cancelled", "denied", "failed", "succeeded"],
+        },
+    )
+
+
+def provider_success_usage_event_sql(*, workspace_id: str, idempotency_key: str) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT id
+FROM usage_events
+WHERE workspace_id = %(workspace_id)s
+  AND event_type = 'provider_attempt_succeeded'
+  AND status = 'succeeded'
+  AND (
+      metadata_json->>'idempotency_key' = %(idempotency_key)s
+      OR metadata_json->>'parent_idempotency_key' = %(idempotency_key)s
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+""".strip(),
+        params={"workspace_id": workspace_id, "idempotency_key": idempotency_key},
+    )
+
+
 def enqueue_index_video_job_sql(
     *,
     workspace_id: str,
@@ -2142,7 +2456,7 @@ def _default_allocations(workspace_id: str, index_profile_id: str) -> tuple[Allo
             workspace_id=workspace_id,
             provider="voyage",
             operation="embed_documents",
-            mode="hosted",
+            credential_mode="hosted",
             model_or_plan=DEFAULT_EMBEDDING_MODEL,
         ),
         default_search_store_allocation(workspace_id=workspace_id, operation="*", index_profile_ref=index_profile_id),
@@ -2420,6 +2734,26 @@ def _looks_retryable_discovery_error(exc: BaseException) -> bool:
     return any(marker in text for marker in ("timeout", "temporarily", "try again", "connection reset", "unavailable"))
 
 
+def _looks_retryable_indexing_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "temporarily",
+            "try again",
+            "connection reset",
+            "connection aborted",
+            "unavailable",
+            "server error",
+            "service unavailable",
+        )
+    )
+
+
 __all__ = [
     "DEFAULT_CHUNKING_VERSION",
     "DEFAULT_EMBEDDING_DIMENSION",
@@ -2438,6 +2772,7 @@ __all__ = [
     "extract_public_youtube_video_id",
     "enqueue_index_video_job_sql",
     "finish_source_discovery_sql",
+    "complete_job_operation_success_sql",
     "job_operation_output_sql",
     "mock_embedding_vector",
     "plan_mock_hosted_public_indexing",
@@ -2449,4 +2784,5 @@ __all__ = [
     "upsert_job_operation_sql",
     "upsert_video_sql",
     "update_job_operation_output_sql",
+    "provider_success_usage_event_sql",
 ]

@@ -34,7 +34,7 @@ def test_webshare_subuser_allocation_maps_to_provider_allocation_metadata() -> N
 
     assert allocation.provider == "webshare"
     assert allocation.operation == "proxy_fetch"
-    assert allocation.mode == "hosted"
+    assert allocation.credential_mode == "hosted"
     assert allocation.external_allocation_id == "451"
     assert allocation.metadata["webshare_subuser_id"] == "451"
     assert allocation.metadata["bandwidth_remaining_bytes"] == 1024
@@ -47,7 +47,7 @@ def test_provider_allocation_policy_denies_disabled_gemini_fallback_before_call(
         workspace_id="ws_alice",
         provider="gemini",
         operation="transcribe_media",
-        mode="hosted",
+        credential_mode="hosted",
         status="disabled",
     )
 
@@ -73,7 +73,7 @@ def test_voyage_estimate_reserves_hosted_allocation_with_stable_idempotency_key(
         workspace_id="ws_alice",
         provider="voyage",
         operation="embed_documents",
-        mode="hosted",
+        credential_mode="hosted",
     )
 
     left = decide_allocation_for_estimate(
@@ -104,7 +104,7 @@ def test_voyage_estimate_reserves_hosted_allocation_with_stable_idempotency_key(
     )
 
     assert left.allowed is True
-    assert left.reservation.allocation_kind == "hosted"
+    assert left.reservation.credential_mode == "hosted"
     assert left.reservation.idempotency_key == right.reservation.idempotency_key
     assert left.metadata["estimate_method"] == "voyage.count_tokens"
 
@@ -160,6 +160,6 @@ def test_search_store_service_allocation_is_separate_from_provider_allocations()
 
     assert decision.allowed is True
     assert decision.reservation.subject == "search_store"
-    assert decision.reservation.allocation_kind == "service_internal"
+    assert decision.reservation.credential_mode == "service_internal"
     assert service_allocation.backend == "postgres_vectorchord"
     assert service_allocation.index_profile_ref == "sip_default"

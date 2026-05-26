@@ -182,7 +182,7 @@ def test_denied_transcribe_reservation_prevents_gemini_call() -> None:
             id="policy",
             workspace_id="ws_test",
             allowed_operations={"gemini.transcribe_media"},
-            max_units_by_operation={"gemini.transcribe_media": {"total_tokens": 500}},
+            hard_limits_by_operation={"gemini.transcribe_media": {"total_tokens": 500}},
         ),
     )
 

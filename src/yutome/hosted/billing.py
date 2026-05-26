@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from yutome.hosted.errors import redact_sensitive_failure_text
 from yutome.hosted.ids import input_hash
 from yutome.hosted.models import (
     EntitlementPolicy,
@@ -109,8 +110,8 @@ class EntitlementPolicyRecord(BaseModel):
             workspace_id=self.workspace_id,
             allow_all_operations=False,
             allowed_operations=set(self.allowed_operations),
-            max_units_by_operation=dict(self.hard_limits),
-            soft_units_by_operation=dict(self.soft_limits),
+            hard_limits_by_operation=dict(self.hard_limits),
+            soft_limits_by_operation=dict(self.soft_limits),
         )
 
 
@@ -354,7 +355,7 @@ class BillingDebugReservation(BaseModel):
     operation: str
     operation_key: str
     allocation_id: str | None = None
-    allocation_kind: str
+    credential_mode: str
     reservation_status: str
     entitlement_decision: dict[str, Any] = Field(default_factory=dict)
     estimated_units: dict[str, Any] = Field(default_factory=dict)
@@ -558,7 +559,7 @@ def billing_export_event_from_usage_event(
         metadata["price_book_version"] = price_book_version
     if product_code is not None:
         metadata["product_code"] = product_code
-    metadata.update(event.metadata)
+    metadata.update(_redacted_metadata(event.metadata))
 
     return BillingExportEvent(
         idempotency_key=billing_export_idempotency_key(event),
@@ -590,6 +591,7 @@ def credit_order_idempotency_key(
     product_id: str | None = None,
     billing_period_start: str | None = None,
     billing_period_end: str | None = None,
+    grant_discriminator: str | None = None,
 ) -> str:
     return input_hash(
         {
@@ -602,6 +604,7 @@ def credit_order_idempotency_key(
             "product_id": product_id,
             "billing_period_start": billing_period_start,
             "billing_period_end": billing_period_end,
+            "grant_discriminator": grant_discriminator,
         },
         prefix="cred",
     )
@@ -621,6 +624,7 @@ def credit_ledger_entry_from_order(
     product_id: str | None = None,
     billing_period_start: str | None = None,
     billing_period_end: str | None = None,
+    grant_discriminator: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> CreditLedgerEntry:
     idempotency_key = credit_order_idempotency_key(
@@ -633,6 +637,7 @@ def credit_ledger_entry_from_order(
         product_id=product_id,
         billing_period_start=billing_period_start,
         billing_period_end=billing_period_end,
+        grant_discriminator=grant_discriminator,
     )
     return CreditLedgerEntry(
         id=idempotency_key,
@@ -1381,7 +1386,7 @@ WITH recent_reservations AS (
         reservation.operation,
         reservation.subject || '.' || reservation.operation AS operation_key,
         reservation.allocation_id,
-        reservation.allocation_kind,
+        reservation.credential_mode,
         reservation.status AS reservation_status,
         reservation.decision_json,
         reservation.estimated_units_json,
@@ -1510,7 +1515,7 @@ def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReser
         operation=operation,
         operation_key=_optional_string(row.get("operation_key")) or f"{subject}.{operation}",
         allocation_id=_optional_string(row.get("allocation_id")),
-        allocation_kind=str(row["allocation_kind"]),
+        credential_mode=str(row["credential_mode"]),
         reservation_status=str(row["reservation_status"]),
         entitlement_decision=dict(_json_value(row.get("decision_json"))),
         estimated_units=dict(_json_value(row.get("estimated_units_json"))),
@@ -1534,6 +1539,20 @@ def _billable_units(units: dict[str, Any]) -> UnitMap:
             )
         numeric[unit] = quantity
     return numeric
+
+
+def _redacted_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): _redacted_metadata_value(item) for key, item in value.items()}
+
+
+def _redacted_metadata_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_sensitive_failure_text(value)
+    if isinstance(value, Mapping):
+        return _redacted_metadata(value)
+    if isinstance(value, list):
+        return [_redacted_metadata_value(item) for item in value]
+    return value
 
 
 def _negated_units(units: dict[str, UnitQuantity]) -> UnitMap:
@@ -1803,7 +1822,7 @@ def _credit_entries_from_polar_event(event: PolarWebhookEvent, *, workspace_id: 
     billing_reason = _optional_string(order.get("billing_reason")) or "purchase"
     occurred_at = event.timestamp
     entries: list[CreditLedgerEntry] = []
-    for grant in _credit_grants_from_order(order):
+    for grant_index, grant in enumerate(_credit_grants_from_order(order)):
         unit = str(grant["unit"])
         quantity = normalize_unit_quantity(grant["quantity"])
         reason = str(grant.get("reason") or "order_grant")
@@ -1821,12 +1840,14 @@ def _credit_entries_from_polar_event(event: PolarWebhookEvent, *, workspace_id: 
             product_id=product_id,
             billing_period_start=period_start,
             billing_period_end=period_end,
+            grant_discriminator=_credit_grant_discriminator(grant, grant_index),
             metadata={
                 "polar_event_type": event.type,
                 "billing_reason": billing_reason,
                 "product_id": product_id,
                 "checkout_id": order.get("checkout_id"),
                 "subscription_id": order.get("subscription_id"),
+                "grant_index": grant_index,
                 **{key: value for key, value in grant.items() if key not in {"unit", "quantity"}},
             },
         )
@@ -1856,6 +1877,13 @@ def _credit_grants_from_order(order: dict[str, Any]) -> list[dict[str, Any]]:
     if unit is not None and quantity is not None:
         return [{"unit": unit, "quantity": quantity}]
     return []
+
+
+def _credit_grant_discriminator(grant: Mapping[str, Any], index: int) -> str:
+    grant_id = _optional_string(grant.get("grant_id") or grant.get("id"))
+    if grant_id is not None:
+        return f"grant_id:{grant_id}"
+    return input_hash({"grant_index": index, "grant": dict(grant)}, prefix="grant")
 
 
 def _metadata_value(data: dict[str, Any], key: str) -> Any:

@@ -136,7 +136,7 @@ def test_provider_wrapper_denies_before_calling_provider() -> None:
             id="policy",
             workspace_id="ws_alice",
             allowed_operations={"gemini.cleanup_transcript"},
-            max_units_by_operation={"gemini.cleanup_transcript": {"total_tokens": 500}},
+            hard_limits_by_operation={"gemini.cleanup_transcript": {"total_tokens": 500}},
         ),
     )
 

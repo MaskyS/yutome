@@ -117,7 +117,7 @@ class ProviderAllocation(BaseModel):
     workspace_id: str
     provider: Literal["gemini", "voyage", "webshare", "youtube"]
     operation: str
-    mode: CredentialMode = "hosted"
+    credential_mode: CredentialMode = "hosted"
     status: AllocationStatus = "active"
     model_or_plan: str | None = None
     external_allocation_id: str | None = None
@@ -129,7 +129,7 @@ class ServiceAllocation(BaseModel):
     workspace_id: str
     service: Literal["search_store"]
     operation: str
-    mode: CredentialMode = "service_internal"
+    credential_mode: CredentialMode = "service_internal"
     status: AllocationStatus = "active"
     backend: str
     index_profile_ref: str | None = None
@@ -141,10 +141,10 @@ class EntitlementPolicy(BaseModel):
     workspace_id: str
     allow_all_operations: bool = False
     allowed_operations: set[str] = Field(default_factory=set)
-    max_units_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
-    soft_units_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
+    hard_limits_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
+    soft_limits_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
 
-    @field_validator("max_units_by_operation", "soft_units_by_operation", mode="before")
+    @field_validator("hard_limits_by_operation", "soft_limits_by_operation", mode="before")
     @classmethod
     def _normalize_limit_units(cls, value: Any) -> dict[str, UnitMap]:
         if value is None:
@@ -169,7 +169,7 @@ class WorkspaceBalance(BaseModel):
     @field_validator("remaining_units", mode="before")
     @classmethod
     def _normalize_remaining_units(cls, value: Any) -> UnitMap:
-        return normalize_unit_map(value)
+        return normalize_unit_map(value, allow_negative=True)
 
     def has_units(self, estimate: dict[str, UnitQuantity]) -> tuple[bool, str | None]:
         exact_estimate = normalize_unit_map(estimate)
@@ -195,7 +195,7 @@ class UsageReservation(BaseModel):
     subject: UsageSubject
     operation: str
     allocation_id: str | None = None
-    allocation_kind: CredentialMode
+    credential_mode: CredentialMode
     estimated_units: UnitMap = Field(default_factory=dict)
     idempotency_key: str
     status: ReservationStatus

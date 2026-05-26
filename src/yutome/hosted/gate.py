@@ -46,7 +46,7 @@ class UsageGate:
             subject=subject,  # type: ignore[arg-type]
             operation=operation,
             allocation_id=allocation.id if allocation else None,
-            allocation_kind=allocation.mode if allocation else "disabled",
+            credential_mode=allocation.credential_mode if allocation else "disabled",
             estimated_units=exact_estimate,
             idempotency_key=idempotency_key,
             status="reserved" if decision.allowed else "denied",
@@ -67,12 +67,12 @@ class UsageGate:
             return UsageDecision(allowed=False, reason="allocation_missing", message="No allocation is configured.")
         if allocation.workspace_id != workspace_id:
             return UsageDecision(allowed=False, reason="workspace_mismatch", message="Allocation belongs to another workspace.")
-        if allocation.mode == "disabled" or allocation.status in {"disabled", "invalid"}:
+        if allocation.credential_mode == "disabled" or allocation.status in {"disabled", "invalid"}:
             return UsageDecision(allowed=False, reason="allocation_disabled", message="Allocation is disabled or invalid.")
         if not policy.operation_allowed(operation_key):
             return UsageDecision(allowed=False, reason="operation_not_allowed", message="Operation is not enabled by policy.")
 
-        maxima = policy.max_units_by_operation.get(operation_key, {})
+        maxima = policy.hard_limits_by_operation.get(operation_key, {})
         for unit, maximum in maxima.items():
             quantity = estimated_units.get(unit)
             if quantity is not None and unit_quantity_decimal(quantity) > unit_quantity_decimal(maximum):
@@ -82,7 +82,7 @@ class UsageGate:
                     message=f"Estimated {unit} exceeds the operation limit.",
                 )
 
-        soft_maxima = policy.soft_units_by_operation.get(operation_key, {})
+        soft_maxima = policy.soft_limits_by_operation.get(operation_key, {})
         for unit, maximum in soft_maxima.items():
             quantity = estimated_units.get(unit)
             if quantity is not None and unit_quantity_decimal(quantity) > unit_quantity_decimal(maximum):

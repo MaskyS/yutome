@@ -124,6 +124,31 @@ RETURNING *;
     )
 
 
+def active_job_lease_sql(
+    *,
+    job_id: str,
+    lease_owner: str,
+    now: datetime,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT id
+FROM jobs
+WHERE id = %(job_id)s
+  AND lease_owner = %(lease_owner)s
+  AND lease_expires_at > %(now)s
+  AND status <> ALL(%(terminal_statuses)s)
+FOR UPDATE;
+""".strip(),
+        params={
+            "job_id": job_id,
+            "lease_owner": lease_owner,
+            "now": now,
+            "terminal_statuses": sorted(TERMINAL_JOB_STATUSES),
+        },
+    )
+
+
 def release_job_lease_sql(*, job_id: str, lease_owner: str) -> SqlStatement:
     return SqlStatement(
         sql="""
@@ -143,6 +168,7 @@ def retry_job_sql(
     *,
     job_id: str,
     lease_owner: str,
+    now: datetime,
     retry_after: datetime,
     error_code: str,
     error_message: str | None = None,
@@ -159,12 +185,14 @@ SET status = %(status)s,
     lease_expires_at = NULL
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
+  AND lease_expires_at > %(now)s
   AND status <> ALL(%(terminal_statuses)s)
 RETURNING *;
 """.strip(),
         params={
             "job_id": job_id,
             "lease_owner": lease_owner,
+            "now": now,
             "retry_after": retry_after,
             "error_code": error_code,
             "error_message": error_message,
@@ -207,6 +235,7 @@ SET status = %(status)s,
     lease_expires_at = CASE WHEN %(terminal)s THEN NULL ELSE lease_expires_at END
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
+  AND lease_expires_at > %(now)s
   AND status <> ALL(%(terminal_statuses)s)
 RETURNING *;
 """.strip(),
@@ -232,6 +261,8 @@ def update_job_operation_status_sql(
     error_code: str | None = None,
     error_message: str | None = None,
     usage_reservation_id: str | None = None,
+    job_id: str | None = None,
+    lease_owner: str | None = None,
 ) -> SqlStatement:
     return SqlStatement(
         sql="""
@@ -246,6 +277,18 @@ SET status = %(status)s,
     updated_at = %(now)s
 WHERE id = %(operation_id)s
   AND workspace_id = %(workspace_id)s
+  AND (
+      %(job_id)s IS NULL
+      OR EXISTS (
+          SELECT 1
+          FROM jobs
+          WHERE jobs.id = %(job_id)s
+            AND jobs.workspace_id = job_operations.workspace_id
+            AND jobs.lease_owner = %(lease_owner)s
+            AND jobs.lease_expires_at > %(now)s
+            AND jobs.status <> ALL(%(terminal_statuses)s)
+      )
+  )
 RETURNING *;
 """.strip(),
         params={
@@ -254,6 +297,9 @@ RETURNING *;
             "status": status,
             "now": now,
             "usage_reservation_id": usage_reservation_id,
+            "job_id": job_id,
+            "lease_owner": lease_owner,
+            "terminal_statuses": sorted(TERMINAL_JOB_STATUSES),
             "status_metadata_json": _json_param({"error_code": error_code, "error_message": error_message}),
         },
     )
@@ -324,6 +370,7 @@ __all__: Sequence[str] = [
     "JOB_CLAIMABLE_INDEX_SQL",
     "JOB_IDEMPOTENCY_CONSTRAINT_SQL",
     "claim_jobs_sql",
+    "active_job_lease_sql",
     "job_repository_constraint_statements",
     "release_job_lease",
     "release_job_lease_sql",

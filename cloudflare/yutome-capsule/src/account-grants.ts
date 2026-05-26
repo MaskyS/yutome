@@ -11,6 +11,21 @@ import {
 
 export type HostedAccountGrantStatus = "active" | "revoked";
 
+/**
+ * The Cloudflare edge's KV cache of a connector grant — the OAuth authorization binding one
+ * assistant client to one workspace. See docs/hosted-glossary.md ("connector grant").
+ *
+ * This is one of two records for the same concept across the language boundary. The Python
+ * control-plane record `AccountGrant` (src/yutome/hosted/control_plane.py) is the broader
+ * source of truth — it also covers CLI and account-session grant kinds. They are
+ * intentionally not identical:
+ *  - `grant_id` here is the storage-key form; `connector_grant_id` is the domain field used
+ *    in token props (props may carry either name — both resolve to this `grant_id`).
+ *  - `token_version` is a string on the edge and an int in the Python record. They never
+ *    cross: the edge issues and validates its own OAuth tokens, and the Python API trusts
+ *    the edge's signed headers rather than re-validating the token, so no single value is
+ *    written by one side and compared by the other.
+ */
 export interface HostedAccountGrant {
   grant_id: string;
   user_id: string;
@@ -69,8 +84,14 @@ const ACCOUNT_GRANT_PREFIX = "yutome:account-grant:";
 export const YUTOME_MCP_SCOPE = "yutome.search.read";
 export const DEFAULT_MCP_AUDIENCE = "https://mcp.yutome.com/mcp";
 export const DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth";
+export const DEFAULT_ACCOUNT_SESSION_MAX_AGE_SECONDS = 60 * 60;
+export const DEFAULT_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS = 60;
 export const ACCOUNT_SESSION_COOKIE_NAME = "yutome_account_session";
 export const ACCOUNT_SESSION_HEADER = "x-yutome-account-session";
+const ACCOUNT_SESSION_REPLAY_PREFIX = "yutome:account-session-replay:";
+
+type AccountSessionEnv = Pick<Env, "YUTOME_ACCOUNT_SESSION_HMAC_SECRET" | "YUTOME_ACCOUNT_SESSION_AUDIENCE"> &
+  Partial<Pick<Env, "OAUTH_KV" | "YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS" | "YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS">>;
 
 export function accountGrantKey(grantId: string): string {
   return `${ACCOUNT_GRANT_PREFIX}${normalizeGrantId(grantId)}`;
@@ -118,8 +139,14 @@ export async function issueHostedAccountGrant(
 
 export async function resolveHostedAccountSessionFromRequest(
   request: Request,
-  env: Pick<Env, "YUTOME_ACCOUNT_SESSION_HMAC_SECRET" | "YUTOME_ACCOUNT_SESSION_AUDIENCE">,
-  options: { selectedWorkspaceId?: string; allowWorkspaceSelection?: boolean } = {},
+  env: AccountSessionEnv,
+  options: {
+    selectedWorkspaceId?: string;
+    allowWorkspaceSelection?: boolean;
+    allowHeaderFallback?: boolean;
+    consumeReplay?: boolean;
+    now?: Date;
+  } = {},
 ): Promise<HostedAccountSession> {
   const secret = env.YUTOME_ACCOUNT_SESSION_HMAC_SECRET?.trim();
   if (!secret) {
@@ -130,7 +157,7 @@ export async function resolveHostedAccountSessionFromRequest(
     );
   }
 
-  const token = accountSessionTokenFromRequest(request);
+  const token = accountSessionTokenFromRequest(request, { allowHeaderFallback: options.allowHeaderFallback === true });
   if (!token) {
     throw new HostedAccountGrantError(
       "hosted_account_session_missing",
@@ -142,7 +169,10 @@ export async function resolveHostedAccountSessionFromRequest(
   const payload = await verifyAccountSessionToken(token, secret);
   const audience = accountSessionAudience(env);
   assertAccountSessionAudience(payload.aud, audience);
-  assertAccountSessionFresh(payload.exp);
+  assertAccountSessionFresh(payload, env, options.now);
+  if (options.consumeReplay) {
+    await consumeAccountSessionReplay(env, payload, options.now);
+  }
 
   const user_id = normalizeAccountId(payload.user_id ?? payload.sub, "user_id");
   const session_id = nonEmptyOptionalString(payload.session_id ?? payload.sid);
@@ -158,15 +188,21 @@ export async function resolveHostedAccountSessionFromRequest(
   });
 }
 
-export function accountSessionTokenFromRequest(request: Request): string | null {
+export function accountSessionTokenFromRequest(
+  request: Request,
+  options: { allowHeaderFallback?: boolean } = {},
+): string | null {
   // Browser OAuth redirects can only carry the hosted account session via cookie.
   // The explicit header remains a dev/test adapter and is used only when the cookie is absent.
   const cookieToken = readCookieValue(request.headers.get("cookie"), ACCOUNT_SESSION_COOKIE_NAME);
   if (cookieToken) {
     return cookieToken;
   }
-  const headerToken = request.headers.get(ACCOUNT_SESSION_HEADER)?.trim();
-  return headerToken || null;
+  if (options.allowHeaderFallback) {
+    const headerToken = request.headers.get(ACCOUNT_SESSION_HEADER)?.trim();
+    return headerToken || null;
+  }
+  return null;
 }
 
 export function readCookieValue(cookieHeader: string | null | undefined, name: string): string | null {
@@ -326,6 +362,9 @@ interface TokenSummaryLike {
 interface AccountSessionPayload extends Record<string, unknown> {
   aud?: unknown;
   exp?: unknown;
+  iat?: unknown;
+  jti?: unknown;
+  nonce?: unknown;
   user_id?: unknown;
   sub?: unknown;
   workspace_id?: unknown;
@@ -436,7 +475,7 @@ export async function readHostedAccountGrant(env: Env, grantId: string): Promise
 }
 
 async function writeHostedAccountGrant(env: Env, grant: HostedAccountGrant): Promise<void> {
-  await env.OAUTH_KV.put(accountGrantKey(grant.grant_id), JSON.stringify(grant));
+  await env.OAUTH_KV.put(accountGrantKey(grant.grant_id), JSON.stringify(grant), kvTtlOptionsFromExpiresAt(grant.expires_at));
 }
 
 function assertGrantActive(grant: HostedAccountGrant, now: Date = new Date()): void {
@@ -668,6 +707,73 @@ function accountSessionAudience(
   return env.YUTOME_ACCOUNT_SESSION_AUDIENCE?.trim() || DEFAULT_ACCOUNT_SESSION_AUDIENCE;
 }
 
+function accountSessionMaxAgeSeconds(env: AccountSessionEnv): number {
+  return positiveIntegerEnv(env.YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS, DEFAULT_ACCOUNT_SESSION_MAX_AGE_SECONDS);
+}
+
+function accountSessionClockSkewSeconds(env: AccountSessionEnv): number {
+  return positiveIntegerEnv(env.YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS, DEFAULT_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS);
+}
+
+async function consumeAccountSessionReplay(
+  env: AccountSessionEnv,
+  payload: AccountSessionPayload,
+  now: Date = new Date(),
+): Promise<void> {
+  const replayId = nonEmptyOptionalString(payload.jti) ?? nonEmptyOptionalString(payload.nonce);
+  if (!replayId) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session replay id is required.",
+      401,
+    );
+  }
+  if (!env.OAUTH_KV) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session replay protection is not configured.",
+      500,
+    );
+  }
+  const key = `${ACCOUNT_SESSION_REPLAY_PREFIX}${replayId}`;
+  const existing = await env.OAUTH_KV.get(key);
+  if (existing) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session has already been used.",
+      401,
+    );
+  }
+  await env.OAUTH_KV.put(key, now.toISOString(), {
+    expirationTtl: accountSessionReplayTtlSeconds(payload, env, now),
+  });
+}
+
+function accountSessionReplayTtlSeconds(payload: AccountSessionPayload, env: AccountSessionEnv, now: Date): number {
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const expSeconds = typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp : nowSeconds;
+  const maxAgeSeconds = accountSessionMaxAgeSeconds(env) + accountSessionClockSkewSeconds(env);
+  const untilExpiry = Math.max(1, Math.ceil(expSeconds - nowSeconds));
+  return Math.max(60, Math.min(untilExpiry, maxAgeSeconds));
+}
+
+function kvTtlOptionsFromExpiresAt(expiresAt: string | undefined): { expirationTtl: number } | undefined {
+  if (!expiresAt) {
+    return undefined;
+  }
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return undefined;
+  }
+  const seconds = Math.ceil((expiresAtMs - Date.now()) / 1000);
+  return { expirationTtl: Math.max(60, seconds) };
+}
+
+function positiveIntegerEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function assertAccountSessionAudience(value: unknown, expected: string): void {
   const audiences = Array.isArray(value)
     ? value.map((entry) => nonEmptyOptionalString(entry)).filter(isString)
@@ -683,18 +789,42 @@ function assertAccountSessionAudience(value: unknown, expected: string): void {
   }
 }
 
-function assertAccountSessionFresh(value: unknown): void {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
+function assertAccountSessionFresh(payload: AccountSessionPayload, env: AccountSessionEnv, now: Date = new Date()): void {
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
     throw new HostedAccountGrantError(
       "hosted_account_session_invalid",
       "Hosted account session expiry is required.",
       401,
     );
   }
-  if (value <= Math.floor(Date.now() / 1000)) {
+  if (typeof payload.iat !== "number" || !Number.isFinite(payload.iat)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session issued-at time is required.",
+      401,
+    );
+  }
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const skewSeconds = accountSessionClockSkewSeconds(env);
+  const maxAgeSeconds = accountSessionMaxAgeSeconds(env);
+  if (payload.exp <= nowSeconds - skewSeconds) {
     throw new HostedAccountGrantError(
       "hosted_account_session_invalid",
       "Hosted account session has expired.",
+      401,
+    );
+  }
+  if (payload.iat > nowSeconds + skewSeconds) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session was issued in the future.",
+      401,
+    );
+  }
+  if (nowSeconds - payload.iat > maxAgeSeconds + skewSeconds) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session is older than the allowed max age.",
       401,
     );
   }

@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,11 @@ def default_usage_ledger_path(config_path: Path = Path(DEFAULT_CONFIG_FILENAME))
 
 
 class JsonlUsageLedger:
-    """Append-only local ledger used for debug commands and early tests.
+    """Append-only local JSONL ledger for CLI debug commands and early tests.
 
-    Hosted production will use Postgres. Keeping this adapter narrow gives the
-    CLI a useful inspection path before the hosted database exists.
+    The authoritative hosted ledger is Postgres (`PostgresUsageLedger`); this narrow
+    adapter exists only to give the CLI a readable inspection path and is not used for
+    hosted authorization.
     """
 
     def __init__(self, path: Path) -> None:
@@ -364,7 +366,57 @@ def _balance_after_usage_event(
     remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")))
     reserved = normalize_unit_map(_json_mapping(row.get("reserved_units_jsonb")))
     remaining_delta = subtract_unit_maps(estimated, actual)
-    return _clamp_non_negative(add_unit_maps(remaining, remaining_delta)), _clamp_non_negative(subtract_unit_maps(reserved, estimated))
+    return add_unit_maps(remaining, remaining_delta), _clamp_non_negative(subtract_unit_maps(reserved, estimated))
+
+
+def release_stale_unknown_usage_reservations(
+    connection: Any,
+    *,
+    now: datetime | None = None,
+    older_than_seconds: int = 3600,
+    limit: int = 100,
+) -> int:
+    if older_than_seconds <= 0:
+        raise ValueError("older_than_seconds must be positive.")
+    if limit <= 0:
+        raise ValueError("limit must be positive.")
+    clock = now or datetime.now(timezone.utc)
+    rows = _execute_rows(
+        connection,
+        SqlStatement(
+            sql=_STALE_UNKNOWN_USAGE_RESERVATIONS_SQL,
+            params={
+                "now": clock,
+                "older_than": clock - timedelta(seconds=older_than_seconds),
+                "limit": limit,
+            },
+        ),
+    )
+    ledger = PostgresUsageLedger(connection)
+    released = 0
+    for row in rows:
+        if "workspace_id" not in row or "subject" not in row or "idempotency_key" not in row:
+            continue
+        reservation = usage_reservation_from_row(row)
+        event = UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id=reservation.workspace_id,
+            subject=reservation.subject,
+            operation=reservation.operation,
+            event_type="provider_attempt_released",
+            status="released",
+            error_code="unknown_timeout",
+            metadata={
+                "idempotency_key": reservation.idempotency_key,
+                "unknown_usage_event_id": row.get("unknown_usage_event_id"),
+                "estimated_units": dict(reservation.estimated_units),
+                "release_reason": "unknown_provider_outcome_ttl",
+            },
+            created_at=clock,
+        )
+        ledger.append(event)
+        released += 1
+    return released
 
 
 def _clamp_non_negative(units: Mapping[str, UnitQuantity]) -> UnitMap:
@@ -395,6 +447,24 @@ def _transaction(connection: Any):
 def _execute_one(connection: Any, statement: SqlStatement) -> Mapping[str, Any] | None:
     result = connection.execute(statement.sql, statement.params)
     return _one_row_from_result(result)
+
+
+def _execute_rows(connection: Any, statement: SqlStatement) -> list[dict[str, Any]]:
+    result = connection.execute(statement.sql, statement.params)
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [dict(row) for row in result]
+    if isinstance(result, tuple):
+        return [dict(row) for row in result]
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        return [dict(row) for row in result.fetchall()]
+    try:
+        return [dict(row) for row in result]
+    except TypeError:
+        return []
 
 
 def _one_row_from_result(result: Any) -> Mapping[str, Any] | None:
@@ -493,6 +563,22 @@ WHERE workspace_id = %(workspace_id)s
   AND period_start_at <= now()
   AND period_end_at > now()
 FOR UPDATE;
+""".strip()
+
+
+_STALE_UNKNOWN_USAGE_RESERVATIONS_SQL = """
+SELECT
+    reservation.*,
+    event.id AS unknown_usage_event_id
+FROM usage_reservations AS reservation
+JOIN usage_events AS event
+  ON event.reservation_id = reservation.id
+ AND event.workspace_id = reservation.workspace_id
+WHERE reservation.status = 'reserved'
+  AND event.status = 'unknown'
+  AND event.created_at <= %(older_than)s
+ORDER BY event.created_at ASC, event.id ASC
+LIMIT %(limit)s;
 """.strip()
 
 

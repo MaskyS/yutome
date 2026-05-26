@@ -11,7 +11,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from yutome.hosted.allocation_policy import default_search_store_allocation
-from yutome.hosted.http_api import TOKEN_ENV_VAR, WORKSPACE_HEADER, build_app, build_postgres_app, error_body
+from yutome.hosted.account import DEFAULT_ACCOUNT_SESSION_AUDIENCE, session_token_hash
+from yutome.hosted.http_api import (
+    ACCOUNT_SESSION_COOKIE_NAME,
+    ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR,
+    ACCOUNT_SESSION_TTL_SECONDS,
+    TOKEN_ENV_VAR,
+    WORKSPACE_HEADER,
+    build_app,
+    build_postgres_app,
+    error_body,
+)
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpQueryAdapter, HostedMcpUsageContext
 from yutome.hosted.models import EntitlementPolicy, UsageEvent, WorkspaceBalance
 from yutome.hosted.search_store import SearchStoreUsage
@@ -33,6 +43,11 @@ def polar_headers(raw_body: bytes, *, secret: str = "polar-secret", webhook_id: 
         "webhook-timestamp": timestamp,
         "webhook-signature": f"v1,{signature}",
     }
+
+
+def decode_base64url_json(value: str) -> dict[str, Any]:
+    padded = value + ("=" * (-len(value) % 4))
+    return json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
 
 
 def _allow_search_usage_context(
@@ -424,6 +439,111 @@ def test_polar_webhook_accepts_signature_and_processes_order_credit() -> None:
     assert credit_params["workspace_id"] == "ws_http"
     assert credit_params["external_order_id"] == "ord_123"
     assert credit_params["quantity_text"] == "5"
+
+
+def test_account_bootstrap_creates_signed_session_and_persists_hash_only() -> None:
+    connection = RecordingConnection()
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            expected_api_token=TEST_API_TOKEN,
+            account_session_secret="account-session-secret",
+        )
+    )
+
+    response = client.post(
+        "/account/bootstrap",
+        json={"email": " ALICE@YUTOME.COM ", "name": "Alice", "workspace_name": "Alice Research"},
+        headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["principal"]["normalized_email"] == "alice@yutome.com"
+    assert body["principal"]["workspace_id"].startswith("ws_")
+    assert body["session"]["audience"] == DEFAULT_ACCOUNT_SESSION_AUDIENCE
+    assert body["session"]["cookie_name"] == ACCOUNT_SESSION_COOKIE_NAME
+    assert body["session"]["max_age_seconds"] == ACCOUNT_SESSION_TTL_SECONDS
+
+    token = body["session"]["token"]
+    version, encoded_payload, encoded_signature = token.split(".")
+    assert version == "v1"
+    payload = decode_base64url_json(encoded_payload)
+    assert payload["aud"] == DEFAULT_ACCOUNT_SESSION_AUDIENCE
+    assert isinstance(payload["iat"], int)
+    assert isinstance(payload["jti"], str)
+    assert payload["exp"] - payload["iat"] == ACCOUNT_SESSION_TTL_SECONDS
+    assert payload["user_id"] == body["principal"]["user_id"]
+    assert payload["workspace_id"] == body["principal"]["workspace_id"]
+    assert payload["workspace_ids"] == [body["principal"]["workspace_id"]]
+    expected_signature = hmac.new(
+        b"account-session-secret",
+        f"v1.{encoded_payload}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    assert base64.urlsafe_b64decode(encoded_signature + ("=" * (-len(encoded_signature) % 4))) == expected_signature
+
+    account_session_calls = [params for sql, params in connection.calls if "INSERT INTO account_sessions" in sql]
+    assert len(account_session_calls) == 1
+    assert account_session_calls[0]["session_hash"] == session_token_hash(token)
+    assert token not in json.dumps(connection.calls, default=str)
+
+
+def test_account_bootstrap_requires_api_token_before_db_write() -> None:
+    connection = RecordingConnection()
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            expected_api_token=TEST_API_TOKEN,
+            account_session_secret="account-session-secret",
+        )
+    )
+
+    response = client.post(
+        "/account/bootstrap",
+        json={"email": "alice@yutome.com", "name": "Alice", "workspace_name": "Alice Research"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_required"
+    assert connection.calls == []
+
+
+def test_account_bootstrap_requires_connection_and_signing_secret() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    missing_connection = TestClient(
+        build_app(
+            adapter=adapter,
+            expected_api_token=TEST_API_TOKEN,
+            account_session_secret="account-session-secret",
+        )
+    )
+    missing_secret = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=RecordingConnection(),
+            expected_api_token=TEST_API_TOKEN,
+        )
+    )
+    headers = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
+    payload = {"email": "alice@yutome.com", "name": "Alice", "workspace_name": "Alice Research"}
+
+    connection_response = missing_connection.post("/account/bootstrap", json=payload, headers=headers)
+    secret_response = missing_secret.post("/account/bootstrap", json=payload, headers=headers)
+
+    assert connection_response.status_code == 503
+    assert error_body(connection_response.json())["code"] == "account_bootstrap_connection_unconfigured"
+    assert secret_response.status_code == 503
+    assert error_body(secret_response.json())["code"] == "account_session_signing_unconfigured"
+    assert ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR in error_body(secret_response.json())["message"]
 
 
 def test_tool_call_endpoint_uses_workspace_from_auth_header(
