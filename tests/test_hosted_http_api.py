@@ -86,6 +86,63 @@ class RecordingSearchStore:
         self.calls.append({"resource": "source", "workspace_id": workspace_id, "id": source_id})
         return self._resource(workspace_id, "source", source_id)
 
+    def list_status(self, *, workspace_id: str) -> dict[str, Any]:
+        self.calls.append({"list": "status", "workspace_id": workspace_id})
+        return {
+            "searchable_now": 1,
+            "still_indexing": 0,
+            "needs_attention": 0,
+            "channels": 1,
+            "videos": 1,
+            "chunks": 1,
+            "transcript_versions": 1,
+            "statuses": {"indexed": 1},
+        }
+
+    def list_videos(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        video_id: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            {
+                "list": "videos",
+                "workspace_id": workspace_id,
+                "limit": limit,
+                "offset": offset,
+                "channel": channel,
+                "video_id": video_id,
+                "order_by": order_by,
+            }
+        )
+        return [{"video_id": video_id or "vid_http", "resource_uri": "yutome://video/vid_http", "title": "HTTP video"}]
+
+    def list_channels(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        selected: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            {
+                "list": "channels",
+                "workspace_id": workspace_id,
+                "limit": limit,
+                "offset": offset,
+                "channel": channel,
+                "selected": selected,
+            }
+        )
+        return [{"channel_id": channel or "chan_http", "resource_uri": "yutome://channel/chan_http", "selected": selected}]
+
     def _resource(self, workspace_id: str, kind: str, id_: str) -> dict[str, Any]:
         from yutome.hosted.resources import HostedResourceNotFound
 
@@ -233,6 +290,40 @@ def test_tool_call_endpoint_uses_workspace_from_auth_header(
     assert store.calls == [{"workspace_id": "ws_http", "query": "Crohn", "limit": 4}]
     assert ledger.events[0].workspace_id == "ws_http"
     assert ledger.events[0].operation == "lexical_query"
+
+
+def test_tool_call_endpoint_accepts_contract_list_and_q_tools(
+    hosted_http_client: tuple[TestClient, RecordingSearchStore, RecordingLedger],
+) -> None:
+    client, store, _ledger = hosted_http_client
+
+    list_response = client.post(
+        "/tools/call",
+        json={"name": "list", "arguments": {"entity": "videos", "order_by": "newest", "limit": 1}},
+        headers={WORKSPACE_HEADER: "ws_http"},
+    )
+    q_response = client.post(
+        "/tools/call",
+        json={"name": "q", "arguments": {"request": {"project": "status_breakdown"}}},
+        headers={WORKSPACE_HEADER: "ws_http"},
+    )
+
+    assert list_response.status_code == 200
+    assert list_response.json()["result"]["rows"][0]["video_id"] == "vid_http"
+    assert q_response.status_code == 200
+    assert q_response.json()["result"]["rows"][0]["videos"] == 1
+    assert store.calls == [
+        {
+            "list": "videos",
+            "workspace_id": "ws_http",
+            "limit": 1,
+            "offset": 0,
+            "channel": None,
+            "video_id": None,
+            "order_by": "newest",
+        },
+        {"list": "status", "workspace_id": "ws_http"},
+    ]
 
 
 def test_configured_api_token_rejects_missing_authorization_before_workspace_dispatch() -> None:

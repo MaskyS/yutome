@@ -84,6 +84,32 @@ class SearchStore(Protocol):
     def resource_source(self, *, workspace_id: str, source_id: str) -> dict[str, Any]:
         ...
 
+    def list_status(self, *, workspace_id: str) -> dict[str, Any]:
+        ...
+
+    def list_videos(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        video_id: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def list_channels(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        selected: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        ...
+
 
 class PostgresVectorChordSearchStore:
     """Hosted search adapter for the VectorChord-first Postgres substrate.
@@ -208,6 +234,45 @@ class PostgresVectorChordSearchStore:
 
     def resource_source(self, *, workspace_id: str, source_id: str) -> dict[str, Any]:
         return self.resources.source(workspace_id=workspace_id, source_id=source_id)
+
+    def list_status(self, *, workspace_id: str) -> dict[str, Any]:
+        return self.resources.list_status(workspace_id=workspace_id)
+
+    def list_videos(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        video_id: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.resources.list_videos(
+            workspace_id=workspace_id,
+            limit=limit,
+            offset=offset,
+            channel=channel,
+            video_id=video_id,
+            order_by=order_by,
+        )
+
+    def list_channels(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        selected: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.resources.list_channels(
+            workspace_id=workspace_id,
+            limit=limit,
+            offset=offset,
+            channel=channel,
+            selected=selected,
+        )
 
 
 VECTORCHORD_REQUIRED_EXTENSIONS = ("vector", "vchord", "pg_tokenizer", "vchord_bm25")

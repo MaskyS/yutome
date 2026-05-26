@@ -106,6 +106,67 @@ class RecordingSearchStore:
         self.calls.append({"resource": "source", "workspace_id": workspace_id, "id": source_id})
         return self._resource(workspace_id, "source", source_id)
 
+    def list_status(self, *, workspace_id: str) -> dict[str, Any]:
+        self.calls.append({"list": "status", "workspace_id": workspace_id})
+        return {
+            "searchable_now": 1,
+            "still_indexing": 2,
+            "needs_attention": 0,
+            "channels": 3,
+            "videos": 4,
+            "chunks": 5,
+            "transcript_versions": 6,
+            "statuses": {"indexed": 1, "pending": 2},
+        }
+
+    def list_videos(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        video_id: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            {
+                "list": "videos",
+                "workspace_id": workspace_id,
+                "limit": limit,
+                "offset": offset,
+                "channel": channel,
+                "video_id": video_id,
+                "order_by": order_by,
+            }
+        )
+        if self.rows and "video_id" in self.rows[0] and "chunk_id" not in self.rows[0]:
+            return self.rows
+        return [{"video_id": video_id or "vid_1", "title": "Hosted video"}]
+
+    def list_channels(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        selected: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            {
+                "list": "channels",
+                "workspace_id": workspace_id,
+                "limit": limit,
+                "offset": offset,
+                "channel": channel,
+                "selected": selected,
+            }
+        )
+        if self.rows and "channel_id" in self.rows[0] and "chunk_id" not in self.rows[0]:
+            return self.rows
+        return [{"channel_id": channel or "chan_1", "title": "Hosted channel", "selected": selected}]
+
     def _resource(self, workspace_id: str, kind: str, id_: str) -> dict[str, Any]:
         from yutome.hosted.resources import HostedResourceNotFound
 
@@ -480,10 +541,10 @@ def test_unsupported_tool_and_resource_return_clear_errors() -> None:
     auth = HostedMcpAuthContext(workspace_id="ws_alice")
 
     with pytest.raises(HostedMcpError) as tool_exc:
-        adapter.call_tool(auth=auth, name="list", arguments={"entity": "status"})
+        adapter.call_tool(auth=auth, name="unknown", arguments={})
 
     assert tool_exc.value.code == "unsupported_tool"
-    assert tool_exc.value.to_dict()["error"]["data"]["supported"] == ["find", "show"]
+    assert tool_exc.value.to_dict()["error"]["data"]["supported"] == ["find", "list", "q", "show"]
 
     with pytest.raises(HostedMcpError) as resource_exc:
         adapter.read_resource(auth=auth, uri="yutome://unknown/chunk_1")
@@ -577,6 +638,169 @@ def test_show_context_returns_structured_unsupported_error() -> None:
 
     assert exc_info.value.code == "unsupported_show_context"
     assert exc_info.value.status_code == 501
+
+
+def test_list_status_videos_and_channels_are_workspace_scoped() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    auth = HostedMcpAuthContext(workspace_id="ws_alice")
+
+    status = adapter.call_tool(auth=auth, name="list", arguments={"entity": "status"})
+    videos = adapter.call_tool(
+        auth=auth,
+        name="list",
+        arguments={"entity": "videos", "channel": "chan_1", "order_by": "newest", "limit": 2, "offset": 4},
+    )
+    channels = adapter.call_tool(
+        auth=auth,
+        name="list",
+        arguments={"entity": "channels", "selected": True, "limit": 3},
+    )
+
+    assert status["rows"][0]["videos"] == 4
+    assert videos["rows"][0]["video_id"] == "vid_1"
+    assert channels["rows"][0]["channel_id"] == "chan_1"
+    assert store.calls == [
+        {"list": "status", "workspace_id": "ws_alice"},
+        {
+            "list": "videos",
+            "workspace_id": "ws_alice",
+            "limit": 2,
+            "offset": 4,
+            "channel": "chan_1",
+            "video_id": None,
+            "order_by": "newest",
+        },
+        {
+            "list": "channels",
+            "workspace_id": "ws_alice",
+            "limit": 3,
+            "offset": 0,
+            "channel": None,
+            "selected": True,
+        },
+    ]
+
+
+def test_list_attention_and_advanced_filters_return_structured_unsupported() -> None:
+    adapter = HostedMcpQueryAdapter(search_store=RecordingSearchStore())
+
+    with pytest.raises(HostedMcpError) as attention_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="list",
+            arguments={"entity": "attention"},
+        )
+    with pytest.raises(HostedMcpError) as filter_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="list",
+            arguments={"entity": "videos", "since": "2026-01-01"},
+        )
+
+    assert attention_exc.value.code == "unsupported_list_entity"
+    assert attention_exc.value.status_code == 501
+    assert filter_exc.value.code == "unsupported_list_filter"
+    assert filter_exc.value.status_code == 501
+
+
+def test_q_accepts_safe_status_video_channel_and_chunk_shapes() -> None:
+    store = RecordingSearchStore(
+        rows=[
+            {
+                "chunk_id": "chunk_1",
+                "video_id": "vid_1",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "text": "Hosted chunk search.",
+                "lexical_score": 0.5,
+                "score": 0.5,
+            }
+        ]
+    )
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    auth = HostedMcpAuthContext(workspace_id="ws_alice")
+
+    status = adapter.call_tool(auth=auth, name="q", arguments={"request": {"project": "status_breakdown"}})
+    videos = adapter.call_tool(
+        auth=auth,
+        name="q",
+        arguments={
+            "request": {
+                "entity": "video",
+                "project": "video_card",
+                "filter": {"video_id": {"eq": "vid_1"}, "channel_id": {"eq": "chan_1"}},
+                "order_by": [{"field": "published_at", "direction": "desc"}],
+                "limit": 2,
+                "offset": 1,
+            }
+        },
+    )
+    channels = adapter.call_tool(
+        auth=auth,
+        name="q",
+        arguments={"request": {"entity": "channel", "filter": {"channel_selected": {"eq": True}}, "limit": 2}},
+    )
+    chunks = adapter.call_tool(
+        auth=auth,
+        name="q",
+        arguments={
+            "request": {
+                "entity": "chunk",
+                "search": {"over": "chunk_text", "mode": "lexical", "text": "Crohn"},
+                "project": "chunk",
+                "limit": 1,
+            }
+        },
+    )
+
+    assert status["rows"][0]["searchable_now"] == 1
+    assert videos["rows"][0]["video_id"] == "vid_1"
+    assert channels["rows"][0]["channel_id"] == "chan_1"
+    assert chunks["rows"][0]["chunk_id"] == "chunk_1"
+    assert store.calls[:3] == [
+        {"list": "status", "workspace_id": "ws_alice"},
+        {
+            "list": "videos",
+            "workspace_id": "ws_alice",
+            "limit": 2,
+            "offset": 1,
+            "channel": "chan_1",
+            "video_id": "vid_1",
+            "order_by": "newest",
+        },
+        {
+            "list": "channels",
+            "workspace_id": "ws_alice",
+            "limit": 2,
+            "offset": 0,
+            "channel": None,
+            "selected": True,
+        },
+    ]
+    assert store.calls[3] == {"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn", "limit": 1}
+
+
+def test_q_rejects_unsupported_shapes_and_nested_workspace_injection() -> None:
+    adapter = HostedMcpQueryAdapter(search_store=RecordingSearchStore())
+
+    with pytest.raises(HostedMcpError) as unsupported_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="q",
+            arguments={"request": {"entity": "chunk", "search": {"mode": "semantic", "text": "Crohn"}}},
+        )
+    with pytest.raises(HostedMcpError) as workspace_exc:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="q",
+            arguments={"request": {"entity": "video", "workspace_id": "ws_evil"}},
+        )
+
+    assert unsupported_exc.value.code == "unsupported_q_shape"
+    assert unsupported_exc.value.status_code == 501
+    assert workspace_exc.value.code == "workspace_argument_not_allowed"
+    assert workspace_exc.value.to_dict()["error"]["data"]["arguments"] == ["request.workspace_id"]
 
 
 def _usage_context_provider(

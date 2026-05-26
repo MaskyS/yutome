@@ -61,6 +61,49 @@ class HostedResourceQueries:
             raise HostedResourceNotFound(kind="source", id_=source_id)
         return format_source_resource(row)
 
+    def list_status(self, *, workspace_id: str) -> dict[str, Any]:
+        statement = list_status_sql(workspace_id=workspace_id)
+        row = _one(self.connection.execute(statement.sql, statement.params))
+        return format_status_row(row or {})
+
+    def list_videos(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        video_id: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        statement = list_videos_sql(
+            workspace_id=workspace_id,
+            limit=limit,
+            offset=offset,
+            channel=channel,
+            video_id=video_id,
+            order_by=order_by,
+        )
+        return [format_video_list_row(row) for row in _rows(self.connection.execute(statement.sql, statement.params))]
+
+    def list_channels(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        offset: int = 0,
+        channel: str | None = None,
+        selected: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        statement = list_channels_sql(
+            workspace_id=workspace_id,
+            limit=limit,
+            offset=offset,
+            channel=channel,
+            selected=selected,
+        )
+        return [format_channel_list_row(row) for row in _rows(self.connection.execute(statement.sql, statement.params))]
+
 
 def chunk_resource_sql(*, workspace_id: str, chunk_id: str) -> SqlStatement:
     return SqlStatement(
@@ -251,6 +294,168 @@ LIMIT 1;
     )
 
 
+def list_status_sql(*, workspace_id: str) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT
+    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s) AS videos,
+    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s AND v.active_transcript_version_id IS NOT NULL) AS searchable_now,
+    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s AND v.active_transcript_version_id IS NULL) AS still_indexing,
+    0::integer AS needs_attention,
+    (SELECT count(*) FROM chunks c WHERE c.workspace_id = %(workspace_id)s) AS chunks,
+    (SELECT count(*) FROM transcript_versions tv WHERE tv.workspace_id = %(workspace_id)s) AS transcript_versions,
+    (SELECT count(*) FROM sources s WHERE s.workspace_id = %(workspace_id)s AND s.source_type = 'channel') AS channels,
+    (
+        SELECT COALESCE(jsonb_object_agg(status, count), '{}'::jsonb)
+        FROM (
+            SELECT
+                CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END AS status,
+                count(*) AS count
+            FROM videos v
+            WHERE v.workspace_id = %(workspace_id)s
+            GROUP BY 1
+        ) status_counts
+    ) AS statuses;
+""".strip(),
+        params={"workspace_id": workspace_id},
+    )
+
+
+def list_videos_sql(
+    *,
+    workspace_id: str,
+    limit: int,
+    offset: int = 0,
+    channel: str | None = None,
+    video_id: str | None = None,
+    order_by: str | None = None,
+) -> SqlStatement:
+    order_clause = {
+        None: "v.published_at DESC NULLS LAST, v.created_at DESC, v.id",
+        "newest": "v.published_at DESC NULLS LAST, v.created_at DESC, v.id",
+        "oldest": "v.published_at ASC NULLS LAST, v.created_at ASC, v.id",
+        "longest": "v.duration_seconds DESC NULLS LAST, v.published_at DESC NULLS LAST, v.id",
+        "shortest": "v.duration_seconds ASC NULLS LAST, v.published_at DESC NULLS LAST, v.id",
+        "title": "v.title ASC, v.published_at DESC NULLS LAST, v.id",
+    }.get(order_by)
+    if order_clause is None:
+        order_clause = "v.published_at DESC NULLS LAST, v.created_at DESC, v.id"
+    return SqlStatement(
+        sql=f"""
+SELECT
+    v.id AS video_id,
+    v.youtube_video_id,
+    v.source_id,
+    v.active_transcript_version_id,
+    v.channel_id,
+    v.title,
+    v.description,
+    v.published_at,
+    v.duration_seconds,
+    v.metadata_json,
+    s.display_name AS source_display_name,
+    s.source_url,
+    s.source_type,
+    count(c.id) FILTER (WHERE c.transcript_version_id = v.active_transcript_version_id) AS active_chunk_count
+FROM videos v
+LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
+LEFT JOIN chunks c ON c.video_id = v.id AND c.workspace_id = v.workspace_id
+WHERE v.workspace_id = %(workspace_id)s
+  AND (%(video_id)s::text IS NULL OR v.id = %(video_id)s::text OR v.youtube_video_id = %(video_id)s::text)
+  AND (
+    %(channel)s::text IS NULL
+    OR v.channel_id = %(channel)s::text
+    OR v.metadata_json->>'channel_handle' = %(channel)s::text
+    OR v.metadata_json->>'channel_title' = %(channel)s::text
+    OR s.canonical_channel_id = %(channel)s::text
+    OR s.display_name = %(channel)s::text
+  )
+GROUP BY v.id, s.id
+ORDER BY {order_clause}
+LIMIT %(limit)s
+OFFSET %(offset)s;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "video_id": video_id,
+            "channel": channel,
+            "limit": max(1, min(limit, 200)),
+            "offset": max(0, offset),
+        },
+    )
+
+
+def list_channels_sql(
+    *,
+    workspace_id: str,
+    limit: int,
+    offset: int = 0,
+    channel: str | None = None,
+    selected: bool | None = None,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+WITH channel_sources AS (
+    SELECT
+        COALESCE(s.canonical_channel_id, s.id) AS channel_id,
+        max(s.display_name) AS title,
+        bool_or(s.selected) AS selected,
+        count(DISTINCT s.id) AS source_count,
+        array_remove(array_agg(DISTINCT s.id), NULL) AS source_ids,
+        max(s.last_discovered_at) AS last_discovered_at,
+        max(s.last_indexed_at) AS last_indexed_at
+    FROM sources s
+    WHERE s.workspace_id = %(workspace_id)s
+      AND s.source_type = 'channel'
+      AND (%(selected)s::boolean IS NULL OR s.selected = %(selected)s::boolean)
+    GROUP BY COALESCE(s.canonical_channel_id, s.id)
+),
+channel_videos AS (
+    SELECT
+        COALESCE(v.channel_id, s.canonical_channel_id) AS channel_id,
+        max(COALESCE(v.metadata_json->>'channel_title', s.display_name)) AS title,
+        max(v.metadata_json->>'channel_handle') AS channel_handle,
+        count(DISTINCT v.id) AS video_count,
+        max(v.published_at) AS latest_published_at
+    FROM videos v
+    LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
+    WHERE v.workspace_id = %(workspace_id)s
+    GROUP BY COALESCE(v.channel_id, s.canonical_channel_id)
+)
+SELECT
+    COALESCE(cs.channel_id, cv.channel_id) AS channel_id,
+    COALESCE(cv.title, cs.title) AS title,
+    cv.channel_handle,
+    COALESCE(cv.video_count, 0) AS video_count,
+    cv.latest_published_at,
+    COALESCE(cs.selected, true) AS selected,
+    COALESCE(cs.source_count, 0) AS source_count,
+    COALESCE(cs.source_ids, ARRAY[]::text[]) AS source_ids,
+    cs.last_discovered_at,
+    cs.last_indexed_at
+FROM channel_sources cs
+FULL OUTER JOIN channel_videos cv USING (channel_id)
+WHERE COALESCE(cs.channel_id, cv.channel_id) IS NOT NULL
+  AND (
+    %(channel)s::text IS NULL
+    OR COALESCE(cs.channel_id, cv.channel_id) = %(channel)s::text
+    OR cv.channel_handle = %(channel)s::text
+    OR COALESCE(cv.title, cs.title) = %(channel)s::text
+  )
+ORDER BY cv.latest_published_at DESC NULLS LAST, COALESCE(cv.title, cs.title) ASC, COALESCE(cs.channel_id, cv.channel_id)
+LIMIT %(limit)s
+OFFSET %(offset)s;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "channel": channel,
+            "selected": selected,
+            "limit": max(1, min(limit, 200)),
+            "offset": max(0, offset),
+        },
+    )
+
+
 def format_chunk_resource(row: Mapping[str, Any]) -> dict[str, Any]:
     chunk_id = str(row["chunk_id"])
     video_id = str(row["video_id"])
@@ -382,6 +587,46 @@ def format_source_resource(row: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def format_status_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    statuses = row.get("statuses") or {}
+    if not isinstance(statuses, Mapping):
+        statuses = {}
+    return {
+        "searchable_now": int(row.get("searchable_now") or 0),
+        "still_indexing": int(row.get("still_indexing") or 0),
+        "needs_attention": int(row.get("needs_attention") or 0),
+        "channels": int(row.get("channels") or 0),
+        "videos": int(row.get("videos") or 0),
+        "chunks": int(row.get("chunks") or 0),
+        "transcript_versions": int(row.get("transcript_versions") or 0),
+        "statuses": dict(statuses),
+    }
+
+
+def format_video_list_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return format_video_resource(row)
+
+
+def format_channel_list_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    channel_id = str(row["channel_id"])
+    return _compact(
+        {
+            "channel_id": channel_id,
+            "library_channel_id": channel_id,
+            "resource_uri": f"yutome://channel/{channel_id}",
+            "title": row.get("title"),
+            "channel_handle": row.get("channel_handle"),
+            "selected": row.get("selected"),
+            "video_count": row.get("video_count"),
+            "latest_published_at": _json_value(row.get("latest_published_at")),
+            "source_count": row.get("source_count"),
+            "source_ids": list(row.get("source_ids") or []),
+            "last_discovered_at": _json_value(row.get("last_discovered_at")),
+            "last_indexed_at": _json_value(row.get("last_indexed_at")),
+        }
+    )
+
+
 def _one(result: Any) -> dict[str, Any] | None:
     rows = _rows(result)
     return rows[0] if rows else None
@@ -456,6 +701,12 @@ __all__ = [
     "TRANSCRIPT_TEXT_CAP",
     "channel_resource_sql",
     "chunk_resource_sql",
+    "format_channel_list_row",
+    "format_status_row",
+    "format_video_list_row",
+    "list_channels_sql",
+    "list_status_sql",
+    "list_videos_sql",
     "source_resource_sql",
     "transcript_resource_sql",
     "video_resource_sql",

@@ -20,6 +20,9 @@ from yutome.hosted.search_store import (
 from yutome.hosted.resources import (
     channel_resource_sql,
     chunk_resource_sql,
+    list_channels_sql,
+    list_status_sql,
+    list_videos_sql,
     source_resource_sql,
     transcript_resource_sql,
     video_resource_sql,
@@ -181,6 +184,91 @@ def test_resource_sql_is_workspace_scoped_for_supported_hosts() -> None:
     assert "v.channel_id = %(channel_id)s" in statements[2].sql
     assert "tv.id = %(transcript_version_id)s" in statements[3].sql
     assert "id = %(source_id)s" in statements[4].sql
+
+
+def test_list_sql_helpers_are_workspace_scoped_and_parameterized() -> None:
+    status = list_status_sql(workspace_id="ws_alice")
+    videos = list_videos_sql(workspace_id="ws_alice", limit=5, offset=2, channel="chan_1", order_by="newest")
+    channels = list_channels_sql(workspace_id="ws_alice", limit=6, offset=3, selected=True)
+
+    assert "%(workspace_id)s" in status.sql
+    assert "searchable_now" in status.sql
+    assert "v.workspace_id = %(workspace_id)s" in videos.sql
+    assert "ORDER BY v.published_at DESC NULLS LAST" in videos.sql
+    assert videos.params == {
+        "workspace_id": "ws_alice",
+        "video_id": None,
+        "channel": "chan_1",
+        "limit": 5,
+        "offset": 2,
+    }
+    assert "s.workspace_id = %(workspace_id)s" in channels.sql
+    assert "s.selected = %(selected)s::boolean" in channels.sql
+    assert channels.params["selected"] is True
+    assert channels.params["limit"] == 6
+    assert channels.params["offset"] == 3
+
+
+def test_search_store_list_methods_format_postgres_rows() -> None:
+    status_connection = RecordingConnection(
+        rows=[
+            {
+                "searchable_now": 1,
+                "still_indexing": 2,
+                "needs_attention": 0,
+                "channels": 3,
+                "videos": 4,
+                "chunks": 5,
+                "transcript_versions": 6,
+                "statuses": {"indexed": 1, "pending": 2},
+            }
+        ]
+    )
+    video_connection = RecordingConnection(
+        rows=[
+            {
+                "video_id": "vid_1",
+                "youtube_video_id": "yt_1",
+                "source_id": "src_1",
+                "active_transcript_version_id": "tx_1",
+                "channel_id": "chan_1",
+                "title": "Hosted Video",
+                "description": "Description",
+                "published_at": "2026-01-01T00:00:00Z",
+                "duration_seconds": 60,
+                "metadata_json": {"channel_title": "Hosted Channel"},
+                "source_display_name": "Source Channel",
+                "source_url": "https://youtube.com/@hosted",
+                "source_type": "channel",
+                "active_chunk_count": 2,
+            }
+        ]
+    )
+    channel_connection = RecordingConnection(
+        rows=[
+            {
+                "channel_id": "chan_1",
+                "title": "Hosted Channel",
+                "channel_handle": "@hosted",
+                "selected": True,
+                "video_count": 4,
+                "latest_published_at": "2026-01-01T00:00:00Z",
+                "source_count": 1,
+                "source_ids": ["src_1"],
+            }
+        ]
+    )
+
+    assert PostgresVectorChordSearchStore(status_connection).list_status(workspace_id="ws_alice")["videos"] == 4
+    video = PostgresVectorChordSearchStore(video_connection).list_videos(workspace_id="ws_alice", limit=1)[0]
+    channel = PostgresVectorChordSearchStore(channel_connection).list_channels(workspace_id="ws_alice", limit=1)[0]
+
+    assert video["resource_uri"] == "yutome://video/vid_1"
+    assert video["youtube_url"] == "https://youtube.com/watch?v=yt_1"
+    assert video["channel_title"] == "Hosted Channel"
+    assert channel["resource_uri"] == "yutome://channel/chan_1"
+    assert channel["library_channel_id"] == "chan_1"
+    assert channel["selected"] is True
 
 
 def test_search_store_resource_methods_format_postgres_rows() -> None:

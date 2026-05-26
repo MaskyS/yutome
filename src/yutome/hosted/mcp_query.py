@@ -42,7 +42,7 @@ FORBIDDEN_TOOL_ARGUMENT_KEYS = frozenset(
         "user_id",
     }
 )
-SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "show"})
+SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "list", "q", "show"})
 SUPPORTED_TOOL = "find"
 SUPPORTED_RESOURCE_HOSTS: frozenset[str] = frozenset({"channel", "chunk", "transcript", "video"})
 
@@ -178,6 +178,10 @@ class HostedMcpQueryAdapter:
         normalized_arguments = _normalize_tool_arguments(arguments or {})
         if normalized_name == "show":
             return self._show(auth=auth, arguments=normalized_arguments)
+        if normalized_name == "list":
+            return self._list(auth=auth, arguments=normalized_arguments).model_dump()
+        if normalized_name == "q":
+            return self._q(auth=auth, arguments=normalized_arguments).model_dump()
         return self._find(auth=auth, arguments=normalized_arguments).model_dump()
 
     def read_resource(self, *, auth: HostedMcpAuthContext, uri: str) -> dict[str, Any]:
@@ -400,6 +404,70 @@ class HostedMcpQueryAdapter:
             data={"kind": request.kind, "supported": sorted(HostedShowRequest.SUPPORTED_KINDS)},
         )
 
+    def _list(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> QueryResult:
+        request = HostedListRequest.from_arguments(arguments)
+        if request.entity == "status":
+            return QueryResult(rows=[self.search_store.list_status(workspace_id=auth.workspace_id)])
+        if request.entity == "video":
+            return QueryResult(
+                rows=self.search_store.list_videos(
+                    workspace_id=auth.workspace_id,
+                    limit=request.limit,
+                    offset=request.offset,
+                    channel=request.channel,
+                    order_by=request.order_by,
+                )
+            )
+        if request.entity == "channel":
+            return QueryResult(
+                rows=self.search_store.list_channels(
+                    workspace_id=auth.workspace_id,
+                    limit=request.limit,
+                    offset=request.offset,
+                    channel=request.channel,
+                    selected=request.selected,
+                )
+            )
+        raise AssertionError("validated list request produced an unknown entity")
+
+    def _q(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> QueryResult:
+        request = HostedQRequest.from_arguments(arguments)
+        if request.kind == "status":
+            return QueryResult(rows=[self.search_store.list_status(workspace_id=auth.workspace_id)])
+        if request.kind == "video":
+            return QueryResult(
+                rows=self.search_store.list_videos(
+                    workspace_id=auth.workspace_id,
+                    limit=request.limit,
+                    offset=request.offset,
+                    channel=request.channel,
+                    video_id=request.video_id,
+                    order_by=request.order_by,
+                )
+            )
+        if request.kind == "channel":
+            return QueryResult(
+                rows=self.search_store.list_channels(
+                    workspace_id=auth.workspace_id,
+                    limit=request.limit,
+                    offset=request.offset,
+                    channel=request.channel,
+                    selected=request.selected,
+                )
+            )
+        if request.kind == "chunk_lexical":
+            return self._find_lexical(
+                auth=auth,
+                request=HostedFindRequest(
+                    text=request.text or "",
+                    limit=request.limit,
+                    mode="lexical",
+                    project=request.project,
+                    notes=["hosted_q_mapped_to_lexical_chunk_search"],
+                ),
+            )
+        raise AssertionError("validated q request produced an unknown kind")
+
     def _read_resource(
         self,
         *,
@@ -551,6 +619,197 @@ class HostedShowRequest:
         )
 
 
+@dataclass(frozen=True)
+class HostedListRequest:
+    entity: str
+    limit: int
+    offset: int = 0
+    channel: str | None = None
+    selected: bool | None = None
+    order_by: str | None = None
+
+    @classmethod
+    def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedListRequest:
+        _reject_workspace_argument_injection(arguments)
+        raw_entity = str(arguments.get("entity") or "").strip()
+        if raw_entity in {"video", "videos"}:
+            entity = "video"
+        elif raw_entity in {"channel", "channels"}:
+            entity = "channel"
+        elif raw_entity == "status":
+            entity = "status"
+        elif raw_entity == "attention":
+            raise HostedMcpError(
+                code="unsupported_list_entity",
+                message="Hosted MCP list attention is not backed by the hosted schema yet.",
+                status_code=501,
+                data={"entity": raw_entity},
+            )
+        else:
+            raise HostedMcpError(
+                code="unsupported_list_entity",
+                message="Hosted MCP list supports status, videos, and channels.",
+                status_code=400,
+                data={"entity": raw_entity, "supported": ["channels", "status", "videos"]},
+            )
+
+        unsupported_filters = [
+            key
+            for key in ("since", "until", "status", "source", "language")
+            if arguments.get(key) is not None
+        ]
+        if unsupported_filters:
+            raise HostedMcpError(
+                code="unsupported_list_filter",
+                message="Hosted MCP list only supports channel and selected filters in this adapter slice.",
+                status_code=501,
+                data={"filters": unsupported_filters},
+            )
+        if entity == "status":
+            extra = [key for key in ("channel", "selected", "order_by", "project") if arguments.get(key) is not None]
+            if extra:
+                raise HostedMcpError(
+                    code="unsupported_list_filter",
+                    message="Hosted MCP list status does not support filters or projections.",
+                    status_code=501,
+                    data={"filters": extra},
+                )
+        if entity == "video" and arguments.get("selected") is not None:
+            raise HostedMcpError(
+                code="unsupported_list_filter",
+                message="Hosted MCP selected filtering is only supported for channel lists.",
+                status_code=501,
+                data={"filters": ["selected"]},
+            )
+        order_by = _normalize_list_order(arguments.get("order_by"))
+        if entity == "channel" and order_by is not None:
+            raise HostedMcpError(
+                code="unsupported_list_order",
+                message="Hosted MCP channel lists do not support order_by yet.",
+                status_code=501,
+                data={"order_by": order_by},
+            )
+        project = arguments.get("project")
+        if project not in {None, "thin", "video_card", "channel_card", "status_breakdown"}:
+            raise HostedMcpError(
+                code="unsupported_list_project",
+                message="Hosted MCP list supports thin, video_card, channel_card, and status_breakdown projections.",
+                status_code=501,
+                data={"project": project},
+            )
+        return cls(
+            entity=entity,
+            limit=_coerce_limit(arguments.get("limit", 20)),
+            offset=_coerce_offset(arguments.get("offset", 0)),
+            channel=_optional_str(arguments.get("channel")),
+            selected=_optional_bool(arguments.get("selected")),
+            order_by=order_by,
+        )
+
+
+@dataclass(frozen=True)
+class HostedQRequest:
+    kind: str
+    limit: int
+    offset: int = 0
+    project: str | None = None
+    text: str | None = None
+    channel: str | None = None
+    video_id: str | None = None
+    selected: bool | None = None
+    order_by: str | None = None
+
+    @classmethod
+    def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedQRequest:
+        _reject_workspace_argument_injection(arguments)
+        raw_request = arguments.get("request", arguments)
+        if not isinstance(raw_request, Mapping):
+            raise HostedMcpError(
+                code="invalid_arguments",
+                message="q requires a QueryRequest object or a request object argument.",
+                status_code=400,
+            )
+        _reject_workspace_argument_injection(raw_request)
+        entity = str(raw_request.get("entity") or "chunk")
+        project = raw_request.get("project", "thin")
+        limit = _coerce_limit(raw_request.get("limit", 10))
+        offset = _coerce_offset(raw_request.get("offset", 0))
+        order_by = _q_order_by(raw_request.get("order_by"))
+        raw_filter = raw_request.get("filter")
+        filter_obj = {} if raw_filter is None else raw_filter
+        if not isinstance(filter_obj, Mapping):
+            raise HostedMcpError(
+                code="unsupported_q_filter",
+                message="Hosted MCP q filters must be objects for supported hosted query shapes.",
+                status_code=400,
+                data={"filter": filter_obj},
+            )
+
+        if project == "status_breakdown":
+            if entity not in {"chunk", "video", "channel"} or raw_request.get("search") is not None or _nonempty_filter_keys(filter_obj):
+                raise _unsupported_q("status_breakdown only supports an otherwise empty QueryRequest.")
+            return cls(kind="status", limit=1)
+
+        if entity == "video":
+            if raw_request.get("search") is not None:
+                raise _unsupported_q("Hosted MCP q video search is not implemented yet.")
+            _reject_unknown_filter_keys(filter_obj, {"channel_id", "video_id"})
+            if project not in {"thin", "video_card"}:
+                raise _unsupported_q("Hosted MCP q video supports thin and video_card projections only.")
+            return cls(
+                kind="video",
+                limit=limit,
+                offset=offset,
+                project=None if project == "thin" else str(project),
+                channel=_predicate_eq(filter_obj, "channel_id"),
+                video_id=_predicate_eq(filter_obj, "video_id"),
+                order_by=order_by,
+            )
+
+        if entity == "channel":
+            if raw_request.get("search") is not None:
+                raise _unsupported_q("Hosted MCP q channel search is not implemented yet.")
+            _reject_unknown_filter_keys(filter_obj, {"channel_id", "channel_selected"})
+            if project not in {"thin", "channel_card"}:
+                raise _unsupported_q("Hosted MCP q channel supports thin and channel_card projections only.")
+            return cls(
+                kind="channel",
+                limit=limit,
+                offset=offset,
+                project=None if project == "thin" else str(project),
+                channel=_predicate_eq(filter_obj, "channel_id"),
+                selected=_predicate_bool_eq(filter_obj, "channel_selected"),
+            )
+
+        if entity == "chunk":
+            search = raw_request.get("search")
+            if not isinstance(search, Mapping):
+                raise _unsupported_q("Hosted MCP q chunk requires lexical search over chunk_text.")
+            if search.get("over", "chunk_text") != "chunk_text" or search.get("mode", "lexical") != "lexical":
+                raise _unsupported_q("Hosted MCP q chunk currently supports lexical chunk_text search only.")
+            text = str(search.get("text") or "").strip()
+            if not text:
+                raise HostedMcpError(code="invalid_arguments", message="q chunk lexical search requires search.text.", status_code=400)
+            if offset != 0:
+                raise _unsupported_q("Hosted MCP q chunk lexical search does not support offset yet.")
+            per_group_limit = raw_request.get("per_group_limit")
+            if raw_request.get("group_by") is not None or per_group_limit is not None and per_group_limit != 3:
+                raise _unsupported_q("Hosted MCP q chunk grouping is not implemented yet.")
+            if _nonempty_filter_keys(filter_obj):
+                raise _unsupported_q("Hosted MCP q chunk filters are not implemented yet.")
+            if project not in {"thin", "chunk", "metadata"}:
+                raise _unsupported_q("Hosted MCP q chunk supports thin, chunk, and metadata projections only.")
+            return cls(
+                kind="chunk_lexical",
+                limit=limit,
+                offset=offset,
+                project=None if project == "thin" else str(project),
+                text=text,
+            )
+
+        raise _unsupported_q(f"Hosted MCP q does not support entity={entity!r}.")
+
+
 class NoopUsageLedger:
     def append(self, event: UsageEvent) -> None:
         return None
@@ -644,7 +903,7 @@ def _normalize_tool_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _reject_workspace_argument_injection(arguments: Mapping[str, Any]) -> None:
-    forbidden = sorted(FORBIDDEN_TOOL_ARGUMENT_KEYS.intersection(arguments))
+    forbidden = sorted(_forbidden_argument_paths(arguments))
     if forbidden:
         raise HostedMcpError(
             code="workspace_argument_not_allowed",
@@ -652,6 +911,22 @@ def _reject_workspace_argument_injection(arguments: Mapping[str, Any]) -> None:
             status_code=400,
             data={"arguments": forbidden},
         )
+
+
+def _forbidden_argument_paths(value: Any, *, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_str = str(key)
+            path = f"{prefix}.{key_str}" if prefix else key_str
+            if key_str in FORBIDDEN_TOOL_ARGUMENT_KEYS:
+                paths.add(path)
+            paths.update(_forbidden_argument_paths(item, prefix=path))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for index, item in enumerate(value):
+            path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            paths.update(_forbidden_argument_paths(item, prefix=path))
+    return paths
 
 
 def _raise_unsupported_tool(name: str) -> None:
@@ -827,6 +1102,10 @@ def _coerce_limit(value: Any) -> int:
     return max(1, min(_coerce_int(value, name="limit"), 200))
 
 
+def _coerce_offset(value: Any) -> int:
+    return max(0, _coerce_int(value, name="offset"))
+
+
 def _coerce_int(value: Any, *, name: str) -> int:
     try:
         return int(value)
@@ -877,6 +1156,122 @@ def _json_scalar(value: Any) -> Any:
     except (TypeError, ValueError):
         return str(value)
     return value
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise HostedMcpError(
+        code="invalid_arguments",
+        message="selected must be a boolean.",
+        status_code=400,
+    )
+
+
+def _normalize_list_order(value: Any) -> str | None:
+    if value is None or value == "" or value == "relevance":
+        return None
+    order = str(value)
+    if order not in {"newest", "oldest", "longest", "shortest", "title"}:
+        raise HostedMcpError(
+            code="unsupported_list_order",
+            message="Hosted MCP list supports newest, oldest, longest, shortest, and title order_by values.",
+            status_code=501,
+            data={"order_by": value},
+        )
+    return order
+
+
+def _q_order_by(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise _unsupported_q("Hosted MCP q order_by must be a list of order objects.")
+    if not value:
+        return None
+    if len(value) > 1:
+        raise _unsupported_q("Hosted MCP q supports at most one order_by item.")
+    item = value[0]
+    if not isinstance(item, Mapping):
+        raise _unsupported_q("Hosted MCP q order_by items must be objects.")
+    field = item.get("field")
+    direction = item.get("direction", "desc")
+    aliases = {
+        ("published_at", "desc"): "newest",
+        ("published_at", "asc"): "oldest",
+        ("duration_seconds", "desc"): "longest",
+        ("duration_seconds", "asc"): "shortest",
+        ("title", "asc"): "title",
+        ("title", "desc"): "title",
+    }
+    try:
+        return aliases[(field, direction)]
+    except KeyError as exc:
+        raise _unsupported_q("Hosted MCP q does not support the requested order_by shape.") from exc
+
+
+def _predicate_eq(filter_obj: Mapping[str, Any], key: str) -> str | None:
+    predicate = filter_obj.get(key)
+    if _empty_query_value(predicate):
+        return None
+    if not isinstance(predicate, Mapping):
+        raise _unsupported_q(f"Hosted MCP q filter.{key} must be a predicate object.")
+    if set(predicate) != {"eq"}:
+        raise _unsupported_q(f"Hosted MCP q filter.{key} only supports eq.")
+    return _optional_str(predicate.get("eq"))
+
+
+def _predicate_bool_eq(filter_obj: Mapping[str, Any], key: str) -> bool | None:
+    predicate = filter_obj.get(key)
+    if _empty_query_value(predicate):
+        return None
+    if not isinstance(predicate, Mapping):
+        raise _unsupported_q(f"Hosted MCP q filter.{key} must be a predicate object.")
+    if set(predicate) != {"eq"}:
+        raise _unsupported_q(f"Hosted MCP q filter.{key} only supports eq.")
+    return _optional_bool(predicate.get("eq"))
+
+
+def _nonempty_filter_keys(filter_obj: Mapping[str, Any]) -> set[str]:
+    return {str(key) for key, value in filter_obj.items() if not _empty_query_value(value)}
+
+
+def _empty_query_value(value: Any) -> bool:
+    return value is None or value == {}
+
+
+def _reject_unknown_filter_keys(filter_obj: Mapping[str, Any], supported: set[str]) -> None:
+    unknown = sorted(_nonempty_filter_keys(filter_obj) - supported)
+    if unknown:
+        raise HostedMcpError(
+            code="unsupported_q_filter",
+            message="Hosted MCP q received filters that are not supported by this hosted adapter slice.",
+            status_code=501,
+            data={"filters": unknown, "supported": sorted(supported)},
+        )
+
+
+def _unsupported_q(message: str) -> HostedMcpError:
+    return HostedMcpError(
+        code="unsupported_q_shape",
+        message=message,
+        status_code=501,
+    )
 
 
 def validation_error_to_mcp_error(exc: ValidationError) -> HostedMcpError:
