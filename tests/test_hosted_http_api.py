@@ -11,6 +11,13 @@ from yutome.hosted.models import UsageEvent
 from yutome.hosted.search_store import SearchStoreUsage
 
 
+TEST_API_TOKEN = "hosted-test-token"
+
+
+def auth_headers(workspace_id: str, *, token: str = TEST_API_TOKEN) -> dict[str, str]:
+    return {WORKSPACE_HEADER: workspace_id, "Authorization": f"Bearer {token}"}
+
+
 class RecordingSearchStore:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -176,7 +183,7 @@ def hosted_http_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Rec
     store = RecordingSearchStore()
     ledger = RecordingLedger()
     adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
-    return TestClient(build_app(adapter=adapter)), store, ledger
+    return TestClient(build_app(adapter=adapter, expected_api_token=TEST_API_TOKEN)), store, ledger
 
 
 def test_health_endpoint_shape(hosted_http_client: tuple[TestClient, RecordingSearchStore, RecordingLedger]) -> None:
@@ -235,6 +242,26 @@ def test_readyz_returns_503_when_readiness_check_reports_not_ready(
     assert store.calls == []
 
 
+def test_readyz_sanitizes_readiness_exception() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+
+    def leaking_readiness_check() -> dict[str, Any]:
+        raise RuntimeError("psycopg failed for postgresql://user:secret@db.internal/yutome")
+
+    client = TestClient(build_app(adapter=adapter, readiness_check=leaking_readiness_check))
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["checks"] == {"ok": False, "error": "readiness_check_failed"}
+    assert "secret" not in response.text
+    assert "postgresql://" not in response.text
+    assert "psycopg" not in response.text
+
+
 def test_postgres_app_builder_wires_connection_search_store_and_adapter() -> None:
     connection = RecordingConnection(
         rows=[
@@ -250,13 +277,13 @@ def test_postgres_app_builder_wires_connection_search_store_and_adapter() -> Non
             }
         ]
     )
-    app = build_postgres_app(connection=connection)
+    app = build_postgres_app(connection=connection, expected_api_token=TEST_API_TOKEN)
     client = TestClient(app)
 
     response = client.post(
         "/mcp/tools/call",
         json={"name": "find", "arguments": {"text": "Postgres", "mode": "lexical", "limit": 2}},
-        headers={WORKSPACE_HEADER: "ws_pg"},
+        headers=auth_headers("ws_pg"),
     )
 
     assert response.status_code == 200
@@ -278,7 +305,7 @@ def test_tool_call_endpoint_uses_workspace_from_auth_header(
     response = client.post(
         "/tools/call",
         json={"name": "find", "arguments": {"text": "Crohn", "mode": "lexical", "limit": 4}},
-        headers={WORKSPACE_HEADER: "ws_http"},
+        headers=auth_headers("ws_http"),
     )
 
     assert response.status_code == 200
@@ -300,12 +327,12 @@ def test_tool_call_endpoint_accepts_contract_list_and_q_tools(
     list_response = client.post(
         "/tools/call",
         json={"name": "list", "arguments": {"entity": "videos", "order_by": "newest", "limit": 1}},
-        headers={WORKSPACE_HEADER: "ws_http"},
+        headers=auth_headers("ws_http"),
     )
     q_response = client.post(
         "/tools/call",
         json={"name": "q", "arguments": {"request": {"project": "status_breakdown"}}},
-        headers={WORKSPACE_HEADER: "ws_http"},
+        headers=auth_headers("ws_http"),
     )
 
     assert list_response.status_code == 200
@@ -343,6 +370,52 @@ def test_configured_api_token_rejects_missing_authorization_before_workspace_dis
     assert ledger.events == []
 
 
+def test_unconfigured_api_token_rejects_tool_and_resource_before_adapter_dispatch() -> None:
+    store = RecordingSearchStore()
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
+    client = TestClient(build_app(adapter=adapter))
+
+    tool_response = client.post(
+        "/tools/call",
+        json={"name": "find", "arguments": {"text": "Crohn", "mode": "lexical"}},
+        headers={WORKSPACE_HEADER: "ws_http", "Authorization": "Bearer any-token"},
+    )
+    resource_response = client.post(
+        "/resources/read",
+        json={"uri": "yutome://chunk/chunk_http"},
+        headers={WORKSPACE_HEADER: "ws_http", "Authorization": "Bearer any-token"},
+    )
+
+    assert tool_response.status_code == 503
+    assert error_body(tool_response.json())["code"] == "api_token_unconfigured"
+    assert resource_response.status_code == 503
+    assert error_body(resource_response.json())["code"] == "api_token_unconfigured"
+    assert store.calls == []
+    assert ledger.events == []
+
+
+def test_explicit_auth_dependency_can_be_used_for_tests_without_token() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+
+    def test_auth() -> Any:
+        from yutome.hosted.mcp_query import HostedMcpAuthContext
+
+        return HostedMcpAuthContext(workspace_id="ws_http").validated()
+
+    client = TestClient(build_app(adapter=adapter, auth_dependency=test_auth))
+
+    response = client.post(
+        "/resources/read",
+        json={"uri": "yutome://chunk/chunk_http"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["chunk_id"] == "chunk_http"
+    assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]
+
+
 def test_configured_api_token_rejects_invalid_authorization_before_store_or_ledger() -> None:
     store = RecordingSearchStore()
     ledger = RecordingLedger()
@@ -370,7 +443,7 @@ def test_configured_api_token_allows_valid_tool_call() -> None:
     response = client.post(
         "/tools/call",
         json={"name": "find", "arguments": {"text": "Crohn", "mode": "lexical", "limit": 2}},
-        headers={WORKSPACE_HEADER: "ws_http", "Authorization": "Bearer hosted-secret"},
+        headers=auth_headers("ws_http", token="hosted-secret"),
     )
 
     assert response.status_code == 200
@@ -387,11 +460,12 @@ def test_missing_or_invalid_workspace_header_is_rejected(
     missing = client.post(
         "/tools/call",
         json={"name": "find", "arguments": {"text": "Crohn", "mode": "lexical"}},
+        headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
     )
     invalid = client.post(
         "/tools/call",
         json={"name": "find", "arguments": {"text": "Crohn", "mode": "lexical"}},
-        headers={WORKSPACE_HEADER: "not a workspace"},
+        headers=auth_headers("not a workspace"),
     )
 
     assert missing.status_code == 401
@@ -441,7 +515,7 @@ def test_resource_read_endpoint_returns_payload(
     response = client.post(
         "/resources/read",
         json={"uri": "yutome://chunk/chunk_http"},
-        headers={WORKSPACE_HEADER: "ws_http"},
+        headers=auth_headers("ws_http"),
     )
 
     assert response.status_code == 200
@@ -460,7 +534,7 @@ def test_resource_read_endpoint_hides_cross_workspace_resources_as_missing(
     response = client.post(
         "/resources/read",
         json={"uri": "yutome://chunk/chunk_http"},
-        headers={WORKSPACE_HEADER: "ws_bob"},
+        headers=auth_headers("ws_bob"),
     )
 
     assert response.status_code == 404

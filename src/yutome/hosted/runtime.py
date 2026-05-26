@@ -113,13 +113,13 @@ class HostedCommandRunner:
         try:
             store = PostgresVectorChordSearchStore(self.connect())
             extensions = store.extension_check()
-        except Exception as exc:  # pragma: no cover - live connection path
+        except Exception:  # pragma: no cover - live connection path
             return HostedDbCheck(
                 ok=False,
                 url_env=url_env,
                 url_configured=True,
                 database_reachable=False,
-                error=str(exc),
+                error="database_unreachable",
             )
         return HostedDbCheck(
             ok=all(extensions.values()),

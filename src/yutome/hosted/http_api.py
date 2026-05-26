@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -18,6 +19,8 @@ GRANT_HEADER = "X-Yutome-Grant-Id"
 CLIENT_HEADER = "X-Yutome-Client-Id"
 SESSION_HEADER = "X-Yutome-Session-Id"
 TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
+_SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
 
 
 class ToolCallRequest(BaseModel):
@@ -53,7 +56,7 @@ def build_postgres_app(
     app = build_app(
         adapter=adapter,
         readiness_check=readiness_check,
-        expected_api_token=expected_api_token or _api_token_from_env(),
+        expected_api_token=_normalize_api_token(expected_api_token) or _api_token_from_env(),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -77,7 +80,9 @@ def build_app(
         version="0.1.0",
     )
     app.state.hosted_adapter = adapter
-    app.state.hosted_api_auth_required = bool(expected_api_token)
+    normalized_api_token = _normalize_api_token(expected_api_token)
+    app.state.hosted_api_auth_required = True
+    app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -88,7 +93,7 @@ def build_app(
         client_id: str | None = Header(default=None, alias=CLIENT_HEADER),
         session_id: str | None = Header(default=None, alias=SESSION_HEADER),
     ) -> HostedMcpAuthContext:
-        _verify_bearer_token(authorization=authorization, expected_api_token=expected_api_token)
+        _verify_bearer_token(authorization=authorization, expected_api_token=normalized_api_token)
         if workspace_id is None or not workspace_id.strip():
             raise _http_error(
                 HostedMcpError(
@@ -145,8 +150,9 @@ def build_app(
             checks = _jsonable(readiness_check())
         except Exception as exc:  # pragma: no cover - defensive live readiness path
             payload["ok"] = False
-            payload["checks"] = {"ok": False, "error": str(exc)}
+            payload["checks"] = _readiness_exception_payload(exc)
             return JSONResponse(status_code=503, content=payload)
+        checks = _sanitize_readiness_payload(checks)
         payload["checks"] = checks
         if isinstance(checks, Mapping) and checks.get("ok") is False:
             payload["ok"] = False
@@ -192,13 +198,22 @@ def _parse_scopes(scopes_header: str | None) -> set[str]:
 
 def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
-    token = env.get(TOKEN_ENV_VAR)
+    return _normalize_api_token(env.get(TOKEN_ENV_VAR))
+
+
+def _normalize_api_token(token: str | None) -> str | None:
     return token.strip() if token and token.strip() else None
 
 
 def _verify_bearer_token(*, authorization: str | None, expected_api_token: str | None) -> None:
     if not expected_api_token:
-        return
+        raise _http_error(
+            HostedMcpError(
+                code="api_token_unconfigured",
+                message=f"Set {TOKEN_ENV_VAR} before serving hosted MCP tools or resources.",
+                status_code=503,
+            )
+        )
     if authorization is None or not authorization.strip():
         raise _http_error(
             HostedMcpError(
@@ -240,6 +255,31 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _readiness_exception_payload(_exc: Exception) -> dict[str, Any]:
+    return {"ok": False, "error": "readiness_check_failed"}
+
+
+def _sanitize_readiness_payload(value: Any, *, field_name: str | None = None) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_readiness_payload(item, field_name=str(key).lower())
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_readiness_payload(item, field_name=field_name) for item in value]
+    if isinstance(value, str):
+        if field_name in _READINESS_ERROR_FIELDS:
+            return value if _SAFE_READINESS_ERROR_CODE.fullmatch(value) else "readiness_check_failed"
+        if _looks_sensitive_readiness_string(value):
+            return "[redacted]"
+    return value
+
+
+def _looks_sensitive_readiness_string(value: str) -> bool:
+    lowered = value.lower()
+    return "://" in value or "password" in lowered or "credential" in lowered or "secret" in lowered
 
 
 def error_body(response_json: Mapping[str, Any]) -> Mapping[str, Any]:

@@ -236,6 +236,29 @@ def test_db_check_missing_url_is_structured_and_does_not_connect(monkeypatch) ->
     assert result.error == "postgres_url_missing"
 
 
+def test_db_check_live_connection_errors_are_sanitized(monkeypatch) -> None:
+    monkeypatch.setenv("YUTOME_POSTGRES_URL", "postgresql://user:secret@db.internal/yutome")
+
+    class FailingStore:
+        def __init__(self, _connection: Any) -> None:
+            pass
+
+        def extension_check(self) -> dict[str, bool]:
+            raise RuntimeError("psycopg OperationalError for postgresql://user:secret@db.internal/yutome")
+
+    monkeypatch.setattr("yutome.hosted.runtime.PostgresVectorChordSearchStore", FailingStore)
+    runner = HostedCommandRunner(AppConfig(), connection=RecordingConnection())
+
+    result = runner.db_check()
+    payload = result.model_dump(mode="json")
+
+    assert result.ok is False
+    assert result.database_reachable is False
+    assert result.error == "database_unreachable"
+    assert "secret" not in json.dumps(payload)
+    assert "postgresql://" not in json.dumps(payload)
+
+
 def test_source_refresh_tick_sql_claims_due_policies_with_skip_locked() -> None:
     now = datetime(2026, 5, 26, 3, 30, tzinfo=timezone.utc)
 
@@ -459,7 +482,8 @@ def test_build_hosted_api_app_attaches_runtime_postgres_components(monkeypatch) 
     assert api_app.state.hosted_adapter.search_store is api_app.state.hosted_search_store
     assert api_app.state.hosted_adapter.gate.connection is connection
     assert api_app.state.hosted_adapter.ledger.connection is connection
-    assert api_app.state.hosted_api_auth_required is False
+    assert api_app.state.hosted_api_auth_required is True
+    assert api_app.state.hosted_api_auth_configured is False
 
 
 def test_build_hosted_api_app_enables_token_auth_from_env(monkeypatch) -> None:
@@ -470,6 +494,7 @@ def test_build_hosted_api_app_enables_token_auth_from_env(monkeypatch) -> None:
     api_app = build_hosted_api_app(runner)
 
     assert api_app.state.hosted_api_auth_required is True
+    assert api_app.state.hosted_api_auth_configured is True
 
 
 def test_hosted_api_cli_command_runs_fake_app_server(monkeypatch, tmp_path: Path) -> None:
