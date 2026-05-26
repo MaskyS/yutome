@@ -499,7 +499,7 @@ def test_worker_once_claims_and_executes_index_video_jobs(monkeypatch) -> None:
     assert result.affected_rows == 1
     assert result.params["executions"][0]["status"] == "succeeded"
     assert executions[0]["init"]["connection"] is connection
-    assert "job_type = ANY(%(job_types)s)" in connection.calls[0][0]
+    assert "job_type = ANY(%(job_types)s::text[])" in connection.calls[0][0]
     assert connection.calls[0][1]["job_types"] == ["index_video", "discover_source"]
 
 

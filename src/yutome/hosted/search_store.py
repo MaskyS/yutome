@@ -328,7 +328,7 @@ def extension_check_sql(extensions: Sequence[str] = VECTORCHORD_REQUIRED_EXTENSI
         sql="""
 SELECT extname
 FROM pg_extension
-WHERE extname = ANY(%(extensions)s)
+WHERE extname = ANY(%(extensions)s::text[])
 ORDER BY extname;
 """.strip(),
         params={"extensions": list(extensions)},

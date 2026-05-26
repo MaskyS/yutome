@@ -2102,7 +2102,7 @@ def update_job_operation_output_sql(
         sql="""
 UPDATE job_operations
 SET output_json = %(output_json)s::jsonb,
-    usage_reservation_id = COALESCE(%(usage_reservation_id)s, usage_reservation_id),
+    usage_reservation_id = COALESCE(%(usage_reservation_id)s::text, usage_reservation_id),
     updated_at = %(now)s
 WHERE workspace_id = %(workspace_id)s
   AND id = %(operation_id)s
@@ -2133,20 +2133,20 @@ def complete_job_operation_success_sql(
 UPDATE job_operations
 SET output_json = %(output_json)s::jsonb,
     status = 'succeeded',
-    usage_reservation_id = COALESCE(%(usage_reservation_id)s, usage_reservation_id),
+    usage_reservation_id = COALESCE(%(usage_reservation_id)s::text, usage_reservation_id),
     updated_at = %(now)s
 WHERE workspace_id = %(workspace_id)s
   AND id = %(operation_id)s
   AND (
-      %(job_id)s IS NULL
+      %(job_id)s::text IS NULL
       OR EXISTS (
           SELECT 1
           FROM jobs
-          WHERE jobs.id = %(job_id)s
+          WHERE jobs.id = %(job_id)s::text
             AND jobs.workspace_id = job_operations.workspace_id
-            AND jobs.lease_owner = %(lease_owner)s
+            AND jobs.lease_owner = %(lease_owner)s::text
             AND jobs.lease_expires_at > %(now)s
-            AND jobs.status <> ALL(%(terminal_statuses)s)
+            AND jobs.status <> ALL(%(terminal_statuses)s::text[])
       )
   )
 RETURNING *;

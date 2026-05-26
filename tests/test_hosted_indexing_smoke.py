@@ -20,6 +20,7 @@ from yutome.hosted.indexing import (
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
+    complete_job_operation_success_sql,
     enqueue_index_video_job_sql,
     finish_source_discovery_sql,
     mock_embedding_vector,
@@ -177,6 +178,22 @@ class HostedExecutorConnection:
                 connection.transaction_events.append("rollback" if exc_type else "commit")
 
         return Tx()
+
+
+def test_complete_job_operation_success_sql_casts_nullable_lease_guard_params() -> None:
+    statement = complete_job_operation_success_sql(
+        operation_id="op_cleanup",
+        workspace_id="ws_alice",
+        output={"text": "cleaned"},
+        now=NOW,
+        job_id=None,
+        lease_owner=None,
+    )
+
+    assert "%(usage_reservation_id)s::text" in statement.sql
+    assert "%(job_id)s::text IS NULL" in statement.sql
+    assert "jobs.id = %(job_id)s::text" in statement.sql
+    assert "jobs.lease_owner = %(lease_owner)s::text" in statement.sql
 
 
 def _executor_job() -> Job:

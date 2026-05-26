@@ -147,7 +147,7 @@ SELECT
 FROM provider_allocations
 WHERE workspace_id = %(workspace_id)s
   AND provider = %(provider)s
-  AND operation = ANY(%(operations)s)
+  AND operation = ANY(%(operations)s::text[])
 ORDER BY CASE WHEN operation = %(operation)s THEN 0 ELSE 1 END, id;
 """.strip()
 
@@ -166,7 +166,7 @@ SELECT
 FROM service_allocations
 WHERE workspace_id = %(workspace_id)s
   AND service = %(service)s
-  AND operation = ANY(%(operations)s)
+  AND operation = ANY(%(operations)s::text[])
 ORDER BY CASE WHEN operation = %(operation)s THEN 0 ELSE 1 END, id;
 """.strip()
 

@@ -15,6 +15,7 @@ from yutome.hosted.jobs import (
     renew_job_lease_sql,
     retry_job_after,
     retry_job_sql,
+    update_job_operation_status_sql,
 )
 
 
@@ -48,10 +49,10 @@ def test_claim_jobs_sql_uses_skip_locked_and_claimable_filters() -> None:
 
     assert "WITH claimable AS" in statement.sql
     assert "FOR UPDATE SKIP LOCKED" in statement.sql
-    assert "status = ANY(%(claimable_statuses)s)" in statement.sql
+    assert "status = ANY(%(claimable_statuses)s::text[])" in statement.sql
     assert "(lease_owner IS NULL OR lease_expires_at <= %(now)s)" in statement.sql
     assert "workspace_id = %(workspace_id)s" in statement.sql
-    assert "job_type = ANY(%(job_types)s)" in statement.sql
+    assert "job_type = ANY(%(job_types)s::text[])" in statement.sql
     assert "ORDER BY priority ASC, created_at ASC, id ASC" in statement.sql
     assert statement.params["lease_expires_at"] == NOW + timedelta(seconds=120)
     assert statement.params["claimable_statuses"] == ["queued", "retry_wait"]
@@ -79,13 +80,29 @@ def test_renew_release_and_retry_sql_are_owner_guarded() -> None:
     assert "leased_at = NULL" in release.sql
     assert "status = %(status)s" in retry.sql
     assert "lease_expires_at > %(now)s" in retry.sql
-    assert "status <> ALL(%(terminal_statuses)s)" in retry.sql
+    assert "status <> ALL(%(terminal_statuses)s::text[])" in retry.sql
     assert retry.params["status"] == "retry_wait"
     assert retry.params["retry_after"] == retry_at
 
     active = active_job_lease_sql(job_id="job_1", lease_owner="worker-1", now=NOW)
     assert "FOR UPDATE" in active.sql
     assert "lease_expires_at > %(now)s" in active.sql
+
+
+def test_job_operation_status_sql_casts_nullable_lease_guard_params() -> None:
+    statement = update_job_operation_status_sql(
+        operation_id="op_1",
+        workspace_id="ws_alice",
+        status="failed_retryable",
+        now=NOW,
+        job_id=None,
+        lease_owner=None,
+    )
+
+    assert "%(usage_reservation_id)s::text" in statement.sql
+    assert "%(job_id)s::text IS NULL" in statement.sql
+    assert "jobs.id = %(job_id)s::text" in statement.sql
+    assert "jobs.lease_owner = %(lease_owner)s::text" in statement.sql
 
 
 def test_job_lease_model_helpers_respect_owner_and_terminal_boundaries() -> None:

@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from yutome.hosted.indexing import complete_job_operation_success_sql
+from yutome.hosted.jobs import claim_jobs_sql, update_job_operation_status_sql
 from yutome.hosted.postgres import (
     apply_hosted_schema,
     apply_phase1_schema,
@@ -7,6 +17,7 @@ from yutome.hosted.postgres import (
     phase1_schema_statements,
     phase4_schema_statements,
 )
+from yutome.hosted.search_store import extension_check_sql
 
 
 class RecordingConnection:
@@ -108,3 +119,145 @@ def test_apply_hosted_schema_runs_all_statements() -> None:
 
     assert applied == 2
     assert connection.statements == ["CREATE EXTENSION vector;", "CREATE TABLE jobs;"]
+
+
+def test_hosted_sql_does_not_leave_postgres_params_untyped_in_ambiguous_contexts() -> None:
+    hosted_dir = Path(__file__).parents[1] / "src" / "yutome" / "hosted"
+    risky_patterns = {
+        r"%\([^)]+\)s\s+IS\s+NULL": "cast nullable placeholders used in IS NULL, for example %(id)s::text IS NULL",
+        r"COALESCE\s*\(\s*%\([^)]+\)s\s*,": "cast placeholders passed to COALESCE, for example COALESCE(%(id)s::text, id)",
+        r"\b(?:ANY|ALL)\s*\(\s*%\([^)]+\)s\s*\)": "cast array placeholders, for example ANY(%(ids)s::text[])",
+        r"\bIN\s+(?:\(\s*)?%\([^)]+\)s": "use = ANY(%(ids)s::<type>[]) instead of binding a list directly to IN",
+    }
+    findings: list[str] = []
+
+    for path in sorted(hosted_dir.glob("*.py")):
+        text = path.read_text()
+        for pattern, guidance in risky_patterns.items():
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                line = text.count("\n", 0, match.start()) + 1
+                findings.append(f"{path.relative_to(hosted_dir.parents[2])}:{line}: {match.group(0)!r}; {guidance}")
+
+    assert findings == []
+
+
+def test_live_postgres_accepts_nullable_and_array_hosted_job_parameters() -> None:
+    dsn = os.getenv("YUTOME_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("set YUTOME_TEST_POSTGRES_DSN to validate psycopg/Postgres parameter inference")
+
+    import psycopg
+
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    connection = None
+    last_error: BaseException | None = None
+    for _ in range(20):
+        try:
+            connection = psycopg.connect(dsn, autocommit=False)
+            break
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            time.sleep(0.25)
+    if connection is None:
+        raise AssertionError("could not connect to live Postgres test DSN") from last_error
+
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE jobs (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    source_id text,
+                    job_type text NOT NULL,
+                    status text NOT NULL,
+                    priority integer NOT NULL DEFAULT 100,
+                    idempotency_key text NOT NULL DEFAULT 'idem',
+                    run_after timestamptz,
+                    executor_kind text,
+                    executor_ref text,
+                    lease_owner text,
+                    leased_at timestamptz,
+                    lease_expires_at timestamptz,
+                    retry_after timestamptz,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    started_at timestamptz,
+                    finished_at timestamptz,
+                    cancelled_at timestamptz,
+                    error_code text,
+                    error_message text,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE job_operations (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    job_id text NOT NULL,
+                    operation text NOT NULL DEFAULT 'gemini.cleanup_transcript',
+                    source_id text,
+                    video_id text,
+                    input_hash text NOT NULL DEFAULT 'hash',
+                    idempotency_key text NOT NULL DEFAULT 'op-idem',
+                    status text NOT NULL DEFAULT 'planned',
+                    attempt_count integer NOT NULL DEFAULT 0,
+                    usage_reservation_id text,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    output_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO jobs (
+                    id, workspace_id, job_type, status, priority, idempotency_key,
+                    lease_owner, lease_expires_at, created_at
+                )
+                VALUES ('job_1', 'ws_1', 'index_video', 'queued', 10, 'idem_1', NULL, NULL, %(now)s);
+                """,
+                {"now": now},
+            )
+            cursor.execute(
+                """
+                INSERT INTO job_operations (id, workspace_id, job_id, operation, idempotency_key)
+                VALUES ('op_1', 'ws_1', 'job_1', 'gemini.cleanup_transcript', 'op_idem_1');
+                """
+            )
+
+            for statement in (
+                claim_jobs_sql(
+                    lease_owner="worker_1",
+                    now=now,
+                    lease_seconds=900,
+                    limit=1,
+                    job_types=["index_video"],
+                    executor_kind=None,
+                    executor_ref=None,
+                ),
+                update_job_operation_status_sql(
+                    operation_id="op_1",
+                    workspace_id="ws_1",
+                    status="failed_retryable",
+                    now=now,
+                    usage_reservation_id=None,
+                    job_id=None,
+                    lease_owner=None,
+                ),
+                complete_job_operation_success_sql(
+                    operation_id="op_1",
+                    workspace_id="ws_1",
+                    output={"ok": True},
+                    now=now + timedelta(seconds=1),
+                    usage_reservation_id=None,
+                    job_id=None,
+                    lease_owner=None,
+                ),
+                extension_check_sql(["vector", "vchord"]),
+            ):
+                cursor.execute(statement.sql, statement.params)
+
+        connection.rollback()

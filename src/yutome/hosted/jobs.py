@@ -48,7 +48,7 @@ def claim_jobs_sql(
     _validate_positive("limit", limit)
 
     filters: list[str] = [
-        "status = ANY(%(claimable_statuses)s)",
+        "status = ANY(%(claimable_statuses)s::text[])",
         "(run_after IS NULL OR run_after <= %(now)s)",
         "(retry_after IS NULL OR retry_after <= %(now)s)",
         "(lease_owner IS NULL OR lease_expires_at <= %(now)s)",
@@ -71,7 +71,7 @@ def claim_jobs_sql(
         filters.append("workspace_id = %(workspace_id)s")
         params["workspace_id"] = workspace_id
     if job_types:
-        filters.append("job_type = ANY(%(job_types)s)")
+        filters.append("job_type = ANY(%(job_types)s::text[])")
         params["job_types"] = list(job_types)
 
     where_sql = "\n      AND ".join(filters)
@@ -90,8 +90,8 @@ UPDATE jobs
 SET lease_owner = %(lease_owner)s,
     leased_at = %(now)s,
     lease_expires_at = %(lease_expires_at)s,
-    executor_kind = COALESCE(%(executor_kind)s, executor_kind),
-    executor_ref = COALESCE(%(executor_ref)s, executor_ref)
+    executor_kind = COALESCE(%(executor_kind)s::text, executor_kind),
+    executor_ref = COALESCE(%(executor_ref)s::text, executor_ref)
 FROM claimable
 WHERE jobs.id = claimable.id
 RETURNING jobs.*;
@@ -117,7 +117,7 @@ SET lease_expires_at = %(lease_expires_at)s
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
   AND lease_expires_at > %(now)s
-  AND status <> ALL(%(terminal_statuses)s)
+  AND status <> ALL(%(terminal_statuses)s::text[])
 RETURNING *;
 """.strip(),
         params=params,
@@ -137,7 +137,7 @@ FROM jobs
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
   AND lease_expires_at > %(now)s
-  AND status <> ALL(%(terminal_statuses)s)
+  AND status <> ALL(%(terminal_statuses)s::text[])
 FOR UPDATE;
 """.strip(),
         params={
@@ -186,7 +186,7 @@ SET status = %(status)s,
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
   AND lease_expires_at > %(now)s
-  AND status <> ALL(%(terminal_statuses)s)
+  AND status <> ALL(%(terminal_statuses)s::text[])
 RETURNING *;
 """.strip(),
         params={
@@ -236,7 +236,7 @@ SET status = %(status)s,
 WHERE id = %(job_id)s
   AND lease_owner = %(lease_owner)s
   AND lease_expires_at > %(now)s
-  AND status <> ALL(%(terminal_statuses)s)
+  AND status <> ALL(%(terminal_statuses)s::text[])
 RETURNING *;
 """.strip(),
         params={
@@ -268,7 +268,7 @@ def update_job_operation_status_sql(
         sql="""
 UPDATE job_operations
 SET status = %(status)s,
-    usage_reservation_id = COALESCE(%(usage_reservation_id)s, usage_reservation_id),
+    usage_reservation_id = COALESCE(%(usage_reservation_id)s::text, usage_reservation_id),
     attempt_count = CASE
         WHEN %(status)s IN ('started', 'failed_retryable', 'failed_final') THEN attempt_count + 1
         ELSE attempt_count
@@ -278,15 +278,15 @@ SET status = %(status)s,
 WHERE id = %(operation_id)s
   AND workspace_id = %(workspace_id)s
   AND (
-      %(job_id)s IS NULL
+      %(job_id)s::text IS NULL
       OR EXISTS (
           SELECT 1
           FROM jobs
-          WHERE jobs.id = %(job_id)s
+          WHERE jobs.id = %(job_id)s::text
             AND jobs.workspace_id = job_operations.workspace_id
-            AND jobs.lease_owner = %(lease_owner)s
+            AND jobs.lease_owner = %(lease_owner)s::text
             AND jobs.lease_expires_at > %(now)s
-            AND jobs.status <> ALL(%(terminal_statuses)s)
+            AND jobs.status <> ALL(%(terminal_statuses)s::text[])
       )
   )
 RETURNING *;

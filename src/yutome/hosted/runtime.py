@@ -669,7 +669,7 @@ WITH expired_jobs AS (
     FROM jobs
     WHERE lease_owner IS NOT NULL
       AND lease_expires_at <= %(now)s
-      AND status <> ALL(%(terminal_statuses)s)
+      AND status <> ALL(%(terminal_statuses)s::text[])
     ORDER BY lease_expires_at ASC, id ASC
     LIMIT %(limit)s
     FOR UPDATE SKIP LOCKED

@@ -972,7 +972,7 @@ VALUES (
     %(unit_mapping_jsonb)s::jsonb,
     %(status)s,
     %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s, now())
+    COALESCE(%(created_at)s::timestamptz, now())
 )
 ON CONFLICT (version) DO UPDATE
 SET effective_at = EXCLUDED.effective_at,
@@ -1010,14 +1010,14 @@ VALUES (
     %(workspace_id)s,
     %(plan_key)s,
     %(price_book_id)s,
-    %(allowed_operations)s,
+    %(allowed_operations)s::text[],
     %(included_units_jsonb)s::jsonb,
     %(hard_limits_jsonb)s::jsonb,
     %(soft_limits_jsonb)s::jsonb,
     %(grace_policy_jsonb)s::jsonb,
     %(status)s,
     %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s, now())
+    COALESCE(%(created_at)s::timestamptz, now())
 )
 ON CONFLICT (workspace_id, plan_key, price_book_id) DO UPDATE
 SET allowed_operations = EXCLUDED.allowed_operations,
@@ -1057,9 +1057,9 @@ VALUES (
     %(used_units_jsonb)s::jsonb,
     %(reserved_units_jsonb)s::jsonb,
     %(remaining_units_jsonb)s::jsonb,
-    %(unlimited_units)s,
+    %(unlimited_units)s::text[],
     %(metadata_json)s::jsonb,
-    COALESCE(%(updated_at)s, now())
+    COALESCE(%(updated_at)s::timestamptz, now())
 )
 ON CONFLICT (workspace_id) DO UPDATE
 SET entitlement_policy_id = EXCLUDED.entitlement_policy_id,
@@ -1103,8 +1103,8 @@ VALUES (
     %(last_webhook_at)s,
     %(status)s,
     %(metadata_json)s::jsonb,
-    COALESCE(%(created_at)s, now()),
-    COALESCE(%(updated_at)s, now())
+    COALESCE(%(created_at)s::timestamptz, now()),
+    COALESCE(%(updated_at)s::timestamptz, now())
 )
 ON CONFLICT (workspace_id, provider) DO UPDATE
 SET external_customer_id = EXCLUDED.external_customer_id,
@@ -1275,7 +1275,7 @@ def finish_billing_export_sql(
         sql="""
 UPDATE billing_exports
 SET status = %(status)s,
-    external_event_id = COALESCE(%(external_event_id)s, external_event_id),
+    external_event_id = COALESCE(%(external_event_id)s::text, external_event_id),
     last_error_jsonb = %(last_error_jsonb)s::jsonb,
     exported_at = CASE WHEN %(status)s = 'succeeded' THEN %(now)s ELSE exported_at END,
     updated_at = %(now)s
