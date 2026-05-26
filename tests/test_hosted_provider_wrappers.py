@@ -184,6 +184,32 @@ def test_provider_wrapper_records_retryable_failed_event() -> None:
     assert failed.metadata["exception_type"] == "FakeProviderError"
 
 
+def test_provider_wrapper_redacts_sensitive_failure_metadata() -> None:
+    ledger = RecordingLedger()
+
+    def call() -> object:
+        raise FakeProviderError(
+            407,
+            "Proxy failed http://webshare-user:SuperSecretPass@proxy.example:80 "
+            "api_key=pa-1234567890abcdef token=sk-providersecret12345 "
+            "Authorization: Bearer eyJsecretsecret.abc123456.def789012",
+        )
+
+    with pytest.raises(FakeProviderError):
+        execute_provider_call(_context(ledger), call)
+
+    failed = ledger.events[1]
+    message = failed.metadata["message"]
+    assert "SuperSecretPass" not in message
+    assert "pa-1234567890abcdef" not in message
+    assert "sk-providersecret12345" not in message
+    assert "eyJsecretsecret" not in message
+    assert "http://***:***@proxy.example:80" in message
+    assert "api_key=***" in message
+    assert "token=***" in message
+    assert "Bearer ***" in message
+
+
 def test_provider_wrapper_can_use_durable_postgres_usage_adapters_without_double_charge() -> None:
     connection = RecordingConnection()
     response = {"request_id": "resp_1", "tokens": 91}
