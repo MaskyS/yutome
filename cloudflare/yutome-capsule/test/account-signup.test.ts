@@ -138,6 +138,36 @@ test("connector-only deployments do not expose account signup", async () => {
   assert.equal(response.status, 404);
 });
 
+test("hosted signup scopes the cookie to YUTOME_COOKIE_DOMAIN when set", async () => {
+  const response = await handleAccountSignupRequest(
+    signupPostRequest({
+      email: "carol@example.com",
+      name: "Carol",
+      workspace_name: "Carol Research",
+      return_to: "/authorize?client_id=c&state=s",
+    }),
+    hostedEnv({ YUTOME_COOKIE_DOMAIN: "yutome.com" }),
+    (async () =>
+      Response.json({
+        ok: true,
+        principal: { user_id: "user_carol", workspace_id: "ws_carol" },
+        session: {
+          token: "session-token",
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          audience: "yutome:hosted-oauth",
+          cookie_name: ACCOUNT_SESSION_COOKIE_NAME,
+        },
+      })) as typeof fetch,
+  );
+
+  assert.equal(response.status, 302);
+  const setCookie = response.headers.get("set-cookie") || "";
+  assert.match(setCookie, /Domain=yutome\.com/);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Lax/);
+});
+
 function hostedEnv(overrides: Partial<Env> = {}): Env {
   return {
     OAUTH_KV: {} as KVNamespace,

@@ -43,6 +43,9 @@ export interface Env {
   YUTOME_ACCOUNT_SESSION_AUDIENCE?: string;
   YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS?: string;
   YUTOME_ACCOUNT_SESSION_CLOCK_SKEW_SECONDS?: string;
+  // Parent domain (e.g. "yutome.com") so the account-session cookie set here is
+  // shared with app.yutome.com. Unset = host-only (single-host / local dev).
+  YUTOME_COOKIE_DOMAIN?: string;
   YUTOME_MCP_AUDIENCE?: string;
   YUTOME_TOKEN_VERSION?: string;
   YUTOME_TOKEN_TTL_SECONDS?: string;

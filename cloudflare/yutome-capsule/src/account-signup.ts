@@ -63,9 +63,13 @@ export async function handleAccountSignupRequest(
     location: returnTo,
     "cache-control": "no-store",
   });
+  // Scope to the parent domain (e.g. yutome.com) so app.yutome.com and
+  // mcp.yutome.com share one session; host-only when unset (local/single-host).
+  const cookieDomain = env.YUTOME_COOKIE_DOMAIN?.trim();
+  const domainAttr = cookieDomain ? `; Domain=${cookieDomain}` : "";
   headers.append(
     "set-cookie",
-    `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(bootstrap.session.token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${cookieMaxAge}`,
+    `${ACCOUNT_SESSION_COOKIE_NAME}=${encodeURIComponent(bootstrap.session.token)}; HttpOnly; Secure; SameSite=Lax; Path=/${domainAttr}; Max-Age=${cookieMaxAge}`,
   );
   return new Response(null, {
     status: 302,
