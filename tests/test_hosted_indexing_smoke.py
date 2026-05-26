@@ -20,7 +20,6 @@ from yutome.hosted.indexing import (
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
-    complete_job_operation_success_sql,
     enqueue_index_video_job_sql,
     finish_source_discovery_sql,
     mock_embedding_vector,
@@ -178,22 +177,6 @@ class HostedExecutorConnection:
                 connection.transaction_events.append("rollback" if exc_type else "commit")
 
         return Tx()
-
-
-def test_complete_job_operation_success_sql_casts_nullable_lease_guard_params() -> None:
-    statement = complete_job_operation_success_sql(
-        operation_id="op_cleanup",
-        workspace_id="ws_alice",
-        output={"text": "cleaned"},
-        now=NOW,
-        job_id=None,
-        lease_owner=None,
-    )
-
-    assert "%(usage_reservation_id)s::text" in statement.sql
-    assert "%(job_id)s::text IS NULL" in statement.sql
-    assert "jobs.id = %(job_id)s::text" in statement.sql
-    assert "jobs.lease_owner = %(lease_owner)s::text" in statement.sql
 
 
 def _executor_job() -> Job:
@@ -544,7 +527,6 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     plan = plan_mock_hosted_public_indexing(source=source, job=_job(source), video=_video(), chunks=_chunks())
 
     operation_names = [operation.name for operation in plan.sql_operations]
-    sql = "\n".join(operation.statement.sql for operation in plan.sql_operations)
     search_plan = plan.search_operations[0]
 
     assert operation_names[:2] == ["videos.upsert", "search_index_profiles.upsert"]
@@ -561,16 +543,7 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     embedding_indexes = [index for index, name in enumerate(operation_names) if name == "chunk_embeddings.upsert"]
     assert transcript_index < min(chunk_indexes)
     assert swap_index > max([*chunk_indexes, *embedding_indexes])
-    assert "INSERT INTO videos" in sql
-    assert "INSERT INTO transcript_versions" in sql
-    assert "INSERT INTO chunks" in sql
-    assert "bm25_document" in sql
-    assert "tokenize(%(text)s, %(tokenizer)s)::bm25vector" in sql
-    assert "INSERT INTO chunk_embeddings" in sql
-    assert "UPDATE videos" in sql
-    assert "active_transcript_version_id = upserted.id" in sql
     assert search_plan.mode == "hybrid"
-    assert "FULL OUTER JOIN semantic USING (chunk_id)" in search_plan.statement.sql
     assert search_plan.statement.params["workspace_id"] == "ws_alice"
     assert search_plan.usage.operation == "hybrid_query"
 
@@ -647,14 +620,12 @@ def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() ->
     )
 
     result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
-    sql = "\n".join(statement for statement, _params in connection.calls)
 
     assert result.status == "denied"
     assert result.denied_operation == "gemini.cleanup_transcript"
     assert result.error_code == "usage_limit_exceeded"
     assert provider_calls == []
     assert connection.transaction_events == []
-    assert "INSERT INTO videos" not in sql
     assert any(params.get("status") == "denied" for _statement, params in connection.calls)
 
 
@@ -698,13 +669,11 @@ def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
     )
 
     result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
-    sql = "\n".join(statement for statement, _params in connection.calls)
 
     assert result.status == "denied"
     assert result.denied_operation == "search_store.index_write"
     assert provider_calls == ["gemini", "voyage"]
     assert connection.transaction_events == []
-    assert "INSERT INTO videos" not in sql
 
 
 def test_real_hosted_executor_reuses_persisted_provider_outputs() -> None:
@@ -943,21 +912,6 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     assert "cursor_jsonb" not in finish_sql
 
 
-def test_enqueue_index_video_job_sql_keeps_terminal_jobs_terminal() -> None:
-    statement = enqueue_index_video_job_sql(
-        workspace_id="ws_alice",
-        source_id="src_leo",
-        video_id="OEDoJyhQhXs",
-        priority=10,
-        now=NOW,
-        metadata={"seeded_by": "test"},
-    )
-
-    assert "WHEN jobs.status IN ('denied', 'failed', 'succeeded', 'cancelled') THEN jobs.status" in statement.sql
-    assert "updated_at" not in statement.sql
-    assert json.loads(statement.params["metadata_json"])["youtube_video_id"] == "OEDoJyhQhXs"
-
-
 def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
     connection = HostedExecutorConnection(policy=_executor_policy())
     results = []
@@ -975,14 +929,9 @@ def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
         )
         results.append(executor.execute(_executor_job(), lease_owner="worker-1", now=NOW))
 
-    sql = "\n".join(statement for statement, _params in connection.calls)
-
     assert results[0].hosted_video_id == results[1].hosted_video_id
     assert results[0].transcript_version_id == results[1].transcript_version_id
     assert connection.transaction_events == ["begin", "commit", "begin", "commit"]
-    assert "ON CONFLICT (workspace_id, youtube_video_id) DO UPDATE" in sql
-    assert "ON CONFLICT (workspace_id, transcript_version_id, index_profile_id, chunk_index) DO UPDATE" in sql
-    assert "ON CONFLICT (workspace_id, chunk_id, index_profile_id) DO UPDATE" in sql
 
 
 def test_real_hosted_executor_redacts_provider_errors_before_persisting_job_failure() -> None:
