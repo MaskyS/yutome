@@ -22,14 +22,22 @@ export interface HostedAccountGrant {
   status: HostedAccountGrantStatus;
   created_at: string;
   updated_at: string;
+  session_id?: string;
   expires_at?: string;
   revoked_at?: string;
+}
+
+export interface HostedAccountSession {
+  user_id: string;
+  workspace_id: string;
+  workspace_ids: string[];
+  session_id?: string;
 }
 
 export interface IssueHostedAccountGrantOptions {
   grantId: string;
   authRequest: AuthRequest;
-  workspaceId: string;
+  accountSession: HostedAccountSession;
   audience: string;
   tokenVersion: string;
   expiresAt: string;
@@ -38,7 +46,9 @@ export interface IssueHostedAccountGrantOptions {
 
 export class HostedAccountGrantError extends Error {
   readonly code:
-    | "hosted_account_user_missing"
+    | "hosted_account_session_missing"
+    | "hosted_account_session_invalid"
+    | "hosted_account_workspace_mismatch"
     | "hosted_grant_missing"
     | "hosted_grant_revoked"
     | "hosted_grant_expired"
@@ -58,6 +68,8 @@ export class HostedAccountGrantError extends Error {
 const ACCOUNT_GRANT_PREFIX = "yutome:account-grant:";
 export const YUTOME_MCP_SCOPE = "yutome.search.read";
 export const DEFAULT_MCP_AUDIENCE = "https://mcp.yutome.com/mcp";
+export const DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth";
+const ACCOUNT_SESSION_HEADER = "x-yutome-account-session";
 
 export function accountGrantKey(grantId: string): string {
   return `${ACCOUNT_GRANT_PREFIX}${normalizeGrantId(grantId)}`;
@@ -67,29 +79,82 @@ export async function issueHostedAccountGrant(
   env: Env,
   options: IssueHostedAccountGrantOptions,
 ): Promise<HostedAccountGrant> {
+  const requestedGrant = {
+    user_id: normalizeAccountId(options.accountSession.user_id, "user_id"),
+    workspace_id: normalizeTenantId(options.accountSession.workspace_id, "workspace_id"),
+    client_id: normalizeGrantId(options.authRequest.clientId),
+    scopes: normalizeRequiredScopes(options.authRequest.scope),
+    audience: nonEmptyString(options.audience, "audience"),
+    token_version: nonEmptyString(options.tokenVersion, "token_version"),
+    session_id: nonEmptyOptionalString(options.accountSession.session_id),
+  };
   const existing = await readHostedAccountGrant(env, options.grantId);
   if (existing) {
     assertGrantActive(existing, options.now);
+    assertGrantMatchesAuthorization(existing, requestedGrant);
     return existing;
   }
 
   const now = options.now ?? new Date();
   const grant: HostedAccountGrant = {
     grant_id: normalizeGrantId(options.grantId),
-    user_id: configuredAccountUserId(env),
-    workspace_id: normalizeTenantId(options.workspaceId, "workspace_id"),
-    client_id: normalizeGrantId(options.authRequest.clientId),
-    scopes: normalizeScopes(options.authRequest.scope),
-    audience: nonEmptyString(options.audience, "audience"),
-    token_version: nonEmptyString(options.tokenVersion, "token_version"),
+    user_id: requestedGrant.user_id,
+    workspace_id: requestedGrant.workspace_id,
+    client_id: requestedGrant.client_id,
+    scopes: requestedGrant.scopes,
+    audience: requestedGrant.audience,
+    token_version: requestedGrant.token_version,
     status: "active",
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
+    session_id: requestedGrant.session_id,
     expires_at: nonEmptyOptionalString(options.expiresAt),
   };
 
   await writeHostedAccountGrant(env, grant);
   return grant;
+}
+
+export async function resolveHostedAccountSessionFromRequest(
+  request: Request,
+  env: Pick<Env, "YUTOME_ACCOUNT_SESSION_HMAC_SECRET" | "YUTOME_ACCOUNT_SESSION_AUDIENCE">,
+  options: { selectedWorkspaceId?: string; allowWorkspaceSelection?: boolean } = {},
+): Promise<HostedAccountSession> {
+  const secret = env.YUTOME_ACCOUNT_SESSION_HMAC_SECRET?.trim();
+  if (!secret) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_missing",
+      "Hosted OAuth requires a configured account session verifier.",
+      500,
+    );
+  }
+
+  const token = request.headers.get(ACCOUNT_SESSION_HEADER)?.trim();
+  if (!token) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_missing",
+      "Sign in to Yutome before approving hosted MCP access.",
+      401,
+    );
+  }
+
+  const payload = await verifyAccountSessionToken(token, secret);
+  const audience = accountSessionAudience(env);
+  assertAccountSessionAudience(payload.aud, audience);
+  assertAccountSessionFresh(payload.exp);
+
+  const user_id = normalizeAccountId(payload.user_id ?? payload.sub, "user_id");
+  const session_id = nonEmptyOptionalString(payload.session_id ?? payload.sid);
+  const workspaceIds = normalizedAccountWorkspaceIds(payload);
+  const selectedWorkspace = selectedWorkspaceId(options.selectedWorkspaceId);
+  const workspace_id = resolveSelectedAccountWorkspace(workspaceIds, selectedWorkspace, options.allowWorkspaceSelection);
+
+  return withoutUndefined({
+    user_id,
+    workspace_id,
+    workspace_ids: workspaceIds,
+    session_id,
+  });
 }
 
 export async function resolveActiveHostedAccountGrantFromProps(
@@ -137,7 +202,7 @@ export async function resolveHostedMcpAuthContextFromStoredGrant(
     user_id: grant.user_id,
     grant_id: grant.grant_id,
     client_id: grant.client_id,
-    session_id: nonEmptyOptionalString(options.sessionId),
+    session_id: nonEmptyOptionalString(options.sessionId ?? grant.session_id),
     audience: grant.audience,
     expires_at: grant.expires_at,
     token_version: grant.token_version,
@@ -217,6 +282,17 @@ interface TokenSummaryLike {
   };
 }
 
+interface AccountSessionPayload extends Record<string, unknown> {
+  aud?: unknown;
+  exp?: unknown;
+  user_id?: unknown;
+  sub?: unknown;
+  workspace_id?: unknown;
+  workspace_ids?: unknown;
+  session_id?: unknown;
+  sid?: unknown;
+}
+
 export async function handleRevokeRequest(ctx: {
   request: Request;
   env: Env;
@@ -292,15 +368,15 @@ export async function handleRevokeRequest(ctx: {
   }
 }
 
-export function hostedGrantProps(grant: HostedAccountGrant, installId?: string): YutomeAuthProps {
+export function hostedGrantProps(grant: HostedAccountGrant): YutomeAuthProps {
   return withoutUndefined({
     capsule: "hosted",
     workspace_id: grant.workspace_id,
-    install_id: installId,
     connector_grant_id: grant.grant_id,
     grant_id: grant.grant_id,
     user_id: grant.user_id,
     client_id: grant.client_id,
+    session_id: grant.session_id,
     scopes: grant.scopes,
     audience: grant.audience,
     token_version: grant.token_version,
@@ -377,6 +453,7 @@ function normalizeStoredGrant(value: Record<string, unknown>): HostedAccountGran
     status,
     created_at: nonEmptyString(value.created_at, "created_at"),
     updated_at: nonEmptyString(value.updated_at, "updated_at"),
+    session_id: nonEmptyOptionalString(value.session_id),
     expires_at: nonEmptyOptionalString(value.expires_at),
     revoked_at: nonEmptyOptionalString(value.revoked_at),
   });
@@ -411,6 +488,40 @@ function assertTokenPropsMatchStoredGrant(
   }
 }
 
+function assertGrantMatchesAuthorization(
+  grant: HostedAccountGrant,
+  requested: {
+    user_id: string;
+    workspace_id: string;
+    client_id: string;
+    scopes: string[];
+    audience: string;
+    token_version: string;
+    session_id?: string;
+  },
+): void {
+  const mismatches: string[] = [];
+  compareOptionalString(requested.workspace_id, grant.workspace_id, "workspace_id", mismatches);
+  compareOptionalString(requested.user_id, grant.user_id, "user_id", mismatches);
+  compareOptionalString(requested.client_id, grant.client_id, "client_id", mismatches);
+  compareOptionalString(requested.audience, grant.audience, "audience", mismatches);
+  compareOptionalString(requested.token_version, grant.token_version, "token_version", mismatches);
+  if ((requested.session_id ?? "") !== (grant.session_id ?? "")) {
+    mismatches.push("session_id");
+  }
+  if (!sameStringSet(requested.scopes, grant.scopes)) {
+    mismatches.push("scopes");
+  }
+
+  if (mismatches.length > 0) {
+    throw new HostedAccountGrantError(
+      "hosted_grant_mismatch",
+      `Hosted MCP authorization does not match stored account grant: ${mismatches.join(", ")}.`,
+      401,
+    );
+  }
+}
+
 function compareOptionalString(
   value: unknown,
   expected: string,
@@ -431,20 +542,206 @@ function sameStringSet(left: string[], right: string[]): boolean {
   return left.every((value) => rightSet.has(value));
 }
 
-function configuredAccountUserId(env: Env): string {
-  const userId = env.YUTOME_ACCOUNT_USER_ID;
-  if (typeof userId !== "string" || !userId.trim()) {
+async function verifyAccountSessionToken(token: string, secret: string): Promise<AccountSessionPayload> {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== "v1" || !parts[1] || !parts[2]) {
     throw new HostedAccountGrantError(
-      "hosted_account_user_missing",
-      "YUTOME_ACCOUNT_USER_ID is required for hosted OAuth grants.",
-      500,
+      "hosted_account_session_invalid",
+      "Hosted account session was not a signed v1 token.",
+      401,
     );
   }
-  return normalizeGrantId(userId);
+  const signed = `${parts[0]}.${parts[1]}`;
+  const expected = await hmacSha256(signed, secret);
+  const actual = decodeBase64Url(parts[2]);
+  if (!constantTimeEqual(actual, expected)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session signature was invalid.",
+      401,
+    );
+  }
+  try {
+    const parsed = JSON.parse(decodeUtf8(decodeBase64Url(parts[1])));
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as AccountSessionPayload;
+    }
+  } catch {
+    // Normalize below so session parsing failures do not look like stored-grant failures.
+  }
+  throw new HostedAccountGrantError(
+    "hosted_account_session_invalid",
+    "Hosted account session payload was not valid JSON.",
+    401,
+  );
+}
+
+async function hmacSha256(value: string, secret: string): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
+}
+
+function constantTimeEqual(actual: Uint8Array, expected: Uint8Array): boolean {
+  let diff = actual.length ^ expected.length;
+  const length = Math.max(actual.length, expected.length);
+  for (let index = 0; index < length; index += 1) {
+    diff |= (actual[index] ?? 0) ^ (expected[index] ?? 0);
+  }
+  return diff === 0;
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session contained invalid base64url data.",
+      401,
+    );
+  }
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function decodeUtf8(value: Uint8Array): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(value);
+  } catch {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session payload was not valid UTF-8.",
+      401,
+    );
+  }
+}
+
+function accountSessionAudience(
+  env: Pick<Env, "YUTOME_ACCOUNT_SESSION_AUDIENCE">,
+): string {
+  return env.YUTOME_ACCOUNT_SESSION_AUDIENCE?.trim() || DEFAULT_ACCOUNT_SESSION_AUDIENCE;
+}
+
+function assertAccountSessionAudience(value: unknown, expected: string): void {
+  const audiences = Array.isArray(value)
+    ? value.map((entry) => nonEmptyOptionalString(entry)).filter(isString)
+    : typeof value === "string"
+      ? [value.trim()]
+      : [];
+  if (!audiences.includes(expected)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      `Hosted account session audience must be ${expected}.`,
+      401,
+    );
+  }
+}
+
+function assertAccountSessionFresh(value: unknown): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session expiry is required.",
+      401,
+    );
+  }
+  if (value <= Math.floor(Date.now() / 1000)) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session has expired.",
+      401,
+    );
+  }
+}
+
+function normalizedAccountWorkspaceIds(payload: AccountSessionPayload): string[] {
+  const candidates = [
+    payload.workspace_id,
+    ...(Array.isArray(payload.workspace_ids) ? payload.workspace_ids : []),
+  ];
+  return [...new Set(candidates.map((value) => optionalTenantId(value, "workspace_id")).filter(isString))];
+}
+
+function selectedWorkspaceId(value: unknown): string | undefined {
+  return optionalTenantId(value, "workspace_id");
+}
+
+function resolveSelectedAccountWorkspace(
+  workspaceIds: string[],
+  selected: string | undefined,
+  allowWorkspaceSelection = false,
+): string {
+  if (workspaceIds.length === 0) {
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      "Hosted account session did not include any workspaces.",
+      401,
+    );
+  }
+  if (selected) {
+    if (!workspaceIds.includes(selected)) {
+      throw new HostedAccountGrantError(
+        "hosted_account_workspace_mismatch",
+        "Selected workspace is not available in the signed Yutome account session.",
+        403,
+      );
+    }
+    return selected;
+  }
+  if (workspaceIds.length === 1) {
+    return workspaceIds[0];
+  }
+  if (allowWorkspaceSelection) {
+    return workspaceIds[0];
+  }
+  throw new HostedAccountGrantError(
+    "hosted_account_workspace_mismatch",
+    "Choose a Yutome workspace before approving hosted MCP access.",
+    400,
+  );
+}
+
+function optionalTenantId(value: unknown, field: "workspace_id"): string | undefined {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return undefined;
+  }
+  try {
+    return normalizeTenantId(value, field);
+  } catch (err) {
+    if (err instanceof HostedAccountGrantError) {
+      throw err;
+    }
+    throw new HostedAccountGrantError(
+      "hosted_account_session_invalid",
+      err instanceof Error ? err.message : `Hosted account session ${field} is invalid.`,
+      401,
+    );
+  }
+}
+
+function normalizeAccountId(value: unknown, field: string): string {
+  return nonEmptyString(value, field);
 }
 
 function normalizeGrantId(value: unknown): string {
   return nonEmptyString(value, "grant_id");
+}
+
+function normalizeRequiredScopes(value: unknown): string[] {
+  const scopes = normalizeScopes(value);
+  if (!scopes.includes(YUTOME_MCP_SCOPE)) {
+    throw new HostedAccountGrantError(
+      "hosted_grant_invalid",
+      `Hosted MCP authorization requests must include the ${YUTOME_MCP_SCOPE} scope.`,
+      400,
+    );
+  }
+  return scopes;
 }
 
 function normalizeScopes(value: unknown): string[] {

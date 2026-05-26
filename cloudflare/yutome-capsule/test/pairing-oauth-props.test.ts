@@ -39,12 +39,9 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
   let completed: unknown;
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
-    YUTOME_WORKSPACE_ID: "ws_alice",
-    YUTOME_INSTALL_ID: "inst_mac",
-    YUTOME_ACCOUNT_USER_ID: "user_alice",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
     YUTOME_MCP_AUDIENCE: "https://mcp.yutome.com/mcp",
     YUTOME_TOKEN_VERSION: "v2",
     YUTOME_TOKEN_TTL_SECONDS: "3600",
@@ -54,9 +51,17 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     OPENAI_API_KEY: "provider-secret",
     WEB_SHARE_TOKEN: "provider-secret",
   } as Env & Record<string, unknown>;
+  const accountSessionToken = await signedAccountSession({
+    workspace_id: "ws_alice",
+    workspace_ids: ["ws_alice", "ws_billing"],
+    session_id: "acct_session_alice",
+  });
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken, {
+      accountSessionToken,
+      workspaceId: "ws_alice",
+    }),
     env,
     oauthHelpers: {
       completeAuthorization: async (input: unknown) => {
@@ -77,11 +82,11 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
   assert.deepEqual(authorization.props, {
     capsule: "hosted",
     workspace_id: "ws_alice",
-    install_id: "inst_mac",
     connector_grant_id: grantId,
     grant_id: grantId,
     user_id: "user_alice",
     client_id: "client-1",
+    session_id: "acct_session_alice",
     scopes: ["yutome.search.read"],
     audience: "https://mcp.yutome.com/mcp",
     token_version: "v2",
@@ -95,11 +100,11 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
   assert.equal(Date.parse(authorization.props.expires_at as string) > Date.parse(authorization.props.paired_at as string), true);
   assert.deepEqual(authorization.metadata, {
     workspace_id: "ws_alice",
-    install_id: "inst_mac",
     connector_grant_id: grantId,
     grant_id: grantId,
     user_id: "user_alice",
     client_id: "client-1",
+    session_id: "acct_session_alice",
     scopes: ["yutome.search.read"],
     audience: "https://mcp.yutome.com/mcp",
     token_version: "v2",
@@ -113,6 +118,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     user_id: "user_alice",
     grant_id: grantId,
     client_id: "client-1",
+    session_id: "acct_session_alice",
     audience: "https://mcp.yutome.com/mcp",
     expires_at: authorization.props.expires_at,
     token_version: "v2",
@@ -131,6 +137,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     status: "active",
     created_at: authorization.props.paired_at,
     updated_at: authorization.props.paired_at,
+    session_id: "acct_session_alice",
     expires_at: authorization.props.expires_at,
   });
 
@@ -193,18 +200,16 @@ test("hosted OAuth pairing rejects revoked staged account grant", async () => {
   let completed = false;
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
-    YUTOME_WORKSPACE_ID: "ws_alice",
-    YUTOME_INSTALL_ID: "inst_mac",
-    YUTOME_ACCOUNT_USER_ID: "user_alice",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
     RELAY: {} as DurableObjectNamespace,
     MCP_OBJECT: {} as DurableObjectNamespace,
   } as Env;
+  const accountSessionToken = await signedAccountSession();
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken, { accountSessionToken }),
     env,
     oauthHelpers: {
       completeAuthorization: async () => {
@@ -258,18 +263,16 @@ test("hosted OAuth pairing rejects expired staged account grant", async () => {
   let completed = false;
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
-    YUTOME_WORKSPACE_ID: "ws_alice",
-    YUTOME_INSTALL_ID: "inst_mac",
-    YUTOME_ACCOUNT_USER_ID: "user_alice",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
     RELAY: {} as DurableObjectNamespace,
     MCP_OBJECT: {} as DurableObjectNamespace,
   } as Env;
+  const accountSessionToken = await signedAccountSession();
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken, { accountSessionToken }),
     env,
     oauthHelpers: {
       completeAuthorization: async () => {
@@ -290,7 +293,6 @@ test("hosted account grant resolver rejects expired stored grants and accepts fu
   const kv = new MemoryKv();
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
     RELAY: {} as DurableObjectNamespace,
@@ -359,7 +361,6 @@ test("hosted grant auth rejects token prop mismatches before hosted routing", as
   const kv = new MemoryKv();
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
     YUTOME_HOSTED_API_URL: "https://hosted.example",
@@ -430,7 +431,6 @@ test("hosted grant auth derives routing from stored grant when token only identi
   const kv = new MemoryKv();
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
     YUTOME_HOSTED_API_URL: "https://hosted.example/mcp",
@@ -494,7 +494,7 @@ test("hosted grant auth derives routing from stored grant when token only identi
   assert.equal(headers.get("x-yutome-scopes"), "profile yutome.search.read");
 });
 
-test("hosted OAuth pairing rejects missing configured tenant identity", async () => {
+test("hosted OAuth pairing rejects missing account session", async () => {
   const grantId = "22222222-3333-4444-8555-666666666666";
   const csrfToken = "csrf-token";
   const kv = new MemoryKv();
@@ -517,15 +517,15 @@ test("hosted OAuth pairing rejects missing configured tenant identity", async ()
   let completed = false;
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
     RELAY: {} as DurableObjectNamespace,
     MCP_OBJECT: {} as DurableObjectNamespace,
   } as Env;
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken),
     env,
     oauthHelpers: {
       completeAuthorization: async () => {
@@ -535,9 +535,63 @@ test("hosted OAuth pairing rejects missing configured tenant identity", async ()
     } as never,
   });
 
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 401);
   assert.equal(completed, false);
-  assert.match(await response.text(), /Missing hosted tenant identity/);
+  assert.match(await response.text(), /Sign in to Yutome/);
+});
+
+test("hosted OAuth pairing rejects workspace selection outside account session", async () => {
+  const grantId = "22222222-3333-4444-8555-666666666667";
+  const csrfToken = "csrf-token";
+  const kv = new MemoryKv();
+  await kv.put(
+    `${AUTH_STATE_PREFIX}${grantId}`,
+    JSON.stringify({
+      authRequest: {
+        clientId: "client-1",
+        redirectUri: "https://assistant.example/callback",
+        scope: ["yutome.search.read"],
+        resource: "https://mcp.yutome.com/mcp",
+      },
+      redirectUri: "https://assistant.example/callback",
+      scope: ["yutome.search.read"],
+      csrfToken,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+
+  let completed = false;
+  const env = {
+    OAUTH_KV: kv as unknown as KVNamespace,
+    YUTOME_RELAY_TOKEN: "bridge-token",
+    YUTOME_WORKER_MODE: "hosted",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
+    RELAY: {} as DurableObjectNamespace,
+    MCP_OBJECT: {} as DurableObjectNamespace,
+  } as Env;
+  const accountSessionToken = await signedAccountSession({
+    workspace_id: "ws_alice",
+    workspace_ids: ["ws_alice"],
+  });
+
+  const response = await handlePairingRequest({
+    request: pairingPostRequest(grantId, csrfToken, {
+      accountSessionToken,
+      workspaceId: "ws_bob",
+    }),
+    env,
+    oauthHelpers: {
+      completeAuthorization: async () => {
+        completed = true;
+        return { redirectTo: "https://assistant.example/done" };
+      },
+    } as never,
+  });
+
+  assert.equal(response.status, 403);
+  assert.equal(completed, false);
+  assert.match(await response.text(), /Selected workspace/);
+  assert.equal(await readHostedAccountGrant(env, grantId), null);
 });
 
 test("connector-only OAuth pairing keeps local defaults explicit", async () => {
@@ -570,7 +624,7 @@ test("connector-only OAuth pairing keeps local defaults explicit", async () => {
   } as Env;
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken, { pairingCode: "PAIR-123" }),
     env,
     oauthHelpers: {
       completeAuthorization: async (input: unknown) => {
@@ -633,18 +687,16 @@ test("hosted OAuth pairing rejects authorization requests missing canonical MCP 
   let completed = false;
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
-    YUTOME_WORKSPACE_ID: "ws_alice",
-    YUTOME_INSTALL_ID: "inst_mac",
-    YUTOME_ACCOUNT_USER_ID: "user_alice",
+    YUTOME_ACCOUNT_SESSION_HMAC_SECRET: "account-session-secret",
     RELAY: {} as DurableObjectNamespace,
     MCP_OBJECT: {} as DurableObjectNamespace,
   } as Env;
+  const accountSessionToken = await signedAccountSession();
 
   const response = await handlePairingRequest({
-    request: pairingPostRequest(grantId, csrfToken, "PAIR-123"),
+    request: pairingPostRequest(grantId, csrfToken, { accountSessionToken }),
     env,
     oauthHelpers: {
       completeAuthorization: async () => {
@@ -664,7 +716,6 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
   const kv = new MemoryKv();
   const env = {
     OAUTH_KV: kv as unknown as KVNamespace,
-    YUTOME_PAIRING_CODE: "PAIR-123",
     YUTOME_RELAY_TOKEN: "bridge-token",
     YUTOME_WORKER_MODE: "hosted",
     RELAY: {} as DurableObjectNamespace,
@@ -748,20 +799,64 @@ test("revoke endpoint keeps connector-only behavior explicit", async () => {
   assert.equal(response.status, 404);
 });
 
-function pairingPostRequest(authRequestId: string, csrfToken: string, pairingCode: string): Request {
+function pairingPostRequest(
+  authRequestId: string,
+  csrfToken: string,
+  options: { pairingCode?: string; accountSessionToken?: string; workspaceId?: string } = {},
+): Request {
   const form = new URLSearchParams({
     auth_request_id: authRequestId,
     csrf_token: csrfToken,
-    pairing_code: pairingCode,
   });
+  if (options.pairingCode) {
+    form.set("pairing_code", options.pairingCode);
+  }
+  if (options.workspaceId) {
+    form.set("workspace_id", options.workspaceId);
+  }
+  const headers = new Headers({
+    "content-type": "application/x-www-form-urlencoded",
+    cookie: `__Host-yutome_pairing_${authRequestId}=${csrfToken}`,
+  });
+  if (options.accountSessionToken) {
+    headers.set("x-yutome-account-session", options.accountSessionToken);
+  }
   return new Request("https://mcp.yutome.com/pair", {
     method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      cookie: `__Host-yutome_pairing_${authRequestId}=${csrfToken}`,
-    },
+    headers,
     body: form,
   });
+}
+
+async function signedAccountSession(
+  payload: Record<string, unknown> = {},
+  secret = "account-session-secret",
+): Promise<string> {
+  const tokenPayload = {
+    aud: "yutome:hosted-oauth",
+    exp: Math.floor(Date.now() / 1000) + 3600,
+    user_id: "user_alice",
+    workspace_id: "ws_alice",
+    workspace_ids: ["ws_alice"],
+    session_id: "acct_session_1",
+    ...payload,
+  };
+  const encodedPayload = base64UrlEncode(new TextEncoder().encode(JSON.stringify(tokenPayload)));
+  const signed = `v1.${encodedPayload}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signed)));
+  return `${signed}.${base64UrlEncode(signature)}`;
+}
+
+function base64UrlEncode(value: Uint8Array): string {
+  const binary = String.fromCharCode(...value);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 class MemoryKv {

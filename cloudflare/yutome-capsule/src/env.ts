@@ -3,14 +3,15 @@
  *
  * Secrets (set via `wrangler secret put`):
  *   YUTOME_RELAY_TOKEN  — bearer token the laptop bridge presents on /relay/connect
- *   YUTOME_PAIRING_CODE — printed by `yutome connect`, consumed at /pair
+ *   YUTOME_PAIRING_CODE — printed by `yutome connect`, consumed at /pair in connector-only mode
  *   YUTOME_HOSTED_API_TOKEN — bearer token used by hosted-mode edge → API calls
+ *   YUTOME_ACCOUNT_SESSION_HMAC_SECRET — verifies account-app signed hosted OAuth sessions
  *
  * Vars:
- *   YUTOME_WORKSPACE_ID — optional hosted workspace routing id
+ *   YUTOME_WORKSPACE_ID — optional connector relay routing id
  *   YUTOME_INSTALL_ID   — optional desktop/install routing id
  *   YUTOME_HOSTED_API_URL — Railway/Python hosted MCP query API base URL
- *   YUTOME_ACCOUNT_USER_ID — staged hosted account user id for OAuth grants
+ *   YUTOME_ACCOUNT_SESSION_AUDIENCE — optional account-session audience, defaults to yutome:hosted-oauth
  *   YUTOME_MCP_AUDIENCE — optional OAuth audience/resource for hosted MCP tokens
  *   YUTOME_TOKEN_VERSION — optional token contract version, defaults to v1
  *   YUTOME_TOKEN_TTL_SECONDS — optional token prop expiry hint, defaults to 30 days
@@ -28,15 +29,16 @@ export interface Env {
 
   // Secrets
   YUTOME_RELAY_TOKEN: string;
-  YUTOME_PAIRING_CODE: string;
+  YUTOME_PAIRING_CODE?: string;
   YUTOME_HOSTED_API_TOKEN?: string;
+  YUTOME_ACCOUNT_SESSION_HMAC_SECRET?: string;
 
   // Vars
   YUTOME_WORKER_MODE: string;
   YUTOME_WORKSPACE_ID?: string;
   YUTOME_INSTALL_ID?: string;
   YUTOME_HOSTED_API_URL?: string;
-  YUTOME_ACCOUNT_USER_ID?: string;
+  YUTOME_ACCOUNT_SESSION_AUDIENCE?: string;
   YUTOME_MCP_AUDIENCE?: string;
   YUTOME_TOKEN_VERSION?: string;
   YUTOME_TOKEN_TTL_SECONDS?: string;

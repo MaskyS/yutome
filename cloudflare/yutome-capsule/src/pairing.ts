@@ -1,11 +1,13 @@
 /**
- * /authorize + /pair — pairing-code consent flow used by the OAuthProvider's defaultHandler.
+ * /authorize + /pair — OAuth consent flow used by the OAuthProvider's defaultHandler.
  *
  * When Claude/ChatGPT redirects the browser to /authorize, the OAuth provider
- * routes the unauthenticated request here. We render an HTML form asking for
- * the pairing code that `yutome connect` printed. On a valid code we call
- * `OAuthHelpers.completeAuthorization()`, which finalizes the grant and
- * redirects the browser back to the MCP client with the auth code.
+ * routes the unauthenticated request here. Connector-only deployments ask for
+ * the pairing code that `yutome connect` printed. Hosted deployments require
+ * the account app to attach a signed account-session header and then approve a
+ * selected workspace. A valid approval calls `OAuthHelpers.completeAuthorization()`,
+ * which finalizes the grant and redirects the browser back to the MCP client
+ * with the auth code.
  */
 import type { Env, YutomeAuthProps } from "./env";
 import type { AuthRequest, ClientInfo, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
@@ -13,8 +15,10 @@ import {
   assertAuthRequestTargetsMcpAudience,
   configuredMcpAudience,
   HostedAccountGrantError,
+  type HostedAccountSession,
   hostedGrantProps,
   issueHostedAccountGrant,
+  resolveHostedAccountSessionFromRequest,
 } from "./account-grants.ts";
 import { isHostedWorkerMode, resolveConfiguredBridgeIdentity, TenantRoutingError } from "./tenant-routing.ts";
 
@@ -58,6 +62,29 @@ export async function handleAuthorizeRequest(ctx: PairingContext): Promise<Respo
   const url = new URL(request.url);
   const authRequest = await oauthHelpers.parseAuthRequest(request);
   const client = await oauthHelpers.lookupClient(authRequest.clientId);
+  if (isHostedWorkerMode(env.YUTOME_WORKER_MODE)) {
+    let accountSession;
+    try {
+      accountSession = await resolveHostedAccountSessionFromRequest(request, env, {
+        allowWorkspaceSelection: true,
+      });
+    } catch (err) {
+      if (err instanceof HostedAccountGrantError) {
+        return errorResponse(err.message, undefined, err.status);
+      }
+      throw err;
+    }
+    try {
+      assertAuthRequestTargetsMcpAudience(authRequest, configuredMcpAudience(env));
+    } catch (err) {
+      if (err instanceof HostedAccountGrantError) {
+        return errorResponse(err.message, undefined, err.status);
+      }
+      throw err;
+    }
+    const renderState = await createAuthorizationState(env, authRequest, client);
+    return renderHostedConsentForm(url, "", renderState, accountSession);
+  }
   const renderState = await createAuthorizationState(env, authRequest, client);
   return renderForm(url, "", renderState);
 }
@@ -87,6 +114,43 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
   }
   const renderState = toRenderState(authRequestId, state);
 
+  if (isHostedWorkerMode(env.YUTOME_WORKER_MODE)) {
+    let accountSession;
+    try {
+      accountSession = await resolveHostedAccountSessionFromRequest(request, env, {
+        selectedWorkspaceId: String(form.get("workspace_id") || "").trim(),
+      });
+    } catch (err) {
+      if (err instanceof HostedAccountGrantError) {
+        return errorResponse(err.message, authRequestId, err.status);
+      }
+      throw err;
+    }
+
+    let grant;
+    try {
+      grant = await resolveHostedOAuthGrant({
+        authRequestId,
+        authRequest: state.authRequest,
+        accountSession,
+        env,
+      });
+    } catch (err) {
+      if (err instanceof HostedAccountGrantError) {
+        return errorResponse(err.message, authRequestId, err.status);
+      }
+      throw err;
+    }
+
+    return completePairingAuthorization({
+      authRequestId,
+      env,
+      oauthHelpers,
+      state,
+      grant,
+    });
+  }
+
   const supplied = String(form.get("pairing_code") || "").trim().toUpperCase();
   const expected = String(env.YUTOME_PAIRING_CODE || "").trim().toUpperCase();
   if (!expected) {
@@ -110,21 +174,86 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
     throw err;
   }
 
-  let grant;
-  try {
-    grant = await resolveOAuthGrant({
+  const grant = resolveConnectorOAuthGrant({
+    authRequestId,
+    authRequest: state.authRequest,
+    bridgeIdentity,
+    env,
+  });
+
+  return completePairingAuthorization({
+    authRequestId,
+    env,
+    oauthHelpers,
+    state,
+    grant,
+  });
+}
+
+async function resolveHostedOAuthGrant({
+  authRequestId,
+  authRequest,
+  accountSession,
+  env,
+}: {
+  authRequestId: string;
+  authRequest: AuthRequest;
+  accountSession: HostedAccountSession;
+  env: Env;
+}): Promise<{ userId: string; props: YutomeAuthProps }> {
+  const pairedAt = new Date();
+  const audience = configuredMcpAudience(env);
+  assertAuthRequestTargetsMcpAudience(authRequest, audience);
+  const accountGrant = await issueHostedAccountGrant(env, {
+    grantId: authRequestId,
+    authRequest,
+    accountSession,
+    audience,
+    tokenVersion: configuredTokenVersion(env),
+    expiresAt: new Date(pairedAt.getTime() + configuredTokenTtlSeconds(env) * 1000).toISOString(),
+    now: pairedAt,
+  });
+  return {
+    userId: accountGrant.user_id,
+    props: hostedGrantProps(accountGrant),
+  };
+}
+
+function resolveConnectorOAuthGrant({
+  authRequestId,
+  authRequest,
+  bridgeIdentity,
+  env,
+}: {
+  authRequestId: string;
+  authRequest: AuthRequest;
+  bridgeIdentity: { workspace_id: string; install_id: string };
+  env: Env;
+}): { userId: string; props: YutomeAuthProps } {
+  return {
+    userId: "yutome-owner",
+    props: buildConnectorOAuthGrantProps({
       authRequestId,
-      authRequest: state.authRequest,
+      authRequest,
       bridgeIdentity,
       env,
-    });
-  } catch (err) {
-    if (err instanceof HostedAccountGrantError) {
-      return errorResponse(err.message, authRequestId, err.status);
-    }
-    throw err;
-  }
+    }),
+  };
+}
 
+async function completePairingAuthorization({
+  authRequestId,
+  env,
+  oauthHelpers,
+  state,
+  grant,
+}: {
+  authRequestId: string;
+  env: Env;
+  oauthHelpers: OAuthHelpers;
+  state: StoredAuthorizationRequest;
+  grant: { userId: string; props: YutomeAuthProps };
+}): Promise<Response> {
   const { redirectTo } = await oauthHelpers.completeAuthorization({
     request: state.authRequest,
     userId: grant.userId,
@@ -144,47 +273,6 @@ export async function handlePairingRequest(ctx: PairingContext): Promise<Respons
   );
 
   return redirectResponse(redirectTo);
-}
-
-async function resolveOAuthGrant({
-  authRequestId,
-  authRequest,
-  bridgeIdentity,
-  env,
-}: {
-  authRequestId: string;
-  authRequest: AuthRequest;
-  bridgeIdentity: { workspace_id: string; install_id: string };
-  env: Env;
-}): Promise<{ userId: string; props: YutomeAuthProps }> {
-  if (isHostedWorkerMode(env.YUTOME_WORKER_MODE)) {
-    const pairedAt = new Date();
-    const audience = configuredMcpAudience(env);
-    assertAuthRequestTargetsMcpAudience(authRequest, audience);
-    const accountGrant = await issueHostedAccountGrant(env, {
-      grantId: authRequestId,
-      authRequest,
-      workspaceId: bridgeIdentity.workspace_id,
-      audience,
-      tokenVersion: configuredTokenVersion(env),
-      expiresAt: new Date(pairedAt.getTime() + configuredTokenTtlSeconds(env) * 1000).toISOString(),
-      now: pairedAt,
-    });
-    return {
-      userId: accountGrant.user_id,
-      props: hostedGrantProps(accountGrant, bridgeIdentity.install_id),
-    };
-  }
-
-  return {
-    userId: "yutome-owner",
-    props: buildConnectorOAuthGrantProps({
-      authRequestId,
-      authRequest,
-      bridgeIdentity,
-      env,
-    }),
-  };
 }
 
 function buildConnectorOAuthGrantProps({
@@ -223,6 +311,7 @@ function oauthGrantMetadata(props: YutomeAuthProps): Record<string, unknown> {
     grant_id: props.grant_id,
     user_id: props.user_id,
     client_id: props.client_id,
+    session_id: props.session_id,
     scopes: props.scopes,
     audience: props.audience,
     token_version: props.token_version,
@@ -332,6 +421,83 @@ export function renderForm(url: URL, error: string, authState?: RenderAuthorizat
         `${cookieName}=${authState.csrfToken}; Path=/; Max-Age=${AUTH_STATE_TTL_SECONDS}; Secure; HttpOnly; SameSite=Lax`,
       );
     }
+  }
+  return new Response(body, {
+    status: error ? 401 : 200,
+    headers,
+  });
+}
+
+function renderHostedConsentForm(
+  url: URL,
+  error: string,
+  authState: RenderAuthorizationState,
+  accountSession: HostedAccountSession,
+): Response {
+  const action = `/pair${url.search}`;
+  const workspaceOptions = accountSession.workspace_ids.map((workspaceId) =>
+    `<option value="${escapeHtml(workspaceId)}" ${workspaceId === accountSession.workspace_id ? "selected" : ""}>${escapeHtml(workspaceId)}</option>`,
+  ).join("");
+  const workspaceControl = accountSession.workspace_ids.length > 1
+    ? `<label>Workspace
+      <select name="workspace_id" required>${workspaceOptions}</select>
+    </label>`
+    : `<input type="hidden" name="workspace_id" value="${escapeHtml(accountSession.workspace_id)}" />`;
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Authorize Yutome Remote MCP</title>
+  <link rel="icon" type="image/png" sizes="48x48" href="/icon-48.png" />
+  <link rel="apple-touch-icon" sizes="256x256" href="/icon.png" />
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 2.5rem auto; max-width: 38rem; padding: 0 1rem; color: #111; }
+    .brand { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+    .brand img { width: 48px; height: 48px; }
+    .brand h1 { margin: 0; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    label { display: grid; gap: 0.4rem; margin: 1.25rem 0; font-weight: 500; }
+    select { padding: 0.7rem; border: 1px solid #999; border-radius: 8px; font: inherit; background: white; }
+    button { padding: 0.8rem 1.1rem; border: 0; border-radius: 8px; background: #111; color: white; font-weight: 600; font-size: 1rem; }
+    code { background: #f3f3f3; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    dl { border: 1px solid #ddd; border-radius: 8px; padding: 0.85rem; }
+    dl div + div { margin-top: 0.65rem; }
+    dt { color: #555; font-size: 0.82rem; }
+    dd { margin: 0.1rem 0 0; overflow-wrap: anywhere; }
+    .error { color: #9f1239; font-weight: 500; }
+    .hint { color: #555; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="brand">
+    <img src="/icon-48.png" alt="" width="48" height="48" />
+    <h1>Authorize Yutome for this assistant</h1>
+  </div>
+  <p class="hint">Claude or ChatGPT wants permission to search a Yutome workspace.</p>
+  <dl class="target">
+    <div><dt>Assistant app</dt><dd>${escapeHtml(authState.clientName || "Unnamed MCP client")}</dd></div>
+    <div><dt>Redirect</dt><dd><code>${escapeHtml(authState.redirectUri)}</code></dd></div>
+    <div><dt>Scope</dt><dd>${escapeHtml(authState.scope.join(" ") || "none")}</dd></div>
+    <div><dt>User</dt><dd>${escapeHtml(accountSession.user_id)}</dd></div>
+  </dl>
+  ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
+  <form method="post" action="${escapeHtml(action)}">
+    <input type="hidden" name="auth_request_id" value="${escapeHtml(authState.authRequestId)}" />
+    <input type="hidden" name="csrf_token" value="${escapeHtml(authState.csrfToken)}" />
+    ${workspaceControl}
+    <button type="submit">Approve</button>
+  </form>
+</body>
+</html>
+	`;
+  const headers = new Headers(securityHeaders());
+  const cookieName = csrfCookieName(authState.authRequestId);
+  if (cookieName) {
+    headers.append(
+      "set-cookie",
+      `${cookieName}=${authState.csrfToken}; Path=/; Max-Age=${AUTH_STATE_TTL_SECONDS}; Secure; HttpOnly; SameSite=Lax`,
+    );
   }
   return new Response(body, {
     status: error ? 401 : 200,
