@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from yutome.config import AppConfig
+from yutome.config import AppConfig, ProxyConfig
+from yutome.hashing import sha256_json
 from yutome.hosted.control_plane import Job, Source
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.mcp_query import HostedMcpUsageContext
@@ -15,11 +16,13 @@ from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEve
 from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
+    HostedIndexingError,
     HostedIndexingExecutor,
     HostedSourceDiscoveryExecutor,
     HostedVideoInput,
     IndexProfileInput,
     TranscriptChunkInput,
+    _hosted_ytdlp_published_at,
     mock_embedding_vector,
     plan_mock_hosted_public_indexing,
     plan_real_hosted_public_indexing,
@@ -203,6 +206,38 @@ def _executor_policy(
     )
 
 
+def _webshare_config() -> AppConfig:
+    return AppConfig(
+        proxy=ProxyConfig(
+            enabled=True,
+            kind="webshare",
+            webshare_username="proxy-user",
+            webshare_password="proxy-pass",
+        )
+    )
+
+
+class AllowAnyProviderUsage:
+    def for_subject(self, *, auth, subject, operation, estimated_units):  # noqa: ANN001, ANN202
+        return HostedMcpUsageContext(
+            allocation=ProviderAllocation(
+                id=f"alloc_{subject}_{operation}",
+                workspace_id=auth.workspace_id,
+                provider=subject,
+                operation=operation,
+            ),
+            policy=EntitlementPolicy(
+                id=f"policy_{subject}_{operation}",
+                workspace_id=auth.workspace_id,
+                allowed_operations={f"{subject}.{operation}"},
+            ),
+            balance=WorkspaceBalance(
+                workspace_id=auth.workspace_id,
+                remaining_units={key: 1_000_000_000 for key in estimated_units},
+            ),
+        )
+
+
 def _metadata_fetcher(video_id: str, _source: Source, _job: Job) -> HostedVideoInput:
     return HostedVideoInput(
         youtube_video_id=video_id,
@@ -211,6 +246,21 @@ def _metadata_fetcher(video_id: str, _source: Source, _job: Job) -> HostedVideoI
         channel_id="UCleoandlongevity",
         duration_seconds=60,
         metadata={"channel_title": "Leo and Longevity"},
+    )
+
+
+def test_hosted_ytdlp_published_at_prefers_exact_date_fields_then_timestamp() -> None:
+    assert _hosted_ytdlp_published_at(
+        {"upload_date": "20220201", "release_date": "20210101", "timestamp": 100}
+    ) == datetime(2022, 2, 1, tzinfo=timezone.utc)
+    assert _hosted_ytdlp_published_at({"release_date": "20210101", "timestamp": 100}) == datetime(
+        2021, 1, 1, tzinfo=timezone.utc
+    )
+    assert _hosted_ytdlp_published_at({"modified_date": "20200102", "timestamp": 100}) == datetime(
+        2020, 1, 2, tzinfo=timezone.utc
+    )
+    assert _hosted_ytdlp_published_at({"timestamp": 1643750702}) == datetime.fromtimestamp(
+        1643750702, tz=timezone.utc
     )
 
 
@@ -769,25 +819,56 @@ def test_real_hosted_executor_refuses_provider_replay_after_success_event_withou
     assert provider_calls == []
 
 
-def test_hosted_metadata_fetch_reserves_youtube_operation_without_webshare(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hosted_metadata_fetch_requires_webshare_before_provider_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = RecordingGate()
     ledger = RecordingLedger()
 
-    class AllowYouTubeUsage:
-        def for_subject(self, *, auth, subject, operation, estimated_units):  # noqa: ANN001, ANN202
-            return HostedMcpUsageContext(
-                allocation=ProviderAllocation(
-                    id=f"alloc_{subject}_{operation}",
-                    workspace_id=auth.workspace_id,
-                    provider=subject,
-                    operation=operation,
-                ),
-                policy=EntitlementPolicy(id="policy", workspace_id=auth.workspace_id, allowed_operations={f"{subject}.{operation}"}),
-                balance=WorkspaceBalance(workspace_id=auth.workspace_id, remaining_units={"request_count": 10}),
-            )
+    def fail_discover_video(**_kwargs):  # noqa: ANN003, ANN202
+        raise AssertionError("metadata fetch must not call YouTube without hosted Webshare")
+
+    monkeypatch.setattr("yutome.hosted.indexing.discover_video", fail_discover_video)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=AppConfig(),
+        gate=gate,
+        ledger=ledger,
+        usage_context_provider=AllowAnyProviderUsage(),
+    )
+
+    with pytest.raises(HostedIndexingError, match="Webshare residential proxy credentials"):
+        executor._fetch_video_metadata("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert gate.calls == []
+    assert ledger.events == []
+
+
+def test_hosted_metadata_fetch_routes_through_webshare_and_maps_selected_ytdlp_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = RecordingGate()
+    ledger = RecordingLedger()
+    raw_metadata = {
+        "id": "OEDoJyhQhXs",
+        "title": "Metered metadata",
+        "description": "Full YouTube description",
+        "duration": 60,
+        "upload_date": "20220201",
+        "timestamp": 1643750702,
+        "webpage_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        "live_status": "not_live",
+        "thumbnails": [{"url": "https://img.youtube.com/small.jpg"}, {"url": "https://img.youtube.com/large.jpg"}],
+        "formats": [{"format_id": "bad-for-hosted-row"}],
+        "requested_formats": [{"format_id": "also-too-large"}],
+        "subtitles": {"en": []},
+        "automatic_captions": {"en": []},
+        "heatmap": [],
+        "http_headers": {"User-Agent": "volatile"},
+    }
 
     def fake_discover_video(**kwargs):  # noqa: ANN003, ANN202
-        assert kwargs["hosted_context"] is None
+        assert kwargs["proxy"].kind == "webshare"
+        assert kwargs["proxy"].webshare_username == "proxy-user"
+        assert kwargs["hosted_context"] is not None
         return DiscoveredVideo(
             video_id="OEDoJyhQhXs",
             title="Metered metadata",
@@ -797,44 +878,72 @@ def test_hosted_metadata_fetch_reserves_youtube_operation_without_webshare(monke
             channel_handle="@leoandlongevity",
             duration_seconds=60,
             playlist_tab="video",
-            raw={},
+            raw=raw_metadata,
         )
 
     monkeypatch.setattr("yutome.hosted.indexing.discover_video", fake_discover_video)
     executor = HostedIndexingExecutor(
         connection=HostedExecutorConnection(policy=_executor_policy()),
-        config=AppConfig(),
+        config=_webshare_config(),
         gate=gate,
         ledger=ledger,
-        usage_context_provider=AllowYouTubeUsage(),
+        usage_context_provider=AllowAnyProviderUsage(),
     )
 
     video = executor._fetch_video_metadata("OEDoJyhQhXs", _source(), _executor_job())
 
     assert video.youtube_video_id == "OEDoJyhQhXs"
+    assert video.description == "Full YouTube description"
+    assert video.published_at == datetime(2022, 2, 1, tzinfo=timezone.utc)
+    assert video.metadata == {
+        "source": "yt_dlp",
+        "channel_title": "Leo",
+        "channel_handle": "@leoandlongevity",
+        "playlist_tab": "video",
+        "thumbnail_url": "https://img.youtube.com/large.jpg",
+        "webpage_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        "live_status": "not_live",
+        "upload_date": "20220201",
+        "timestamp": 1643750702,
+        "metadata_hash": sha256_json(raw_metadata),
+    }
+    assert "formats" not in video.metadata
+    assert "automatic_captions" not in video.metadata
+    assert "http_headers" not in video.metadata
     assert [(call["subject"], call["operation"]) for call in gate.calls] == [("youtube", "metadata_fetch")]
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
 
 
-def test_hosted_transcript_fetch_reserves_youtube_operation_without_webshare(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hosted_transcript_fetch_requires_webshare_before_provider_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = RecordingGate()
     ledger = RecordingLedger()
 
-    class AllowYouTubeUsage:
-        def for_subject(self, *, auth, subject, operation, estimated_units):  # noqa: ANN001, ANN202
-            return HostedMcpUsageContext(
-                allocation=ProviderAllocation(
-                    id=f"alloc_{subject}_{operation}",
-                    workspace_id=auth.workspace_id,
-                    provider=subject,
-                    operation=operation,
-                ),
-                policy=EntitlementPolicy(id="policy", workspace_id=auth.workspace_id, allowed_operations={f"{subject}.{operation}"}),
-                balance=WorkspaceBalance(workspace_id=auth.workspace_id, remaining_units={"request_count": 10}),
-            )
+    def fail_fetch_transcript(**_kwargs):  # noqa: ANN003, ANN202
+        raise AssertionError("transcript fetch must not call YouTube without hosted Webshare")
+
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fail_fetch_transcript)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=AppConfig(),
+        gate=gate,
+        ledger=ledger,
+        usage_context_provider=AllowAnyProviderUsage(),
+    )
+
+    with pytest.raises(HostedIndexingError, match="Webshare residential proxy credentials"):
+        executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert gate.calls == []
+    assert ledger.events == []
+
+
+def test_hosted_transcript_fetch_routes_through_webshare(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = RecordingGate()
+    ledger = RecordingLedger()
 
     def fake_fetch_transcript(**kwargs):  # noqa: ANN003, ANN202
-        assert kwargs["hosted_context"] is None
+        assert kwargs["proxy"].kind == "webshare"
+        assert kwargs["hosted_context"] is not None
         return TranscriptFetchResult(
             raw_snippets=[{"start": 0.0, "duration": 4.0, "text": "Metered transcript fetch."}],
             source="youtube-transcript-api",
@@ -845,10 +954,10 @@ def test_hosted_transcript_fetch_reserves_youtube_operation_without_webshare(mon
     monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fake_fetch_transcript)
     executor = HostedIndexingExecutor(
         connection=HostedExecutorConnection(policy=_executor_policy()),
-        config=AppConfig(),
+        config=_webshare_config(),
         gate=gate,
         ledger=ledger,
-        usage_context_provider=AllowYouTubeUsage(),
+        usage_context_provider=AllowAnyProviderUsage(),
     )
 
     result = executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
@@ -892,6 +1001,7 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
 
     def discoverer(_source: Source, _context: ProviderCallContext | None, limit: int | None) -> list[DiscoveredVideo]:
         assert limit == 2
+        assert _context is not None
         return [
             DiscoveredVideo(
                 video_id="OEDoJyhQhXs",
@@ -920,9 +1030,10 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     connection = DiscoveryConnection()
     executor = HostedSourceDiscoveryExecutor(
         connection=connection,
-        config=AppConfig(),
+        config=_webshare_config(),
         gate=UsageGate(),
         ledger=RecordingLedger(),
+        usage_context_provider=AllowAnyProviderUsage(),
         video_discoverer=discoverer,
     )
     job = Job(

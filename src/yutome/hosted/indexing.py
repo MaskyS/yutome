@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -14,8 +14,9 @@ from sqlalchemy import case, func, literal_column
 from sqlalchemy.dialects.postgresql import insert
 
 from yutome.chunking import CHUNKER_VERSION, build_chunks
-from yutome.config import AppConfig
+from yutome.config import AppConfig, ProxyConfig
 from yutome.gemini import transcribe_youtube_url_with_gemini
+from yutome.hashing import sha256_json
 from yutome.hosted.allocations import Allocation, resolve_allocation
 from yutome.hosted.allocation_policy import default_search_store_allocation
 from yutome.hosted.control_plane import (
@@ -87,8 +88,88 @@ class HostedVideoInput:
     channel_id: str | None = None
     description: str = ""
     duration_seconds: int | None = None
-    published_at: str | None = None
+    published_at: datetime | None = None
     metadata: Mapping[str, Any] | None = None
+
+
+def _hosted_ytdlp_published_at(metadata: Mapping[str, Any]) -> datetime | None:
+    for key in ("upload_date", "release_date", "modified_date"):
+        parsed = _hosted_ytdlp_date(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    timestamp = _float_or_none(metadata.get("timestamp"))
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _hosted_ytdlp_date(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not re.fullmatch(r"\d{8}", text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _hosted_ytdlp_thumbnail_url(metadata: Mapping[str, Any]) -> str | None:
+    if thumbnail := _text_or_none(metadata.get("thumbnail")):
+        return thumbnail
+    thumbnails = metadata.get("thumbnails")
+    if isinstance(thumbnails, Sequence) and not isinstance(thumbnails, (str, bytes)):
+        for thumbnail in reversed(thumbnails):
+            if isinstance(thumbnail, Mapping) and (url := _text_or_none(thumbnail.get("url"))):
+                return url
+    return None
+
+
+def _hosted_ytdlp_metadata(discovered: DiscoveredVideo) -> dict[str, Any]:
+    raw = discovered.raw or {}
+    metadata = {
+        "source": "yt_dlp",
+        "channel_title": discovered.channel_title,
+        "channel_handle": discovered.channel_handle,
+        "playlist_tab": discovered.playlist_tab,
+        "thumbnail_url": _hosted_ytdlp_thumbnail_url(raw),
+        "webpage_url": _text_or_none(raw.get("webpage_url")) or discovered.url,
+        "live_status": _text_or_none(raw.get("live_status")),
+        "upload_date": raw.get("upload_date"),
+        "release_date": raw.get("release_date"),
+        "timestamp": raw.get("timestamp"),
+        "metadata_hash": sha256_json(raw),
+    }
+    return {key: value for key, value in metadata.items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -169,6 +250,10 @@ class HostedSourceDiscoveryExecutionResult:
 
 class HostedIndexingError(RuntimeError):
     code = "hosted_indexing_failed"
+
+
+class HostedWebshareRequired(HostedIndexingError):
+    code = "webshare_required"
 
 
 class HostedIndexingLostLease(HostedIndexingError):
@@ -666,6 +751,15 @@ class HostedIndexingExecutor:
         self.voyage_embedder = voyage_embedder or self._embed_with_voyage
         self.cwd = cwd or Path.cwd()
 
+    def _require_hosted_webshare_proxy(self, *, operation: str) -> ProxyConfig:
+        proxy = self.config.proxy
+        if proxy.enabled and proxy.kind == "webshare" and proxy.webshare_username and proxy.webshare_password:
+            return proxy
+        raise HostedWebshareRequired(
+            f"Hosted YouTube {operation} requires Webshare residential proxy credentials. "
+            "Set YUTOME_WEBSHARE_USERNAME and YUTOME_WEBSHARE_PASSWORD for the hosted worker."
+        )
+
     def execute(
         self,
         job: Job,
@@ -1019,6 +1113,7 @@ class HostedIndexingExecutor:
             )
 
     def _fetch_video_metadata(self, video_id: str, source: Source, job: Job) -> HostedVideoInput:
+        proxy = self._require_hosted_webshare_proxy(operation="metadata fetch")
         metadata = {"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "metadata_fetch"}
         youtube_context = self._youtube_fetch_context(
             workspace_id=job.workspace_id,
@@ -1039,7 +1134,7 @@ class HostedIndexingExecutor:
             return discover_video(
                 target=video_id,
                 cwd=self.cwd,
-                proxy=self.config.proxy if self.config.proxy.use_for_metadata else None,
+                proxy=proxy,
                 ytdlp_config=self.config.yt_dlp,
                 hosted_context=webshare_context,
             )
@@ -1055,22 +1150,23 @@ class HostedIndexingExecutor:
                 metadata={"fetch_source": "yt-dlp.metadata"},
             ),
         )
+        raw = discovered.raw or {}
+        duration_seconds = discovered.duration_seconds
+        if duration_seconds is None:
+            duration_seconds = _int_or_none(raw.get("duration"))
         return HostedVideoInput(
             youtube_video_id=discovered.video_id,
             title=discovered.title or source.display_name or discovered.video_id,
             url=discovered.url,
             channel_id=discovered.channel_id,
-            duration_seconds=discovered.duration_seconds,
-            metadata={
-                "channel_title": discovered.channel_title,
-                "channel_handle": discovered.channel_handle,
-                "playlist_tab": discovered.playlist_tab,
-                "source": "yt_dlp",
-            },
+            description=_text_or_none(raw.get("description")) or "",
+            duration_seconds=duration_seconds,
+            published_at=_hosted_ytdlp_published_at(raw),
+            metadata=_hosted_ytdlp_metadata(discovered),
         )
 
     def _fetch_transcript(self, video_id: str, source: Source, job: Job) -> TranscriptFetchResult:
-        proxy = self.config.proxy if self.config.proxy.enabled else None
+        proxy = self._require_hosted_webshare_proxy(operation="transcript fetch")
         metadata = {"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "transcript_fetch"}
         youtube_context = self._youtube_fetch_context(
             workspace_id=job.workspace_id,
@@ -1707,6 +1803,9 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                     error_message=decision.message,
                 )
             max_videos = _positive_int_or_none(job.metadata_jsonb.get("max_new_videos_per_run")) or 25
+            proxy_required = source.source_type != "video"
+            if proxy_required:
+                self._require_hosted_webshare_proxy(operation="source discovery")
             hosted_context = self._webshare_proxy_context(
                 workspace_id=job.workspace_id,
                 subject_id=source.canonical_ref,
@@ -1863,7 +1962,7 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
             ]
         if source.source_type not in {"channel", "handle", "playlist", "url"}:
             raise HostedIndexingError(f"source discovery is not implemented for source_type={source.source_type}")
-        proxy = self.config.proxy if self.config.proxy.use_for_discovery else None
+        proxy = self._require_hosted_webshare_proxy(operation="source discovery")
         return discover_videos(
             target=source.source_url,
             cwd=self.cwd,
@@ -2836,9 +2935,11 @@ __all__ = [
     "HostedIndexingPlan",
     "HostedIndexingExecutionResult",
     "HostedIndexingExecutor",
+    "HostedIndexingError",
     "HostedSourceDiscoveryExecutionResult",
     "HostedSourceDiscoveryExecutor",
     "HostedVideoInput",
+    "HostedWebshareRequired",
     "IndexProfileInput",
     "PlannedSqlOperation",
     "REAL_HOSTED_CHUNKING_VERSION",

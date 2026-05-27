@@ -19,6 +19,7 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 
 def apply_env_to_config(config):
     proxy_updates = {}
+    explicit_use_for_metadata = os.environ.get("YUTOME_PROXY_USE_FOR_METADATA")
     if proxy_urls := os.environ.get("YUTOME_PROXY_URLS"):
         proxy_updates["urls"] = [url.strip() for url in proxy_urls.split(",") if url.strip()]
         proxy_updates["enabled"] = True
@@ -47,10 +48,18 @@ def apply_env_to_config(config):
         proxy_updates["kind"] = "webshare"
     if use_for_discovery := os.environ.get("YUTOME_PROXY_USE_FOR_DISCOVERY"):
         proxy_updates["use_for_discovery"] = _env_bool(use_for_discovery)
-    if use_for_metadata := os.environ.get("YUTOME_PROXY_USE_FOR_METADATA"):
-        proxy_updates["use_for_metadata"] = _env_bool(use_for_metadata)
+    if explicit_use_for_metadata is not None:
+        proxy_updates["use_for_metadata"] = _env_bool(explicit_use_for_metadata)
     if use_for_asr_audio := os.environ.get("YUTOME_PROXY_USE_FOR_ASR_AUDIO"):
         proxy_updates["use_for_asr_audio"] = _env_bool(use_for_asr_audio)
+    effective_proxy = config.proxy.model_copy(update=proxy_updates) if proxy_updates else config.proxy
+    if (
+        explicit_use_for_metadata is None
+        and effective_proxy.kind == "webshare"
+        and effective_proxy.webshare_username
+        and effective_proxy.webshare_password
+    ):
+        proxy_updates["use_for_metadata"] = True
 
     gemini_updates = {}
     if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):

@@ -2484,6 +2484,34 @@ def test_env_can_enable_webshare_proxy_and_gemini(monkeypatch, tmp_path: Path) -
     assert config.transcripts.request_timeout_seconds == 12.5
 
 
+def test_webshare_credentials_auto_enable_local_metadata_proxy(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    monkeypatch.setenv("YUTOME_WEBSHARE_USERNAME", "proxy-user")
+    monkeypatch.setenv("YUTOME_WEBSHARE_PASSWORD", "proxy-pass")
+
+    config = apply_env_to_config(load_config(config_path))
+
+    assert config.proxy.enabled is True
+    assert config.proxy.kind == "webshare"
+    assert config.proxy.use_for_metadata is True
+    assert config.proxy.use_for_discovery is False
+
+
+def test_webshare_metadata_auto_enable_can_be_disabled(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    monkeypatch.setenv("YUTOME_WEBSHARE_USERNAME", "proxy-user")
+    monkeypatch.setenv("YUTOME_WEBSHARE_PASSWORD", "proxy-pass")
+    monkeypatch.setenv("YUTOME_PROXY_USE_FOR_METADATA", "false")
+
+    config = apply_env_to_config(load_config(config_path))
+
+    assert config.proxy.enabled is True
+    assert config.proxy.kind == "webshare"
+    assert config.proxy.use_for_metadata is False
+
+
 def test_oauth_client_secrets_loader_accepts_installed_shape(tmp_path: Path) -> None:
     secrets_path = tmp_path / "client_secret.json"
     secrets_path.write_text(
