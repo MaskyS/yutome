@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import typer
 
+from . import _bridge
 from . import _legacy
 from .context import config_path
 
@@ -47,31 +48,31 @@ def bridge_start(
     foreground: bool = typer.Option(False, "--foreground", help="Run in foreground."),
 ) -> None:
     """Start the bridge."""
-    _legacy.bridge_start_command(config=config_path(ctx), foreground=foreground)
+    _bridge.bridge_start_command(config=config_path(ctx), foreground=foreground)
 
 
 @bridge_app.command("stop")
 def bridge_stop(ctx: typer.Context) -> None:
     """Stop the bridge."""
-    _legacy.bridge_stop_command(config=config_path(ctx))
+    _bridge.bridge_stop_command(config=config_path(ctx))
 
 
 @bridge_app.command("status")
 def bridge_status(ctx: typer.Context) -> None:
     """Show bridge process status."""
-    _legacy.bridge_status_command(config=config_path(ctx))
+    _bridge.bridge_status_command(config=config_path(ctx))
 
 
 @bridge_app.command("install")
 def bridge_install(ctx: typer.Context) -> None:
     """Install bridge auto-start."""
-    _legacy.bridge_install_command(config=config_path(ctx))
+    _bridge.bridge_install_command(config=config_path(ctx))
 
 
 @bridge_app.command("uninstall")
 def bridge_uninstall() -> None:
     """Remove bridge auto-start."""
-    _legacy.bridge_uninstall_command()
+    _bridge.bridge_uninstall_command()
 
 
 @remote_app.command("prepare")
