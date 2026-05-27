@@ -85,6 +85,24 @@ account_sessions = Table(
 
 Index("idx_account_sessions_session_hash", account_sessions.c.session_hash, unique=True)
 
+email_login_tokens = Table(
+    "email_login_tokens",
+    hosted_metadata,
+    Column("id", Text, primary_key=True),
+    Column("token_hash", Text, nullable=False),
+    Column("normalized_email", Text, nullable=False),
+    Column("name", Text),
+    Column("workspace_name", Text),
+    Column("redirect_path", Text),
+    Column("user_agent", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+)
+
+Index("idx_email_login_tokens_token_hash", email_login_tokens.c.token_hash, unique=True)
+Index("idx_email_login_tokens_email", email_login_tokens.c.normalized_email, email_login_tokens.c.created_at.desc())
+
 provider_allocations = Table(
     "provider_allocations",
     hosted_metadata,
@@ -581,6 +599,7 @@ __all__ = [
     "chunk_embeddings",
     "chunks",
     "credit_ledger_entries",
+    "email_login_tokens",
     "entitlement_policies",
     "job_operations",
     "jobs",

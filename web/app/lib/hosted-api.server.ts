@@ -48,16 +48,29 @@ function apiUrl(env: YutomeWebEnv, path: string): string {
   return env.YUTOME_HOSTED_API_URL.replace(/\/+$/, "") + path;
 }
 
-export interface BootstrapResult {
-  session: { token: string; expires_at: string; max_age_seconds: number; cookie_name: string };
-  principal: unknown;
+export interface LoginSession {
+  token: string;
+  expires_at: string;
+  max_age_seconds: number;
+  cookie_name: string;
 }
 
-export async function bootstrapAccount(
+export interface StartLoginResult {
+  ok: true;
+  email: string;
+  email_sent: boolean;
+  // Present only when the API runs with YUTOME_AUTH_DEV_RETURN_LINK (local dev);
+  // never returned in production, where the link is delivered by email.
+  verify_link?: string;
+}
+
+// Sends a single-use sign-in link to the email. Does NOT create a session — the
+// session is minted only when the emailed token is verified (see verifyLogin).
+export async function startLogin(
   env: YutomeWebEnv,
-  body: { email: string; name?: string; workspace_name?: string },
-): Promise<BootstrapResult> {
-  const response = await fetch(apiUrl(env, "/account/bootstrap"), {
+  body: { email: string; name?: string; workspace_name?: string; redirect_path?: string },
+): Promise<StartLoginResult> {
+  const response = await fetch(apiUrl(env, "/account/login/start"), {
     method: "POST",
     headers: {
       authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
@@ -68,11 +81,37 @@ export async function bootstrapAccount(
   });
   const json = await parseJson(response);
   if (!response.ok || json.ok === false) throw toError(response.status, json);
-  const session = json.session as BootstrapResult["session"] | undefined;
+  return {
+    ok: true,
+    email: typeof json.email === "string" ? json.email : body.email,
+    email_sent: json.email_sent !== false,
+    verify_link: typeof json.verify_link === "string" ? json.verify_link : undefined,
+  };
+}
+
+export interface VerifyLoginResult {
+  session: LoginSession;
+  redirect_path: string | null;
+}
+
+// Redeems a single-use sign-in token and returns the session to set as a cookie.
+export async function verifyLogin(env: YutomeWebEnv, token: string): Promise<VerifyLoginResult> {
+  const response = await fetch(apiUrl(env, "/account/login/verify"), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify({ token }),
+  });
+  const json = await parseJson(response);
+  if (!response.ok || json.ok === false) throw toError(response.status, json);
+  const session = json.session as LoginSession | undefined;
   if (!session || typeof session.token !== "string" || typeof session.max_age_seconds !== "number") {
-    throw new HostedApiError(502, "invalid_hosted_api_response", "Bootstrap response was missing a session token.");
+    throw new HostedApiError(502, "invalid_hosted_api_response", "Verify response was missing a session token.");
   }
-  return { session, principal: json.principal };
+  return { session, redirect_path: typeof json.redirect_path === "string" ? json.redirect_path : null };
 }
 
 export interface CliAuthorizeResult {

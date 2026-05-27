@@ -393,4 +393,29 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_embedding_vchordrq
 }
 
 
-POSTGRES_HOSTED_SCHEMA_SQL = POSTGRES_PHASE1_SCHEMA_SQL + "\n" + POSTGRES_PHASE4_SCHEMA_SQL
+# Email magic-link sign-in tokens for the web dashboard. A verified, single-use
+# token is the only way the dashboard mints a session (see /account/login/* in
+# http_api.py); only the token hash is stored, never the raw token.
+POSTGRES_AUTH_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS email_login_tokens (
+    id text PRIMARY KEY,
+    token_hash text NOT NULL,
+    normalized_email text NOT NULL,
+    name text,
+    workspace_name text,
+    redirect_path text,
+    user_agent text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    consumed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_login_tokens_token_hash
+    ON email_login_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_email_login_tokens_email
+    ON email_login_tokens(normalized_email, created_at DESC);
+"""
+
+
+POSTGRES_HOSTED_SCHEMA_SQL = (
+    POSTGRES_PHASE1_SCHEMA_SQL + "\n" + POSTGRES_PHASE4_SCHEMA_SQL + "\n" + POSTGRES_AUTH_SCHEMA_SQL
+)

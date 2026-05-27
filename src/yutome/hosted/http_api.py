@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
@@ -18,9 +18,19 @@ from yutome.hosted.account import (
     AccountBootstrapInput,
     AccountSessionError,
     bootstrap_hosted_account,
+    normalize_email,
     sign_account_session_token,
     verify_account_session_token,
 )
+from yutome.hosted.auth_login import (
+    DEFAULT_LOGIN_TOKEN_TTL_SECONDS,
+    consume_login_token_sql,
+    insert_login_token_sql,
+    login_token_hash,
+    new_login_token,
+    new_login_token_id,
+)
+from yutome.hosted.email import EmailMessage, EmailSender, EmailSendError, build_email_sender_from_env
 from yutome.hosted.account_cli import (
     CLI_ACCOUNT_READ_SCOPE,
     CLI_AUTH_CODE_TTL_SECONDS,
@@ -77,6 +87,9 @@ ACCOUNT_SESSION_AUDIENCE_ENV_VAR = "YUTOME_ACCOUNT_SESSION_AUDIENCE"
 ACCOUNT_SESSION_MAX_AGE_SECONDS_ENV_VAR = "YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS"
 ACCOUNT_SESSION_COOKIE_NAME = "yutome_account_session"
 ACCOUNT_SESSION_TTL_SECONDS = 60 * 60
+APP_BASE_URL_ENV_VAR = "YUTOME_APP_URL"
+LOGIN_TOKEN_TTL_SECONDS_ENV_VAR = "YUTOME_AUTH_LOGIN_TTL_SECONDS"
+AUTH_DEV_RETURN_LINK_ENV_VAR = "YUTOME_AUTH_DEV_RETURN_LINK"
 _SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
 
@@ -100,6 +113,21 @@ class AccountBootstrapRequest(BaseModel):
     email: str
     name: str | None = None
     workspace_name: str | None = None
+
+
+class AccountLoginStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    name: str | None = None
+    workspace_name: str | None = None
+    redirect_path: str | None = None
+
+
+class AccountLoginVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
 
 
 class AccountCliAuthorizeRequest(BaseModel):
@@ -229,6 +257,10 @@ def build_postgres_app(
     account_session_secret: str | None = None,
     account_session_audience: str | None = None,
     account_session_ttl_seconds: int | None = None,
+    email_sender: EmailSender | None = None,
+    app_base_url: str | None = None,
+    login_token_ttl_seconds: int | None = None,
+    dev_return_login_link: bool | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -252,6 +284,10 @@ def build_postgres_app(
         account_session_secret=_normalize_api_token(account_session_secret) or _account_session_secret_from_env(),
         account_session_audience=_normalize_api_token(account_session_audience) or _account_session_audience_from_env(),
         account_session_ttl_seconds=account_session_ttl_seconds or _account_session_ttl_seconds_from_env(),
+        email_sender=email_sender or build_email_sender_from_env(),
+        app_base_url=app_base_url or _app_base_url_from_env(),
+        login_token_ttl_seconds=login_token_ttl_seconds or _login_token_ttl_seconds_from_env(),
+        dev_return_login_link=dev_return_login_link if dev_return_login_link is not None else _auth_dev_return_link_from_env(),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -271,6 +307,10 @@ def build_app(
     account_session_secret: str | None = None,
     account_session_audience: str | None = None,
     account_session_ttl_seconds: int | None = None,
+    email_sender: EmailSender | None = None,
+    app_base_url: str | None = None,
+    login_token_ttl_seconds: int | None = None,
+    dev_return_login_link: bool | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
@@ -294,6 +334,10 @@ def build_app(
     normalized_account_session_secret = _normalize_api_token(account_session_secret)
     normalized_account_session_audience = _normalize_api_token(account_session_audience) or DEFAULT_ACCOUNT_SESSION_AUDIENCE
     account_session_ttl = _positive_int(account_session_ttl_seconds, ACCOUNT_SESSION_TTL_SECONDS)
+    resolved_email_sender = email_sender or build_email_sender_from_env()
+    resolved_app_base_url = (app_base_url or "").strip().rstrip("/")
+    login_token_ttl = _positive_int(login_token_ttl_seconds, DEFAULT_LOGIN_TOKEN_TTL_SECONDS)
+    resolved_dev_return_login_link = bool(dev_return_login_link)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
     app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
@@ -475,6 +519,161 @@ def build_app(
                 "cookie_name": ACCOUNT_SESSION_COOKIE_NAME,
                 "max_age_seconds": account_session_ttl,
             },
+        }
+
+    @app.post("/account/login/start")
+    def account_login_start(
+        request: AccountLoginStartRequest,
+        user_agent: str | None = Header(default=None, alias="User-Agent"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        # Same trusted callers as bootstrap (web BFF / MCP edge), but this only
+        # records a single-use token and emails a link — it never mints a session.
+        _verify_bearer_token_any(
+            authorization=authorization,
+            expected_tokens=(normalized_api_token, normalized_account_api_token),
+        )
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_login_connection_unconfigured",
+                    message="Hosted login requires a database connection.",
+                    status_code=503,
+                )
+            )
+        if not resolved_app_base_url:
+            raise _http_error(
+                HostedMcpError(
+                    code="app_url_unconfigured",
+                    message=f"Set {APP_BASE_URL_ENV_VAR} before issuing sign-in links.",
+                    status_code=503,
+                )
+            )
+        try:
+            normalized = normalize_email(request.email)
+        except ValueError as exc:
+            raise _http_error(
+                HostedMcpError(code="account_login_invalid_email", message=str(exc), status_code=400)
+            ) from exc
+        raw_token = new_login_token()
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=login_token_ttl)
+        statement = insert_login_token_sql(
+            token_id=new_login_token_id(),
+            token_hash=login_token_hash(raw_token),
+            normalized_email=normalized,
+            name=_optional_text(request.name),
+            workspace_name=_optional_text(request.workspace_name),
+            redirect_path=_safe_redirect_path(request.redirect_path),
+            expires_at=expires_at,
+            user_agent=(user_agent or None),
+        )
+        billing_connection.execute(statement.sql, statement.params)
+        verify_link = f"{resolved_app_base_url}/auth/verify?token={quote(raw_token, safe='')}"
+        minutes = max(1, login_token_ttl // 60)
+        message = EmailMessage(
+            to=normalized,
+            subject="Your Yutome sign-in link",
+            text=(
+                "Click to sign in to Yutome:\n\n"
+                f"{verify_link}\n\n"
+                f"This link expires in {minutes} minutes and can be used once. "
+                "If you didn't request it, you can ignore this email."
+            ),
+        )
+        try:
+            resolved_email_sender.send(message)
+        except EmailSendError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_login_email_failed",
+                    message="Could not send the sign-in email. Please try again.",
+                    status_code=502,
+                )
+            ) from exc
+        response: dict[str, Any] = {"ok": True, "email": normalized, "email_sent": True}
+        if resolved_dev_return_login_link:
+            response["verify_link"] = verify_link
+        return response
+
+    @app.post("/account/login/verify")
+    def account_login_verify(
+        request: AccountLoginVerifyRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _verify_bearer_token_any(
+            authorization=authorization,
+            expected_tokens=(normalized_api_token, normalized_account_api_token),
+        )
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_login_connection_unconfigured",
+                    message="Hosted login requires a database connection.",
+                    status_code=503,
+                )
+            )
+        if not normalized_account_session_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_signing_unconfigured",
+                    message=f"Set {ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR} before creating hosted account sessions.",
+                    status_code=503,
+                )
+            )
+        token = request.token.strip()
+        invalid = HostedMcpError(
+            code="account_login_token_invalid",
+            message="This sign-in link is invalid or has expired.",
+            status_code=401,
+        )
+        if not token:
+            raise _http_error(invalid)
+        now = datetime.now(timezone.utc)
+        consume = consume_login_token_sql(token_hash=login_token_hash(token), now=now)
+        rows = _rows_from_result(billing_connection.execute(consume.sql, consume.params))
+        if not rows:
+            raise _http_error(invalid)
+        record = rows[0]
+        try:
+            expires_at = now + timedelta(seconds=account_session_ttl)
+            bootstrap_input = AccountBootstrapInput(
+                email=str(record.get("normalized_email") or ""),
+                name=_optional_text(record.get("name")),
+                workspace_name=_optional_text(record.get("workspace_name")),
+            )
+            session_token = sign_account_session_token(
+                user_id=bootstrap_input.user_id,
+                workspace_id=bootstrap_input.workspace_id,
+                secret=normalized_account_session_secret,
+                expires_at=expires_at,
+                issued_at=now,
+                audience=normalized_account_session_audience,
+            )
+            session_input = AccountBootstrapInput(
+                email=bootstrap_input.email,
+                name=bootstrap_input.name,
+                workspace_name=bootstrap_input.workspace_name,
+                session_token=session_token,
+                session_scopes=(contract.AUTH_SCOPE,),
+                session_audience=normalized_account_session_audience,
+                session_expires_at=expires_at,
+            )
+            result = _bootstrap_account_in_transaction(billing_connection, session_input)
+        except ValueError as exc:
+            raise _http_error(
+                HostedMcpError(code="account_login_invalid", message=str(exc), status_code=400)
+            ) from exc
+        return {
+            "ok": True,
+            "principal": result.principal.model_dump(mode="json"),
+            "session": {
+                "token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "audience": normalized_account_session_audience,
+                "cookie_name": ACCOUNT_SESSION_COOKIE_NAME,
+                "max_age_seconds": account_session_ttl,
+            },
+            "redirect_path": _safe_redirect_path(record.get("redirect_path")),
         }
 
     @app.post("/billing/polar/webhook")
@@ -988,6 +1187,39 @@ def _account_session_ttl_seconds_from_env(environ: Mapping[str, str] | None = No
 
 def _normalize_api_token(token: str | None) -> str | None:
     return token.strip() if token and token.strip() else None
+
+
+def _app_base_url_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return _normalize_api_token(env.get(APP_BASE_URL_ENV_VAR))
+
+
+def _login_token_ttl_seconds_from_env(environ: Mapping[str, str] | None = None) -> int | None:
+    env = os.environ if environ is None else environ
+    raw = _normalize_api_token(env.get(LOGIN_TOKEN_TTL_SECONDS_ENV_VAR))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _auth_dev_return_link_from_env(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    raw = (env.get(AUTH_DEV_RETURN_LINK_ENV_VAR) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _safe_redirect_path(value: Any) -> str | None:
+    """Accept only internal, single-slash-rooted paths so a magic link can't be
+    coerced into an open redirect (`//host`, `https://host`, etc.)."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not trimmed.startswith("/") or trimmed.startswith("//"):
+        return None
+    return trimmed
 
 
 def _verify_bearer_token(*, authorization: str | None, expected_api_token: str | None) -> None:

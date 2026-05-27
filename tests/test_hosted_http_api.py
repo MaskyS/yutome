@@ -973,6 +973,136 @@ def test_account_search_rejects_invalid_session_before_search_store() -> None:
     assert store.calls == []
 
 
+class RecordingEmailSender:
+    def __init__(self) -> None:
+        self.messages: list[Any] = []
+
+    def send(self, message: Any) -> None:
+        self.messages.append(message)
+
+
+class _LoginVerifyConnection:
+    """Returns the token row only for the consume UPDATE; empty otherwise so the
+    bootstrap-in-transaction falls back to deterministic ids (as in the empty
+    bootstrap test)."""
+
+    def __init__(self, token_rows: list[dict[str, Any]]) -> None:
+        self.token_rows = token_rows
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self.calls.append((statement, dict(params or {})))
+        if "email_login_tokens" in statement and statement.strip().upper().startswith("UPDATE"):
+            return list(self.token_rows)
+        return []
+
+
+def _login_app(connection: Any, sender: RecordingEmailSender, *, dev_link: bool = True) -> TestClient:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store, usage_context_provider=_allow_search_usage_context)
+    app = build_app(
+        adapter=adapter,
+        billing_connection=connection,
+        expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+        account_session_secret=ACCOUNT_SESSION_SECRET,
+        email_sender=sender,
+        app_base_url="https://app.example.test",
+        dev_return_login_link=dev_link,
+    )
+    return TestClient(app)
+
+
+def test_account_login_start_issues_token_and_emails_link_without_session() -> None:
+    connection = RecordingConnection()
+    sender = RecordingEmailSender()
+    client = _login_app(connection, sender)
+
+    response = client.post(
+        "/account/login/start",
+        json={"email": " Alice@Example.com ", "name": "Alice", "workspace_name": "Alice WS"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["email"] == "alice@example.com"
+    assert "session" not in body  # no session minted before email is proven
+    verify_link = body["verify_link"]
+    assert verify_link.startswith("https://app.example.test/auth/verify?token=")
+    assert len(sender.messages) == 1
+    assert sender.messages[0].to == "alice@example.com"
+    assert verify_link in sender.messages[0].text
+
+    inserts = [params for sql, params in connection.calls if "INSERT INTO email_login_tokens" in sql]
+    assert len(inserts) == 1
+    raw_token = verify_link.split("token=", 1)[1]
+    assert inserts[0]["token_hash"].startswith("sha256:")
+    assert raw_token not in json.dumps(connection.calls, default=str)  # only the hash is stored
+
+
+def test_account_login_start_requires_bearer_token() -> None:
+    connection = RecordingConnection()
+    sender = RecordingEmailSender()
+    client = _login_app(connection, sender)
+
+    response = client.post("/account/login/start", json={"email": "alice@example.com"})
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_required"
+    assert sender.messages == []
+    assert connection.calls == []
+
+
+def test_account_login_verify_consumes_token_and_mints_session() -> None:
+    connection = _LoginVerifyConnection(
+        [{"normalized_email": "alice@example.com", "name": "Alice", "workspace_name": "Alice WS", "redirect_path": "/dashboard"}]
+    )
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post(
+        "/account/login/verify",
+        json={"token": "raw-login-token"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["session"]["token"]
+    assert body["principal"]["workspace_id"].startswith("ws_")
+    assert body["redirect_path"] == "/dashboard"
+    consume_calls = [params for sql, params in connection.calls if "UPDATE email_login_tokens" in sql]
+    assert len(consume_calls) == 1
+    assert "now" in consume_calls[0]
+
+
+def test_account_login_verify_rejects_unknown_or_expired_token() -> None:
+    connection = _LoginVerifyConnection([])  # consume matches no row (unknown/used/expired)
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post(
+        "/account/login/verify",
+        json={"token": "stale"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_login_token_invalid"
+    assert not any("INSERT INTO account_sessions" in sql for sql, _ in connection.calls)
+
+
+def test_account_login_verify_requires_bearer_token() -> None:
+    connection = _LoginVerifyConnection([{"normalized_email": "alice@example.com"}])
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post("/account/login/verify", json={"token": "raw-login-token"})
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_required"
+    assert connection.calls == []
+
+
 def test_account_show_reads_resource_for_session_workspace() -> None:
     client, store = _account_search_client()
 
