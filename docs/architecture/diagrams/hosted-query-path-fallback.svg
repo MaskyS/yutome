@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 764.15 1082" width="764.15" height="1082" style="--bg:#ffffff;--fg:#1f2328;--line:#d1d9e0;--accent:#0969da;--muted:#59636e;background:var(--bg)">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap');
+  text { font-family: 'Inter', system-ui, sans-serif; }
+  svg {
+    /* Derived from --bg and --fg (overridable via --line, --accent, etc.) */
+    --_text:          var(--fg);
+    --_text-sec:      var(--muted, color-mix(in srgb, var(--fg) 60%, var(--bg)));
+    --_text-muted:    var(--muted, color-mix(in srgb, var(--fg) 40%, var(--bg)));
+    --_text-faint:    color-mix(in srgb, var(--fg) 25%, var(--bg));
+    --_line:          var(--line, color-mix(in srgb, var(--fg) 30%, var(--bg)));
+    --_arrow:         var(--accent, color-mix(in srgb, var(--fg) 50%, var(--bg)));
+    --_node-fill:     var(--surface, color-mix(in srgb, var(--fg) 3%, var(--bg)));
+    --_node-stroke:   var(--border, color-mix(in srgb, var(--fg) 20%, var(--bg)));
+    --_group-fill:    var(--bg);
+    --_group-hdr:     color-mix(in srgb, var(--fg) 5%, var(--bg));
+    --_inner-stroke:  color-mix(in srgb, var(--fg) 12%, var(--bg));
+    --_key-badge:     color-mix(in srgb, var(--fg) 10%, var(--bg));
+  }
+</style>
+<defs>
+  <marker id="seq-arrow" markerWidth="8" markerHeight="4.8" refX="8" refY="2.4" orient="auto-start-reverse">
+    <polygon points="0 0, 8 2.4, 0 4.8" fill="var(--_arrow)" />
+  </marker>
+  <marker id="seq-arrow-open" markerWidth="8" markerHeight="4.8" refX="8" refY="2.4" orient="auto-start-reverse">
+    <polyline points="0 0, 8 2.4, 0 4.8" fill="none" stroke="var(--_arrow)" stroke-width="1" />
+  </marker>
+</defs>
+<rect x="30" y="418" width="195" height="154" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="30" y="418" width="181.88" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="36" y="427" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">alt [hybrid AND soft-deny]</text>
+<line x1="30" y1="524" x2="225" y2="524" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<rect x="30" y="714" width="704.15" height="288" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="30" y="714" width="98.94" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="36" y="723" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">alt [success]</text>
+<line x1="30" y1="852" x2="734.15" y2="852" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<text x="38" y="866" font-size="11" font-weight="400" fill="var(--_text-muted)">[hybrid AND recoverable error]</text>
+<line x1="30" y1="954" x2="734.15" y2="954" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<rect x="30" y="320" width="704.15" height="682" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="30" y="320" width="188.26" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="36" y="329" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">alt [provider usage denied]</text>
+<line x1="30" y1="618" x2="734.15" y2="618" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<text x="38" y="632" font-size="11" font-weight="400" fill="var(--_text-muted)">[embedded]</text>
+<rect x="30" y="118" width="704.15" height="884" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="30" y="118" width="181.88" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="36" y="127" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">alt [hybrid AND soft-deny]</text>
+<line x1="30" y1="256" x2="734.15" y2="256" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<text x="38" y="270" font-size="11" font-weight="400" fill="var(--_text-muted)">[reserved]</text>
+<line x1="127.5" y1="70" x2="127.5" y2="1052" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="303.175" y1="70" x2="303.175" y2="1052" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="478.85" y1="70" x2="478.85" y2="1052" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="665.25" y1="70" x2="665.25" y2="1052" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="127.5" y1="90" x2="303.175" y2="90" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="215.3375" y="84" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">reserve search_store (semantic|hybrid_query)</text>
+<line x1="303.175" y1="158" x2="127.5" y2="158" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" marker-end="url(#seq-arrow)" />
+<text x="215.3375" y="152" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">soft denial</text>
+<polyline points="127.5,198 157.5,198 157.5,218 127.5,218" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="208" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">fall back to _find_lexical (tagged)</text>
+<line x1="127.5" y1="292" x2="303.175" y2="292" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="215.3375" y="286" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">reserve voyage.embed_query (via ProviderCallContext)</text>
+<polyline points="127.5,360 157.5,360 157.5,380 127.5,380" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="370" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">release search_store reservation</text>
+<polyline points="127.5,458 157.5,458 157.5,478 127.5,478" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="468" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">fall back to _find_lexical (tagged)</text>
+<polyline points="127.5,552 157.5,552 157.5,572 127.5,572" fill="none" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="562" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">raise usage_denied (403)</text>
+<line x1="478.85" y1="646" x2="127.5" y2="646" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" marker-end="url(#seq-arrow)" />
+<text x="303.175" y="640" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">query vector</text>
+<line x1="127.5" y1="686" x2="665.25" y2="686" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="396.375" y="680" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">semantic_search OR hybrid_search</text>
+<line x1="665.25" y1="754" x2="127.5" y2="754" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" marker-end="url(#seq-arrow)" />
+<text x="396.375" y="748" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">rows + usage</text>
+<polyline points="127.5,794 157.5,794 157.5,814 127.5,814" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="804" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">record success (settle)</text>
+<polyline points="127.5,888 157.5,888 157.5,908 127.5,908" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="898" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">record failure + fall back to lexical</text>
+<polyline points="127.5,982 157.5,982 157.5,1002 127.5,1002" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="163.5" y="992" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">record failure + raise</text>
+<rect x="40" y="30" width="175" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="127.5" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">adapter._find_vector</text>
+<rect x="255" y="30" width="96.35000000000001" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="303.175" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">UsageGate</text>
+<rect x="391.35" y="30" width="175" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="478.85" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">Voyage (embed_query)</text>
+<rect x="606.35" y="30" width="117.80000000000001" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="665.25" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">search store</text>
+</svg>

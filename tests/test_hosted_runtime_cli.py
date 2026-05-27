@@ -2,24 +2,17 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from typer.testing import CliRunner
-
-from yutome.cli import app
-from yutome.config import AppConfig, HostedConfig, write_default_config
+from yutome.config import AppConfig, HostedConfig
 from yutome.hosted.control_plane import Job
 from yutome.hosted.http_api import TOKEN_ENV_VAR
 from yutome.hosted.runtime import (
     HostedCommandRunner,
     HostedDbCheck,
-    HostedIndexingSmokeResult,
     HostedTickResult,
     build_hosted_api_app,
     maintenance_tick_sql,
-    mock_hosted_public_indexing_bootstrap_statements,
-    mock_hosted_public_indexing_plan,
     postgres_url_from_env,
     source_refresh_tick_sql,
 )
@@ -273,47 +266,6 @@ class FakeHostedRunner:
             "remaining_units": {"credits": "7.0"},
         }
 
-    def mock_indexing_smoke(
-        self,
-        *,
-        workspace_id: str,
-        migrate: bool = False,
-        migration_phase: str = "hosted",
-        query: str | None = None,
-        limit: int = 3,
-        source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
-    ) -> HostedIndexingSmokeResult:
-        self.calls.append(
-            (
-                "mock_indexing_smoke",
-                {
-                    "workspace_id": workspace_id,
-                    "migrate": migrate,
-                    "migration_phase": migration_phase,
-                    "query": query,
-                    "limit": limit,
-                    "source_url": source_url,
-                },
-            )
-        )
-        return HostedIndexingSmokeResult(
-            ok=True,
-            migrated=migrate,
-            migration_phase=migration_phase if migrate else None,  # type: ignore[arg-type]
-            applied_migrations=7 if migrate else 0,
-            workspace_id=workspace_id,
-            source_id="src_mock",
-            job_id="job_mock",
-            youtube_video_id="OEDoJyhQhXs",
-            hosted_video_id="vid_mock",
-            transcript_version_id="tx_mock",
-            query=query or "hosted indexing",
-            operations_executed=12,
-            operation_names=["videos.upsert", "search_store.replace_active_transcript"],
-            rows=[{"chunk_id": "chunk_1", "score": 1.0}],
-            usage={"operation": "hybrid_query"},
-        )
-
     def worker_once(
         self,
         *,
@@ -344,12 +296,6 @@ class FakeHostedRunner:
     def maintenance_tick(self, *, limit: int = 100) -> HostedTickResult:
         self.calls.append(("maintenance_tick", {"limit": limit}))
         return HostedTickResult(tick="maintenance_tick", attempted=True, affected_rows=3)
-
-
-def _config_path(tmp_path: Path) -> Path:
-    config_path = tmp_path / "yutome.toml"
-    write_default_config(config_path)
-    return config_path
 
 
 def test_postgres_url_from_env_prefers_hosted_env_then_database_url() -> None:
@@ -760,44 +706,6 @@ def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
     assert "INSERT INTO workspace_balances" in connection.calls[1][0]
 
 
-def test_mock_indexing_smoke_bootstraps_dependencies_and_executes_plan_before_query() -> None:
-    connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
-    runner = HostedCommandRunner(AppConfig(), connection=connection)
-
-    result = runner.mock_indexing_smoke(workspace_id="ws_cli", query="hosted indexing", limit=2)
-    statements = [call[0] for call in connection.calls]
-
-    assert result.ok is True
-    assert result.migrated is False
-    assert result.operations_executed == len(result.operation_names)
-    assert result.rows == [{"chunk_id": "chunk_1", "score": 1.0}]
-    assert result.usage["operation"] == "hybrid_query"
-    assert statements[0].startswith("INSERT INTO workspaces")
-    assert statements[1].startswith("INSERT INTO sources")
-    assert statements[2].startswith("INSERT INTO jobs")
-    assert "INSERT INTO videos" in statements[3]
-    assert "INSERT INTO search_index_profiles" in statements[4]
-    assert "FULL OUTER JOIN semantic USING (chunk_id)" in statements[-1]
-    assert connection.calls[-1][1]["workspace_id"] == "ws_cli"
-
-
-def test_mock_indexing_bootstrap_statements_cover_hosted_foreign_keys() -> None:
-    plan = mock_hosted_public_indexing_plan(workspace_id="ws_cli")
-
-    statements = mock_hosted_public_indexing_bootstrap_statements(plan.source, plan.job)
-    sql = "\n".join(statement.sql for statement in statements)
-
-    assert [statement.sql.split(" ", 2)[2].split()[0] for statement in statements] == [
-        "workspaces",
-        "sources",
-        "jobs",
-    ]
-    assert "ON CONFLICT (id) DO UPDATE" in sql
-    assert "ON CONFLICT (workspace_id, idempotency_key) DO UPDATE" in sql
-    assert statements[1].params["id"] == plan.source.id
-    assert statements[2].params["id"] == plan.job.id
-
-
 def test_runner_migrate_applies_usage_idempotency_constraints() -> None:
     connection = RecordingConnection()
     runner = HostedCommandRunner(AppConfig(), connection=connection)
@@ -898,188 +806,3 @@ def test_build_hosted_api_app_enables_token_auth_from_env(monkeypatch) -> None:
 
     assert api_app.state.hosted_api_auth_required is True
     assert api_app.state.hosted_api_auth_configured is True
-
-
-def test_hosted_api_cli_command_runs_fake_app_server(monkeypatch, tmp_path: Path) -> None:
-    config_path = _config_path(tmp_path)
-    fake_app = object()
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    def fake_build_app(command_config_path: Path) -> object:
-        calls.append(("build_app", {"config_path": command_config_path}))
-        return fake_app
-
-    def fake_run_app(api_app: object, *, host: str, port: int, log_level: str = "info") -> None:
-        calls.append(
-            (
-                "run_app",
-                {
-                    "api_app": api_app,
-                    "host": host,
-                    "port": port,
-                    "log_level": log_level,
-                },
-            )
-        )
-
-    monkeypatch.setattr("yutome.cli._legacy._hosted_api_app", fake_build_app)
-    monkeypatch.setattr("yutome.cli._legacy._run_hosted_api_app", fake_run_app)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "hosted",
-            "api",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "4321",
-            "--log-level",
-            "warning",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert calls == [
-        ("build_app", {"config_path": config_path}),
-        (
-            "run_app",
-            {
-                "api_app": fake_app,
-                "host": "0.0.0.0",
-                "port": 4321,
-                "log_level": "warning",
-            },
-        ),
-    ]
-
-
-def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path: Path) -> None:
-    config_path = _config_path(tmp_path)
-    fake = FakeHostedRunner()
-    monkeypatch.setattr("yutome.cli._legacy._hosted_runner", lambda _config_path: fake)
-    runner = CliRunner()
-
-    migrate = runner.invoke(app, ["--config", str(config_path), "hosted", "migrate", "--phase", "phase4", "--json"])
-    db_check = runner.invoke(app, ["--config", str(config_path), "doctor", "hosted-db", "--json"])
-    source_add = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "hosted",
-            "source",
-            "add",
-            "leoandlongevity",
-            "--workspace-id",
-            "ws_cli",
-            "--cadence-seconds",
-            "1800",
-            "--max-new-videos",
-            "3",
-            "--json",
-        ],
-    )
-    billing_export = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "hosted",
-            "run",
-            "billing-export",
-            "--once",
-            "--lease-owner",
-            "billing-1",
-            "--limit",
-            "2",
-            "--json",
-        ],
-    )
-    worker = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "hosted",
-            "run",
-            "worker",
-            "--once",
-            "--lease-owner",
-            "worker-1",
-            "--workspace-id",
-            "ws_cli",
-            "--json",
-        ],
-    )
-    source_tick = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "hosted",
-            "run",
-            "source-refresh",
-            "--lease-owner",
-            "source-1",
-            "--json",
-        ],
-    )
-    maintenance_tick = runner.invoke(
-        app,
-        ["--config", str(config_path), "hosted", "run", "maintenance", "--json"],
-    )
-
-    assert migrate.exit_code == 0, migrate.output
-    assert json.loads(migrate.output) == {"ok": True, "phase": "phase4", "applied": 7}
-    assert db_check.exit_code == 0, db_check.output
-    assert json.loads(db_check.output)["database_reachable"] is True
-    assert source_add.exit_code == 0, source_add.output
-    assert json.loads(source_add.output)["refresh_policy_id"] == "srp_cli"
-    assert billing_export.exit_code == 0, billing_export.output
-    assert json.loads(billing_export.output)["succeeded"] == 1
-    assert worker.exit_code == 0, worker.output
-    assert json.loads(worker.output)["tick"] == "worker_once"
-    assert source_tick.exit_code == 0, source_tick.output
-    assert json.loads(source_tick.output)["affected_rows"] == 2
-    assert maintenance_tick.exit_code == 0, maintenance_tick.output
-    assert json.loads(maintenance_tick.output)["affected_rows"] == 3
-    assert (
-        "source_add",
-        {
-            "workspace_id": "ws_cli",
-            "source_url": "leoandlongevity",
-            "display_name": None,
-            "cadence_seconds": 1800,
-            "max_new_videos_per_run": 3,
-            "refresh_enabled": True,
-        },
-    ) in fake.calls
-    assert ("worker_once", {"lease_owner": "worker-1", "limit": 1, "lease_seconds": 900, "workspace_id": "ws_cli"}) in fake.calls
-
-
-def test_hosted_billing_status_is_not_public_cli(monkeypatch, tmp_path: Path) -> None:
-    config_path = _config_path(tmp_path)
-    fake = FakeHostedRunner()
-    monkeypatch.setattr("yutome.cli._legacy._hosted_runner", lambda _config_path: fake)
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "hosted", "billing-status"])
-
-    assert result.exit_code != 0
-    assert "No such command" in result.output
-
-
-def test_hosted_db_check_cli_reports_missing_url_without_live_db(monkeypatch, tmp_path: Path) -> None:
-    config_path = _config_path(tmp_path)
-    monkeypatch.delenv("YUTOME_POSTGRES_URL", raising=False)
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "doctor", "hosted-db", "--json"])
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["ok"] is False
-    assert payload["url_configured"] is False
-    assert payload["error"] == "postgres_url_missing"

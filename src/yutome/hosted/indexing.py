@@ -53,7 +53,6 @@ from yutome.hosted.repositories import SqlStatement, upsert_usage_reservation_sq
 from yutome.hosted.schema import job_operations, jobs, search_index_profiles, transcript_versions, videos
 from yutome.hosted.search_store import (
     SearchStoreQueryPlan,
-    hybrid_query_plan,
     replace_active_transcript_sql,
     validate_supported_embedding_profile,
 )
@@ -75,7 +74,7 @@ from yutome.youtube import (
 DEFAULT_INDEX_PROFILE_ID = "sip_voyage4lite_bm25_default"
 DEFAULT_EMBEDDING_MODEL = HOSTED_DEFAULT_EMBEDDING_MODEL
 DEFAULT_EMBEDDING_DIMENSION = HOSTED_DEFAULT_EMBEDDING_DIMENSION
-DEFAULT_CHUNKING_VERSION = "hosted_mock_chunker_v1"
+DEFAULT_CHUNKING_VERSION = "hosted_chunker_v1"
 REAL_HOSTED_CHUNKING_VERSION = CHUNKER_VERSION
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -373,231 +372,6 @@ def extract_public_youtube_video_id(value: str) -> str | None:
     if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
         return parts[1] if YOUTUBE_VIDEO_ID_RE.fullmatch(parts[1]) else None
     return None
-
-
-def plan_mock_hosted_public_indexing(
-    *,
-    source: Source,
-    job: Job,
-    video: HostedVideoInput,
-    chunks: Sequence[TranscriptChunkInput],
-    index_profile: IndexProfileInput | None = None,
-    allocations: Sequence[Allocation] | None = None,
-    policy: EntitlementPolicy | None = None,
-    balance: WorkspaceBalance | None = None,
-    gate: UsageGate | None = None,
-    search_query: str | None = None,
-) -> HostedIndexingPlan:
-    """Build the first hosted public indexing smoke plan as pure data and SQL."""
-
-    _validate_public_indexing_inputs(source=source, job=job, video=video, chunks=chunks)
-    profile = index_profile or _default_mock_index_profile(source.workspace_id)
-    validate_supported_embedding_profile(
-        backend=profile.backend,
-        embedding_model=profile.embedding_model,
-        embedding_dimension=profile.embedding_dimension,
-    )
-    hosted_video_id = _stable_id("vid", source.workspace_id, video.youtube_video_id)
-    normalized_chunks = tuple(sorted(chunks, key=lambda chunk: chunk.chunk_index))
-    content_hash = input_hash(
-        {
-            "video": video.youtube_video_id,
-            "language_code": "en",
-            "chunks": [_chunk_hash_payload(chunk) for chunk in normalized_chunks],
-        }
-    )
-    transcript_version_id = _stable_id("tx", source.workspace_id, video.youtube_video_id, content_hash)
-    embedding_vectors = [
-        mock_embedding_vector(chunk.text, dimension=profile.embedding_dimension, salt=f"{video.youtube_video_id}:{chunk.chunk_index}")
-        for chunk in normalized_chunks
-    ]
-
-    active_allocations = tuple(allocations or _default_allocations(source.workspace_id, profile.id))
-    active_policy = policy or EntitlementPolicy(id=f"policy_{source.workspace_id}", workspace_id=source.workspace_id)
-    active_balance = balance or WorkspaceBalance(workspace_id=source.workspace_id)
-    active_gate = gate or UsageGate()
-
-    usage_reservations = (
-        _reserve_usage(
-            workspace_id=source.workspace_id,
-            subject="voyage",
-            operation="embed_documents",
-            estimated_units={
-                "total_tokens": float(sum(_token_estimate(chunk.text) for chunk in normalized_chunks)),
-                "vectors": float(len(normalized_chunks)),
-            },
-            allocations=active_allocations,
-            policy=active_policy,
-            balance=active_balance,
-            gate=active_gate,
-            subject_id=video.youtube_video_id,
-            input_payload={"chunks": [_chunk_hash_payload(chunk) for chunk in normalized_chunks], "profile": profile.id},
-            extras=[profile.id],
-            created_at=job.created_at,
-        ),
-        _reserve_usage(
-            workspace_id=source.workspace_id,
-            subject="search_store",
-            operation="index_write",
-            estimated_units={
-                "transcript_versions": 1.0,
-                "chunks": float(len(normalized_chunks)),
-                "embeddings": float(len(embedding_vectors)),
-            },
-            allocations=active_allocations,
-            policy=active_policy,
-            balance=active_balance,
-            gate=active_gate,
-            subject_id=video.youtube_video_id,
-            input_payload={"content_hash": content_hash, "profile": profile.id},
-            extras=[profile.id],
-            created_at=job.created_at,
-        ),
-        _reserve_usage(
-            workspace_id=source.workspace_id,
-            subject="search_store",
-            operation="hybrid_query",
-            estimated_units={
-                "queries": 1.0,
-                "candidate_limit": 12.0,
-                "query_vector_dimensions": float(profile.embedding_dimension),
-            },
-            allocations=active_allocations,
-            policy=active_policy,
-            balance=active_balance,
-            gate=active_gate,
-            subject_id=video.youtube_video_id,
-            input_payload={"query": search_query or _default_search_query(normalized_chunks), "profile": profile.id},
-            extras=[profile.id],
-            created_at=job.created_at,
-        ),
-    )
-
-    job_operations = tuple(
-        _job_operation(
-            workspace_id=source.workspace_id,
-            job_id=job.id,
-            source_id=source.id,
-            video_id=video.youtube_video_id,
-            operation=reservation.operation_key,
-            input_payload={
-                "video": video.youtube_video_id,
-                "content_hash": content_hash,
-                "reservation_key": reservation.idempotency_key,
-            },
-            idempotency_extras=[profile.id],
-            usage_reservation_id=reservation.id,
-            created_at=job.created_at,
-        )
-        for reservation in usage_reservations
-    )
-
-    search_plan = hybrid_query_plan(
-        workspace_id=source.workspace_id,
-        query=search_query or _default_search_query(normalized_chunks),
-        query_vector=mock_embedding_vector(search_query or _default_search_query(normalized_chunks), dimension=profile.embedding_dimension),
-        limit=3,
-        candidate_multiplier=4,
-        index_profile_ref=profile.id,
-    )
-
-    sql_operations: list[PlannedSqlOperation] = [
-        PlannedSqlOperation(name="videos.upsert", statement=upsert_video_sql(source, video, hosted_video_id=hosted_video_id)),
-        PlannedSqlOperation(name="search_index_profiles.upsert", statement=upsert_index_profile_sql(source.workspace_id, profile)),
-    ]
-    sql_operations.extend(
-        PlannedSqlOperation(
-            name=f"usage_reservations.{reservation.operation_key}",
-            statement=upsert_usage_reservation_sql(reservation),
-            idempotency_key=reservation.idempotency_key,
-        )
-        for reservation in usage_reservations
-    )
-    sql_operations.extend(
-        PlannedSqlOperation(
-            name=f"job_operations.{operation.operation}",
-            statement=upsert_job_operation_sql(operation),
-            operation_id=operation.id,
-            idempotency_key=operation.idempotency_key,
-        )
-        for operation in job_operations
-    )
-    transcript_metadata = {"job_id": job.id, "source_id": source.id, "youtube_video_id": video.youtube_video_id}
-    sql_operations.append(
-        PlannedSqlOperation(
-            name="transcript_versions.upsert_replacement",
-            statement=upsert_transcript_version_sql(
-                workspace_id=source.workspace_id,
-                video_id=hosted_video_id,
-                transcript_version_id=transcript_version_id,
-                source="mock_hosted_transcript",
-                language_code="en",
-                content_hash=content_hash,
-                metadata=transcript_metadata,
-            ),
-            idempotency_key=job_operations[1].idempotency_key,
-        )
-    )
-    for chunk, vector in zip(normalized_chunks, embedding_vectors, strict=True):
-        chunk_id = _stable_id("chk", source.workspace_id, transcript_version_id, str(chunk.chunk_index))
-        sql_operations.append(
-            PlannedSqlOperation(
-                name="chunks.upsert",
-                statement=upsert_chunk_sql(
-                    workspace_id=source.workspace_id,
-                    hosted_video_id=hosted_video_id,
-                    transcript_version_id=transcript_version_id,
-                    index_profile_id=profile.id,
-                    tokenizer=profile.tokenizer,
-                    chunk=chunk,
-                    chunk_id=chunk_id,
-                ),
-                idempotency_key=job_operations[1].idempotency_key,
-            )
-        )
-        sql_operations.append(
-            PlannedSqlOperation(
-                name="chunk_embeddings.upsert",
-                statement=upsert_chunk_embedding_sql(
-                    workspace_id=source.workspace_id,
-                    chunk_id=chunk_id,
-                    index_profile_id=profile.id,
-                    embedding=vector,
-                    embedding_id=_stable_id("emb", source.workspace_id, chunk_id, profile.id),
-                    usage_reservation_id=usage_reservations[0].id,
-                ),
-                idempotency_key=job_operations[0].idempotency_key,
-            )
-        )
-    sql_operations.append(
-        PlannedSqlOperation(
-            name="search_store.replace_active_transcript",
-            statement=replace_active_transcript_sql(
-                workspace_id=source.workspace_id,
-                video_id=hosted_video_id,
-                transcript_version_id=transcript_version_id,
-                source="mock_hosted_transcript",
-                language_code="en",
-                content_hash=content_hash,
-                metadata=transcript_metadata,
-            ),
-            idempotency_key=job_operations[1].idempotency_key,
-        )
-    )
-
-    return HostedIndexingPlan(
-        source=source,
-        job=job,
-        video=video,
-        hosted_video_id=hosted_video_id,
-        transcript_version_id=transcript_version_id,
-        transcript_content_hash=content_hash,
-        index_profile=profile,
-        job_operations=job_operations,
-        usage_reservations=usage_reservations,
-        sql_operations=tuple(sql_operations),
-        search_operations=(search_plan,),
-    )
 
 
 def plan_real_hosted_public_indexing(
@@ -1961,7 +1735,7 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                 )
             ]
         if source.source_type not in {"channel", "handle", "playlist", "url"}:
-            raise HostedIndexingError(f"source discovery is not implemented for source_type={source.source_type}")
+            raise HostedIndexingError(f"unsupported source_type for discovery: {source.source_type}")
         proxy = self._require_hosted_webshare_proxy(operation="source discovery")
         return discover_videos(
             target=source.source_url,
@@ -2471,22 +2245,6 @@ SELECT
     )
 
 
-def mock_embedding_vector(text: str, *, dimension: int = DEFAULT_EMBEDDING_DIMENSION, salt: str = "") -> list[float]:
-    if dimension <= 0:
-        raise ValueError("dimension must be positive")
-    digest = input_hash({"text": text, "salt": salt}, prefix="").lstrip("_")
-    values: list[float] = []
-    cursor = 0
-    while len(values) < dimension:
-        if cursor + 8 > len(digest):
-            digest += input_hash({"digest": digest}, prefix="").lstrip("_")
-            cursor = 0
-        bucket = int(digest[cursor : cursor + 8], 16)
-        values.append(round((bucket / 0xFFFFFFFF) * 2.0 - 1.0, 6))
-        cursor += 8
-    return values
-
-
 def _validate_public_indexing_inputs(
     *,
     source: Source,
@@ -2610,7 +2368,7 @@ def _job_operation(
 def _default_allocations(workspace_id: str, index_profile_id: str) -> tuple[Allocation, ...]:
     return (
         ProviderAllocation(
-            id=f"alloc_{workspace_id}_voyage_mock",
+            id=f"alloc_{workspace_id}_voyage_default",
             workspace_id=workspace_id,
             provider="voyage",
             operation="embed_documents",
@@ -2660,11 +2418,6 @@ def _index_profile_identity(profile: IndexProfileInput) -> dict[str, Any]:
 
 def _index_profile_fingerprint(profile: IndexProfileInput) -> str:
     return input_hash(_index_profile_identity(profile), prefix="sip")
-
-
-def _default_mock_index_profile(workspace_id: str) -> IndexProfileInput:
-    profile = IndexProfileInput()
-    return replace(profile, id=_workspace_index_profile_id(workspace_id, profile))
 
 
 def _default_real_index_profile(workspace_id: str) -> IndexProfileInput:
@@ -2950,8 +2703,6 @@ __all__ = [
     "finish_source_discovery_sql",
     "complete_job_operation_success_sql",
     "job_operation_output_sql",
-    "mock_embedding_vector",
-    "plan_mock_hosted_public_indexing",
     "plan_real_hosted_public_indexing",
     "source_from_public_youtube_input",
     "upsert_chunk_embedding_sql",

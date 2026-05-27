@@ -1,8 +1,8 @@
 # Product Design Notes
 
-`yutome` should be understood as a local-first YouTube antilibrary, not only as a channel scraper or transcript index.
+`yutome` should be understood as a Postgres-backed YouTube antilibrary, not only as a channel scraper or transcript index.
 
-The user has a set of channels they care about, and that corpus contains far more latent value than they can watch, remember, or manually organize. The product promise is that those unwatched or half-remembered videos become searchable, citable, exportable, and available to the user's normal agent or chat workflow without requiring a centralized server.
+The user has a set of channels they care about, and that corpus contains far more latent value than they can watch, remember, or manually organize. The product promise is that those unwatched or half-remembered videos become searchable, citable, exportable, and available to the user's normal agent or chat workflow through one Postgres database with VectorChord Suite for lexical and vector search.
 
 ## User Model
 
@@ -31,27 +31,27 @@ The broader import flow should support:
 - Plain URL or handle lists for the lowest-friction manual path.
 - Direct paste of channel URLs, handles, channel IDs, video URLs, or video IDs for sources outside subscriptions.
 
-Playlists are useful later, but they should not complicate the main library model until playlist ingest is explicit. Single videos are now the smallest useful source under the same local corpus idea.
+Playlists are useful later, but they should not complicate the main library model until playlist ingest is explicit. Single videos are now the smallest useful source under the same corpus model.
 
 ## OAuth Position
 
-OAuth is the preferred subscription-import experience because Takeout is too heavy for the common case. However, a local-first project should not require a centralized server just to import private subscription data.
+OAuth is the preferred subscription-import experience because Takeout is too heavy for the common case. The import path should keep YouTube OAuth grants separate from Yutome account auth and provider credentials.
 
 The local OAuth design is:
 
 1. User provides a Google OAuth desktop/local client secrets file.
 2. `yutome` opens a system-browser consent page with the read-only YouTube scope.
 3. The callback returns to a localhost redirect.
-4. The refresh/access token is stored locally under `data/auth/`.
-5. `yutome` calls YouTube Data API subscription listing and stores channels in the local library.
+4. The refresh/access token is stored in the configured Yutome credential location.
+5. `yutome` calls YouTube Data API subscription listing and stores sources in Postgres.
 
-This is less polished than a hosted broker, but it keeps the trust boundary local. A hosted broker can be considered later if onboarding friction is too high.
+This keeps subscription import decoupled from transcript search storage and from provider billing.
 
 ## Daily-Driver LLM Integration
 
 The important product surface is not a standalone chat UI. A standalone `yutome ask` command can exist, but the main product promise is that a user's regular agent or chat app can query their YouTube corpus.
 
-Multi-device access is part of that promise. Local-first storage is useful for ownership, but a laptop-only MCP process is not enough for a user who wants the same corpus available from multiple agents, phones, tablets, work machines, or hosted chat surfaces. The product needs a remote access track: an authenticated hosted API, remote MCP adapter, or private corpus/index replica that uses the same retrieval contract as the local CLI/MCP/HTTP surfaces.
+Multi-device access is part of that promise. A laptop-only MCP process is not enough for a user who wants the same corpus available from multiple agents, phones, tablets, work machines, or hosted chat surfaces. The product needs a remote access track: an authenticated API and remote MCP adapter that use the same Postgres-backed retrieval contract as CLI, MCP, and HTTP surfaces.
 
 The local connector should expose:
 

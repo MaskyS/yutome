@@ -5,10 +5,8 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
-from yutome.config import DEFAULT_CONFIG_FILENAME, load_config
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.ids import input_hash
 from yutome.hosted.models import (
@@ -32,46 +30,6 @@ from yutome.hosted.repositories import (
     usage_event_from_row,
     usage_reservation_from_row,
 )
-from yutome.paths import ProjectPaths
-
-
-def default_usage_ledger_path(config_path: Path = Path(DEFAULT_CONFIG_FILENAME)) -> Path:
-    config = load_config(config_path)
-    project_root = config_path.parent if config_path.is_absolute() else (Path.cwd() / config_path).parent
-    configured = config.hosted.usage_ledger_path
-    if configured.is_absolute():
-        return configured
-    if configured.parts and configured.parts[0] == str(config.storage.data_dir):
-        return project_root / configured
-    paths = ProjectPaths.from_config(config, project_root=project_root)
-    return paths.data_dir / configured
-
-
-class JsonlUsageLedger:
-    """Append-only local JSONL ledger for CLI debug commands and early tests.
-
-    The authoritative hosted ledger is Postgres (`PostgresUsageLedger`); this narrow
-    adapter exists only to give the CLI a readable inspection path and is not used for
-    hosted authorization.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def append(self, event: UsageEvent) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(event.model_dump_json() + "\n")
-
-    def recent(self, *, limit: int = 20) -> list[UsageEvent]:
-        if not self.path.exists():
-            return []
-        rows: list[UsageEvent] = []
-        with self.path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    rows.append(UsageEvent.model_validate(json.loads(line)))
-        return rows[-max(0, limit) :]
 
 
 class PostgresUsageGate:
@@ -164,6 +122,22 @@ class PostgresUsageLedger:
             persisted = usage_event_from_row(row) if row else durable
             _reconcile_balance_for_usage_event(self.connection, persisted)
             return persisted
+
+    def recent(self, *, workspace_id: str, limit: int = 20) -> list[UsageEvent]:
+        rows = _execute_rows(
+            self.connection,
+            SqlStatement(
+                sql="""
+SELECT *
+FROM usage_events
+WHERE workspace_id = %(workspace_id)s
+ORDER BY created_at DESC, id DESC
+LIMIT %(limit)s;
+""".strip(),
+                params={"workspace_id": workspace_id, "limit": max(0, limit)},
+            ),
+        )
+        return [usage_event_from_row(row) for row in reversed(rows)]
 
 
 def stable_usage_reservation(reservation: UsageReservation) -> UsageReservation:

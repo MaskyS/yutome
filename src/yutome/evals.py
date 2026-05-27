@@ -16,7 +16,6 @@ class EvalCase(BaseModel):
 
     name: str
     query: str
-    in_: Literal["chunks", "titles", "descriptions"] = Field(default="chunks", alias="in")
     mode: Literal["lexical", "semantic", "hybrid", "none"] | None = None
     channel: str | None = None
     source: str | None = None
@@ -59,7 +58,6 @@ def _run_case(*, config: AppConfig, paths: ProjectPaths, case: EvalCase) -> dict
         config=config,
         paths=paths,
         text=case.query,
-        in_=case.in_,
         mode=case.mode,
         channel=case.channel,
         source=case.source,

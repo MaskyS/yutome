@@ -42,7 +42,7 @@ Setup is account-level, not device-level. You should not need a new Yutome endpo
 Laptop on (bridge running):
 
 - Claude/ChatGPT can call `find`, `list`, `show`, and `q` through the Worker.
-- Results come from local SQLite, LanceDB, and artifacts via a long-lived WebSocket from the bridge to the Worker's Durable Object (Cloudflare WebSocket Hibernation).
+- Results come from the configured Postgres + VectorChord database and local artifacts via a long-lived WebSocket from the bridge to the Worker's Durable Object (Cloudflare WebSocket Hibernation).
 - Resources (`yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`) are reachable via `resources/read` — host UIs can render citations inline without burning a tool call.
 
 Laptop off or bridge stopped:
@@ -52,7 +52,7 @@ Laptop off or bridge stopped:
 
 The Worker uses Cloudflare's `@cloudflare/workers-oauth-provider` for OAuth 2.1 (DCR, optional CIMD, PKCE S256, refresh tokens) and the Agents SDK's `McpAgent` for the MCP protocol surface. Pairing is gated by the printed code plus short-lived OAuth state and CSRF validation; no Yutome account, Auth0, Clerk, or Cloudflare Access setup is required.
 
-Remote MCP mode does not require Voyage, Webshare, Gemini, or proxy credentials. The basic laptop-backed connector fits Cloudflare's free Workers plan (Workers + 1 KV namespace + 2 Durable Objects, all SQLite-backed). Always-on/offline search is a later replica mode and may require enabling Cloudflare billing.
+Remote MCP mode does not require Webshare, Gemini, or proxy credentials. Semantic/hybrid search requires the configured Postgres + VectorChord database and whatever embedding provider is configured for query vectors. The basic laptop-backed connector fits Cloudflare's free Workers plan (Workers + 1 KV namespace + 2 Durable Objects for relay state). Always-on/offline search requires a reachable Postgres + VectorChord database.
 
 ## Current Supported Shape
 
@@ -200,4 +200,4 @@ Before public hosted remote MCP:
 - Add corpus ownership/ACL checks.
 - Add rate limits and audit logging.
 - Decide whether remote clients are read-only or can enqueue sync/quality jobs.
-- Decide where the corpus and LanceDB indexes live: private server, hosted read-only replica, or sync from the local machine.
+- Decide where the Postgres + VectorChord database is operated: local development stack, private server, or hosted Yutome infrastructure.

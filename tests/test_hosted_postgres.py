@@ -90,7 +90,10 @@ def live_postgres_dsn() -> Iterator[str]:
             .rsplit(":", 1)[1]
         )
         dsn = f"postgresql://postgres:postgres@127.0.0.1:{port}/yutome_test"
-        _wait_for_postgres(dsn)
+        try:
+            _wait_for_postgres(dsn)
+        except AssertionError as exc:
+            pytest.skip(f"auto-started Postgres test container did not become ready: {exc}")
         yield dsn
     finally:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -189,6 +192,79 @@ def test_phase1_schema_applies_to_fresh_postgres_schema(live_postgres_dsn: str) 
             assert "credential_mode" in provider_columns
             assert "mode" not in provider_columns
             assert "credential_mode" in reservation_columns
+        finally:
+            connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
+
+
+def test_account_jobs_query_returns_enriched_source_and_video_context(live_postgres_dsn: str) -> None:
+    # The dashboard Activity feed needs each job row joined to its source's
+    # display name/type and (for index_video) the video title. Exercise the
+    # generated SQL against real Postgres so a wrong column/join/JSONB key fails
+    # here rather than only in production. Minimal stand-in tables (matching the
+    # columns the query reads) keep this free of the VectorChord extensions the
+    # full indexing schema requires.
+    import psycopg
+    from psycopg.rows import dict_row
+
+    from yutome.hosted.http_api import _account_jobs_sql
+
+    schema = f"yutome_jobs_{os.getpid()}"
+    workspace_id = "ws_jobs_test"
+    with psycopg.connect(live_postgres_dsn, autocommit=True, row_factory=dict_row) as connection:
+        connection.execute(f'CREATE SCHEMA "{schema}";')
+        try:
+            connection.execute(f'SET search_path TO "{schema}";')
+            connection.execute(
+                """
+                CREATE TABLE jobs (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    source_id text,
+                    job_type text NOT NULL,
+                    status text NOT NULL,
+                    priority integer,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    started_at timestamptz,
+                    finished_at timestamptz,
+                    cancelled_at timestamptz,
+                    error_code text,
+                    error_message text,
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+            connection.execute(
+                "CREATE TABLE sources (id text PRIMARY KEY, display_name text, source_type text, source_url text);"
+            )
+            connection.execute(
+                "CREATE TABLE videos (workspace_id text NOT NULL, youtube_video_id text NOT NULL, title text NOT NULL DEFAULT '');"
+            )
+            connection.execute(
+                "INSERT INTO sources (id, display_name, source_type, source_url) "
+                "VALUES ('src_chan', '@chan', 'channel', 'https://www.youtube.com/@chan');"
+            )
+            connection.execute(
+                "INSERT INTO videos (workspace_id, youtube_video_id, title) "
+                "VALUES (%(ws)s, 'abcdEFGHijk', 'Indexed Title');",
+                {"ws": workspace_id},
+            )
+            connection.execute(
+                """
+                INSERT INTO jobs (id, workspace_id, source_id, job_type, status, metadata_json)
+                VALUES ('job_index', %(ws)s, 'src_chan', 'index_video', 'succeeded', %(meta)s::jsonb);
+                """,
+                {"ws": workspace_id, "meta": '{"youtube_video_id": "abcdEFGHijk"}'},
+            )
+
+            statement = _account_jobs_sql(workspace_id=workspace_id, limit=25)
+            rows = connection.execute(statement.sql, statement.params).fetchall()
+
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["source_display_name"] == "@chan"
+            assert row["source_type"] == "channel"
+            assert row["source_url"] == "https://www.youtube.com/@chan"
+            assert row["video_title"] == "Indexed Title"
         finally:
             connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
 

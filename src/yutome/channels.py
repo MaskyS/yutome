@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import csv
 import re
-import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Protocol
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from yutome.hashing import sha256_text
+from yutome.hosted.repositories import SqlStatement
 
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
@@ -66,110 +66,153 @@ def import_channels_from_file(path: Path, *, selected: bool = True) -> list[Libr
     return list(_channels_from_plain_list(path, selected=selected))
 
 
+class SqlConnection(Protocol):
+    def execute(self, statement: str, params: Mapping[str, Any] | None = None) -> Any:
+        ...
+
+
 def upsert_library_channel(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     channel: LibraryChannel,
     *,
+    workspace_id: str,
     selected: bool | None = None,
 ) -> None:
-    if channel.channel_id:
-        connection.execute(
-            """
-            INSERT INTO channels(channel_id, handle, source_url, title)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                handle = COALESCE(channels.handle, excluded.handle),
-                source_url = COALESCE(channels.source_url, excluded.source_url),
-                title = COALESCE(channels.title, excluded.title)
-            """,
-            (channel.channel_id, channel.handle, channel.source_url, channel.title),
-        )
+    statement = upsert_library_channel_sql(channel, workspace_id=workspace_id, selected=selected)
+    connection.execute(statement.sql, statement.params)
+
+
+def upsert_library_channel_sql(
+    channel: LibraryChannel,
+    *,
+    workspace_id: str,
+    selected: bool | None = None,
+) -> SqlStatement:
     effective_selected = channel.selected if selected is None else selected
-    connection.execute(
-        """
-        INSERT INTO library_channels(
-            library_channel_id, source, source_url, channel_id, handle, title, selected, import_source
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(source_url) DO UPDATE SET
-            source = excluded.source,
-            channel_id = COALESCE(excluded.channel_id, library_channels.channel_id),
-            handle = COALESCE(excluded.handle, library_channels.handle),
-            title = COALESCE(excluded.title, library_channels.title),
-            selected = excluded.selected,
-            import_source = COALESCE(excluded.import_source, library_channels.import_source),
-            updated_at = datetime('now')
-        """,
-        (
-            channel.library_channel_id,
-            channel.source,
-            channel.source_url,
-            channel.channel_id,
-            channel.handle,
-            channel.title,
-            1 if effective_selected else 0,
-            channel.import_source,
-        ),
+    return SqlStatement(
+        sql="""
+INSERT INTO sources (
+    id, workspace_id, source_type, source_url, canonical_channel_id,
+    display_name, selected, auto_index_allowed, import_source, metadata_json, status
+)
+VALUES (
+    %(id)s, %(workspace_id)s, %(source_type)s, %(source_url)s,
+    %(canonical_channel_id)s, %(display_name)s, %(selected)s, true,
+    %(import_source)s, %(metadata_json)s::jsonb, 'active'
+)
+ON CONFLICT (workspace_id, source_url) DO UPDATE
+SET source_type = EXCLUDED.source_type,
+    canonical_channel_id = COALESCE(EXCLUDED.canonical_channel_id, sources.canonical_channel_id),
+    display_name = COALESCE(EXCLUDED.display_name, sources.display_name),
+    selected = EXCLUDED.selected,
+    import_source = EXCLUDED.import_source,
+    metadata_json = sources.metadata_json || EXCLUDED.metadata_json,
+    status = EXCLUDED.status,
+    updated_at = now()
+RETURNING *;
+""".strip(),
+        params={
+            "id": channel.library_channel_id,
+            "workspace_id": workspace_id,
+            "source_type": _postgres_channel_source_type(channel),
+            "source_url": channel.source_url,
+            "canonical_channel_id": channel.channel_id,
+            "display_name": channel.title,
+            "selected": effective_selected,
+            "import_source": channel.import_source or "manual",
+            "metadata_json": _json_object(
+                {
+                    "source": channel.source,
+                    "handle": channel.handle,
+                }
+            ),
+        },
     )
 
 
 def list_library_channels(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     *,
+    workspace_id: str,
     selected_only: bool = False,
 ) -> list[LibraryChannel]:
-    where = "WHERE selected = 1" if selected_only else ""
-    rows = connection.execute(
-        f"""
-        SELECT library_channel_id, source, source_url, channel_id, handle, title, selected, import_source
-        FROM library_channels
-        {where}
-        ORDER BY selected DESC, COALESCE(title, handle, source_url), source_url
-        """
-    ).fetchall()
-    return [
-        LibraryChannel(
-            library_channel_id=row["library_channel_id"],
-            source=row["source"],
-            source_url=row["source_url"],
-            channel_id=row["channel_id"],
-            handle=row["handle"],
-            title=row["title"],
-            selected=bool(row["selected"]),
-            import_source=row["import_source"],
-        )
-        for row in rows
-    ]
+    statement = list_library_channels_sql(workspace_id=workspace_id, selected_only=selected_only)
+    rows = _rows_from_result(connection.execute(statement.sql, statement.params))
+    return [_channel_from_postgres_row(row) for row in rows]
+
+
+def list_library_channels_sql(*, workspace_id: str, selected_only: bool = False) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT
+    id AS library_channel_id,
+    source_type,
+    source_url,
+    canonical_channel_id AS channel_id,
+    display_name AS title,
+    selected,
+    import_source,
+    metadata_json
+FROM sources
+WHERE workspace_id = %(workspace_id)s
+  AND source_type IN ('channel', 'handle', 'url')
+  AND (%(selected_only)s::boolean = false OR selected = true)
+ORDER BY selected DESC, COALESCE(display_name, metadata_json->>'handle', source_url), source_url;
+""".strip(),
+        params={"workspace_id": workspace_id, "selected_only": selected_only},
+    )
 
 
 def set_library_channel_selected(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     *,
+    workspace_id: str,
     selector: str,
     selected: bool,
 ) -> int:
-    if selector == "all":
-        cursor = connection.execute(
-            "UPDATE library_channels SET selected = ?, updated_at = datetime('now')",
-            (1 if selected else 0,),
-        )
-        return cursor.rowcount
     candidates = _selector_candidates(selector)
-    placeholders = ",".join("?" for _ in candidates)
-    cursor = connection.execute(
-        f"""
-        UPDATE library_channels
-        SET selected = ?, updated_at = datetime('now')
-        WHERE library_channel_id IN ({placeholders})
-           OR source_url IN ({placeholders})
-           OR source IN ({placeholders})
-           OR channel_id IN ({placeholders})
-           OR handle IN ({placeholders})
-           OR title IN ({placeholders})
-        """,
-        (1 if selected else 0, *candidates, *candidates, *candidates, *candidates, *candidates, *candidates),
+    statement = set_library_channel_selected_sql(
+        workspace_id=workspace_id,
+        candidates=candidates,
+        selected=selected,
+        all_channels=selector == "all",
     )
-    return cursor.rowcount
+    cursor = connection.execute(statement.sql, statement.params)
+    return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+def set_library_channel_selected_sql(
+    *,
+    workspace_id: str,
+    candidates: list[str],
+    selected: bool,
+    all_channels: bool = False,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+UPDATE sources
+SET selected = %(selected)s,
+    updated_at = now()
+WHERE workspace_id = %(workspace_id)s
+  AND source_type IN ('channel', 'handle', 'url')
+  AND (
+    %(all_channels)s::boolean = true
+    OR id = ANY(%(candidates)s::text[])
+    OR source_url = ANY(%(candidates)s::text[])
+    OR canonical_channel_id = ANY(%(candidates)s::text[])
+    OR display_name = ANY(%(candidates)s::text[])
+    OR metadata_json->>'source' = ANY(%(candidates)s::text[])
+    OR metadata_json->>'handle' = ANY(%(candidates)s::text[])
+    OR ('@' || metadata_json->>'handle') = ANY(%(candidates)s::text[])
+  );
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "selected": selected,
+            "all_channels": all_channels,
+            "candidates": candidates,
+        },
+    )
 
 
 def _channels_from_csv(path: Path, *, selected: bool) -> Iterable[LibraryChannel]:
@@ -221,6 +264,75 @@ def _with_selected(channel: LibraryChannel, selected: bool) -> LibraryChannel:
         selected=selected,
         import_source=channel.import_source,
     )
+
+
+def _postgres_channel_source_type(channel: LibraryChannel) -> str:
+    if channel.channel_id:
+        return "channel"
+    if channel.handle:
+        return "handle"
+    return "url"
+
+
+def _channel_from_postgres_row(row: Mapping[str, Any]) -> LibraryChannel:
+    metadata = _metadata(row.get("metadata_json"))
+    channel_id = _optional_str(row.get("channel_id"))
+    handle = _optional_str(metadata.get("handle")) or _handle_from_value(str(row.get("source_url") or ""))
+    source_url = str(row["source_url"])
+    source = _optional_str(metadata.get("source")) or _channel_source_key(
+        source_url,
+        channel_id=channel_id,
+        handle=handle,
+    )
+    return LibraryChannel(
+        library_channel_id=str(row["library_channel_id"]),
+        source=source,
+        source_url=source_url,
+        channel_id=channel_id,
+        handle=handle,
+        title=_optional_str(row.get("title")),
+        selected=bool(row.get("selected")),
+        import_source=_optional_str(row.get("import_source")),
+    )
+
+
+def _metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        import json
+
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_object(value: Mapping[str, Any]) -> str:
+    import json
+
+    compact = {key: item for key, item in value.items() if item is not None}
+    return json.dumps(compact, sort_keys=True, separators=(",", ":"))
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        rows = result.fetchall()
+    elif isinstance(result, list):
+        rows = result
+    else:
+        rows = list(result)
+    return [dict(row) for row in rows]
 
 
 def _canonical_source_url(raw: str, *, channel_id: str | None, handle: str | None) -> str:

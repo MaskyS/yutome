@@ -1,8 +1,4 @@
-"""Yutome command-line interface.
-
-The public CLI is a small set of job-oriented namespaces. The legacy module is
-kept as private plumbing while handlers are moved behind the new surface.
-"""
+"""Yutome command-line interface."""
 
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ import typer
 
 from yutome.config import DEFAULT_CONFIG_FILENAME
 
-from . import _legacy
+from . import actions
 from . import corpus as corpus_cli
 from . import doctor as doctor_cli
 from . import export as export_cli
@@ -22,7 +18,7 @@ from . import serve as serve_cli
 from .context import config_path, install_context
 
 app = typer.Typer(
-    help="Index and search a local YouTube transcript library.",
+    help="Index and search a Postgres-backed YouTube transcript library.",
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -47,12 +43,12 @@ def root(
     version: bool = typer.Option(
         False,
         "--version",
-        callback=_legacy._version_callback,
+        callback=actions._version_callback,
         is_eager=True,
         help="Show the installed yutome version and exit.",
     ),
 ) -> None:
-    """Index and search a local YouTube transcript library."""
+    """Index and search a Postgres-backed YouTube transcript library."""
     install_context(ctx, config_path=config)
 
 
@@ -69,14 +65,9 @@ def setup(
         "-y",
         help="Run non-interactively and print next steps instead of prompting.",
     ),
-    hosted: bool = typer.Option(
-        False,
-        "--hosted",
-        help="Configure hosted Yutome account mode instead of local provider keys.",
-    ),
 ) -> None:
-    """Guided first-run setup for a local yutome project."""
-    _legacy.setup(channel=source, config=config_path(ctx), yes=yes, hosted=hosted)
+    """Guided first-run setup for a yutome project."""
+    actions.setup(channel=source, config=config_path(ctx), yes=yes)
 
 
 @app.command("connect")
@@ -91,11 +82,6 @@ def connect_command(
         False,
         "--deploy",
         help="Deploy the tracked Cloudflare Worker with Wrangler through npx.",
-    ),
-    open_cloudflare: bool = typer.Option(
-        False,
-        "--open-cloudflare",
-        help="Open the Cloudflare Workers dashboard after preparing the Worker project.",
     ),
     worker_name: str | None = typer.Option(
         None,
@@ -112,29 +98,15 @@ def connect_command(
         "--pairing-code",
         help="Pairing code secret for an already-deployed Worker endpoint.",
     ),
-    assistant_app: str = typer.Option(
-        "all",
-        "--app",
-        "--assistant",
-        help="Assistant instructions to print: claude, chatgpt, both, other, or all.",
-    ),
-    mode: str = typer.Option(
-        "connector-only",
-        "--mode",
-        help="Remote mode: connector-only or replica.",
-    ),
 ) -> None:
     """Set up remote access for assistant apps."""
-    _legacy.connect_command(
+    actions.connect_command(
         config=config_path(ctx),
         endpoint=endpoint,
         deploy=deploy,
-        open_cloudflare=open_cloudflare,
         worker_name=worker_name,
         relay_token=relay_token,
         pairing_code=pairing_code,
-        assistant_app=assistant_app,
-        mode=mode,
     )
 
 
@@ -153,16 +125,14 @@ def disconnect_command(
     ),
     keep_state: bool = typer.Option(False, "--keep-state", help="Keep local remote connector state."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be disconnected without changing anything."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
 ) -> None:
     """Disconnect Yutome from the remote MCP endpoint."""
-    _legacy.disconnect_command(
+    actions.disconnect_command(
         config=config_path(ctx),
         worker_name=worker_name,
         remove_cloudflare=remove_cloudflare,
         keep_state=keep_state,
         dry_run=dry_run,
-        yes=yes,
     )
 
 
@@ -171,13 +141,8 @@ def status_command(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
-    """Print local library status."""
-    _legacy.status_command(config=config_path(ctx), json_output=json_output)
-
-
-def __getattr__(name: str) -> object:
-    """Expose legacy helpers for imports while the CLI internals are split."""
-    return getattr(_legacy, name)
+    """Print corpus status."""
+    actions.status_command(config=config_path(ctx), json_output=json_output)
 
 
 __all__ = ["app"]

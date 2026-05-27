@@ -8,7 +8,6 @@ runtime behavior.
 
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.ids import idempotency_key, input_hash
-from yutome.hosted.ledger import JsonlUsageLedger
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.models import (
     EntitlementPolicy,
@@ -22,7 +21,6 @@ from yutome.hosted.models import (
 
 __all__ = [
     "EntitlementPolicy",
-    "JsonlUsageLedger",
     "ProviderAllocation",
     "ServiceAllocation",
     "UsageDecision",

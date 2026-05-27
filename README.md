@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/MaskyS/yutome/main/docs/assets/yutome-wordmark.png" alt="Yutome" width="420">
 </p>
 
-Yutome ingests transcripts from the YouTube channels you point at, stores them on your machine, and connects to whichever AI app you already use — Claude, ChatGPT, Cursor, anything MCP-compatible.
+Yutome ingests transcripts from the YouTube channels you point at, stores catalog/search state in Postgres with VectorChord Suite, and connects to whichever AI app you already use — Claude, ChatGPT, Cursor, anything MCP-compatible.
 
 The library is searchable from the command line, from any local MCP client, or remotely from claude.ai / ChatGPT through a small Cloudflare Worker you deploy yourself.
 
@@ -14,7 +14,7 @@ Yutome is a command-line tool. You set it up from the terminal; from there it ha
 uv tool install yutome
 ```
 
-This puts a single `yutome` command on your PATH. For now the package installs the full feature set by default: yt-dlp, LanceDB, Voyage embeddings, MCP server, HTTP API, and the bundled Cloudflare Worker used by remote connectors.
+This puts a single `yutome` command on your PATH. For now the package installs the full feature set by default: yt-dlp, Postgres client support, Voyage embeddings, MCP server, HTTP API, and the bundled Cloudflare Worker used by remote connectors.
 
 **Don't have uv or Python yet?** uv installs itself in one command and will fetch Python for you if it's missing.
 
@@ -55,9 +55,9 @@ yutome corpus sync                                   # discover videos, fetch tr
 yutome search find "first principles"                # ranked search across everything indexed
 ```
 
-`yutome setup` is interactive by default; pass `-y` to skip prompts and just print what would happen. It prompts for any API keys it needs. To set keys ahead of time, copy `.env.example` to `.env`. The only commonly-needed key is `VOYAGE_API_KEY` (semantic search) — get one at [voyageai.com](https://www.voyageai.com/). Without it, `find` still works but falls back to keyword search only. Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
+`yutome setup` is interactive by default; pass `-y` to skip prompts and just print what would happen. It expects `YUTOME_POSTGRES_URL` to point at a Postgres database with VectorChord Suite installed (`vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`). To set keys ahead of time, copy `.env.example` to `.env`. The only commonly-needed provider key is `VOYAGE_API_KEY` (semantic search) — get one at [voyageai.com](https://www.voyageai.com/). Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
 
-The indexed corpus lives under `./data/` next to `yutome.toml` — SQLite catalog, LanceDB vector index, transcript artifacts. Back it up like any other project directory.
+Postgres is the database for catalog rows, jobs, lexical indexes, vectors, and usage records. The `./data/` directory next to `yutome.toml` holds transcript artifacts, exports, remote connector state, and logs.
 
 Run `yutome --help` for the full surface. The most-used commands:
 

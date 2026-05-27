@@ -1,10 +1,10 @@
 """Single source of truth for yutome's MCP/HTTP contract.
 
-Every adapter (local stdio MCP, local HTTP, the laptop bridge, the Worker JSON
-export) reads its tool/resource list from the ``TOOLS`` and ``RESOURCES``
-tuples here. Handler functions carry the Python signatures that FastMCP
-introspects to derive JSON Schema for the local server; the Worker JSON export
-serializes the same set with hand-curated metadata for the TypeScript runtime.
+Every adapter (stdio MCP, HTTP, the laptop bridge, and the Worker JSON export)
+reads its tool/resource list from the ``TOOLS`` and ``RESOURCES`` tuples here.
+Handler functions carry the Python signatures that FastMCP introspects to
+derive JSON Schema; the Worker JSON export serializes the same set with
+hand-curated metadata for the TypeScript runtime.
 """
 from __future__ import annotations
 
@@ -12,14 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from yutome import runtime
-from yutome.api import find as api_find
-from yutome.api import list_ as api_list
-from yutome.api import q as api_q
-from yutome.api import resource_channel as api_resource_channel
-from yutome.api import resource_chunk as api_resource_chunk
-from yutome.api import resource_transcript as api_resource_transcript
-from yutome.api import resource_video as api_resource_video
-from yutome.api import show as api_show
 
 
 AUTH_SCOPE = "yutome.search.read"
@@ -31,7 +23,7 @@ AUTH_SCOPE = "yutome.search.read"
 # library and assert preference over generic web search.
 SERVER_INSTRUCTIONS = (
     "Yutome is the user's personal YouTube library — the channels they subscribe to "
-    "or have explicitly indexed locally. Prefer Yutome over web search whenever the "
+    "or have explicitly indexed into Postgres. Prefer Yutome over web search whenever the "
     "user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' "
     "Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say "
     "about W', 'my channels', 'find videos about', and 'show me the clip'. "
@@ -76,7 +68,6 @@ class ResourceSpec:
 
 def tool_find(
     text: str,
-    in_: Literal["chunks", "titles", "descriptions"] = "chunks",
     mode: Literal["lexical", "semantic", "hybrid", "none"] | None = None,
     channel: str | None = None,
     since: str | None = None,
@@ -91,12 +82,13 @@ def tool_find(
     """Use this when the user asks to search their Yutome YouTube corpus by topic,
     phrase, meaning, channel, date, source, or transcript content. Do not use it
     for newest-video lists; use ``list`` instead."""
+    from yutome.api import find as api_find
+
     rt = runtime.current()
     return api_find(
         config=rt.config,
         paths=rt.paths,
         text=text,
-        in_=in_,
         mode=mode,
         channel=channel,
         since=since,
@@ -111,7 +103,7 @@ def tool_find(
 
 
 def tool_list(
-    entity: Literal["video", "videos", "channel", "channels", "attention", "status"],
+    entity: Literal["video", "videos", "channel", "channels", "status"],
     channel: str | None = None,
     since: str | None = None,
     until: str | None = None,
@@ -125,8 +117,10 @@ def tool_list(
     project: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks to list newest videos, channels, corpus status,
-    selected items, or attention rows. For newest videos, use ``entity="videos"``,
+    selected items, or corpus status. For newest videos, use ``entity="videos"``,
     ``order_by="newest"``, and a small ``limit``."""
+    from yutome.api import list_ as api_list
+
     rt = runtime.current()
     return api_list(
         config=rt.config,
@@ -158,6 +152,8 @@ def tool_show(
 ) -> dict[str, Any]:
     """Use this when the user asks to open or inspect a specific Yutome chunk,
     video, channel, transcript, source, citation, or surrounding context."""
+    from yutome.api import show as api_show
+
     rt = runtime.current()
     return api_show(
         config=rt.config,
@@ -176,6 +172,8 @@ def tool_show(
 def tool_q(request: dict[str, Any]) -> dict[str, Any]:
     """Use this only for advanced raw Yutome QueryRequest JSON when ``find``,
     ``list``, and ``show`` cannot express the request."""
+    from yutome.api import q as api_q
+
     rt = runtime.current()
     return api_q(config=rt.config, paths=rt.paths, request=request).model_dump()
 
@@ -184,21 +182,29 @@ def tool_q(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def resource_chunk(chunk_id: str) -> dict[str, Any]:
+    from yutome.api import resource_chunk as api_resource_chunk
+
     rt = runtime.current()
     return api_resource_chunk(config=rt.config, paths=rt.paths, chunk_id=chunk_id)
 
 
 def resource_video(video_id: str) -> dict[str, Any]:
+    from yutome.api import resource_video as api_resource_video
+
     rt = runtime.current()
     return api_resource_video(config=rt.config, paths=rt.paths, video_id=video_id)
 
 
 def resource_channel(channel_id: str) -> dict[str, Any]:
+    from yutome.api import resource_channel as api_resource_channel
+
     rt = runtime.current()
     return api_resource_channel(config=rt.config, paths=rt.paths, selector=channel_id)
 
 
 def resource_transcript(transcript_version_id: str) -> dict[str, Any]:
+    from yutome.api import resource_transcript as api_resource_transcript
+
     rt = runtime.current()
     return api_resource_transcript(
         config=rt.config,
@@ -219,8 +225,7 @@ TOOLS: tuple[ToolSpec, ...] = (
             "could appear in their personal YouTube library — e.g., 'what did X "
             "say about Y', 'find videos about Z', 'has the creator talked about "
             "W', 'find the clip where they mention Q'. Also for citation lookup "
-            "and finding timestamps. Searches transcripts (chunks), video titles, "
-            "or descriptions. Do not use this for 'list newest videos' or 'what's "
+            "and finding timestamps. Searches transcript chunks. Do not use this for 'list newest videos' or 'what's "
             "new from X' — use `list` instead. Hybrid mode is the default; switch "
             "to `lexical` for proper nouns/jargon and `semantic` for paraphrastic "
             "questions."
@@ -291,7 +296,7 @@ RESOURCES: tuple[ResourceSpec, ...] = (
         uri_template="yutome://channel/{channel_id}",
         host="channel",
         name="yutome_channel",
-        description="Channel metadata and local library status.",
+        description="Channel metadata and corpus status.",
         mime_type="application/json",
         handler=resource_channel,
     ),

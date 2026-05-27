@@ -2,19 +2,19 @@
 
 Last researched: 2026-05-21
 
-This document records the product and architecture decision for making Yutome usable from mainstream LLM apps without turning the default product into a centrally hosted transcript database.
+This document records the product and architecture decision for making Yutome usable from mainstream LLM apps while using one Postgres + VectorChord database for catalog, lexical search, vectors, jobs, and usage records.
 
 The short version:
 
 - **Remote MCP is the primary noob product surface.** The user should connect Claude or ChatGPT to Yutome once, then ask questions in the LLM app they already use.
-- **V1 works when the user's computer is on.** The remote endpoint is a public connector front door that routes requests back to Yutome Desktop.
-- **Always-on search comes next through a user-owned replica.** The same connector can later answer from a Cloudflare-hosted mirror in the user's own account when the laptop is off.
+- **V1 works when the bridge can reach the configured database.** The remote endpoint is a public connector front door that routes requests back to Yutome Desktop or another process with access to Postgres.
+- **Always-on search comes next through a reachable Postgres deployment.** The same connector can later answer without the laptop if it is configured to use hosted Yutome infrastructure or another reachable Postgres + VectorChord database.
 - **Provider setup stays just-in-time.** Remote MCP mode must not require Voyage, Webshare, Gemini, proxy accounts, or Yutome cloud identity.
-- **Replica mode may require provider keys.** If the user wants semantic/hybrid search while the laptop is off, the cloud needs a query embedding path. For parity with the local LanceDB/Voyage index, the first design uses the user's Voyage key as a Cloudflare secret, with explicit consent.
+- **Always-on semantic search may require provider keys.** If the user wants semantic/hybrid search while the laptop is off, the query plane needs an embedding path. The Postgres + VectorChord database remains the search store.
 
 ## Product Context
 
-Yutome is a local-first YouTube antilibrary. The current product value is that a user's subscribed or selected channels become searchable, citable, exportable, and available to agents without requiring a central Yutome server. The existing docs already establish this local-first posture in [product-design.md](product-design.md) and the existing remote/API surface in [remote-access.md](remote-access.md).
+Yutome is a Postgres-backed YouTube antilibrary. The current product value is that a user's subscribed or selected channels become searchable, citable, exportable, and available to agents through the same Postgres + VectorChord retrieval contract. The existing remote/API surface is described in [remote-access.md](remote-access.md).
 
 The noob-user problem is not primarily "how do they run a server?" It is "how do they ask their normal assistant about their YouTube corpus without thinking about Yutome as an app?" Many users will not want to open a dashboard or deploy a service. They will open Claude, ChatGPT, or another assistant and ask:
 
@@ -28,7 +28,7 @@ That pushes Yutome toward a connector-first product:
 ```text
 Claude / ChatGPT / agent
   -> Yutome remote MCP connector
-  -> local or replicated Yutome corpus
+  -> Postgres + VectorChord Yutome corpus
 ```
 
 The web UI can still exist later as an inspector, but the main surface should be the user's daily-driver LLM app.
@@ -146,7 +146,7 @@ Build a **Yutome Cloud Capsule** with two product modes.
 
 This is the V1 default.
 
-The user's local machine remains the source of truth. Cloudflare only provides the public HTTPS/OAuth/MCP front door and request routing. The corpus, SQLite catalog, LanceDB index, transcript artifacts, Webshare config, Google OAuth refresh token, Gemini config, and local job state all remain on the user's computer.
+The configured Postgres + VectorChord database is the source of truth. Cloudflare only provides the public HTTPS/OAuth/MCP front door and request routing. Transcript artifacts and provider credentials remain with the configured Yutome runtime; catalog rows, lexical indexes, dense vectors, jobs, and usage records live in Postgres.
 
 Flow:
 
@@ -156,15 +156,15 @@ Claude / ChatGPT
   -> Cloudflare Worker + Durable Object session/router
   -> WebSocket bridge to Yutome Desktop (Cloudflare WebSocket Hibernation)
   -> local api.py find/list/show/q
-  -> local SQLite + LanceDB + artifacts
+  -> Postgres + VectorChord + artifacts
 ```
 
 Laptop on:
 
 - Claude/ChatGPT can call Yutome through the remote MCP connector.
-- Results come from the current local corpus and local retrieval implementation.
+- Results come from the configured Postgres + VectorChord corpus and retrieval implementation.
 - No Voyage/Webshare/Gemini/proxy account is required just to connect remotely.
-- If semantic search is already enabled locally, Desktop uses its normal local Voyage/LanceDB setup.
+- If semantic search is enabled, Desktop uses the configured query embedding path and VectorChord dense-vector indexes.
 
 Laptop off:
 
@@ -172,7 +172,7 @@ Laptop off:
 - The response should include last seen time, capsule mode, and a plain instruction to open Yutome Desktop.
 - No transcript search is available.
 
-This mode solves the "best app is no app" problem without making Yutome a hosted transcript provider.
+This mode solves the "best app is no app" problem while keeping the same Postgres search store across desktop and hosted paths.
 
 Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome serve bridge`; the bridge runs the local `find/list/show/q` or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
 
@@ -254,7 +254,7 @@ For Always-On Search Replica mode:
 - **D1** can hold channel/video/chunk/catalog metadata.
 - **R2** can hold transcript artifacts and exportable corpus files.
 - **Vectorize** can hold queryable embeddings.
-- **Worker secrets** can hold the user's Voyage key if they opt into semantic/hybrid replica parity.
+- **Worker secrets** can hold the configured embedding-provider key if they opt into semantic/hybrid replica parity.
 
 Cloudflare documents Worker secrets as encrypted text bindings for API keys and auth tokens. Source: [Cloudflare Workers secrets](https://developers.cloudflare.com/workers/configuration/secrets/).
 
@@ -333,7 +333,7 @@ Neither gives us the clean user-owned Cloudflare replica path.
 
 Zapier MCP, Pipedream MCP, and Composio-style MCP services show that users can connect one MCP endpoint to many apps, and they support major clients like Claude and ChatGPT. Sources: [Zapier MCP](https://help.zapier.com/hc/en-us/articles/36265392843917-Use-Zapier-MCP-with-your-client), [Pipedream MCP](https://pipedream.com/docs/connect/mcp/users/), [Composio MCP](https://docs.composio.dev/docs/mcp-providers).
 
-These platforms are strong for SaaS APIs and workflow actions. Yutome is different: the core data is a private local transcript/index corpus. A SaaS action platform does not remove the need to host, tunnel, or replicate that corpus.
+These platforms are strong for SaaS APIs and workflow actions. Yutome is different: the core data is a private transcript/search corpus. A SaaS action platform does not remove the need to operate, tunnel, or expose that corpus safely.
 
 ### Fully Yutome-hosted corpus
 
@@ -395,7 +395,7 @@ This distinction keeps the replica useful while avoiding accidental cloud backup
 
 Requires no new provider accounts.
 
-If the local corpus was built with lexical search only, remote MCP still works for lexical find/list/show/q. If local semantic search is configured, Desktop uses the existing local Voyage/LanceDB setup. If Webshare is not configured, that only affects future ingest reliability, not remote search over already-indexed data.
+If the configured corpus has only lexical indexes, remote MCP still works for lexical find/list/show/q. If semantic search is configured, Desktop uses the configured embedding provider and Postgres + VectorChord dense-vector indexes. If Webshare is not configured, that only affects future ingest reliability, not remote search over already-indexed data.
 
 ### Always-On Replica
 
@@ -432,7 +432,7 @@ Noob-facing copy should avoid implementation words like Worker, Durable Object, 
 
 The user-facing verb should be **connect**, not **capsule**. "Cloud Capsule" is the architecture/product name for the user-owned remote environment, but a normal user should not need to understand or type it. Remote setup should appear as a guided step inside `yutome setup`, plus a direct `yutome connect` command for users who already have a local corpus.
 
-`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after the local corpus steps. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, the user chooses which assistant they want help with (Claude, ChatGPT, both, or another MCP client), ChatGPT also requires selecting the Yutome app in each chat from `+` > `More` / composer tools, the laptop-backed V1 needs this computer and `yutome serve bridge` online, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Voyage, Webshare, Gemini, or proxy credentials.
+`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after database and corpus setup. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, the user chooses which assistant they want help with (Claude, ChatGPT, both, or another MCP client), ChatGPT also requires selecting the Yutome app in each chat from `+` > `More` / composer tools, the bridge-backed V1 needs a Yutome process that can reach Postgres, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Webshare, Gemini, or proxy credentials.
 
 Primary choice:
 
@@ -655,7 +655,7 @@ Only after usage is understood:
 
 - Claude and ChatGPT MCP connector behavior is still moving. Keep the Worker standards-based and test both clients regularly.
 - OAuth compatibility is the highest-risk implementation area. Prefer Cloudflare's existing OAuth provider library if it fits the pairing model.
-- Query parity between LanceDB local hybrid search and Vectorize/D1 cloud search may not be exact. Treat "same answer quality" as an eval target, not a guaranteed identical ranking.
+- Query parity between bridge-backed Postgres + VectorChord search and any replica-backed query path may not be exact. Treat "same answer quality" as an eval target, not a guaranteed identical ranking.
 - User-owned Cloudflare is cleaner legally and financially, but still adds a required account for always-on mode.
 - Uploading a Voyage key to Cloudflare is a meaningful trust boundary change. It must be explicit and reversible.
 
@@ -665,4 +665,4 @@ Ship **Remote Connector Only** first, using Cloudflare as a user-owned public MC
 
 Then ship **Always-On Search Replica** behind the same connector URL. The replica should be read-only, user-owned, and scoped to search/citation data. It should sync corpus data but not local secrets. Semantic replica uses Voyage parity with explicit key upload consent.
 
-Do not start with fully Yutome-hosted transcript search. That may become a paid managed tier later, but the first architecture should prove connector usage and preserve the local-first trust boundary.
+Do not introduce another search substrate for the connector. The first architecture should prove connector usage over the same Postgres + VectorChord retrieval contract used by the CLI, MCP, and HTTP surfaces.

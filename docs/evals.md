@@ -1,6 +1,6 @@
 # Retrieval Evals
 
-`yutome doctor eval` executes small local retrieval benchmarks against the current SQLite/LanceDB corpus. Evals are intentionally corpus-relative: they assert that known queries surface known videos, chunks, or terms.
+`yutome doctor eval` executes small retrieval benchmarks against the configured Postgres + VectorChord corpus. Evals are intentionally corpus-relative: they assert that known queries surface known videos, chunks, or terms.
 
 ## Format
 
@@ -35,4 +35,4 @@ uv run yutome doctor eval evals/leo-smoke.json --json
 
 ## Use
 
-Start with a tiny smoke suite before changing retrieval ranking, chunking, FTS behavior, LanceDB schema, or query projections. Add cases only when the expected hit is stable and timestamp/source quality has been inspected.
+Start with a tiny smoke suite before changing retrieval ranking, chunking, VectorChord BM25/vector schema, or query projections. Add cases only when the expected hit is stable and timestamp/source quality has been inspected.

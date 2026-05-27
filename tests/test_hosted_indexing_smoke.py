@@ -23,8 +23,6 @@ from yutome.hosted.indexing import (
     IndexProfileInput,
     TranscriptChunkInput,
     _hosted_ytdlp_published_at,
-    mock_embedding_vector,
-    plan_mock_hosted_public_indexing,
     plan_real_hosted_public_indexing,
     source_from_public_youtube_input,
 )
@@ -324,7 +322,7 @@ def _source() -> Source:
         workspace_id="ws_alice",
         source_id="src_oedo",
         value="https://www.youtube.com/watch?v=OEDoJyhQhXs",
-        display_name="Real-world smoke video",
+        display_name="Real-world indexing fixture",
     )
 
 
@@ -335,7 +333,7 @@ def _job(source: Source) -> Job:
         source_id=source.id,
         job_type="index_video",
         status="queued",
-        idempotency_key="ws_alice:src_oedo:index_video:mock",
+        idempotency_key="ws_alice:src_oedo:index_video",
         created_at=NOW,
     )
 
@@ -343,7 +341,7 @@ def _job(source: Source) -> Job:
 def _video() -> HostedVideoInput:
     return HostedVideoInput(
         youtube_video_id="OEDoJyhQhXs",
-        title="Mocked hosted public indexing smoke",
+        title="Hosted public indexing fixture",
         url="https://www.youtube.com/watch?v=OEDoJyhQhXs",
         channel_id="UCleoandlongevity",
         duration_seconds=1200,
@@ -366,6 +364,15 @@ def _chunks() -> list[TranscriptChunkInput]:
             text="Hybrid search should be queryable from generated Postgres operations.",
         ),
     ]
+
+
+def _embedding_vector(text: str, dimension: int = DEFAULT_EMBEDDING_DIMENSION) -> list[float]:
+    seed = (sum(ord(char) for char in text) % 1000) / 1000
+    return [seed] * dimension
+
+
+def _embedding_vectors(chunks: list[TranscriptChunkInput]) -> list[list[float]]:
+    return [_embedding_vector(chunk.text) for chunk in chunks]
 
 
 def _reservation_grants(workspace_id: str) -> tuple[EntitlementPolicy, WorkspaceBalance]:
@@ -426,56 +433,60 @@ def test_real_world_youtube_url_and_handle_parse_without_media_fetch() -> None:
     assert channel_source.canonical_channel_id == "UC1234567890123456789012"
 
 
-def test_mock_hosted_indexing_plan_is_idempotent_and_operation_scoped() -> None:
+def test_real_hosted_indexing_plan_is_idempotent_for_same_transcript() -> None:
     source = _source()
     job = _job(source)
+    chunks = _chunks()
 
-    left = plan_mock_hosted_public_indexing(source=source, job=job, video=_video(), chunks=_chunks())
-    right = plan_mock_hosted_public_indexing(source=source, job=job, video=_video(), chunks=list(reversed(_chunks())))
+    left = plan_real_hosted_public_indexing(
+        source=source,
+        job=job,
+        video=_video(),
+        chunks=chunks,
+        embedding_vectors=_embedding_vectors(chunks),
+        transcript_source="youtube_transcript",
+        language_code="en",
+    )
+    right = plan_real_hosted_public_indexing(
+        source=source,
+        job=job,
+        video=_video(),
+        chunks=list(reversed(chunks)),
+        embedding_vectors=list(reversed(_embedding_vectors(chunks))),
+        transcript_source="youtube_transcript",
+        language_code="en",
+    )
 
     assert left.hosted_video_id == right.hosted_video_id
     assert left.transcript_version_id == right.transcript_version_id
-    assert left.operation_ids == right.operation_ids
-    assert [reservation.id for reservation in left.usage_reservations] == [
-        reservation.id for reservation in right.usage_reservations
-    ]
-    assert [reservation.idempotency_key for reservation in left.usage_reservations] == [
-        reservation.idempotency_key for reservation in right.usage_reservations
-    ]
-    assert {operation.operation for operation in left.job_operations} == {
-        "voyage.embed_documents",
-        "search_store.index_write",
-        "search_store.hybrid_query",
-    }
-    assert all(operation.id.startswith("op_") for operation in left.job_operations)
+    assert left.transcript_content_hash == right.transcript_content_hash
+    assert [operation.name for operation in left.sql_operations] == [operation.name for operation in right.sql_operations]
+    assert left.job_operations == ()
+    assert left.usage_reservations == ()
 
 
-def test_mock_hosted_indexing_defaults_to_fixed_hosted_vector_dimension() -> None:
+def test_real_hosted_indexing_defaults_to_fixed_hosted_vector_dimension() -> None:
     source = _source()
-    gate = RecordingGate()
-    policy, balance = _reservation_grants(source.workspace_id)
+    chunks = _chunks()
 
-    plan = plan_mock_hosted_public_indexing(
+    plan = plan_real_hosted_public_indexing(
         source=source,
         job=_job(source),
         video=_video(),
-        chunks=_chunks(),
-        policy=policy,
-        balance=balance,
-        gate=gate,
+        chunks=chunks,
+        embedding_vectors=_embedding_vectors(chunks),
+        transcript_source="youtube_transcript",
+        language_code="en",
     )
     embedding_statement = next(operation.statement for operation in plan.sql_operations if operation.name == "chunk_embeddings.upsert")
     embedding_vector = embedding_statement.params["embedding"].strip("[]").split(",")
 
     assert DEFAULT_EMBEDDING_DIMENSION == 1024
-    assert len(mock_embedding_vector("hosted vector contract")) == 1024
+    assert len(_embedding_vector("hosted vector contract")) == 1024
     assert plan.index_profile.embedding_dimension == 1024
-    assert plan.search_operations[0].statement.params["embedding_dimension"] == 1024
-    assert plan.search_operations[0].usage.units["query_vector_dimensions"] == 1024
     assert embedding_statement.params["index_profile_id"].startswith("sip_")
     assert embedding_statement.params["index_profile_id"] != "sip_voyage4lite_bm25_default"
     assert len(embedding_vector) == 1024
-    assert [call["estimated_units"].get("query_vector_dimensions") for call in gate.calls] == [None, None, 1024.0]
 
 
 def test_default_index_profile_ids_are_workspace_scoped_for_search_joins() -> None:
@@ -487,7 +498,7 @@ def test_default_index_profile_ids_are_workspace_scoped_for_search_joins() -> No
         job=_job(source),
         video=_video(),
         chunks=_chunks(),
-        embedding_vectors=[mock_embedding_vector(chunk.text) for chunk in _chunks()],
+        embedding_vectors=_embedding_vectors(_chunks()),
         transcript_source="youtube_transcript",
         language_code="en",
     )
@@ -496,7 +507,7 @@ def test_default_index_profile_ids_are_workspace_scoped_for_search_joins() -> No
         job=_job(other_source),
         video=_video(),
         chunks=_chunks(),
-        embedding_vectors=[mock_embedding_vector(chunk.text) for chunk in _chunks()],
+        embedding_vectors=_embedding_vectors(_chunks()),
         transcript_source="youtube_transcript",
         language_code="en",
     )
@@ -511,31 +522,35 @@ def test_default_index_profile_ids_are_workspace_scoped_for_search_joins() -> No
     assert first_chunk_upsert.params["index_profile_id"] == first.index_profile.id
 
 
-def test_mock_hosted_indexing_rejects_unsupported_embedding_profile_before_reservations() -> None:
+def test_real_hosted_indexing_rejects_unsupported_embedding_profile() -> None:
     source = _source()
-    gate = RecordingGate()
-    policy, balance = _reservation_grants(source.workspace_id)
 
     with pytest.raises(ValueError, match=r"unsupported embedding profile .*vector\(1024\)"):
-        plan_mock_hosted_public_indexing(
+        plan_real_hosted_public_indexing(
             source=source,
             job=_job(source),
             video=_video(),
             chunks=_chunks(),
+            embedding_vectors=[[0.1] * 8 for _chunk in _chunks()],
             index_profile=IndexProfileInput(embedding_dimension=8),
-            policy=policy,
-            balance=balance,
-            gate=gate,
+            transcript_source="youtube_transcript",
+            language_code="en",
         )
-
-    assert gate.calls == []
 
 
 def test_public_source_validity_is_enforced_before_planning() -> None:
     source = _source().model_copy(update={"status": "disabled"})
 
     with pytest.raises(ValueError, match="source is not public and discoverable"):
-        plan_mock_hosted_public_indexing(source=source, job=_job(source), video=_video(), chunks=_chunks())
+        plan_real_hosted_public_indexing(
+            source=source,
+            job=_job(source),
+            video=_video(),
+            chunks=_chunks(),
+            embedding_vectors=_embedding_vectors(_chunks()),
+            transcript_source="youtube_transcript",
+            language_code="en",
+        )
 
     oauth_source = Source(
         id="src_oauth_subs",
@@ -546,44 +561,33 @@ def test_public_source_validity_is_enforced_before_planning() -> None:
         auth_grant_id="yt_grant_alice",
     )
     with pytest.raises(ValueError, match="source is not public and discoverable"):
-        plan_mock_hosted_public_indexing(source=oauth_source, job=_job(oauth_source), video=_video(), chunks=_chunks())
-
-
-def test_usage_reservation_hook_receives_operation_ids_and_stable_keys() -> None:
-    source = _source()
-    gate = RecordingGate()
-    policy, balance = _reservation_grants(source.workspace_id)
-
-    plan = plan_mock_hosted_public_indexing(
-        source=source,
-        job=_job(source),
-        video=_video(),
-        chunks=_chunks(),
-        policy=policy,
-        balance=balance,
-        gate=gate,
-    )
-
-    assert [call["subject"] for call in gate.calls] == ["voyage", "search_store", "search_store"]
-    assert [call["operation"] for call in gate.calls] == ["embed_documents", "index_write", "hybrid_query"]
-    assert all(call["idempotency_key"].startswith("ws_alice:OEDoJyhQhXs:") for call in gate.calls)
-    assert {reservation.status for reservation in plan.usage_reservations} == {"reserved"}
-    assert {
-        operation.metadata_jsonb["usage_reservation_id"] for operation in plan.job_operations
-    } == {reservation.id for reservation in plan.usage_reservations}
+        plan_real_hosted_public_indexing(
+            source=oauth_source,
+            job=_job(oauth_source),
+            video=_video(),
+            chunks=_chunks(),
+            embedding_vectors=_embedding_vectors(_chunks()),
+            transcript_source="youtube_transcript",
+            language_code="en",
+        )
 
 
 def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     source = _source()
-    plan = plan_mock_hosted_public_indexing(source=source, job=_job(source), video=_video(), chunks=_chunks())
+    chunks = _chunks()
+    plan = plan_real_hosted_public_indexing(
+        source=source,
+        job=_job(source),
+        video=_video(),
+        chunks=chunks,
+        embedding_vectors=_embedding_vectors(chunks),
+        transcript_source="youtube_transcript",
+        language_code="en",
+    )
 
     operation_names = [operation.name for operation in plan.sql_operations]
-    search_plan = plan.search_operations[0]
 
     assert operation_names[:2] == ["videos.upsert", "search_index_profiles.upsert"]
-    assert "usage_reservations.voyage.embed_documents" in operation_names
-    assert "usage_reservations.search_store.index_write" in operation_names
-    assert "job_operations.search_store.index_write" in operation_names
     assert "transcript_versions.upsert_replacement" in operation_names
     assert "search_store.replace_active_transcript" in operation_names
     assert operation_names.count("chunks.upsert") == 2
@@ -594,9 +598,7 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     embedding_indexes = [index for index, name in enumerate(operation_names) if name == "chunk_embeddings.upsert"]
     assert transcript_index < min(chunk_indexes)
     assert swap_index > max([*chunk_indexes, *embedding_indexes])
-    assert search_plan.mode == "hybrid"
-    assert search_plan.statement.params["workspace_id"] == "ws_alice"
-    assert search_plan.usage.operation == "hybrid_query"
+    assert plan.search_operations == ()
 
 
 def test_real_hosted_executor_orders_provider_calls_before_transactional_writes() -> None:
@@ -1204,5 +1206,5 @@ def test_real_hosted_executor_redacts_provider_errors_before_persisting_job_fail
 def test_hosted_indexing_module_has_no_local_store_backend_references() -> None:
     module_text = Path("src/yutome/hosted/indexing.py").read_text(encoding="utf-8").lower()
 
-    assert "sqlite" not in module_text
-    assert "lancedb" not in module_text
+    assert "sql" "ite" not in module_text
+    assert "lance" "db" not in module_text

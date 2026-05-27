@@ -4,7 +4,7 @@ from __future__ import annotations
 import typer
 
 from . import _bridge
-from . import _legacy
+from . import actions
 from .context import config_path
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run local and remote service adapters.")
@@ -17,7 +17,7 @@ app.add_typer(remote_app, name="remote")
 @app.command("mcp")
 def mcp_command(ctx: typer.Context) -> None:
     """Run the local stdio MCP server."""
-    _legacy.mcp_serve(config=config_path(ctx))
+    actions.mcp_serve(config=config_path(ctx))
 
 
 @app.command("http")
@@ -33,7 +33,7 @@ def http_command(
     ),
 ) -> None:
     """Run the local HTTP API."""
-    _legacy.http_serve(
+    actions.http_serve(
         config=config_path(ctx),
         host=host,
         port=port,
@@ -82,17 +82,7 @@ def remote_prepare(
     show_token: bool = typer.Option(False, "--show-token", help="Print the token once after writing it."),
 ) -> None:
     """Prepare authenticated remote/API access."""
-    _legacy.remote_prepare(config=config_path(ctx), rotate=rotate, show_token=show_token)
-
-
-@remote_app.command("sync")
-def remote_sync(
-    ctx: typer.Context,
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview replica sync without uploading."),
-    json_output: bool = typer.Option(False, "--json", help="Emit the dry-run manifest as JSON."),
-) -> None:
-    """Preview or run read-only replica sync."""
-    _legacy.remote_sync(config=config_path(ctx), dry_run=dry_run, json_output=json_output)
+    actions.remote_prepare(config=config_path(ctx), rotate=rotate, show_token=show_token)
 
 
 @remote_app.command("http")
@@ -103,7 +93,7 @@ def remote_http(
     cors_origin: list[str] | None = typer.Option(None, "--cors-origin", help="Allowed browser origin."),
 ) -> None:
     """Run authenticated HTTP API for remote clients."""
-    _legacy.remote_serve(config=config_path(ctx), host=host, port=port, cors_origin=cors_origin)
+    actions.remote_serve(config=config_path(ctx), host=host, port=port, cors_origin=cors_origin)
 
 
 @remote_app.command("mcp")
@@ -115,4 +105,4 @@ def remote_mcp(
     server_url: str | None = typer.Option(None, "--server-url", help="External base URL for MCP auth metadata."),
 ) -> None:
     """Run authenticated MCP over streamable HTTP."""
-    _legacy.remote_mcp(config=config_path(ctx), host=host, port=port, path=path, server_url=server_url)
+    actions.remote_mcp(config=config_path(ctx), host=host, port=port, path=path, server_url=server_url)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +29,36 @@ class HostedResourceQueries:
         if row is None:
             raise HostedResourceNotFound(kind="chunk", id_=chunk_id)
         return format_chunk_resource(row)
+
+    def context(
+        self,
+        *,
+        workspace_id: str,
+        chunk_id: str | None = None,
+        video_id: str | None = None,
+        time_seconds: int | None = None,
+        youtube_url: str | None = None,
+        token_budget: int = 3000,
+    ) -> dict[str, Any]:
+        if youtube_url:
+            parsed_video_id, parsed_time_seconds = parse_youtube_location(youtube_url)
+            video_id = video_id or parsed_video_id
+            time_seconds = time_seconds if time_seconds is not None else parsed_time_seconds
+        statement = context_anchor_sql(
+            workspace_id=workspace_id,
+            chunk_id=chunk_id,
+            video_id=video_id,
+            time_seconds=time_seconds,
+        )
+        anchor = _one(self.connection.execute(statement.sql, statement.params))
+        if anchor is None:
+            raise HostedResourceNotFound(kind="context", id_=chunk_id or video_id or youtube_url or "")
+        chunks_statement = context_chunks_sql(
+            workspace_id=workspace_id,
+            transcript_version_id=str(anchor["transcript_version_id"]),
+        )
+        transcript_chunks = _rows(self.connection.execute(chunks_statement.sql, chunks_statement.params))
+        return format_context_resource(anchor, transcript_chunks, token_budget=token_budget)
 
     def video(self, *, workspace_id: str, video_id: str) -> dict[str, Any]:
         statement = video_resource_sql(workspace_id=workspace_id, video_id=video_id)
@@ -74,6 +106,11 @@ class HostedResourceQueries:
         offset: int = 0,
         channel: str | None = None,
         video_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        language: str | None = None,
         order_by: str | None = None,
     ) -> list[dict[str, Any]]:
         statement = list_videos_sql(
@@ -82,6 +119,11 @@ class HostedResourceQueries:
             offset=offset,
             channel=channel,
             video_id=video_id,
+            since=since,
+            until=until,
+            status=status,
+            source=source,
+            language=language,
             order_by=order_by,
         )
         return [format_video_list_row(row) for row in _rows(self.connection.execute(statement.sql, statement.params))]
@@ -93,6 +135,11 @@ class HostedResourceQueries:
         limit: int,
         offset: int = 0,
         channel: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        language: str | None = None,
         selected: bool | None = None,
     ) -> list[dict[str, Any]]:
         statement = list_channels_sql(
@@ -100,6 +147,11 @@ class HostedResourceQueries:
             limit=limit,
             offset=offset,
             channel=channel,
+            since=since,
+            until=until,
+            status=status,
+            source=source,
+            language=language,
             selected=selected,
         )
         return [format_channel_list_row(row) for row in _rows(self.connection.execute(statement.sql, statement.params))]
@@ -132,6 +184,97 @@ WHERE c.workspace_id = %(workspace_id)s
 LIMIT 1;
 """.strip(),
         params={"workspace_id": workspace_id, "chunk_id": chunk_id},
+    )
+
+
+def context_anchor_sql(
+    *,
+    workspace_id: str,
+    chunk_id: str | None = None,
+    video_id: str | None = None,
+    time_seconds: int | None = None,
+) -> SqlStatement:
+    if not chunk_id and not video_id:
+        raise ValueError("context requires a chunk id, video id, or timestamped YouTube URL")
+    return SqlStatement(
+        sql="""
+SELECT
+    c.id AS chunk_id,
+    c.video_id,
+    v.youtube_video_id,
+    c.transcript_version_id,
+    c.chunk_index,
+    c.start_seconds,
+    c.end_seconds,
+    c.text,
+    c.metadata_json AS chunk_metadata,
+    v.title,
+    v.channel_id,
+    v.source_id,
+    tv.source AS transcript_source,
+    tv.language_code AS language,
+    tv.metadata_json AS transcript_metadata
+FROM chunks c
+JOIN videos v ON v.id = c.video_id AND v.workspace_id = c.workspace_id
+JOIN transcript_versions tv ON tv.id = c.transcript_version_id AND tv.workspace_id = c.workspace_id
+WHERE c.workspace_id = %(workspace_id)s
+  AND (
+    (%(chunk_id)s::text IS NOT NULL AND c.id = %(chunk_id)s::text)
+    OR (
+      %(chunk_id)s::text IS NULL
+      AND %(video_id)s::text IS NOT NULL
+      AND (v.id = %(video_id)s::text OR v.youtube_video_id = %(video_id)s::text)
+      AND v.active_transcript_version_id = c.transcript_version_id
+    )
+  )
+ORDER BY
+    CASE
+      WHEN %(time_seconds)s::integer IS NOT NULL
+       AND c.start_seconds <= %(time_seconds)s::integer
+       AND c.end_seconds >= %(time_seconds)s::integer THEN 0
+      WHEN %(chunk_id)s::text IS NOT NULL AND c.id = %(chunk_id)s::text THEN 0
+      ELSE 1
+    END,
+    abs(coalesce(c.start_seconds, 0) - coalesce(%(time_seconds)s::integer, 0)),
+    c.chunk_index
+LIMIT 1;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "chunk_id": _blank_to_none(chunk_id),
+            "video_id": _blank_to_none(video_id),
+            "time_seconds": time_seconds,
+        },
+    )
+
+
+def context_chunks_sql(*, workspace_id: str, transcript_version_id: str) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT
+    c.id AS chunk_id,
+    c.video_id,
+    v.youtube_video_id,
+    c.transcript_version_id,
+    c.chunk_index,
+    c.start_seconds,
+    c.end_seconds,
+    c.text,
+    c.metadata_json AS chunk_metadata,
+    v.title,
+    v.channel_id,
+    v.source_id,
+    tv.source AS transcript_source,
+    tv.language_code AS language,
+    tv.metadata_json AS transcript_metadata
+FROM chunks c
+JOIN videos v ON v.id = c.video_id AND v.workspace_id = c.workspace_id
+JOIN transcript_versions tv ON tv.id = c.transcript_version_id AND tv.workspace_id = c.workspace_id
+WHERE c.workspace_id = %(workspace_id)s
+  AND c.transcript_version_id = %(transcript_version_id)s
+ORDER BY c.chunk_index;
+""".strip(),
+        params={"workspace_id": workspace_id, "transcript_version_id": transcript_version_id},
     )
 
 
@@ -328,6 +471,11 @@ def list_videos_sql(
     offset: int = 0,
     channel: str | None = None,
     video_id: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+    language: str | None = None,
     order_by: str | None = None,
 ) -> SqlStatement:
     order_clause = {
@@ -359,6 +507,7 @@ SELECT
     count(c.id) FILTER (WHERE c.transcript_version_id = v.active_transcript_version_id) AS active_chunk_count
 FROM videos v
 LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
+LEFT JOIN transcript_versions tv ON tv.id = v.active_transcript_version_id AND tv.workspace_id = v.workspace_id
 LEFT JOIN chunks c ON c.video_id = v.id AND c.workspace_id = v.workspace_id
 WHERE v.workspace_id = %(workspace_id)s
   AND (%(video_id)s::text IS NULL OR v.id = %(video_id)s::text OR v.youtube_video_id = %(video_id)s::text)
@@ -370,6 +519,25 @@ WHERE v.workspace_id = %(workspace_id)s
     OR s.canonical_channel_id = %(channel)s::text
     OR s.display_name = %(channel)s::text
   )
+  AND (%(since)s::timestamptz IS NULL OR v.published_at >= %(since)s::timestamptz)
+  AND (%(until)s::timestamptz IS NULL OR v.published_at <= %(until)s::timestamptz)
+  AND (
+    %(status)s::text IS NULL
+    OR COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) = %(status)s::text
+    OR (
+      %(status_prefix)s::text IS NOT NULL
+      AND COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) LIKE %(status_prefix)s::text
+    )
+  )
+  AND (
+    %(source)s::text IS NULL
+    OR tv.source = %(source)s::text
+    OR tv.source LIKE %(source_prefix)s::text
+    OR s.id = %(source)s::text
+    OR s.source_url = %(source)s::text
+    OR s.import_source = %(source)s::text
+  )
+  AND (%(language)s::text IS NULL OR tv.language_code = %(language)s::text)
 GROUP BY v.id, s.id
 ORDER BY {order_clause}
 LIMIT %(limit)s
@@ -379,6 +547,13 @@ OFFSET %(offset)s;
             "workspace_id": workspace_id,
             "video_id": video_id,
             "channel": channel,
+            "since": _blank_to_none(since),
+            "until": _blank_to_none(until),
+            "status": _status_exact(status),
+            "status_prefix": _status_prefix(status),
+            "source": _blank_to_none(source),
+            "source_prefix": _prefix(source),
+            "language": _blank_to_none(language),
             "limit": max(1, min(limit, 200)),
             "offset": max(0, offset),
         },
@@ -391,6 +566,11 @@ def list_channels_sql(
     limit: int,
     offset: int = 0,
     channel: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+    language: str | None = None,
     selected: bool | None = None,
 ) -> SqlStatement:
     return SqlStatement(
@@ -419,7 +599,27 @@ channel_videos AS (
         max(v.published_at) AS latest_published_at
     FROM videos v
     LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
+    LEFT JOIN transcript_versions tv ON tv.id = v.active_transcript_version_id AND tv.workspace_id = v.workspace_id
     WHERE v.workspace_id = %(workspace_id)s
+      AND (%(since)s::timestamptz IS NULL OR v.published_at >= %(since)s::timestamptz)
+      AND (%(until)s::timestamptz IS NULL OR v.published_at <= %(until)s::timestamptz)
+      AND (
+        %(status)s::text IS NULL
+        OR COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) = %(status)s::text
+        OR (
+          %(status_prefix)s::text IS NOT NULL
+          AND COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) LIKE %(status_prefix)s::text
+        )
+      )
+      AND (
+        %(source)s::text IS NULL
+        OR tv.source = %(source)s::text
+        OR tv.source LIKE %(source_prefix)s::text
+        OR s.id = %(source)s::text
+        OR s.source_url = %(source)s::text
+        OR s.import_source = %(source)s::text
+      )
+      AND (%(language)s::text IS NULL OR tv.language_code = %(language)s::text)
     GROUP BY COALESCE(v.channel_id, s.canonical_channel_id)
 )
 SELECT
@@ -449,6 +649,13 @@ OFFSET %(offset)s;
         params={
             "workspace_id": workspace_id,
             "channel": channel,
+            "since": _blank_to_none(since),
+            "until": _blank_to_none(until),
+            "status": _status_exact(status),
+            "status_prefix": _status_prefix(status),
+            "source": _blank_to_none(source),
+            "source_prefix": _prefix(source),
+            "language": _blank_to_none(language),
             "selected": selected,
             "limit": max(1, min(limit, 200)),
             "offset": max(0, offset),
@@ -562,6 +769,58 @@ def format_transcript_resource(rows: list[Mapping[str, Any]], *, offset: int = 0
     )
 
 
+def format_context_resource(anchor: Mapping[str, Any], chunks: list[Mapping[str, Any]], *, token_budget: int) -> dict[str, Any]:
+    bounded_budget = max(200, min(int(token_budget), 8000))
+    anchor_id = str(anchor["chunk_id"])
+    anchor_index = next((index for index, row in enumerate(chunks) if str(row.get("chunk_id")) == anchor_id), None)
+    if anchor_index is None:
+        chunks = [anchor]
+        anchor_index = 0
+    selected_indexes = {anchor_index}
+    total_tokens = _chunk_token_count(chunks[anchor_index])
+    left = anchor_index - 1
+    right = anchor_index + 1
+    while left >= 0 or right < len(chunks):
+        added = False
+        for index in (left, right):
+            if index < 0 or index >= len(chunks) or index in selected_indexes:
+                continue
+            candidate_tokens = _chunk_token_count(chunks[index])
+            if total_tokens + candidate_tokens > bounded_budget and selected_indexes:
+                continue
+            selected_indexes.add(index)
+            total_tokens += candidate_tokens
+            added = True
+        left -= 1
+        right += 1
+        if not added:
+            break
+    selected_chunks = [chunks[index] for index in sorted(selected_indexes)]
+    formatted_chunks = [format_chunk_resource(chunk) for chunk in selected_chunks]
+    text = _merge_chunk_text([str(chunk.get("text") or "") for chunk in selected_chunks])
+    return {
+        "anchor": format_chunk_resource(anchor),
+        "token_budget": bounded_budget,
+        "estimated_tokens": total_tokens,
+        "text": text,
+        "chunks": formatted_chunks,
+        "citations": [
+            {
+                "chunk_id": chunk["chunk_id"],
+                "video_id": chunk["video_id"],
+                "youtube_video_id": chunk.get("youtube_video_id"),
+                "title": chunk.get("title"),
+                "youtube_url": chunk.get("youtube_url"),
+                "start_ms": chunk.get("start_ms"),
+                "end_ms": chunk.get("end_ms"),
+                "transcript_version_id": chunk.get("transcript_version_id"),
+                "transcript_source": chunk.get("transcript_source"),
+            }
+            for chunk in formatted_chunks
+        ],
+    }
+
+
 def format_source_resource(row: Mapping[str, Any]) -> dict[str, Any]:
     source_id = str(row["source_id"])
     return _compact(
@@ -666,6 +925,58 @@ def _timestamped_text(row: Mapping[str, Any]) -> str:
     return f"[{_format_timestamp(start_ms)}] {text}"
 
 
+def parse_youtube_location(url: str) -> tuple[str | None, int | None]:
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    video_id = query.get("v", [None])[0]
+    if parsed.hostname and "youtu.be" in parsed.hostname:
+        path_id = parsed.path.strip("/")
+        video_id = path_id or video_id
+    time_seconds = _parse_time_seconds(query.get("t", [None])[0] or query.get("start", [None])[0])
+    return video_id, time_seconds
+
+
+def _parse_time_seconds(value: str | None) -> int | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if normalized.isdigit():
+        return int(normalized)
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", normalized)
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _chunk_token_count(row: Mapping[str, Any]) -> int:
+    metadata_count = _metadata_value(row.get("chunk_metadata"), "token_count")
+    if isinstance(metadata_count, int) and metadata_count > 0:
+        return metadata_count
+    return max(1, len(str(row.get("text") or "").split()))
+
+
+def _merge_chunk_text(parts: list[str]) -> str:
+    merged_words: list[str] = []
+    for part in parts:
+        words = part.split()
+        if not words:
+            continue
+        if not merged_words:
+            merged_words.extend(words)
+            continue
+        max_overlap = min(150, len(merged_words), len(words))
+        overlap = 0
+        for size in range(max_overlap, 0, -1):
+            if merged_words[-size:] == words[:size]:
+                overlap = size
+                break
+        merged_words.extend(words[overlap:])
+    return " ".join(merged_words).strip()
+
+
 def _format_timestamp(ms: int) -> str:
     total = ms // 1000
     hours, remainder = divmod(total, 3600)
@@ -691,6 +1002,32 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _prefix(value: str | None) -> str | None:
+    stripped = _blank_to_none(value)
+    return f"{stripped}%" if stripped else None
+
+
+def _status_exact(value: str | None) -> str | None:
+    stripped = _blank_to_none(value)
+    if not stripped or stripped.endswith("*"):
+        return None
+    return stripped
+
+
+def _status_prefix(value: str | None) -> str | None:
+    stripped = _blank_to_none(value)
+    if not stripped or not stripped.endswith("*"):
+        return None
+    return f"{stripped[:-1]}%"
+
+
 def _compact(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -700,7 +1037,10 @@ __all__ = [
     "HostedResourceQueries",
     "TRANSCRIPT_TEXT_CAP",
     "channel_resource_sql",
+    "context_anchor_sql",
+    "context_chunks_sql",
     "chunk_resource_sql",
+    "format_context_resource",
     "format_channel_list_row",
     "format_status_row",
     "format_video_list_row",

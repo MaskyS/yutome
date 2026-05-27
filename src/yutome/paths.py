@@ -26,8 +26,6 @@ class ProjectPaths:
     root: Path
     data_dir: Path
     artifacts_dir: Path
-    catalog_db: Path
-    lancedb_dir: Path
     portable_export_dir: Path
     obsidian_export_dir: Path
     logs_dir: Path
@@ -41,8 +39,6 @@ class ProjectPaths:
             root=root,
             data_dir=data_dir,
             artifacts_dir=artifacts_dir,
-            catalog_db=resolve_under(data_dir, config.storage.catalog_path),
-            lancedb_dir=resolve_under(data_dir, config.storage.lancedb_path),
             portable_export_dir=data_dir / "exports" / "portable-md",
             obsidian_export_dir=data_dir / "exports" / "obsidian",
             logs_dir=data_dir / "logs",
@@ -52,8 +48,6 @@ class ProjectPaths:
         for directory in (
             self.artifacts_dir / "channels",
             self.artifacts_dir / "videos",
-            self.catalog_db.parent,
-            self.lancedb_dir,
             self.portable_export_dir,
             self.obsidian_export_dir,
             self.logs_dir,

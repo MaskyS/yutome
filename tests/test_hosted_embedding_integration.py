@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from yutome.config import default_config
-from yutome.db import bootstrap_catalog, connect_catalog
-from yutome.embeddings import _embed_voyage_batch, _embed_voyage_query, embed_pending_chunks
+from yutome.embeddings import _embed_voyage_batch, _embed_voyage_query
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.models import (
     EntitlementPolicy,
@@ -126,7 +123,7 @@ def test_voyage_batch_without_hosted_context_uses_direct_provider_call(monkeypat
 
     monkeypatch.setattr(voyageai, "Client", FakeClient)
 
-    records = _embed_voyage_batch(
+    vectors = _embed_voyage_batch(
         _batch(),
         model="voyage-4-lite",
         dimension=1024,
@@ -142,7 +139,7 @@ def test_voyage_batch_without_hosted_context_uses_direct_provider_call(monkeypat
             "output_dimension": 1024,
         }
     ]
-    assert [record["vector"] for record in records] == [[0.1, 0.2], [0.3, 0.4]]
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
 
 
 def test_hosted_voyage_batch_records_normalized_usage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,7 +155,7 @@ def test_hosted_voyage_batch_records_normalized_usage(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(voyageai, "Client", FakeClient)
 
-    records = _embed_voyage_batch(
+    vectors = _embed_voyage_batch(
         _batch(),
         model="voyage-4-lite",
         dimension=1024,
@@ -167,7 +164,7 @@ def test_hosted_voyage_batch_records_normalized_usage(monkeypatch: pytest.Monkey
         hosted_context=_context(ledger),
     )
 
-    assert [record["chunk_id"] for record in records] == ["chunk-a", "chunk-b"]
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
     succeeded = ledger.events[1]
     assert succeeded.subject == "voyage"
@@ -201,7 +198,7 @@ def test_hosted_voyage_batch_retry_uses_one_reservation_and_one_success_charge(
 
     monkeypatch.setattr(voyageai, "Client", FakeClient)
 
-    records = _embed_voyage_batch(
+    vectors = _embed_voyage_batch(
         _batch(),
         model="voyage-4-lite",
         dimension=1024,
@@ -211,7 +208,7 @@ def test_hosted_voyage_batch_retry_uses_one_reservation_and_one_success_charge(
     )
 
     assert calls == 2
-    assert [record["chunk_id"] for record in records] == ["chunk-a", "chunk-b"]
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
     assert len(gate.reserve_calls) == 1
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
     assert len({event.reservation_id for event in ledger.events}) == 1
@@ -287,97 +284,3 @@ def test_hosted_voyage_query_records_normalized_usage(monkeypatch: pytest.Monkey
     assert succeeded.actual_units["total_tokens"] == 7
     assert succeeded.actual_units["vectors"] == 1
     assert succeeded.metadata["input_type"] == "query"
-
-
-def test_embed_pending_chunks_uses_opt_in_hosted_context_factory(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    ledger = RecordingLedger()
-    batches_seen: list[list[str]] = []
-
-    class FakeClient:
-        def embed(self, texts: list[str], **kwargs: Any) -> FakeVoyageResponse:
-            assert texts == ["first chunk", "second chunk"]
-            return FakeVoyageResponse(embeddings=[[0.1, 0.2], [0.3, 0.4]], usage={"total_tokens": 11})
-
-    import voyageai
-
-    monkeypatch.setattr(voyageai, "Client", FakeClient)
-    db_path = tmp_path / "catalog.db"
-    bootstrap_catalog(db_path)
-    config = default_config()
-    config = config.model_copy(
-        update={
-            "embeddings": config.embeddings.model_copy(
-                update={
-                    "enabled": True,
-                    "batch_size": 2,
-                    "concurrency": 1,
-                    "max_retries": 0,
-                    "retry_base_seconds": 0.0,
-                }
-            )
-        }
-    )
-
-    with connect_catalog(db_path) as connection:
-        _insert_pending_chunks(connection)
-
-        def context_factory(batch: list[dict[str, Any]]) -> ProviderCallContext:
-            batches_seen.append([row["chunk_id"] for row in batch])
-            return _context(
-                ledger,
-                estimated_units={"total_tokens": sum(float(row["token_count"] or 0) for row in batch)},
-            )
-
-        stats = embed_pending_chunks(
-            connection=connection,
-            config=config,
-            lancedb_dir=tmp_path / "lancedb",
-            hosted_context_factory=context_factory,
-        )
-
-        embedded_count = connection.execute(
-            "SELECT COUNT(*) FROM embeddings WHERE index_status = 'indexed'"
-        ).fetchone()[0]
-
-    assert stats.embedded_chunks == 2
-    assert batches_seen == [["chunk-a", "chunk-b"]]
-    assert embedded_count == 2
-    assert [event.status for event in ledger.events] == ["started", "succeeded"]
-    assert ledger.events[1].actual_units["total_tokens"] == 11
-    assert ledger.events[1].actual_units["vectors"] == 2
-
-
-def _insert_pending_chunks(connection: Any) -> None:
-    connection.execute("INSERT INTO channels(channel_id, title) VALUES ('chan-1', 'Test Channel')")
-    connection.execute(
-        """
-        INSERT INTO videos(video_id, channel_id, title, description, ingest_status)
-        VALUES ('vid-1', 'chan-1', 'Video', 'Description', 'indexed')
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO transcript_versions(
-            transcript_version_id, video_id, source, language, is_generated,
-            raw_path, normalized_path, text_hash, segment_count, active
-        )
-        VALUES ('tx-1', 'vid-1', 'captions', 'en', 1, 'raw.json', 'normalized.jsonl', 'hash', 2, 1)
-        """
-    )
-    connection.executemany(
-        """
-        INSERT INTO chunks(
-            chunk_id, transcript_version_id, video_id, channel_id, sequence,
-            start_ms, end_ms, text, token_count, text_hash, chunker_version
-        )
-        VALUES (?, 'tx-1', 'vid-1', 'chan-1', ?, ?, ?, ?, ?, ?, 'test-v1')
-        """,
-        [
-            ("chunk-a", 0, 0, 1000, "first chunk", 2, "hash-a"),
-            ("chunk-b", 1, 1000, 2000, "second chunk", 3, "hash-b"),
-        ],
-    )
-    connection.commit()

@@ -22,9 +22,9 @@ This plan treats billing as an output of the usage ledger, not as the first syst
 
 The implementation should move Yutome from a user-operated local stack to a hosted account model. The main product win is setup: the user signs into Yutome once, chooses sources, and connects ChatGPT or Claude to hosted MCP. Yutome owns provider credentials, job execution, search storage, usage gating, and billing export.
 
-### Current State
+### Pre-Cutover State
 
-Today, setup and ingest are mostly user-operated. A user needs a local machine, local config, local databases, provider credentials, and the Cloudflare relay path to expose the local MCP server to hosted clients.
+Before the Postgres cutover, setup and ingest were mostly user-operated. A user needed a local machine, local config, split local databases, provider credentials, and the Cloudflare relay path to expose the local MCP server to hosted clients. This section is retained as requirement evidence, not as a mode to preserve.
 
 ```mermaid
 flowchart LR
@@ -36,20 +36,20 @@ flowchart LR
   local_runtime --> gemini["Gemini cleanup or fallback transcription"]
   local_runtime --> voyage["Voyage document embeddings"]
   local_runtime --> webshare["Webshare proxy use"]
-  local_runtime --> sqlite["SQLite + FTS5"]
-  local_runtime --> lancedb["LanceDB vector store"]
-  sqlite --> local_query["Local lexical / metadata query"]
+  local_runtime --> sqlite["Former SQLite + FTS5"]
+  local_runtime --> lancedb["Former LanceDB vector store"]
+  sqlite --> local_query["Former local lexical / metadata query"]
   lancedb --> local_query
   local_query --> local_mcp["Local MCP server"]
   local_mcp --> relay["Cloudflare Worker + Durable Object relay"]
   relay --> clients["ChatGPT / Claude / MCP clients"]
 ```
 
-Current-state friction:
+Pre-cutover friction:
 
 - The user has to configure several provider accounts or keys before the product feels useful.
 - Ingest depends on the local machine staying online.
-- Search state is split across SQLite and LanceDB.
+- Search state was split across SQLite and LanceDB.
 - Cloudflare is mostly a relay to the user machine, not the owner of hosted product state.
 - Usage and spending are hard to enforce before provider calls because credentials and execution live locally.
 
@@ -183,7 +183,7 @@ These constraints should shape the implementation:
 
 - Hosted V1 should assume one hosted Postgres substrate for searchable hosted state. VectorChord Suite is the first implementation path, including on Railway through a custom Postgres service/image. Railway Postgres/pgvector + Postgres FTS is the fallback if VectorChord database operations are not ready for paid production.
 - Billing implementation target is Polar for V1, but pricing, packaging, and future billing-provider optionality remain open. Usage records should stay billing-neutral and exportable.
-- Current Yutome code already has working provider integrations. The first move should wrap those call sites, but the storage/search target is a replacement of SQLite + LanceDB, not compatibility with them.
+- Yutome code already has working provider integrations. The first move should wrap those call sites, but the storage/search target is a replacement of SQLite + LanceDB, not compatibility with them.
 - Do not design for backwards compatibility with SQLite FTS5 or LanceDB. Use the current codebase to extract requirements and tests; the product path is hosted Postgres with VectorChord Suite by default and pgvector/FTS as the fallback behind the same search-store contract.
 - Hosted provider credentials must never be shipped to local clients or MCP clients.
 - YouTube OAuth grants are for source discovery and should not be confused with Gemini, Voyage, or Webshare credentials.
@@ -215,11 +215,11 @@ Codebase sources:
 - `src/yutome/youtube.py`: YouTube transcript fetching, yt-dlp integration, Webshare proxy support, and 402-style payment classification.
 - `src/yutome/youtube_oauth.py`: desktop YouTube OAuth subscription import.
 - `src/yutome/youtube_import.py`: public channel import and browser-cookie based import.
-- `src/yutome/store.py`: current transcript attempt tracking.
-- `src/yutome/db.py`: current SQLite schema used only as requirement evidence for the new Postgres schema, including the currently underused `jobs` table.
-- `src/yutome/query.py`: current lexical, semantic, hybrid, filter, fallback, and grouping behavior.
-- `src/yutome/embeddings.py`: current Voyage embedding and LanceDB write path to replace with VectorChord writes.
-- `src/yutome/config.py`: current vector backend configuration to simplify around Postgres + VectorChord.
+- `src/yutome/store.py`: transcript attempt tracking.
+- `src/yutome/db.py`: former SQLite schema used only as requirement evidence for the new Postgres schema, including the formerly underused `jobs` table.
+- `src/yutome/query.py`: lexical, semantic, hybrid, filter, fallback, and grouping behavior.
+- `src/yutome/embeddings.py`: former Voyage embedding and LanceDB write path to replace with VectorChord writes.
+- `src/yutome/config.py`: vector backend configuration to simplify around Postgres + VectorChord.
 - `src/yutome/remote_connection.py`: local remote connection state.
 - `cloudflare/yutome-capsule/src/index.ts`: current Cloudflare Worker OAuth, pairing, MCP, relay, and health endpoints.
 - `cloudflare/yutome-capsule/src/yutome-mcp-agent.ts`: MCP tools/resources generated from the local contract.
@@ -368,7 +368,7 @@ Current product direction:
    OAuth subscriptions are useful, but public channel URLs, handles, playlists, and existing import paths remain important.
 
 6. Product search should use one hosted Postgres substrate with VectorChord Suite by default.
-   Current Yutome splits canonical rows across SQLite/FTS5 and a derived LanceDB vector table. The new product should not reproduce that split. Use Postgres for relational metadata, transcript chunks, jobs, usage ledger rows, dense embeddings, VectorChord BM25 lexical indexes, vector indexes, and hybrid query plans. Start with VectorChord Suite; use Railway Postgres/pgvector + Postgres FTS only as the fallback if VectorChord operations are not ready for paid production.
+   The former product split canonical rows across SQLite/FTS5 and a derived LanceDB vector table. The new product should not reproduce that split. Use Postgres for relational metadata, transcript chunks, jobs, usage ledger rows, dense embeddings, VectorChord BM25 lexical indexes, vector indexes, and hybrid query plans. Start with VectorChord Suite; use Railway Postgres/pgvector + Postgres FTS only as the fallback if VectorChord operations are not ready for paid production.
 
 7. Hosted ingest should use Railway first, with Modal kept for burst/backfill execution.
    Railway gives the simplest one-project hoster experience for app/API, always-on workers, cron tick, Postgres, private networking, variables, and logs. Modal fits bursty `yt-dlp`, provider, and media work if Railway workers become too idle-heavy or need stronger burst scaling. Fly Machines remain useful as an alternate self-operated worker pool. None of these runtimes remove the need for Postgres-backed job leasing and stuck-job recovery.
@@ -1096,14 +1096,14 @@ Official behavior to model:
 - PostgreSQL can own durable job dispatch with `FOR UPDATE SKIP LOCKED`; `LISTEN/NOTIFY` can be a wakeup optimization but should not be the durable queue.
 - VectorChord Cloud currently documents no HA support, so production hosted Yutome should evaluate self-managed Postgres, a Postgres host that supports these extensions, or a non-HA early-access posture before relying on VectorChord Cloud itself.
 
-Current Yutome behavior that defines replacement requirements:
+Former Yutome behavior that defines replacement requirements:
 
-- SQLite is currently the canonical store for channels, videos, transcript versions, chunks, transcript attempts, and jobs. Replace this with Postgres tables; do not migrate existing corpora.
-- SQLite FTS5 currently backs lexical chunk and video title/description search through `chunks_fts` and `videos_fts`. Replace this with BM25 columns and indexes.
-- LanceDB is currently a derived vector index for active transcript chunks. Replace this with VectorChord vector columns/indexes.
-- Hybrid search currently uses LanceDB hybrid recall when available and falls back to SQLite lexical search when vector setup or Voyage credentials are missing. Reimplement the behavior over BM25 + VectorChord, but do not promise identical ranking or raw syntax.
-- Pure semantic search currently fails loudly when vector setup or Voyage credentials are missing.
-- Group-by-video is currently post-processed in application code.
+- SQLite was the canonical store for channels, videos, transcript versions, chunks, transcript attempts, and jobs. Replace this with Postgres tables; do not migrate existing corpora.
+- SQLite FTS5 backed lexical chunk and video title/description search through `chunks_fts` and `videos_fts`. Replace this with BM25 columns and indexes.
+- LanceDB was a derived vector index for active transcript chunks. Replace this with VectorChord vector columns/indexes.
+- Hybrid search used LanceDB hybrid recall when available and fell back to SQLite lexical search when vector setup or Voyage credentials were missing. Reimplement the behavior over BM25 + VectorChord, but do not promise identical ranking or raw syntax.
+- Pure semantic search failed loudly when vector setup or Voyage credentials were missing.
+- Group-by-video was post-processed in application code.
 - Raw FTS5 query syntax should not carry forward. Define a new advanced query syntax if users need power-user lexical controls.
 - Current source modeling splits library channels and library sources. New Postgres modeling should collapse this into one `sources` table with typed targets and selection state.
 - Current transcript replacement deletes active chunks. New Postgres modeling should use immutable transcript versions plus `videos.active_transcript_version_id` and atomic pointer swaps.
@@ -1147,7 +1147,7 @@ Search-store operations:
 
 Table direction:
 
-- Use the current SQLite logical tables as requirement input, not as a table-by-table port.
+- Use the former SQLite logical tables as requirement input, not as a table-by-table port.
 - Collapse `library_channels` and `library_sources` into one `sources` table with `source_type`, `source_url`, canonical YouTube refs, `selected`, `import_source`, `auth_grant_id`, and `metadata jsonb`.
 - Put `workspace_id` on every product data table and every indexable row.
 - Add `videos.active_transcript_version_id`; search joins should require `chunks.transcript_version_id = videos.active_transcript_version_id`.

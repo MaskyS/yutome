@@ -131,7 +131,7 @@ all of them.
 
 ## 4. Search and retrieval
 
-- **search store** — the hosted Postgres + VectorChord database that holds chunks,
+- **search store** — the Postgres + VectorChord database that holds chunks,
   embeddings, and indexes and answers queries. (**Canonical** — replaces "search
   substrate" and "hosted database.") [code: `search_store.SearchStore`]
 - **lexical query** — full-text / BM25 search. Needs no provider allocation but still

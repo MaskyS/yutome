@@ -9,7 +9,6 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
-from yutome.db import catalog_is_initialized, connect_catalog
 from yutome.paths import ProjectPaths
 
 
@@ -280,30 +279,25 @@ def _fetch_relay_status(state: RemoteConnectionState, *, timeout: float) -> dict
 
 def build_sync_dry_run_manifest(paths: ProjectPaths) -> dict[str, Any]:
     counts = {
-        "channels": 0,
-        "library_channels": 0,
-        "videos": 0,
-        "transcript_versions": 0,
-        "chunks": 0,
-        "embeddings": 0,
         "transcript_artifact_files": 0,
+        "remote_state_files": 0,
     }
-    if catalog_is_initialized(paths.catalog_db):
-        with connect_catalog(paths.catalog_db) as connection:
-            for table in ("channels", "library_channels", "videos", "transcript_versions", "chunks", "embeddings"):
-                row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
-                counts[table] = int(row["count"] if row is not None else 0)
     transcript_root = paths.artifacts_dir / "videos"
     if transcript_root.exists():
         counts["transcript_artifact_files"] = sum(
             1 for path in transcript_root.glob("*/transcripts/*/*") if path.is_file()
         )
+    remote_root = paths.data_dir / REMOTE_STATE_DIRNAME
+    if remote_root.exists():
+        counts["remote_state_files"] = sum(1 for path in remote_root.glob("*") if path.is_file())
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "dry_run",
         "would_sync": counts,
         "excluded_secret_classes": list(EXCLUDED_SECRET_CLASSES),
         "upload_performed": False,
+        "database": "postgres",
+        "replica_sync": "removed",
     }
 
 

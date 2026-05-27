@@ -30,7 +30,7 @@ from yutome.hosted.models import (
 from yutome.hosted.normalizers import normalize_search_store_usage
 from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied
 from yutome.hosted.resources import HostedResourceNotFound
-from yutome.hosted.search_store import SearchStore
+from yutome.hosted.search_store import SearchFilters, SearchStore
 from yutome.query import QueryResult
 
 
@@ -240,14 +240,21 @@ class HostedMcpQueryAdapter:
     ) -> QueryResult:
         estimate = estimate_search_store_query(
             operation="lexical_query",
-            candidate_limit=request.limit,
+            candidate_limit=_search_limit(request),
         )
         reservation = self._reserve_search_store(auth=auth, request=request, estimate=estimate)
         try:
+            search_kwargs: dict[str, Any] = {
+                "workspace_id": auth.workspace_id,
+                "query": request.text,
+                "limit": _search_limit(request),
+            }
+            if _search_offset(request):
+                search_kwargs["offset"] = _search_offset(request)
+            if request.filters != SearchFilters():
+                search_kwargs["filters"] = request.filters
             rows, usage = self.search_store.lexical_search(
-                workspace_id=auth.workspace_id,
-                query=request.text,
-                limit=request.limit,
+                **search_kwargs,
             )
         except Exception as exc:
             self._record_search_store_failure(
@@ -264,17 +271,13 @@ class HostedMcpQueryAdapter:
             usage=usage,
             metadata=fallback_metadata,
         )
-        return QueryResult(
-            rows=[_contract_find_row(row, project=request.project) for row in rows],
-            notes=request.notes,
-            total=None,
-        )
+        return _find_query_result(rows=rows, request=request, backend=usage.backend)
 
     def _find_vector(self, *, auth: HostedMcpAuthContext, request: HostedFindRequest) -> QueryResult:
         search_operation = "semantic_query" if request.mode == "semantic" else "hybrid_query"
         search_estimate = estimate_search_store_query(
             operation=search_operation,
-            candidate_limit=request.limit,
+            candidate_limit=_search_limit(request),
             query_vector_dimensions=self.embedding_dimension,
         )
         try:
@@ -370,17 +373,31 @@ class HostedMcpQueryAdapter:
 
         try:
             if request.mode == "semantic":
+                semantic_kwargs: dict[str, Any] = {
+                    "workspace_id": auth.workspace_id,
+                    "query_vector": query_vector,
+                    "limit": _search_limit(request),
+                }
+                if _search_offset(request):
+                    semantic_kwargs["offset"] = _search_offset(request)
+                if request.filters != SearchFilters():
+                    semantic_kwargs["filters"] = request.filters
                 rows, usage = self.search_store.semantic_search(
-                    workspace_id=auth.workspace_id,
-                    query_vector=query_vector,
-                    limit=request.limit,
+                    **semantic_kwargs,
                 )
             else:
+                hybrid_kwargs: dict[str, Any] = {
+                    "workspace_id": auth.workspace_id,
+                    "query": request.text,
+                    "query_vector": query_vector,
+                    "limit": _search_limit(request),
+                }
+                if _search_offset(request):
+                    hybrid_kwargs["offset"] = _search_offset(request)
+                if request.filters != SearchFilters():
+                    hybrid_kwargs["filters"] = request.filters
                 rows, usage = self.search_store.hybrid_search(
-                    workspace_id=auth.workspace_id,
-                    query=request.text,
-                    query_vector=query_vector,
-                    limit=request.limit,
+                    **hybrid_kwargs,
                 )
         except Exception as exc:
             if request.mode == "hybrid" and _search_store_exception_allows_lexical_fallback(exc):
@@ -411,11 +428,7 @@ class HostedMcpQueryAdapter:
             )
             raise
         self._record_search_store_success(auth=auth, reservation=search_reservation, rows=rows, usage=usage)
-        return QueryResult(
-            rows=[_contract_find_row(row, project=request.project) for row in rows],
-            notes=request.notes,
-            total=None,
-        )
+        return _find_query_result(rows=rows, request=request, backend=usage.backend)
 
     def _find_lexical_fallback(
         self,
@@ -719,13 +732,23 @@ class HostedMcpQueryAdapter:
             metadata={
                 "transcript_offset": request.transcript_offset,
                 "transcript_limit": request.transcript_limit,
+                "token_budget": request.token_budget,
             }
-            if request.kind == "transcript"
+            if request.kind in {"context", "transcript"}
             else None,
         )
         try:
             if request.kind == "chunk":
                 result = self.search_store.resource_chunk(workspace_id=auth.workspace_id, chunk_id=request.id_)
+            elif request.kind == "context":
+                result = self.search_store.resource_context(
+                    workspace_id=auth.workspace_id,
+                    chunk_id=request.id_ or None,
+                    video_id=request.video_id,
+                    time_seconds=request.time_seconds,
+                    youtube_url=request.youtube_url,
+                    token_budget=request.token_budget,
+                )
             elif request.kind == "video":
                 result = self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=request.id_)
             elif request.kind == "channel":
@@ -742,7 +765,7 @@ class HostedMcpQueryAdapter:
             else:
                 raise HostedMcpError(
                     code="unsupported_show_kind",
-                    message="Hosted MCP show currently supports chunk, video, channel, transcript, and source.",
+                    message="Hosted MCP show supports chunk, context, video, channel, transcript, and source.",
                     status_code=501,
                     data=_capability_data(
                         capability="show",
@@ -784,6 +807,11 @@ class HostedMcpQueryAdapter:
             offset=request.offset,
             metadata={
                 "channel": request.channel,
+                "since": request.since,
+                "until": request.until,
+                "status": request.status,
+                "source": request.source,
+                "language": request.language,
                 "selected": request.selected,
                 "order_by": request.order_by,
             },
@@ -792,21 +820,25 @@ class HostedMcpQueryAdapter:
             if request.entity == "status":
                 rows = [self.search_store.list_status(workspace_id=auth.workspace_id)]
             elif request.entity == "video":
-                rows = self.search_store.list_videos(
-                    workspace_id=auth.workspace_id,
-                    limit=request.limit,
-                    offset=request.offset,
-                    channel=request.channel,
-                    order_by=request.order_by,
-                )
+                list_kwargs: dict[str, Any] = {
+                    "workspace_id": auth.workspace_id,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "channel": request.channel,
+                    "order_by": request.order_by,
+                }
+                _add_optional_list_filters(list_kwargs, request)
+                rows = self.search_store.list_videos(**list_kwargs)
             elif request.entity == "channel":
-                rows = self.search_store.list_channels(
-                    workspace_id=auth.workspace_id,
-                    limit=request.limit,
-                    offset=request.offset,
-                    channel=request.channel,
-                    selected=request.selected,
-                )
+                list_kwargs = {
+                    "workspace_id": auth.workspace_id,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "channel": request.channel,
+                    "selected": request.selected,
+                }
+                _add_optional_list_filters(list_kwargs, request)
+                rows = self.search_store.list_channels(**list_kwargs)
             else:
                 raise AssertionError("validated list request produced an unknown entity")
         except Exception as exc:
@@ -840,6 +872,10 @@ class HostedMcpQueryAdapter:
                     "project": request.project,
                     "channel": request.channel,
                     "video_id": request.video_id,
+                    "since": request.filters.since,
+                    "until": request.filters.until,
+                    "source": request.filters.source,
+                    "language": request.filters.language,
                     "selected": request.selected,
                     "order_by": request.order_by,
                 },
@@ -848,22 +884,26 @@ class HostedMcpQueryAdapter:
                 if request.kind == "status":
                     rows = [self.search_store.list_status(workspace_id=auth.workspace_id)]
                 elif request.kind == "video":
-                    rows = self.search_store.list_videos(
-                        workspace_id=auth.workspace_id,
-                        limit=request.limit,
-                        offset=request.offset,
-                        channel=request.channel,
-                        video_id=request.video_id,
-                        order_by=request.order_by,
-                    )
+                    list_kwargs = {
+                        "workspace_id": auth.workspace_id,
+                        "limit": request.limit,
+                        "offset": request.offset,
+                        "channel": request.channel,
+                        "video_id": request.video_id,
+                        "order_by": request.order_by,
+                    }
+                    _add_optional_search_filters(list_kwargs, request.filters)
+                    rows = self.search_store.list_videos(**list_kwargs)
                 else:
-                    rows = self.search_store.list_channels(
-                        workspace_id=auth.workspace_id,
-                        limit=request.limit,
-                        offset=request.offset,
-                        channel=request.channel,
-                        selected=request.selected,
-                    )
+                    list_kwargs = {
+                        "workspace_id": auth.workspace_id,
+                        "limit": request.limit,
+                        "offset": request.offset,
+                        "channel": request.channel,
+                        "selected": request.selected,
+                    }
+                    _add_optional_search_filters(list_kwargs, request.filters)
+                    rows = self.search_store.list_channels(**list_kwargs)
             except Exception as exc:
                 self._record_search_store_failure(
                     auth=auth,
@@ -887,6 +927,10 @@ class HostedMcpQueryAdapter:
                     limit=request.limit,
                     mode="lexical",
                     project=request.project,
+                    offset=request.offset,
+                    filters=request.filters,
+                    group_by=request.group_by,
+                    per_group_limit=request.per_group_limit,
                     notes=["hosted_q_mapped_to_lexical_chunk_search"],
                     mcp_tool="q",
                     reservation_metadata={"q_kind": request.kind},
@@ -953,6 +997,10 @@ class HostedFindRequest:
     limit: int
     mode: str = "lexical"
     project: str | None = None
+    offset: int = 0
+    filters: SearchFilters = field(default_factory=SearchFilters)
+    group_by: str | None = None
+    per_group_limit: int = 3
     notes: list[str] = field(default_factory=list)
     mcp_tool: str = SUPPORTED_TOOL
     reservation_metadata: dict[str, Any] = field(default_factory=dict)
@@ -984,34 +1032,12 @@ class HostedFindRequest:
             )
 
         search_in = arguments.get("in_", arguments.get("in", "chunks"))
-        if search_in != "chunks":
+        if search_in not in {None, "", "chunks"}:
             raise HostedMcpError(
                 code="unsupported_search_target",
-                message="Hosted MCP currently supports find over chunks only.",
+                message="Hosted MCP find searches transcript chunks.",
                 status_code=400,
                 data={"in": search_in},
-            )
-
-        unsupported_filters = [
-            key
-            for key in ("channel", "since", "until", "source", "language", "group_by")
-            if arguments.get(key) is not None
-        ]
-        if unsupported_filters:
-            raise HostedMcpError(
-                code="unsupported_find_filter",
-                message="Hosted MCP lexical find filters are not implemented yet.",
-                status_code=400,
-                data={"filters": unsupported_filters},
-            )
-
-        offset = _coerce_int(arguments.get("offset", 0), name="offset")
-        if offset != 0:
-            raise HostedMcpError(
-                code="unsupported_find_offset",
-                message="Hosted MCP lexical find does not support offset yet.",
-                status_code=400,
-                data={"offset": offset},
             )
 
         project = arguments.get("project")
@@ -1022,12 +1048,24 @@ class HostedFindRequest:
                 status_code=400,
                 data={"project": project},
             )
+        group_by = _normalize_group_by(arguments.get("group_by"), capability="find.group_by")
+        per_group_limit = _coerce_per_group_limit(arguments.get("per_group_limit", 3))
 
         return cls(
             text=text,
             limit=_coerce_limit(arguments.get("limit", 10)),
             mode=normalized_mode,
             project=None if project == "thin" else project,
+            offset=_coerce_offset(arguments.get("offset", 0)),
+            filters=SearchFilters(
+                channel=_optional_str(arguments.get("channel")),
+                since=_optional_str(arguments.get("since")),
+                until=_optional_str(arguments.get("until")),
+                source=_optional_str(arguments.get("source")),
+                language=_optional_str(arguments.get("language")),
+            ),
+            group_by=group_by,
+            per_group_limit=per_group_limit,
             notes=notes,
         )
 
@@ -1038,6 +1076,10 @@ class HostedShowRequest:
 
     kind: str
     id_: str
+    token_budget: int = 3000
+    video_id: str | None = None
+    time_seconds: int | None = None
+    youtube_url: str | None = None
     transcript_offset: int = 0
     transcript_limit: int | None = None
 
@@ -1052,21 +1094,12 @@ class HostedShowRequest:
                 status_code=400,
                 data=_capability_data(capability="show", requested=kind, supported=cls.SUPPORTED_KINDS),
             )
-        if kind == "context":
-            raise HostedMcpError(
-                code="unsupported_show_context",
-                message="Hosted MCP show context expansion is not implemented in this Python adapter slice.",
-                status_code=501,
-                data=_capability_data(
-                    capability="show.context",
-                    requested=kind,
-                    supported=cls.SUPPORTED_KINDS - {"context"},
-                    unsupported_reason="context_expansion_not_implemented",
-                ),
-            )
         raw_id = arguments.get("id_", arguments.get("id"))
         id_ = str(raw_id or "").strip()
-        if not id_:
+        video_id = _optional_str(arguments.get("video_id"))
+        youtube_url = _optional_str(arguments.get("youtube_url"))
+        time_seconds = None if arguments.get("time_seconds") is None else _coerce_int(arguments.get("time_seconds"), name="time_seconds")
+        if not id_ and not (kind == "context" and (video_id or youtube_url)):
             raise HostedMcpError(
                 code="invalid_arguments",
                 message=f"show(kind={kind!r}) requires id_.",
@@ -1077,6 +1110,10 @@ class HostedShowRequest:
         return cls(
             kind=kind,
             id_=id_,
+            token_budget=max(200, min(_coerce_int(arguments.get("token_budget", 3000), name="token_budget"), 8000)),
+            video_id=video_id,
+            time_seconds=time_seconds,
+            youtube_url=youtube_url,
             transcript_offset=max(0, _coerce_int(arguments.get("transcript_offset", 0), name="transcript_offset")),
             transcript_limit=None
             if transcript_limit is None
@@ -1090,6 +1127,11 @@ class HostedListRequest:
     limit: int
     offset: int = 0
     channel: str | None = None
+    since: str | None = None
+    until: str | None = None
+    status: str | None = None
+    source: str | None = None
+    language: str | None = None
     selected: bool | None = None
     order_by: str | None = None
 
@@ -1106,13 +1148,12 @@ class HostedListRequest:
         elif raw_entity == "attention":
             raise HostedMcpError(
                 code="unsupported_list_entity",
-                message="Hosted MCP list attention is not backed by the hosted schema yet.",
-                status_code=501,
+                message="Hosted MCP list supports status, videos, and channels.",
+                status_code=400,
                 data=_capability_data(
                     capability="list",
                     requested=raw_entity,
                     supported={"channels", "status", "videos"},
-                    unsupported_reason="attention_schema_not_implemented",
                 ),
             )
         else:
@@ -1122,61 +1163,44 @@ class HostedListRequest:
                 status_code=400,
                 data=_capability_data(capability="list", requested=raw_entity, supported={"channels", "status", "videos"}),
             )
-
-        unsupported_filters = [
-            key
-            for key in ("since", "until", "status", "source", "language")
-            if arguments.get(key) is not None
-        ]
-        if unsupported_filters:
-            raise HostedMcpError(
-                code="unsupported_list_filter",
-                message="Hosted MCP list only supports channel and selected filters in this adapter slice.",
-                status_code=501,
-                data=_capability_data(
-                    capability="list.filters",
-                    requested=unsupported_filters,
-                    supported={"channel", "selected"},
-                    unsupported_reason="filter_not_implemented",
-                ),
-            )
         if entity == "status":
-            extra = [key for key in ("channel", "selected", "order_by", "project") if arguments.get(key) is not None]
+            extra = [
+                key
+                for key in ("channel", "selected", "order_by", "project", "since", "until", "status", "source", "language")
+                if arguments.get(key) is not None
+            ]
             if extra:
                 raise HostedMcpError(
                     code="unsupported_list_filter",
                     message="Hosted MCP list status does not support filters or projections.",
-                    status_code=501,
+                    status_code=400,
                     data=_capability_data(
                         capability="list.status.filters",
                         requested=extra,
                         supported=set(),
-                        unsupported_reason="status_filters_not_supported",
                     ),
                 )
         if entity == "video" and arguments.get("selected") is not None:
             raise HostedMcpError(
                 code="unsupported_list_filter",
                 message="Hosted MCP selected filtering is only supported for channel lists.",
-                status_code=501,
+                status_code=400,
                 data=_capability_data(
                     capability="list.video.filters",
                     requested=["selected"],
                     supported={"channel"},
-                    unsupported_reason="selected_only_supported_for_channels",
                 ),
             )
         order_by = _normalize_list_order(arguments.get("order_by"))
         if entity == "channel" and order_by is not None:
             raise HostedMcpError(
                 code="unsupported_list_order",
-                message="Hosted MCP channel lists do not support order_by yet.",
-                status_code=501,
+                message="Hosted MCP channel lists use latest-published ordering; order_by is for video lists.",
+                status_code=400,
                 data=_capability_data(
                     capability="list.channel.order_by",
                     requested=order_by,
                     supported=set(),
-                    unsupported_reason="channel_order_not_implemented",
                 ),
             )
         project = arguments.get("project")
@@ -1196,6 +1220,11 @@ class HostedListRequest:
             limit=_coerce_limit(arguments.get("limit", 20)),
             offset=_coerce_offset(arguments.get("offset", 0)),
             channel=_optional_str(arguments.get("channel")),
+            since=_optional_str(arguments.get("since")),
+            until=_optional_str(arguments.get("until")),
+            status=_optional_str(arguments.get("status")),
+            source=_optional_str(arguments.get("source")),
+            language=_optional_str(arguments.get("language")),
             selected=_optional_bool(arguments.get("selected")),
             order_by=order_by,
         )
@@ -1210,6 +1239,9 @@ class HostedQRequest:
     text: str | None = None
     channel: str | None = None
     video_id: str | None = None
+    filters: SearchFilters = field(default_factory=SearchFilters)
+    group_by: str | None = None
+    per_group_limit: int = 3
     selected: bool | None = None
     order_by: str | None = None
 
@@ -1252,10 +1284,11 @@ class HostedQRequest:
 
         if entity == "video":
             if raw_request.get("search") is not None:
-                raise _unsupported_q("Hosted MCP q video search is not implemented yet.")
-            _reject_unknown_filter_keys(filter_obj, {"channel_id", "video_id"})
+                raise _unsupported_q("Hosted MCP q video entities use filters and order_by; transcript search uses entity='chunk'.")
+            _reject_unknown_filter_keys(filter_obj, {"channel_id", "video_id", "published_at", "transcript_source", "language"})
             if project not in {"thin", "video_card"}:
                 raise _unsupported_q("Hosted MCP q video supports thin and video_card projections only.")
+            filters = _search_filters_from_q_filter(filter_obj)
             return cls(
                 kind="video",
                 limit=limit,
@@ -1263,21 +1296,27 @@ class HostedQRequest:
                 project=None if project == "thin" else str(project),
                 channel=_predicate_eq(filter_obj, "channel_id"),
                 video_id=_predicate_eq(filter_obj, "video_id"),
+                filters=filters,
                 order_by=order_by,
             )
 
         if entity == "channel":
             if raw_request.get("search") is not None:
-                raise _unsupported_q("Hosted MCP q channel search is not implemented yet.")
-            _reject_unknown_filter_keys(filter_obj, {"channel_id", "channel_selected"})
+                raise _unsupported_q("Hosted MCP q channel entities use filters; transcript search uses entity='chunk'.")
+            _reject_unknown_filter_keys(
+                filter_obj,
+                {"channel_id", "channel_handle", "channel_selected", "published_at", "transcript_source", "language"},
+            )
             if project not in {"thin", "channel_card"}:
                 raise _unsupported_q("Hosted MCP q channel supports thin and channel_card projections only.")
+            filters = _search_filters_from_q_filter(filter_obj)
             return cls(
                 kind="channel",
                 limit=limit,
                 offset=offset,
                 project=None if project == "thin" else str(project),
-                channel=_predicate_eq(filter_obj, "channel_id"),
+                channel=filters.channel,
+                filters=filters,
                 selected=_predicate_bool_eq(filter_obj, "channel_selected"),
             )
 
@@ -1290,12 +1329,10 @@ class HostedQRequest:
             text = str(search.get("text") or "").strip()
             if not text:
                 raise HostedMcpError(code="invalid_arguments", message="q chunk lexical search requires search.text.", status_code=400)
-            if offset != 0:
-                raise _unsupported_q("Hosted MCP q chunk lexical search does not support offset yet.")
-            if raw_request.get("group_by") is not None or raw_request.get("per_group_limit") is not None:
-                raise _unsupported_q("Hosted MCP q chunk grouping is not implemented yet.")
-            if _nonempty_filter_keys(filter_obj):
-                raise _unsupported_q("Hosted MCP q chunk filters are not implemented yet.")
+            _reject_unknown_filter_keys(
+                filter_obj,
+                {"channel_id", "channel_handle", "published_at", "transcript_source", "language"},
+            )
             if project not in {"thin", "chunk", "metadata"}:
                 raise _unsupported_q("Hosted MCP q chunk supports thin, chunk, and metadata projections only.")
             return cls(
@@ -1304,6 +1341,9 @@ class HostedQRequest:
                 offset=offset,
                 project=None if project == "thin" else str(project),
                 text=text,
+                filters=_search_filters_from_q_filter(filter_obj),
+                group_by=_normalize_group_by(raw_request.get("group_by"), capability="q.group_by"),
+                per_group_limit=_coerce_per_group_limit(raw_request.get("per_group_limit", 3)),
             )
 
         raise _unsupported_q(f"Hosted MCP q does not support entity={entity!r}.")
@@ -1420,7 +1460,7 @@ def _raise_unsupported_tool(name: str) -> None:
     if contract.tool_by_name(name) is None:
         message = f"Unsupported hosted MCP tool: {name!r}."
     else:
-        message = f"Hosted MCP tool {name!r} is not implemented in this Python adapter slice."
+        message = f"Hosted MCP tool {name!r} is not exposed by the hosted adapter."
     raise HostedMcpError(
         code="unsupported_tool",
         message=message,
@@ -1439,7 +1479,7 @@ def _raise_unsupported_resource(host: str, uri: str) -> None:
         raise AssertionError("resource host marked supported but no handler is registered")
     raise HostedMcpError(
         code="unsupported_resource",
-        message=f"Hosted MCP resource {host!r} is not implemented in this Python adapter slice.",
+        message=f"Hosted MCP resource {host!r} is not exposed by the hosted adapter.",
         status_code=501,
         data=_capability_data(
             capability="resource",
@@ -1473,7 +1513,11 @@ def _query_idempotency_key(*, auth: HostedMcpAuthContext, request: HostedFindReq
                 "mode": request.mode,
                 "text": request.text,
                 "limit": request.limit,
+                "offset": request.offset,
                 "project": request.project,
+                "filters": _filters_payload(request.filters),
+                "group_by": request.group_by,
+                "per_group_limit": request.per_group_limit,
                 **request.reservation_metadata,
             }
         ),
@@ -1493,7 +1537,11 @@ def _provider_idempotency_key(*, auth: HostedMcpAuthContext, request: HostedFind
                 "mode": request.mode,
                 "text": request.text,
                 "limit": request.limit,
+                "offset": request.offset,
                 "project": request.project,
+                "filters": _filters_payload(request.filters),
+                "group_by": request.group_by,
+                "per_group_limit": request.per_group_limit,
             }
         ),
         extras=extras,
@@ -1633,6 +1681,101 @@ def _contract_find_row(row: Mapping[str, Any], *, project: str | None) -> dict[s
             if row.get(key) is not None:
                 hit[key] = row.get(key)
     return {key: value for key, value in hit.items() if value is not None and value != {}}
+
+
+def _find_query_result(*, rows: list[dict[str, Any]], request: HostedFindRequest, backend: str) -> QueryResult:
+    del backend
+    hits = [_contract_find_row(row, project=request.project) for row in rows]
+    notes = [*request.notes]
+    if request.group_by is None:
+        return QueryResult(rows=hits, notes=notes, total=None)
+    grouped_rows = _group_chunk_hits(
+        hits,
+        group_by=request.group_by,
+        limit=request.limit,
+        offset=request.offset,
+        per_group_limit=request.per_group_limit,
+    )
+    return QueryResult(
+        rows=grouped_rows,
+        notes=[*notes, f"group_by={request.group_by}"],
+        total=len(grouped_rows),
+    )
+
+
+def _search_limit(request: HostedFindRequest) -> int:
+    if request.group_by is None:
+        return request.limit
+    return min(200, request.limit * max(1, request.per_group_limit) * 8)
+
+
+def _search_offset(request: HostedFindRequest) -> int:
+    return 0 if request.group_by else request.offset
+
+
+def _group_chunk_hits(
+    hits: list[dict[str, Any]],
+    *,
+    group_by: str,
+    limit: int,
+    offset: int,
+    per_group_limit: int,
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for hit in hits:
+        group_value = _chunk_group_value(hit, group_by)
+        if group_value is None:
+            continue
+        key = str(group_value)
+        if key not in groups:
+            groups[key] = _new_chunk_group(hit, group_by=group_by, group_value=key)
+            order.append(key)
+        group_hits = groups[key]["hits"]
+        if len(group_hits) < per_group_limit:
+            group_hits.append(hit)
+            groups[key]["hit_count"] += 1
+    selected_keys = order[max(0, offset) : max(0, offset) + max(1, limit)]
+    return [groups[key] for key in selected_keys]
+
+
+def _chunk_group_value(hit: Mapping[str, Any], group_by: str) -> str | None:
+    if group_by == "video":
+        return str(hit.get("video_id") or hit.get("youtube_video_id") or "") or None
+    if group_by == "channel":
+        return str(hit.get("channel_id") or hit.get("channel_handle") or "") or None
+    if group_by == "transcript_source":
+        return str(hit.get("transcript_source") or "") or None
+    raise HostedMcpError(
+        code="unsupported_group_by",
+        message="group_by must be one of: video, channel, transcript_source.",
+        status_code=400,
+        data={"group_by": group_by},
+    )
+
+
+def _new_chunk_group(hit: Mapping[str, Any], *, group_by: str, group_value: str) -> dict[str, Any]:
+    group: dict[str, Any] = {
+        "group_by": group_by,
+        "group_value": group_value,
+        "hit_count": 0,
+        "score": hit.get("score"),
+        "hits": [],
+    }
+    for key in (
+        "video_id",
+        "youtube_video_id",
+        "title",
+        "youtube_url",
+        "channel_id",
+        "channel_title",
+        "channel_handle",
+        "transcript_source",
+        "language",
+    ):
+        if key in hit:
+            group[key] = hit[key]
+    return {key: value for key, value in group.items() if value is not None}
 
 
 def _scores(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1984,6 +2127,51 @@ def _optional_bool(value: Any) -> bool | None:
     )
 
 
+def _add_optional_list_filters(kwargs: dict[str, Any], request: HostedListRequest) -> None:
+    for key in ("since", "until", "status", "source", "language"):
+        value = getattr(request, key)
+        if value is not None:
+            kwargs[key] = value
+
+
+def _add_optional_search_filters(kwargs: dict[str, Any], filters: SearchFilters) -> None:
+    for key, value in _filters_payload(filters).items():
+        if value is not None:
+            kwargs[key] = value
+
+
+def _filters_payload(filters: SearchFilters) -> dict[str, str | None]:
+    return {
+        "channel": filters.channel,
+        "since": filters.since,
+        "until": filters.until,
+        "source": filters.source,
+        "language": filters.language,
+    }
+
+
+def _normalize_group_by(value: Any, *, capability: str) -> str | None:
+    if value is None or value == "":
+        return None
+    normalized = str(value)
+    if normalized not in {"video", "channel", "transcript_source"}:
+        raise HostedMcpError(
+            code="unsupported_group_by",
+            message="Hosted MCP grouping supports video, channel, and transcript_source.",
+            status_code=400,
+            data=_capability_data(
+                capability=capability,
+                requested=normalized,
+                supported={"video", "channel", "transcript_source"},
+            ),
+        )
+    return normalized
+
+
+def _coerce_per_group_limit(value: Any) -> int:
+    return max(1, min(_coerce_int(value, name="per_group_limit"), 20))
+
+
 def _normalize_list_order(value: Any) -> str | None:
     if value is None or value == "" or value == "relevance":
         return None
@@ -1992,7 +2180,7 @@ def _normalize_list_order(value: Any) -> str | None:
         raise HostedMcpError(
             code="unsupported_list_order",
             message="Hosted MCP list supports newest, oldest, longest, shortest, and title order_by values.",
-            status_code=501,
+            status_code=400,
             data={"order_by": value},
         )
     return order
@@ -2037,6 +2225,29 @@ def _predicate_eq(filter_obj: Mapping[str, Any], key: str) -> str | None:
     return _optional_str(predicate.get("eq"))
 
 
+def _search_filters_from_q_filter(filter_obj: Mapping[str, Any]) -> SearchFilters:
+    since, until = _predicate_range(filter_obj, "published_at")
+    return SearchFilters(
+        channel=_predicate_eq(filter_obj, "channel_id") or _predicate_eq(filter_obj, "channel_handle"),
+        since=since,
+        until=until,
+        source=_predicate_eq(filter_obj, "transcript_source"),
+        language=_predicate_eq(filter_obj, "language"),
+    )
+
+
+def _predicate_range(filter_obj: Mapping[str, Any], key: str) -> tuple[str | None, str | None]:
+    predicate = filter_obj.get(key)
+    if _empty_query_value(predicate):
+        return None, None
+    if not isinstance(predicate, Mapping):
+        raise _unsupported_q(f"Hosted MCP q filter.{key} must be a predicate object.")
+    unexpected = set(predicate) - {"gte", "lte"}
+    if unexpected:
+        raise _unsupported_q(f"Hosted MCP q filter.{key} only supports gte and lte.")
+    return _optional_str(predicate.get("gte")), _optional_str(predicate.get("lte"))
+
+
 def _predicate_bool_eq(filter_obj: Mapping[str, Any], key: str) -> bool | None:
     predicate = filter_obj.get(key)
     if _empty_query_value(predicate):
@@ -2061,13 +2272,13 @@ def _reject_unknown_filter_keys(filter_obj: Mapping[str, Any], supported: set[st
     if unknown:
         raise HostedMcpError(
             code="unsupported_q_filter",
-            message="Hosted MCP q received filters that are not supported by this hosted adapter slice.",
-            status_code=501,
+            message="Hosted MCP q received filters outside the hosted query contract.",
+            status_code=400,
             data=_capability_data(
                 capability="q.filters",
                 requested=unknown,
                 supported=supported,
-                unsupported_reason="filter_not_implemented",
+                unsupported_reason="unsupported_filter",
             ),
         )
 
@@ -2076,12 +2287,12 @@ def _unsupported_q(message: str) -> HostedMcpError:
     return HostedMcpError(
         code="unsupported_q_shape",
         message=message,
-        status_code=501,
+        status_code=400,
         data=_capability_data(
             capability="q",
             requested="unsupported_query_shape",
             supported={"channel.thin", "channel.channel_card", "chunk.lexical", "status_breakdown", "video.thin", "video.video_card"},
-            unsupported_reason=message,
+            unsupported_reason="unsupported_query_shape",
         ),
     )
 

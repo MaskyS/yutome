@@ -318,7 +318,6 @@ CREATE TABLE IF NOT EXISTS chunks (
     end_seconds numeric,
     text text NOT NULL,
     bm25_document bm25vector NOT NULL,
-    fts_document tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(text, ''))) STORED,
     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(workspace_id, transcript_version_id, index_profile_id, chunk_index)
@@ -378,8 +377,6 @@ CREATE INDEX IF NOT EXISTS idx_videos_active_transcript
     WHERE active_transcript_version_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_chunks_workspace_video
     ON chunks(workspace_id, video_id, chunk_index);
-CREATE INDEX IF NOT EXISTS idx_chunks_fts
-    ON chunks USING gin(fts_document);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_workspace_profile
     ON chunk_embeddings(workspace_id, index_profile_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_embedding_vchordrq

@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
-import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal, Mapping, Protocol
 from urllib.parse import parse_qs, urlparse
 
-from yutome.channels import LibraryChannel, channel_from_input, upsert_library_channel
+from yutome.channels import LibraryChannel, channel_from_input
 from yutome.hashing import sha256_text
+from yutome.hosted.repositories import SqlStatement
 from yutome.youtube import canonical_video_url, extract_video_id
 
 
-SourceType = Literal["youtube_channel", "youtube_video", "youtube_playlist"]
+SourceType = Literal["channel", "handle", "playlist", "video", "url"]
+
+
+class SqlConnection(Protocol):
+    def execute(self, statement: str, params: Mapping[str, Any] | None = None) -> Any:
+        ...
+
+
 @dataclass(frozen=True)
 class LibrarySource:
     source_id: str
@@ -22,6 +30,7 @@ class LibrarySource:
     source: str
     source_url: str
     channel_id: str | None = None
+    playlist_id: str | None = None
     video_id: str | None = None
     handle: str | None = None
     title: str | None = None
@@ -32,7 +41,7 @@ class LibrarySource:
 def source_from_channel(channel: LibraryChannel) -> LibrarySource:
     return LibrarySource(
         source_id=channel.library_channel_id,
-        source_type="youtube_channel",
+        source_type=_source_type_from_channel(channel),
         source=channel.source,
         source_url=channel.source_url,
         channel_id=channel.channel_id,
@@ -56,7 +65,7 @@ def source_from_input(
         source = f"youtube:video:{video_id}"
         return LibrarySource(
             source_id=sha256_text(source)[:24],
-            source_type="youtube_video",
+            source_type="video",
             source=source,
             source_url=canonical_video_url(video_id),
             video_id=video_id,
@@ -67,9 +76,10 @@ def source_from_input(
         source = f"youtube:playlist:{playlist_id}"
         return LibrarySource(
             source_id=sha256_text(source)[:24],
-            source_type="youtube_playlist",
+            source_type="playlist",
             source=source,
             source_url=_canonical_playlist_url(playlist_id),
+            playlist_id=playlist_id,
             title=title.strip() if title and title.strip() else None,
             import_source=import_source,
         )
@@ -87,120 +97,155 @@ def import_sources_from_file(path: Path, *, selected: bool = True) -> list[Libra
 
 
 def upsert_library_source(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     source: LibrarySource,
     *,
+    workspace_id: str,
     selected: bool | None = None,
 ) -> None:
+    statement = upsert_library_source_sql(source, workspace_id=workspace_id, selected=selected)
+    connection.execute(statement.sql, statement.params)
+
+
+def upsert_library_source_sql(
+    source: LibrarySource,
+    *,
+    workspace_id: str,
+    selected: bool | None = None,
+) -> SqlStatement:
     effective_selected = source.selected if selected is None else selected
-    if source.source_type == "youtube_channel":
-        upsert_library_channel(connection, _source_to_channel(source), selected=effective_selected)
-    connection.execute(
-        """
-        INSERT INTO library_sources(
-            source_id, source_type, source, source_url, channel_id, video_id,
-            handle, title, selected, import_source
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(source_url) DO UPDATE SET
-            source_type = excluded.source_type,
-            source = excluded.source,
-            channel_id = COALESCE(excluded.channel_id, library_sources.channel_id),
-            video_id = COALESCE(excluded.video_id, library_sources.video_id),
-            handle = COALESCE(excluded.handle, library_sources.handle),
-            title = COALESCE(excluded.title, library_sources.title),
-            selected = excluded.selected,
-            import_source = COALESCE(excluded.import_source, library_sources.import_source),
-            updated_at = datetime('now')
-        """,
-        (
-            source.source_id,
-            source.source_type,
-            source.source,
-            source.source_url,
-            source.channel_id,
-            source.video_id,
-            source.handle,
-            source.title,
-            1 if effective_selected else 0,
-            source.import_source,
-        ),
+    return SqlStatement(
+        sql="""
+INSERT INTO sources (
+    id, workspace_id, source_type, source_url, canonical_channel_id,
+    canonical_playlist_id, canonical_video_id, display_name, selected,
+    auto_index_allowed, import_source, metadata_json, status
+)
+VALUES (
+    %(id)s, %(workspace_id)s, %(source_type)s, %(source_url)s,
+    %(canonical_channel_id)s, %(canonical_playlist_id)s, %(canonical_video_id)s,
+    %(display_name)s, %(selected)s, true, %(import_source)s,
+    %(metadata_json)s::jsonb, 'active'
+)
+ON CONFLICT (workspace_id, source_url) DO UPDATE
+SET source_type = EXCLUDED.source_type,
+    canonical_channel_id = COALESCE(EXCLUDED.canonical_channel_id, sources.canonical_channel_id),
+    canonical_playlist_id = COALESCE(EXCLUDED.canonical_playlist_id, sources.canonical_playlist_id),
+    canonical_video_id = COALESCE(EXCLUDED.canonical_video_id, sources.canonical_video_id),
+    display_name = COALESCE(EXCLUDED.display_name, sources.display_name),
+    selected = EXCLUDED.selected,
+    import_source = EXCLUDED.import_source,
+    metadata_json = sources.metadata_json || EXCLUDED.metadata_json,
+    status = EXCLUDED.status,
+    updated_at = now()
+RETURNING *;
+""".strip(),
+        params={
+            "id": source.source_id,
+            "workspace_id": workspace_id,
+            "source_type": source.source_type,
+            "source_url": source.source_url,
+            "canonical_channel_id": source.channel_id,
+            "canonical_playlist_id": source.playlist_id,
+            "canonical_video_id": source.video_id,
+            "display_name": source.title,
+            "selected": effective_selected,
+            "import_source": source.import_source or "manual",
+            "metadata_json": _json_object(
+                {
+                    "source": source.source,
+                    "handle": source.handle,
+                }
+            ),
+        },
     )
 
 
 def list_library_sources(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     *,
+    workspace_id: str,
     selected_only: bool = False,
 ) -> list[LibrarySource]:
-    where = "WHERE selected = 1" if selected_only else ""
-    rows = connection.execute(
-        f"""
-        SELECT source_id, source_type, source, source_url, channel_id, video_id,
-               handle, title, selected, import_source
-        FROM library_sources
-        {where}
-        ORDER BY selected DESC, source_type, COALESCE(title, handle, video_id, source_url), source_url
-        """
-    ).fetchall()
+    statement = list_library_sources_sql(workspace_id=workspace_id, selected_only=selected_only)
+    rows = _rows_from_result(connection.execute(statement.sql, statement.params))
     return [_source_from_row(row) for row in rows]
 
 
+def list_library_sources_sql(*, workspace_id: str, selected_only: bool = False) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+SELECT
+    id AS source_id,
+    source_type,
+    source_url,
+    canonical_channel_id AS channel_id,
+    canonical_playlist_id AS playlist_id,
+    canonical_video_id AS video_id,
+    display_name AS title,
+    selected,
+    import_source,
+    metadata_json
+FROM sources
+WHERE workspace_id = %(workspace_id)s
+  AND (%(selected_only)s::boolean = false OR selected = true)
+ORDER BY selected DESC, source_type, COALESCE(display_name, canonical_video_id, canonical_playlist_id, canonical_channel_id, source_url), source_url;
+""".strip(),
+        params={"workspace_id": workspace_id, "selected_only": selected_only},
+    )
+
+
 def set_library_source_selected(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     *,
+    workspace_id: str,
     selector: str,
     selected: bool,
 ) -> int:
-    if selector == "all":
-        source_cursor = connection.execute(
-            "UPDATE library_sources SET selected = ?, updated_at = datetime('now')",
-            (1 if selected else 0,),
-        )
-        connection.execute(
-            "UPDATE library_channels SET selected = ?, updated_at = datetime('now')",
-            (1 if selected else 0,),
-        )
-        return source_cursor.rowcount
     candidates = _selector_candidates(selector)
-    placeholders = ",".join("?" for _ in candidates)
-    source_cursor = connection.execute(
-        f"""
-        UPDATE library_sources
-        SET selected = ?, updated_at = datetime('now')
-        WHERE source_id IN ({placeholders})
-           OR source_url IN ({placeholders})
-           OR source IN ({placeholders})
-           OR channel_id IN ({placeholders})
-           OR video_id IN ({placeholders})
-           OR handle IN ({placeholders})
-           OR title IN ({placeholders})
-        """,
-        (
-            1 if selected else 0,
-            *candidates,
-            *candidates,
-            *candidates,
-            *candidates,
-            *candidates,
-            *candidates,
-            *candidates,
-        ),
+    statement = set_library_source_selected_sql(
+        workspace_id=workspace_id,
+        candidates=candidates,
+        selected=selected,
+        all_sources=selector == "all",
     )
-    connection.execute(
-        f"""
-        UPDATE library_channels
-        SET selected = ?, updated_at = datetime('now')
-        WHERE library_channel_id IN ({placeholders})
-           OR source_url IN ({placeholders})
-           OR source IN ({placeholders})
-           OR channel_id IN ({placeholders})
-           OR handle IN ({placeholders})
-           OR title IN ({placeholders})
-        """,
-        (1 if selected else 0, *candidates, *candidates, *candidates, *candidates, *candidates, *candidates),
+    cursor = connection.execute(statement.sql, statement.params)
+    return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+def set_library_source_selected_sql(
+    *,
+    workspace_id: str,
+    candidates: list[str],
+    selected: bool,
+    all_sources: bool = False,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+UPDATE sources
+SET selected = %(selected)s,
+    updated_at = now()
+WHERE workspace_id = %(workspace_id)s
+  AND (
+    %(all_sources)s::boolean = true
+    OR id = ANY(%(candidates)s::text[])
+    OR source_url = ANY(%(candidates)s::text[])
+    OR canonical_channel_id = ANY(%(candidates)s::text[])
+    OR canonical_playlist_id = ANY(%(candidates)s::text[])
+    OR canonical_video_id = ANY(%(candidates)s::text[])
+    OR display_name = ANY(%(candidates)s::text[])
+    OR metadata_json->>'source' = ANY(%(candidates)s::text[])
+    OR metadata_json->>'handle' = ANY(%(candidates)s::text[])
+    OR ('@' || metadata_json->>'handle') = ANY(%(candidates)s::text[])
+  );
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "selected": selected,
+            "all_sources": all_sources,
+            "candidates": candidates,
+        },
     )
-    return source_cursor.rowcount
 
 
 def _source_to_channel(source: LibrarySource) -> LibraryChannel:
@@ -216,18 +261,27 @@ def _source_to_channel(source: LibrarySource) -> LibraryChannel:
     )
 
 
-def _source_from_row(row: sqlite3.Row) -> LibrarySource:
+def _source_from_row(row: Mapping[str, Any]) -> LibrarySource:
+    metadata = _metadata(row.get("metadata_json"))
+    source_url = str(row["source_url"])
+    source_type = _source_type_from_row(row)
+    channel_id = _optional_str(row.get("channel_id"))
+    playlist_id = _optional_str(row.get("playlist_id"))
+    video_id = _optional_str(row.get("video_id"))
+    handle = _optional_str(metadata.get("handle")) or _handle_from_url(source_url)
     return LibrarySource(
-        source_id=row["source_id"],
-        source_type=row["source_type"],
-        source=row["source"],
-        source_url=row["source_url"],
-        channel_id=row["channel_id"],
-        video_id=row["video_id"],
-        handle=row["handle"],
-        title=row["title"],
-        selected=bool(row["selected"]),
-        import_source=row["import_source"],
+        source_id=str(row["source_id"]),
+        source_type=source_type,
+        source=_optional_str(metadata.get("source"))
+        or _canonical_source_key(source_url, source_type=source_type, channel_id=channel_id, playlist_id=playlist_id, video_id=video_id, handle=handle),
+        source_url=source_url,
+        channel_id=channel_id,
+        playlist_id=playlist_id,
+        video_id=video_id,
+        handle=handle,
+        title=_optional_str(row.get("title")),
+        selected=bool(row.get("selected")),
+        import_source=_optional_str(row.get("import_source")),
     )
 
 
@@ -276,12 +330,95 @@ def _with_selected(source: LibrarySource, selected: bool) -> LibrarySource:
         source=source.source,
         source_url=source.source_url,
         channel_id=source.channel_id,
+        playlist_id=source.playlist_id,
         video_id=source.video_id,
         handle=source.handle,
         title=source.title,
         selected=selected,
         import_source=source.import_source,
     )
+
+
+def _source_type_from_channel(channel: LibraryChannel) -> SourceType:
+    if channel.channel_id:
+        return "channel"
+    if channel.handle:
+        return "handle"
+    return "url"
+
+
+def _source_type_from_row(row: Mapping[str, Any]) -> SourceType:
+    value = str(row.get("source_type") or "url")
+    if value in {"channel", "handle", "playlist", "video", "url"}:
+        return value  # type: ignore[return-value]
+    if value == "youtube_channel":
+        return "channel"
+    if value == "youtube_playlist":
+        return "playlist"
+    if value == "youtube_video":
+        return "video"
+    return "url"
+
+
+def _canonical_source_key(
+    source_url: str,
+    *,
+    source_type: SourceType,
+    channel_id: str | None,
+    playlist_id: str | None,
+    video_id: str | None,
+    handle: str | None,
+) -> str:
+    if source_type == "video" and video_id:
+        return f"youtube:video:{video_id}"
+    if source_type == "playlist" and playlist_id:
+        return f"youtube:playlist:{playlist_id}"
+    if source_type == "channel" and channel_id:
+        return f"youtube:channel:{channel_id}"
+    if source_type == "handle" and handle:
+        return f"youtube:handle:{handle.lower().lstrip('@')}"
+    return f"youtube:url:{source_url.lower()}"
+
+
+def _handle_from_url(value: str) -> str | None:
+    parsed = urlparse(value if "://" in value else f"https://www.youtube.com/{value.lstrip('/')}")
+    match = re.search(r"/@([^/?#]+)", parsed.path)
+    return match.group(1) if match else None
+
+
+def _metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_object(value: Mapping[str, Any]) -> str:
+    compact = {key: item for key, item in value.items() if item is not None}
+    return json.dumps(compact, sort_keys=True, separators=(",", ":"))
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        rows = result.fetchall()
+    elif isinstance(result, list):
+        rows = result
+    else:
+        rows = list(result)
+    return [dict(row) for row in rows]
 
 
 def _selector_candidates(selector: str) -> list[str]:
@@ -291,6 +428,8 @@ def _selector_candidates(selector: str) -> list[str]:
         candidates.update({source.source_id, source.source, source.source_url})
         if source.channel_id:
             candidates.add(source.channel_id)
+        if source.playlist_id:
+            candidates.add(source.playlist_id)
         if source.video_id:
             candidates.add(source.video_id)
         if source.handle:

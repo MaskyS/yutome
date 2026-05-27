@@ -16,7 +16,7 @@ from yutome.hosted.mcp_query import (
 )
 from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, UsageNormalization, WorkspaceBalance
 from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
-from yutome.hosted.search_store import SearchStoreUsage
+from yutome.hosted.search_store import SearchFilters, SearchStoreUsage
 
 
 class RecordingSearchStore:
@@ -25,11 +25,24 @@ class RecordingSearchStore:
         self.calls: list[dict[str, Any]] = []
         self.resources: dict[tuple[str, str, str], dict[str, Any]] = {}
 
-    def lexical_search(self, *, workspace_id: str, query: str, limit: int) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-        self.calls.append({"mode": "lexical", "workspace_id": workspace_id, "query": query, "limit": limit})
+    def lexical_search(
+        self,
+        *,
+        workspace_id: str,
+        query: str,
+        limit: int,
+        offset: int = 0,
+        filters: SearchFilters | None = None,
+    ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+        call: dict[str, Any] = {"mode": "lexical", "workspace_id": workspace_id, "query": query, "limit": limit}
+        if offset:
+            call["offset"] = offset
+        if filters is not None:
+            call["filters"] = filters
+        self.calls.append(call)
         return self.rows, SearchStoreUsage(
             operation="lexical_query",
-            backend="postgres_fts_fallback",
+            backend="vectorchord_bm25",
             index_profile_ref="sip_default",
             units={"queries": 1, "candidate_limit": limit, "result_count": len(self.rows), "latency_ms": 2.5},
             metadata={"storage_backend": "postgres_vectorchord"},
@@ -41,8 +54,15 @@ class RecordingSearchStore:
         workspace_id: str,
         query_vector: list[float],
         limit: int,
+        offset: int = 0,
+        filters: SearchFilters | None = None,
     ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-        self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+        call: dict[str, Any] = {"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit}
+        if offset:
+            call["offset"] = offset
+        if filters is not None:
+            call["filters"] = filters
+        self.calls.append(call)
         return self.rows, SearchStoreUsage(
             operation="semantic_query",
             backend="postgres_vectorchord",
@@ -58,13 +78,18 @@ class RecordingSearchStore:
         query: str,
         query_vector: list[float],
         limit: int,
+        offset: int = 0,
+        filters: SearchFilters | None = None,
     ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-        self.calls.append(
-            {"mode": "hybrid", "workspace_id": workspace_id, "query": query, "query_vector": query_vector, "limit": limit}
-        )
+        call = {"mode": "hybrid", "workspace_id": workspace_id, "query": query, "query_vector": query_vector, "limit": limit}
+        if offset:
+            call["offset"] = offset
+        if filters is not None:
+            call["filters"] = filters
+        self.calls.append(call)
         return self.rows, SearchStoreUsage(
             operation="hybrid_query",
-            backend="postgres_vectorchord_fts_fallback",
+            backend="vectorchord_bm25_pgvector",
             index_profile_ref="sip_default",
             units={"queries": 1, "candidate_limit": limit, "query_vector_dimensions": len(query_vector)},
             metadata={"storage_backend": "postgres_vectorchord", "fusion": "rrf"},
@@ -76,6 +101,29 @@ class RecordingSearchStore:
     def resource_chunk(self, *, workspace_id: str, chunk_id: str) -> dict[str, Any]:
         self.calls.append({"resource": "chunk", "workspace_id": workspace_id, "id": chunk_id})
         return self._resource(workspace_id, "chunk", chunk_id)
+
+    def resource_context(
+        self,
+        *,
+        workspace_id: str,
+        chunk_id: str | None = None,
+        video_id: str | None = None,
+        time_seconds: int | None = None,
+        youtube_url: str | None = None,
+        token_budget: int = 3000,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "resource": "context",
+                "workspace_id": workspace_id,
+                "chunk_id": chunk_id,
+                "video_id": video_id,
+                "time_seconds": time_seconds,
+                "youtube_url": youtube_url,
+                "token_budget": token_budget,
+            }
+        )
+        return self._resource(workspace_id, "context", chunk_id or video_id or youtube_url or "")
 
     def resource_video(self, *, workspace_id: str, video_id: str) -> dict[str, Any]:
         self.calls.append({"resource": "video", "workspace_id": workspace_id, "id": video_id})
@@ -129,19 +177,26 @@ class RecordingSearchStore:
         offset: int = 0,
         channel: str | None = None,
         video_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        language: str | None = None,
         order_by: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.calls.append(
-            {
-                "list": "videos",
-                "workspace_id": workspace_id,
-                "limit": limit,
-                "offset": offset,
-                "channel": channel,
-                "video_id": video_id,
-                "order_by": order_by,
-            }
-        )
+        call = {
+            "list": "videos",
+            "workspace_id": workspace_id,
+            "limit": limit,
+            "offset": offset,
+            "channel": channel,
+            "video_id": video_id,
+            "order_by": order_by,
+        }
+        for key, value in {"since": since, "until": until, "status": status, "source": source, "language": language}.items():
+            if value is not None:
+                call[key] = value
+        self.calls.append(call)
         if self.rows and "video_id" in self.rows[0] and "chunk_id" not in self.rows[0]:
             return self.rows
         return [{"video_id": video_id or "vid_1", "title": "Hosted video"}]
@@ -153,18 +208,25 @@ class RecordingSearchStore:
         limit: int,
         offset: int = 0,
         channel: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        language: str | None = None,
         selected: bool | None = None,
     ) -> list[dict[str, Any]]:
-        self.calls.append(
-            {
-                "list": "channels",
-                "workspace_id": workspace_id,
-                "limit": limit,
-                "offset": offset,
-                "channel": channel,
-                "selected": selected,
-            }
-        )
+        call = {
+            "list": "channels",
+            "workspace_id": workspace_id,
+            "limit": limit,
+            "offset": offset,
+            "channel": channel,
+            "selected": selected,
+        }
+        for key, value in {"since": since, "until": until, "status": status, "source": source, "language": language}.items():
+            if value is not None:
+                call[key] = value
+        self.calls.append(call)
         if self.rows and "channel_id" in self.rows[0] and "chunk_id" not in self.rows[0]:
             return self.rows
         return [{"channel_id": channel or "chan_1", "title": "Hosted channel", "selected": selected}]
@@ -1220,18 +1282,30 @@ def test_show_maps_supported_kinds_to_resource_helpers(kind: str, id_: str) -> N
     assert event.metadata["credential_mode"] == "service_internal"
 
 
-def test_show_context_returns_structured_unsupported_error() -> None:
-    adapter = HostedMcpQueryAdapter(search_store=RecordingSearchStore())
+def test_show_context_reads_context_resource() -> None:
+    store = RecordingSearchStore()
+    payload = {"anchor": {"chunk_id": "chunk_1"}, "text": "neighboring transcript"}
+    store.add_resource("ws_alice", "context", "chunk_1", payload)
+    adapter = _allowing_adapter(search_store=store)
 
-    with pytest.raises(HostedMcpError) as exc_info:
-        adapter.call_tool(
-            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-            name="show",
-            arguments={"kind": "context", "id_": "chunk_1"},
-        )
+    result = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="show",
+        arguments={"kind": "context", "id_": "chunk_1", "token_budget": 1200},
+    )
 
-    assert exc_info.value.code == "unsupported_show_context"
-    assert exc_info.value.status_code == 501
+    assert result == payload
+    assert store.calls == [
+        {
+            "resource": "context",
+            "workspace_id": "ws_alice",
+            "chunk_id": "chunk_1",
+            "video_id": None,
+            "time_seconds": None,
+            "youtube_url": None,
+            "token_budget": 1200,
+        }
+    ]
 
 
 def test_list_status_videos_and_channels_are_workspace_scoped() -> None:
@@ -1284,8 +1358,9 @@ def test_list_status_videos_and_channels_are_workspace_scoped() -> None:
     ]
 
 
-def test_list_attention_and_advanced_filters_return_structured_unsupported() -> None:
-    adapter = HostedMcpQueryAdapter(search_store=RecordingSearchStore())
+def test_list_rejects_unsupported_entities_and_accepts_video_filters() -> None:
+    store = RecordingSearchStore()
+    adapter = _allowing_adapter(search_store=store)
 
     with pytest.raises(HostedMcpError) as attention_exc:
         adapter.call_tool(
@@ -1293,17 +1368,29 @@ def test_list_attention_and_advanced_filters_return_structured_unsupported() -> 
             name="list",
             arguments={"entity": "attention"},
         )
-    with pytest.raises(HostedMcpError) as filter_exc:
-        adapter.call_tool(
-            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-            name="list",
-            arguments={"entity": "videos", "since": "2026-01-01"},
-        )
+    result = adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="list",
+        arguments={"entity": "videos", "since": "2026-01-01", "source": "src_1", "language": "en"},
+    )
 
     assert attention_exc.value.code == "unsupported_list_entity"
-    assert attention_exc.value.status_code == 501
-    assert filter_exc.value.code == "unsupported_list_filter"
-    assert filter_exc.value.status_code == 501
+    assert attention_exc.value.status_code == 400
+    assert result["rows"][0]["video_id"] == "vid_1"
+    assert store.calls == [
+        {
+            "list": "videos",
+            "workspace_id": "ws_alice",
+            "limit": 20,
+            "offset": 0,
+            "channel": None,
+            "video_id": None,
+            "order_by": None,
+            "since": "2026-01-01",
+            "source": "src_1",
+            "language": "en",
+        }
+    ]
 
 
 def test_q_accepts_safe_status_video_channel_and_chunk_shapes() -> None:
@@ -1434,17 +1521,17 @@ def test_q_rejects_unsupported_shapes_and_nested_workspace_injection() -> None:
                 "request": {
                     "entity": "chunk",
                     "search": {"mode": "lexical", "over": "chunk_text", "text": "Crohn"},
-                    "per_group_limit": 3,
+                    "group_by": "playlist",
                 }
             },
         )
 
     assert unsupported_exc.value.code == "unsupported_q_shape"
-    assert unsupported_exc.value.status_code == 501
+    assert unsupported_exc.value.status_code == 400
     assert workspace_exc.value.code == "workspace_argument_not_allowed"
     assert workspace_exc.value.to_dict()["error"]["data"]["arguments"] == ["request.workspace_id"]
     assert mixed_exc.value.code == "invalid_arguments"
-    assert grouping_exc.value.code == "unsupported_q_shape"
+    assert grouping_exc.value.code == "unsupported_group_by"
 
 
 def _usage_context_provider(

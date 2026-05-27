@@ -70,8 +70,8 @@ Why these files matter:
 | `transcripts.py` | Normalized segment model and artifact writes. |
 | `chunking.py` | Chunk size, overlap, forced splitting, chunk ids. |
 | `store.py` | Catalog writes, FTS rebuilds, active transcript handling. |
-| `embeddings.py` | Voyage batching, retries, LanceDB rows, FTS index creation. |
-| `query.py` | Declarative QueryRequest schema, compiler, SQL/Lance execution, projections. |
+| `embeddings.py` | Voyage batching, retries, and Postgres + VectorChord embedding writes. |
+| `query.py` | Declarative QueryRequest schema, compiler, Postgres/VectorChord execution, projections. |
 | `api.py` | Transport-neutral find/list/show/q verbs and resource helpers. |
 | `retrieval.py` | Shared citation/context formatting and chunk lookup helpers. |
 | `mcp_server.py` | MCP tool/resource wiring for find/list/show/q. |
@@ -124,9 +124,9 @@ uv run yutome export obsidian
 Index consistency:
 
 ```bash
-sqlite3 data/indexes/catalog.sqlite "
+psql "$YUTOME_POSTGRES_URL" -c "
 SELECT COUNT(*) AS chunks FROM chunks;
-SELECT COUNT(*) AS indexed_embeddings FROM embeddings WHERE index_status='indexed';
+SELECT COUNT(*) AS indexed_embeddings FROM chunk_embeddings;
 SELECT chunker_version, COUNT(*) AS chunks, MAX(token_count) AS max_tokens
 FROM chunks
 GROUP BY chunker_version;
@@ -136,13 +136,12 @@ GROUP BY ingest_status
 ORDER BY COUNT(*) DESC;
 "
 
-uv run python - <<'PY'
-import lancedb
-t = lancedb.connect("data/indexes/lancedb").open_table("chunks")
-print("rows", t.count_rows())
-print("columns", t.schema.names)
-print("indices", [getattr(i, "name", str(i)) for i in t.list_indices()])
-PY
+psql "$YUTOME_POSTGRES_URL" -c "
+SELECT extname
+FROM pg_extension
+WHERE extname IN ('vchord', 'vchord_bm25', 'pg_tokenizer', 'vector')
+ORDER BY extname;
+"
 ```
 
 ## Expected Current State
@@ -166,10 +165,9 @@ Expected retrieval/index properties:
 
 - `timestamp-aware-v2` chunks.
 - Max chunk size at or below `1000` estimated tokens.
-- SQLite chunk, indexed embedding, and LanceDB row counts agree for active chunks.
-- LanceDB table includes the required metadata columns from `docs/plan.md`.
-- LanceDB has an FTS index on `text`.
-- SQLite has both `chunks_fts` and `videos_fts`.
+- Postgres chunk, indexed embedding, BM25, and dense-vector rows agree for active chunks.
+- VectorChord Suite extensions are installed: `vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`.
+- Chunk and video lexical indexes are present in Postgres.
 - `uv run pytest -q` passes.
 
 ## Review Focus Areas
@@ -237,8 +235,8 @@ Check:
 
 - `yutome corpus rebuild chunks` can regenerate chunks from active normalized transcripts.
 - `yutome corpus rebuild vectors --resume` only embeds pending chunks.
-- Full `yutome corpus rebuild vectors` can recreate LanceDB from SQLite chunks.
-- Stale LanceDB schema produces a clear error.
+- Full `yutome corpus rebuild vectors` can recreate VectorChord dense-vector rows from Postgres chunks.
+- Missing VectorChord extensions or stale search schema produce a clear error.
 - Failed embedding batches stay pending.
 
 ### Export Quality
@@ -273,7 +271,7 @@ Check:
 
 Answer these during review:
 
-1. Should `find --mode hybrid` handle missing LanceDB FTS index by falling back to lexical, or should it fail loudly as it does now?
+1. Should `find --mode hybrid` handle missing VectorChord BM25/vector indexes by falling back to lexical, or should it fail loudly?
 2. Should default retrieval collapse adjacent chunks before returning results?
 3. Should default retrieval enforce a per-video result cap?
 4. Should `show context` support multiple chunk ids in one call?

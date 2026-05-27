@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import re
-import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Mapping, Protocol
 
-from yutome.db import connect_catalog
-from yutome.paths import ProjectPaths, resolve_under
-from yutome.transcripts import TranscriptSegment, format_timestamp, read_normalized_segments
+from yutome.paths import ProjectPaths
+from yutome.transcripts import format_timestamp
 
 ExportMode = Literal["portable-md", "obsidian"]
+
+
+class SqlConnection(Protocol):
+    def execute(self, statement: str, params: Mapping[str, Any] | None = None) -> Any:
+        ...
 
 
 @dataclass(frozen=True)
@@ -29,73 +32,100 @@ class ExportChunk:
     text: str
 
 
-def export_markdown(*, paths: ProjectPaths, mode: ExportMode) -> ExportStats:
+def export_markdown(*, connection: SqlConnection, workspace_id: str, paths: ProjectPaths, mode: ExportMode) -> ExportStats:
     output_dir = paths.portable_export_dir if mode == "portable-md" else paths.obsidian_export_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    with connect_catalog(paths.catalog_db) as connection:
-        rows = connection.execute(
+    rows = _rows_from_result(
+        connection.execute(
             """
-            SELECT
-                v.video_id,
-                v.title,
-                v.description,
-                v.duration_seconds,
-                v.published_at,
-                v.thumbnail_url,
-                c.title AS channel_title,
-                c.handle AS channel_handle,
-                tv.transcript_version_id,
-                tv.source AS transcript_source,
-                tv.language,
-                tv.is_generated,
-                tv.normalized_path
-            FROM videos v
-            JOIN transcript_versions tv
-                ON tv.video_id = v.video_id
-                AND tv.active = 1
-            LEFT JOIN channels c ON c.channel_id = v.channel_id
-            WHERE v.ingest_status = 'indexed'
-            ORDER BY COALESCE(v.published_at, ''), v.video_id
-            """
-        ).fetchall()
-        exported = 0
-        used_names: set[str] = set()
-        for row in rows:
-            segments = read_normalized_segments(resolve_under(paths.root, Path(row["normalized_path"])))
-            if not segments:
-                continue
-            if mode == "obsidian":
-                chunks = _load_chunks(connection, row["video_id"])
-                filename = _obsidian_filename(row["title"] or row["video_id"], row["video_id"], used_names)
-                body = _render_obsidian_markdown(dict(row), segments, chunks)
-            else:
-                filename = _portable_filename(row["title"] or row["video_id"], row["video_id"])
-                body = _render_portable_markdown(dict(row), segments)
-            (output_dir / filename).write_text(body, encoding="utf-8")
-            exported += 1
+SELECT
+    v.id AS hosted_video_id,
+    v.youtube_video_id,
+    v.title,
+    v.description,
+    v.duration_seconds,
+    v.published_at,
+    v.metadata_json AS video_metadata,
+    v.channel_id,
+    s.display_name AS source_display_name,
+    tv.id AS transcript_version_id,
+    tv.source AS transcript_source,
+    tv.language_code AS language,
+    tv.metadata_json AS transcript_metadata
+FROM videos v
+JOIN transcript_versions tv
+  ON tv.id = v.active_transcript_version_id
+ AND tv.workspace_id = v.workspace_id
+LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
+WHERE v.workspace_id = %(workspace_id)s
+  AND v.active_transcript_version_id IS NOT NULL
+ORDER BY v.published_at ASC NULLS LAST, v.youtube_video_id;
+""".strip(),
+            {"workspace_id": workspace_id},
+        )
+    )
+    exported = 0
+    used_names: set[str] = set()
+    for row in rows:
+        chunks = _load_chunks(connection, workspace_id=workspace_id, transcript_version_id=str(row["transcript_version_id"]))
+        if not chunks:
+            continue
+        export_row = _export_row(row)
+        if mode == "obsidian":
+            filename = _obsidian_filename(export_row["title"] or export_row["video_id"], export_row["video_id"], used_names)
+            body = _render_obsidian_markdown(export_row, chunks)
+        else:
+            filename = _portable_filename(export_row["title"] or export_row["video_id"], export_row["video_id"])
+            body = _render_portable_markdown(export_row, chunks)
+        (output_dir / filename).write_text(body, encoding="utf-8")
+        exported += 1
     return ExportStats(exported=exported, output_dir=output_dir)
 
 
-def _load_chunks(connection: sqlite3.Connection, video_id: str) -> list[ExportChunk]:
-    rows = connection.execute(
-        """
-        SELECT chunk_id, sequence, start_ms, end_ms, text
-        FROM chunks
-        WHERE video_id = ?
-        ORDER BY sequence
-        """,
-        (video_id,),
-    ).fetchall()
+def _load_chunks(connection: SqlConnection, *, workspace_id: str, transcript_version_id: str) -> list[ExportChunk]:
+    rows = _rows_from_result(
+        connection.execute(
+            """
+SELECT id AS chunk_id, chunk_index, start_seconds, end_seconds, text
+FROM chunks
+WHERE workspace_id = %(workspace_id)s
+  AND transcript_version_id = %(transcript_version_id)s
+ORDER BY chunk_index;
+""".strip(),
+            {"workspace_id": workspace_id, "transcript_version_id": transcript_version_id},
+        )
+    )
     return [
         ExportChunk(
             chunk_id=row["chunk_id"],
-            sequence=row["sequence"],
-            start_ms=row["start_ms"],
-            end_ms=row["end_ms"],
+            sequence=int(row["chunk_index"]),
+            start_ms=_seconds_to_ms(row.get("start_seconds")),
+            end_ms=_seconds_to_ms(row.get("end_seconds")),
             text=row["text"],
         )
         for row in rows
     ]
+
+
+def _export_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    video_metadata = _json_value(row.get("video_metadata"))
+    transcript_metadata = _json_value(row.get("transcript_metadata"))
+    return {
+        "video_id": row.get("youtube_video_id") or row["hosted_video_id"],
+        "hosted_video_id": row["hosted_video_id"],
+        "title": row.get("title"),
+        "description": row.get("description"),
+        "duration_seconds": row.get("duration_seconds"),
+        "published_at": _json_scalar(row.get("published_at")),
+        "thumbnail_url": video_metadata.get("thumbnail_url"),
+        "channel_title": video_metadata.get("channel_title") or row.get("source_display_name"),
+        "channel_handle": video_metadata.get("channel_handle"),
+        "channel_id": row.get("channel_id"),
+        "transcript_version_id": row.get("transcript_version_id"),
+        "transcript_source": row.get("transcript_source"),
+        "language": row.get("language"),
+        "is_generated": bool(transcript_metadata.get("is_generated")),
+    }
 
 
 def _frontmatter(row: dict, youtube_url: str) -> dict:
@@ -114,7 +144,7 @@ def _frontmatter(row: dict, youtube_url: str) -> dict:
     }
 
 
-def _render_portable_markdown(row: dict, segments: list[TranscriptSegment]) -> str:
+def _render_portable_markdown(row: dict, chunks: list[ExportChunk]) -> str:
     video_id = row["video_id"]
     youtube_url = f"https://youtube.com/watch?v={video_id}"
     title = row.get("title") or video_id
@@ -122,16 +152,14 @@ def _render_portable_markdown(row: dict, segments: list[TranscriptSegment]) -> s
     if row.get("description"):
         lines.extend(["## Description", "", _truncate_description(row["description"]), ""])
     lines.extend(["## Transcript", ""])
-    for segment in segments:
-        seconds = segment.start_ms // 1000
-        timestamp = format_timestamp(segment.start_ms)[:8]
-        lines.append(f"- [{timestamp}](https://youtu.be/{video_id}?t={seconds}) {segment.text}")
+    for chunk in chunks:
+        seconds = chunk.start_ms // 1000
+        timestamp = format_timestamp(chunk.start_ms)[:8]
+        lines.append(f"- [{timestamp}](https://youtu.be/{video_id}?t={seconds}) {chunk.text}")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _render_obsidian_markdown(
-    row: dict, segments: list[TranscriptSegment], chunks: list[ExportChunk]
-) -> str:
+def _render_obsidian_markdown(row: dict, chunks: list[ExportChunk]) -> str:
     video_id = row["video_id"]
     youtube_url = f"https://youtube.com/watch?v={video_id}"
     title = row.get("title") or video_id
@@ -148,25 +176,19 @@ def _render_obsidian_markdown(
         lines.extend(["## Description", "", _truncate_description(row["description"]), ""])
 
     lines.extend(["## Transcript", ""])
-    if chunks:
-        for chunk in chunks:
-            short_id = chunk.chunk_id[:8]
-            lines.append(f"{chunk.text} ^chunk-{short_id}")
-            lines.append("")
-    else:
-        # Fallback for older catalogs missing chunk rows: collapse segments into one paragraph.
-        lines.append(" ".join(segment.text for segment in segments))
+    for chunk in chunks:
+        short_id = chunk.chunk_id[:8]
+        lines.append(f"{chunk.text} ^chunk-{short_id}")
         lines.append("")
 
-    if chunks:
-        lines.extend(["## Timestamps", ""])
-        for chunk in chunks:
-            seconds = chunk.start_ms // 1000
-            timestamp = format_timestamp(chunk.start_ms)[:8]
-            preview = _preview_text(chunk.text, max_chars=80)
-            lines.append(
-                f"- [{timestamp}](https://youtu.be/{video_id}?t={seconds}) — {preview} [[#^chunk-{chunk.chunk_id[:8]}|→]]"
-            )
+    lines.extend(["## Timestamps", ""])
+    for chunk in chunks:
+        seconds = chunk.start_ms // 1000
+        timestamp = format_timestamp(chunk.start_ms)[:8]
+        preview = _preview_text(chunk.text, max_chars=80)
+        lines.append(
+            f"- [{timestamp}](https://youtu.be/{video_id}?t={seconds}) — {preview} [[#^chunk-{chunk.chunk_id[:8]}|→]]"
+        )
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -248,3 +270,42 @@ def _truncate_description(description: str, *, max_chars: int = 4000) -> str:
     if len(compact) <= max_chars:
         return compact
     return compact[: max_chars - 3].rstrip() + "..."
+
+
+def _seconds_to_ms(value: Any) -> int:
+    if value is None:
+        return 0
+    return int(round(float(value) * 1000))
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        rows = result.fetchall()
+    elif isinstance(result, list):
+        rows = result
+    else:
+        rows = list(result)
+    return [dict(row) for row in rows]
+
+
+def _json_value(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        import json
+
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_scalar(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value

@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping, Protocol
 
 from yutome.chunking import CHUNKER_VERSION, build_chunks
 from yutome.config import AppConfig
-from yutome.db import connect_catalog
 from yutome.paths import ProjectPaths, resolve_under
 from yutome.quality_heuristics import assess_transcript_quality
 from yutome.quality_llm import TranscriptCleanupContext, cleanup_transcript_with_gemini
-from yutome.store import rebuild_fts, upsert_transcript_and_chunks
+from yutome.store import upsert_transcript_and_chunks
 from yutome.transcripts import NormalizedTranscript, TranscriptSegment, read_normalized_segments, write_transcript_artifacts
+
+
+class SqlConnection(Protocol):
+    def execute(self, statement: str, params: Mapping[str, Any] | None = None) -> Any:
+        ...
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,8 @@ class _UpgradeResult:
 
 def upgrade_active_transcripts(
     *,
+    connection: SqlConnection,
+    workspace_id: str,
     config: AppConfig,
     paths: ProjectPaths,
     limit: int | None = None,
@@ -68,47 +73,44 @@ def upgrade_active_transcripts(
             )
     scanned = upgraded = skipped_unchanged = skipped_missing = skipped_quality = failed = chunks_saved = 0
     paths.ensure_base_dirs()
-    with connect_catalog(paths.catalog_db) as connection:
-        rows = [
-            dict(row)
-            for row in _candidate_rows(
-                connection,
-                limit=limit,
-                video_id=video_id,
-                video_ids=video_ids,
-                source_filters=source_filters,
-                exclude_llm_cleanup=exclude_llm_cleanup,
-            )
-        ]
-        scanned = len(rows)
-        for result in _upgrade_rows(rows=rows, config=config, paths=paths, quality_gate=quality_gate):
-            for message in result.messages:
-                if progress:
-                    progress(message)
-            if result.skipped_missing:
-                skipped_missing += 1
-                continue
-            if result.skipped_quality:
-                skipped_quality += 1
-                continue
-            if result.skipped_unchanged:
-                skipped_unchanged += 1
-                continue
-            if result.failed:
-                failed += 1
-                continue
-            if result.transcript is None:
-                continue
-            saved_chunks = _persist_upgrade(
-                connection=connection,
-                paths=paths,
-                transcript=result.transcript,
-                channel_id=result.channel_id,
-            )
-            upgraded += 1
-            chunks_saved += saved_chunks
-        rebuild_fts(connection)
-        connection.commit()
+    rows = _candidate_rows(
+        connection,
+        workspace_id=workspace_id,
+        limit=limit,
+        video_id=video_id,
+        video_ids=video_ids,
+        source_filters=source_filters,
+        exclude_llm_cleanup=exclude_llm_cleanup,
+    )
+    scanned = len(rows)
+    for result in _upgrade_rows(rows=rows, config=config, paths=paths, quality_gate=quality_gate):
+        for message in result.messages:
+            if progress:
+                progress(message)
+        if result.skipped_missing:
+            skipped_missing += 1
+            continue
+        if result.skipped_quality:
+            skipped_quality += 1
+            continue
+        if result.skipped_unchanged:
+            skipped_unchanged += 1
+            continue
+        if result.failed:
+            failed += 1
+            continue
+        if result.transcript is None:
+            continue
+        saved_chunks = _persist_upgrade(
+            connection=connection,
+            workspace_id=workspace_id,
+            paths=paths,
+            transcript=result.transcript,
+            channel_id=result.channel_id,
+        )
+        upgraded += 1
+        chunks_saved += saved_chunks
+    _commit_if_supported(connection)
     return QualityUpgradeStats(
         scanned=scanned,
         upgraded=upgraded,
@@ -228,57 +230,62 @@ def _upgrade_row(
 
 
 def _candidate_rows(
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
     *,
+    workspace_id: str,
     limit: int | None,
     video_id: str | None,
     video_ids: list[str] | None,
     source_filters: list[str] | None,
     exclude_llm_cleanup: bool,
-) -> list[sqlite3.Row]:
+) -> list[dict[str, Any]]:
     sql = """
         SELECT
-            v.video_id,
+            v.youtube_video_id AS video_id,
             v.channel_id,
             v.title,
             v.description,
-            c.title AS channel_title,
-            c.handle AS channel_handle,
-            c.description AS channel_description,
-            tv.transcript_version_id,
+            v.metadata_json->>'channel_title' AS channel_title,
+            v.metadata_json->>'channel_handle' AS channel_handle,
+            NULL::text AS channel_description,
+            tv.id AS transcript_version_id,
             tv.source,
-            tv.language,
-            tv.is_generated,
-            tv.normalized_path,
-            tv.text_hash
+            tv.language_code AS language,
+            COALESCE((tv.metadata_json->>'is_generated')::boolean, false) AS is_generated,
+            tv.metadata_json->>'normalized_path' AS normalized_path,
+            tv.content_hash AS text_hash
         FROM transcript_versions tv
-        JOIN videos v ON v.video_id = tv.video_id
-        LEFT JOIN channels c ON c.channel_id = v.channel_id
-        WHERE tv.active = 1
-          AND v.ingest_status = 'indexed'
+        JOIN videos v
+          ON v.id = tv.video_id
+         AND v.workspace_id = tv.workspace_id
+        WHERE tv.workspace_id = %(workspace_id)s
+          AND v.active_transcript_version_id = tv.id
     """
-    params: list[object] = []
+    params: dict[str, Any] = {"workspace_id": workspace_id}
     if video_id:
-        sql += " AND v.video_id = ?"
-        params.append(video_id)
+        sql += " AND (v.id = %(video_id)s OR v.youtube_video_id = %(video_id)s)"
+        params["video_id"] = video_id
     if video_ids:
-        placeholders = ",".join("?" for _ in video_ids)
-        sql += f" AND v.video_id IN ({placeholders})"
-        params.extend(video_ids)
+        sql += " AND (v.id = ANY(%(video_ids)s::text[]) OR v.youtube_video_id = ANY(%(video_ids)s::text[]))"
+        params["video_ids"] = video_ids
     if source_filters:
-        clauses = []
-        for source_filter in source_filters:
-            clauses.append("(tv.source = ? OR tv.source LIKE ?)")
-            params.extend([source_filter, f"{source_filter}%"])
-        sql += " AND (" + " OR ".join(clauses) + ")"
+        sql += """
+          AND EXISTS (
+              SELECT 1
+              FROM unnest(%(source_filters)s::text[]) AS source_filter(value)
+              WHERE tv.source = source_filter.value
+                 OR tv.source LIKE source_filter.value || '%%'
+          )
+        """
+        params["source_filters"] = source_filters
     if exclude_llm_cleanup:
-        sql += " AND tv.source NOT LIKE ?"
-        params.append("%+llm-cleanup:%")
+        sql += " AND tv.source NOT LIKE %(cleanup_source_pattern)s"
+        params["cleanup_source_pattern"] = "%+llm-cleanup:%"
     sql += " ORDER BY v.video_id"
     if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-    return connection.execute(sql, params).fetchall()
+        sql += " LIMIT %(limit)s"
+        params["limit"] = limit
+    return _rows_from_result(connection.execute(sql, params))
 
 
 def _upgrade_one(
@@ -328,7 +335,8 @@ def _quality_metadata_text(row: dict[str, object]) -> str:
 
 def _persist_upgrade(
     *,
-    connection: sqlite3.Connection,
+    connection: SqlConnection,
+    workspace_id: str,
     paths: ProjectPaths,
     transcript: NormalizedTranscript,
     channel_id: str | None,
@@ -371,6 +379,7 @@ def _persist_upgrade(
             )
     upsert_transcript_and_chunks(
         connection,
+        workspace_id=workspace_id,
         transcript_version_id=transcript.version_id,
         video_id=transcript.video_id,
         channel_id=channel_id,
@@ -392,3 +401,23 @@ def _raw_snippet(segment: TranscriptSegment) -> dict[str, float | str]:
         "start": segment.start_ms / 1000,
         "duration": max(0, segment.end_ms - segment.start_ms) / 1000,
     }
+
+
+def _rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if result is None:
+        return []
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    if hasattr(result, "fetchall"):
+        rows = result.fetchall()
+    elif isinstance(result, list):
+        rows = result
+    else:
+        rows = list(result)
+    return [dict(row) for row in rows]
+
+
+def _commit_if_supported(connection: SqlConnection) -> None:
+    commit = getattr(connection, "commit", None)
+    if callable(commit):
+        commit()

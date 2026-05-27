@@ -108,7 +108,7 @@ class RecordingSearchStore:
             }
         ], SearchStoreUsage(
             operation="lexical_query",
-            backend="postgres_fts_fallback",
+            backend="vectorchord_bm25",
             index_profile_ref="sip_default",
             units={"queries": 1, "candidate_limit": limit, "result_count": 1, "latency_ms": 1.2},
         )
@@ -1263,10 +1263,10 @@ def test_account_list_surfaces_adapter_rejected_combinations() -> None:
     channels_order = client.post("/account/list", json={"entity": "channels", "order_by": "newest"}, headers=headers)
     status_filtered = client.post("/account/list", json={"entity": "status", "channel": "chan_http"}, headers=headers)
 
-    assert videos_selected.status_code == 501
+    assert videos_selected.status_code == 400
     assert error_body(videos_selected.json())["code"] == "unsupported_list_filter"
-    assert channels_order.status_code == 501
+    assert channels_order.status_code == 400
     assert error_body(channels_order.json())["code"] == "unsupported_list_order"
-    assert status_filtered.status_code == 501
+    assert status_filtered.status_code == 400
     assert error_body(status_filtered.json())["code"] == "unsupported_list_filter"
     assert store.calls == []  # rejected during argument validation, before any store read

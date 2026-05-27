@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import typer
 
-from . import _legacy
+from . import actions
 from .context import config_path
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Hosted Postgres runtime commands.")
@@ -20,7 +18,7 @@ def api_command(
     log_level: str = typer.Option("info", "--log-level", help="Uvicorn log level."),
 ) -> None:
     """Run the hosted MCP query API."""
-    _legacy.hosted_api(config=config_path(ctx), host=host, port=port, log_level=log_level)
+    actions.hosted_api(config=config_path(ctx), host=host, port=port, log_level=log_level)
 
 
 @app.command("migrate")
@@ -30,7 +28,7 @@ def migrate_command(
     json_output: bool = typer.Option(False, "--json", help="Emit migration result as JSON."),
 ) -> None:
     """Apply hosted Postgres migrations."""
-    _legacy.hosted_migrate(config=config_path(ctx), phase=phase, json_output=json_output)
+    actions.hosted_migrate(config=config_path(ctx), phase=phase, json_output=json_output)
 
 
 @app.command("login")
@@ -43,7 +41,7 @@ def login_command(
     json_output: bool = typer.Option(False, "--json", help="Emit hosted auth state as JSON."),
 ) -> None:
     """Authorize this CLI against a hosted Yutome account."""
-    _legacy.hosted_login(
+    actions.hosted_login(
         config=config_path(ctx),
         app_url=app_url,
         api_url=api_url,
@@ -60,25 +58,21 @@ def jobs_command(
     json_output: bool = typer.Option(False, "--json", help="Emit hosted jobs as JSON."),
 ) -> None:
     """Read recent hosted jobs for the logged-in workspace."""
-    _legacy.hosted_jobs(config=config_path(ctx), limit=limit, json_output=json_output)
+    actions.hosted_jobs(config=config_path(ctx), limit=limit, json_output=json_output)
 
 
 @app.command("usage")
 def usage_command(
     ctx: typer.Context,
-    ledger: Path | None = typer.Option(None, "--ledger", help="Override the hosted usage JSONL ledger path."),
     limit: int = typer.Option(20, "--limit", "-n", min=0, help="Maximum usage events to show."),
     summary: bool = typer.Option(False, "--summary", help="Summarize usage totals."),
-    append_demo: bool = typer.Option(False, "--append-demo", help="Append synthetic usage rows for diagnostics."),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON output."),
 ) -> None:
     """Inspect hosted provider/search-store usage events."""
-    _legacy.usage_command(
+    actions.usage_command(
         config=config_path(ctx),
-        ledger=ledger,
         limit=limit,
         summary=summary,
-        append_demo=append_demo,
         json_output=json_output,
     )
 
@@ -95,7 +89,7 @@ def source_add_command(
     json_output: bool = typer.Option(False, "--json", help="Emit seed result as JSON."),
 ) -> None:
     """Create or update a hosted source and refresh policy."""
-    _legacy.hosted_source_add(
+    actions.hosted_source_add(
         source_url=source_url,
         config=config_path(ctx),
         workspace_id=workspace_id,
@@ -123,7 +117,7 @@ def run_command(
     """Run a hosted daemon job."""
     normalized = job.lower()
     if normalized == "worker":
-        _legacy.hosted_worker(
+        actions.hosted_worker(
             config=config_path(ctx),
             once=once,
             lease_owner=lease_owner,
@@ -135,7 +129,7 @@ def run_command(
         )
         return
     if normalized == "billing-export":
-        _legacy.hosted_billing_export_worker(
+        actions.hosted_billing_export_worker(
             config=config_path(ctx),
             once=once,
             lease_owner=lease_owner,
@@ -145,15 +139,23 @@ def run_command(
         )
         return
     if normalized == "source-refresh":
-        _legacy.hosted_source_refresh_tick(
+        actions.hosted_source_refresh_tick(
             config=config_path(ctx),
+            once=once,
             lease_owner=lease_owner,
             limit=limit,
             lock_seconds=lock_seconds,
+            poll_interval=poll_interval,
             json_output=json_output,
         )
         return
     if normalized == "maintenance":
-        _legacy.hosted_maintenance_tick(config=config_path(ctx), limit=limit, json_output=json_output)
+        actions.hosted_maintenance_tick(
+            config=config_path(ctx),
+            once=once,
+            limit=limit,
+            poll_interval=poll_interval,
+            json_output=json_output,
+        )
         return
     raise typer.BadParameter("job must be one of: worker, billing-export, source-refresh, maintenance")

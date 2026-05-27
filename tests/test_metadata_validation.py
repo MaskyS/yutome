@@ -6,6 +6,8 @@ makes those failures loud instead of silent.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from yutome.store import _published_at_from_flat_discovery
@@ -62,13 +64,13 @@ def test_extract_video_id_accepts_watch_short_and_raw_ids() -> None:
 def test_flat_discovery_published_at_prefers_upload_date() -> None:
     raw = {"upload_date": "20260507", "timestamp": 1778112000}
 
-    assert _published_at_from_flat_discovery(raw) == "20260507"
+    assert _published_at_from_flat_discovery(raw) == datetime(2026, 5, 7, tzinfo=timezone.utc)
 
 
 def test_flat_discovery_published_at_falls_back_to_timestamp() -> None:
     raw = {"timestamp": 1778112000}
 
-    assert _published_at_from_flat_discovery(raw) == "20260507"
+    assert _published_at_from_flat_discovery(raw) == datetime(2026, 5, 7, tzinfo=timezone.utc)
 
 
 def test_flat_discovery_published_at_ignores_bad_timestamp() -> None:

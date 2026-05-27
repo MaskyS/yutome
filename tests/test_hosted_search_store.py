@@ -5,9 +5,7 @@ from typing import Any
 import pytest
 
 from yutome.hosted.search_store import (
-    POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND,
     PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND,
-    POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
     PostgresVectorChordSearchStore,
     VECTORCHORD_REQUIRED_EXTENSIONS,
     VECTORCHORD_BM25_CHUNKS_INDEX,
@@ -80,7 +78,7 @@ def test_lexical_query_plan_prefers_vectorchord_bm25_by_default() -> None:
     assert "v.active_transcript_version_id = c.transcript_version_id" in plan.statement.sql
     assert "sip.backend = %(storage_backend)s" in plan.statement.sql
     assert "ORDER BY bm25_score ASC" in plan.statement.sql
-    assert plan.statement.params == {
+    expected_params = {
         "workspace_id": "ws_alice",
         "query": "crohn probiotics",
         "index_profile_ref": "sip_default",
@@ -89,35 +87,16 @@ def test_lexical_query_plan_prefers_vectorchord_bm25_by_default() -> None:
         "storage_backend": "postgres_vectorchord",
         "limit": 5,
     }
+    assert {key: plan.statement.params[key] for key in expected_params} == expected_params
+    assert plan.statement.params["filter_channel"] is None
+    assert plan.statement.params["filter_source_prefix"] is None
     assert plan.usage.operation == "lexical_query"
-    assert plan.usage.units == {"queries": 1, "candidate_limit": 5}
+    assert plan.usage.units == {"queries": 1, "candidate_limit": 5, "result_limit": 5, "result_offset": 0}
     assert plan.usage.backend == VECTORCHORD_BM25_LEXICAL_BACKEND
     assert plan.usage.metadata == {
         "storage_backend": "postgres_vectorchord",
         "lexical_sql_backend": VECTORCHORD_BM25_LEXICAL_BACKEND,
         "bm25_index_name": VECTORCHORD_BM25_CHUNKS_INDEX,
-        "configured_fallback": False,
-    }
-
-
-def test_lexical_query_plan_uses_fts_only_when_configured_as_fallback() -> None:
-    plan = lexical_query_plan(
-        workspace_id="ws_alice",
-        query="crohn probiotics",
-        limit=5,
-        index_profile_ref="sip_default",
-        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-    )
-
-    assert "websearch_to_tsquery" in plan.statement.sql
-    assert "fts_document @@ query.tsquery" in plan.statement.sql
-    assert "c.bm25_document <&> to_bm25query" not in plan.statement.sql
-    assert plan.usage.backend == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND
-    assert plan.usage.metadata == {
-        "storage_backend": "postgres_vectorchord",
-        "lexical_sql_backend": POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-        "configured_fallback": True,
-        "fallback_reason": "configured_lexical_backend",
     }
 
 
@@ -173,26 +152,6 @@ def test_hybrid_query_plan_uses_rrf_fusion_and_candidate_multiplier() -> None:
     assert plan.usage.metadata["storage_backend"] == "postgres_vectorchord"
     assert plan.usage.metadata["lexical_sql_backend"] == VECTORCHORD_BM25_LEXICAL_BACKEND
     assert plan.usage.metadata["bm25_index_name"] == VECTORCHORD_BM25_CHUNKS_INDEX
-    assert plan.usage.metadata["configured_fallback"] is False
-
-
-def test_hybrid_query_plan_uses_fts_pgvector_only_when_configured_as_fallback() -> None:
-    plan = hybrid_query_plan(
-        workspace_id="ws_alice",
-        query="resistance training",
-        query_vector=[1.0] * 1024,
-        limit=10,
-        candidate_multiplier=3,
-        rrf_k=50,
-        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-    )
-
-    assert "fts_document @@ query.tsquery" in plan.statement.sql
-    assert "c.bm25_document <&> to_bm25query" not in plan.statement.sql
-    assert plan.usage.backend == POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
-    assert plan.usage.metadata["lexical_sql_backend"] == POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND
-    assert plan.usage.metadata["configured_fallback"] is True
-    assert plan.usage.metadata["fallback_reason"] == "configured_lexical_backend"
 
 
 def test_query_plans_cast_nullable_index_profile_ref_for_postgres() -> None:
@@ -226,41 +185,16 @@ def test_search_store_executes_plan_and_adds_result_count_usage() -> None:
     assert usage.units["latency_ms"] >= 0
 
 
-def test_search_store_semantic_path_is_independent_of_lexical_backend() -> None:
+def test_search_store_semantic_path_uses_vector_distance() -> None:
     connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
-    store = PostgresVectorChordSearchStore(
-        connection,
-        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-    )
+    store = PostgresVectorChordSearchStore(connection)
 
     rows, usage = store.semantic_search(workspace_id="ws_alice", query_vector=[0.1] * 1024, limit=3)
 
     assert rows == [{"chunk_id": "chunk_1", "score": 1.0}]
-    assert "fts_document" not in connection.calls[0][0]
     assert "ce.embedding <-> %(query_vector)s::vector(1024)" in connection.calls[0][0]
     assert usage.backend == "postgres_vectorchord"
     assert usage.metadata["semantic_sql_backend"] == PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND
-
-
-def test_search_store_hybrid_path_uses_configured_lexical_fallback() -> None:
-    connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
-    store = PostgresVectorChordSearchStore(
-        connection,
-        lexical_backend=POSTGRES_FTS_FALLBACK_LEXICAL_BACKEND,
-    )
-
-    rows, usage = store.hybrid_search(
-        workspace_id="ws_alice",
-        query="crohn",
-        query_vector=[0.1] * 1024,
-        limit=3,
-    )
-
-    assert rows == [{"chunk_id": "chunk_1", "score": 1.0}]
-    assert "fts_document @@ query.tsquery" in connection.calls[0][0]
-    assert "c.bm25_document <&> to_bm25query" not in connection.calls[0][0]
-    assert usage.backend == POSTGRES_FTS_PGVECTOR_FALLBACK_BACKEND
-    assert usage.metadata["configured_fallback"] is True
 
 
 def test_resource_sql_is_workspace_scoped_for_supported_hosts() -> None:
@@ -290,13 +224,13 @@ def test_list_sql_helpers_are_workspace_scoped_and_parameterized() -> None:
     assert "searchable_now" in status.sql
     assert "v.workspace_id = %(workspace_id)s" in videos.sql
     assert "ORDER BY v.published_at DESC NULLS LAST" in videos.sql
-    assert videos.params == {
-        "workspace_id": "ws_alice",
-        "video_id": None,
-        "channel": "chan_1",
-        "limit": 5,
-        "offset": 2,
-    }
+    assert videos.params["workspace_id"] == "ws_alice"
+    assert videos.params["video_id"] is None
+    assert videos.params["channel"] == "chan_1"
+    assert videos.params["source_prefix"] is None
+    assert videos.params["language"] is None
+    assert videos.params["limit"] == 5
+    assert videos.params["offset"] == 2
     assert "s.workspace_id = %(workspace_id)s" in channels.sql
     assert "s.selected = %(selected)s::boolean" in channels.sql
     assert channels.params["selected"] is True

@@ -1,7 +1,7 @@
 [project]
 name = "yutome"
 version = "0.1.14"
-description = "A local transcript library for the YouTube channels you point at"
+description = "A Postgres-backed transcript library for the YouTube channels you point at"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -16,7 +16,8 @@ keywords = [
     "search",
     "mcp",
     "rag",
-    "local-first",
+    "postgres",
+    "vectorchord",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -37,7 +38,6 @@ dependencies = [
     "fastapi>=0.115,<1",
     "faster-whisper>=1.1",
     "google-genai>=1.40",
-    "lancedb>=0.20",
     "mcp[cli]>=1.27,<2",
     "pydantic>=2.8,<3",
     "questionary>=2.0,<3",

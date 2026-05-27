@@ -4,30 +4,29 @@ Last updated: 2026-05-25
 
 ## Purpose
 
-Make Yutome useful for non-expert users and easy for hosters by replacing the current user-owned setup path with a hosted path:
+Make Yutome useful for non-expert users and easy for hosters by building hosted onboarding on top of the same Postgres + VectorChord database contract used by every runtime mode:
 
 - User signs into a Yutome frontend.
 - Yutome owns and meters Polar billing, Gemini AI, Webshare residential proxying, hosted connector infrastructure, hosted ingest execution, and the chosen hosted search/storage substrate.
 - Users do not create Cloudflare, Gemini, Voyage, or Webshare accounts in the normal path.
-- Advanced users may still use the local-first/BYO mode, but that is not the default hosted onboarding.
+- Advanced users may still operate their own Postgres + VectorChord database, but that is not the default hosted onboarding.
 
-## Current Product Reality
+## Product Reality
 
-Current `yutome setup` is a local CLI wizard with six user-facing steps:
+`yutome setup` should converge on these user-facing steps:
 
-1. Project setup and local SQLite catalog creation.
+1. Project setup and Postgres + VectorChord database configuration through `YUTOME_POSTGRES_URL`.
 2. Webshare residential proxy setup.
 3. Gemini transcript repair/fallback setup.
-4. Semantic search setup through Voyage + LanceDB.
+4. Semantic search setup through the configured embedding provider and VectorChord dense-vector indexes.
 5. YouTube source import and first sync.
-6. Assistant connection through local MCP or a user-deployed Cloudflare Worker.
+6. Assistant connection through MCP or a hosted/user-deployed remote connector.
 
-Current storage/search shape:
+Storage/search shape:
 
-- SQLite is the system of record for channels, library sources, videos, transcript versions, chunks, embedding status, transcript attempts, and jobs.
-- SQLite FTS5 powers lexical chunk/video search, `bm25`, snippets, raw FTS mode, and literal phrase escaping.
-- LanceDB stores chunk embedding rows plus a subset of chunk/video/transcript metadata.
-- Hybrid search uses LanceDB hybrid search over vectors + text, then enriches and validates rows against SQLite.
+- Postgres is the system of record for channels, sources, videos, transcript versions, chunks, embedding status, transcript attempts, jobs, and usage records.
+- VectorChord Suite powers BM25 lexical search and dense-vector search through `vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`.
+- Hybrid search combines Postgres BM25 and VectorChord dense-vector recall, then enriches results from the same database.
 - Semantic/hybrid query embeddings are generated through Voyage.
 
 Current remote connector shape:
@@ -58,7 +57,7 @@ Recommended V1 hosted product:
 - Proxying: Webshare rotating residential, brokered by Yutome with per-user sub-users or equivalent bandwidth attribution.
 - Cloud: Cloudflare for the public frontend, auth/session edge, remote MCP connector, lightweight scheduler triggers, and R2 artifact storage where useful. Do not run media ingest, `yt-dlp`, or VectorChord inside Cloudflare Workers.
 - Runtime: Railway is the default hosted deployment for the API, always-on worker, cron tick, and initial Postgres deployment. Postgres is the durable job/schedule source of truth. Modal is optional later for bursty backfills or expensive media fallback jobs; Fly Machines are a lower-priority worker fallback.
-- Search/storage: keep SQLite + LanceDB locally until the hosted refactor lands, but target **one hosted canonical database** for V1. The default candidate is Postgres + VectorChord Suite, deployed on Railway as a custom Postgres service unless a managed VectorChord-capable host is selected. Managed Postgres + `pgvector` + built-in Postgres FTS is the fallback if VectorChord database operations are not ready for paid production. D1 + Vectorize, Turbopuffer, Typesense, Weaviate, and OpenSearch remain bakeoff controls, but they either split catalog/search or require document-store consistency tradeoffs.
+- Search/storage: use **one Postgres database with VectorChord Suite** for every mode. The default hosted deployment is Railway custom Postgres unless a managed VectorChord-capable host is selected. Managed Postgres + `pgvector` + built-in Postgres FTS is the fallback if VectorChord database operations are not ready for paid production. D1 + Vectorize, Turbopuffer, Typesense, Weaviate, and OpenSearch remain bakeoff controls, but they either split catalog/search or require document-store consistency tradeoffs.
 - Embeddings: use `voyage-4-lite` for hosted semantic search unless evals produce strong evidence that another model is materially better on speed, cost, and retrieval accuracy. Current Yutome already uses `voyage-4-lite`, so this preserves ranking behavior and avoids changing two variables at once.
 
 Hosted embedding candidates:
@@ -474,9 +473,9 @@ Not recommended as the single canonical hosted database:
 - **Typesense / Weaviate / OpenSearch**: valid search-first bakeoff controls, but only become one-substrate candidates if Yutome accepts document-store consistency for jobs/catalog/billing.
 - **Milvus / Vespa**: too much operational burden for V1 noob hosting unless simpler systems fail retrieval quality or scale tests.
 
-### Current Yutome Storage Responsibilities
+### Superseded Split-Store Responsibilities
 
-Current code uses SQLite as the canonical catalog and workflow database:
+The former SQLite/LanceDB implementation is requirement evidence only; it is not a compatibility target:
 
 - `src/yutome/db.py` defines channels, library channels/sources, videos, transcript versions, chunks, embeddings, transcript attempts, and jobs. It also creates `videos_fts` and `chunks_fts`.
 - `src/yutome/store.py` owns catalog writes: discovered video upserts, metadata upserts, active transcript replacement, chunk replacement, ingest status, transcript attempts, and FTS rebuilds.
@@ -484,16 +483,16 @@ Current code uses SQLite as the canonical catalog and workflow database:
 - `src/yutome/retrieval.py` resolves chunks, neighboring context, source URLs, snippets, and metadata from SQLite rows.
 - `src/yutome/embeddings.py` reads active chunks from SQLite, embeds them with Voyage, writes a LanceDB `chunks` table, and records embedding status back into SQLite.
 
-Current LanceDB usage is intentionally rebuildable and secondary:
+The former LanceDB usage was rebuildable and secondary:
 
 - LanceDB stores active chunk rows with vectors plus duplicated chunk/transcript metadata.
 - `ensure_lancedb_chunk_indexes()` creates a LanceDB FTS index on `text`.
 - Hybrid search uses `table.search(query_type="hybrid").vector(...).text(...).where(..., prefilter=True).rerank()`.
 - LanceDB filters only cover fields duplicated in its chunk table: `video_id`, `channel_id`, `chunk_id`, `source`, `language`, `is_generated`, `sequence`, `start_ms`, and `token_count`.
 - Filters needing video/channel/job state (`channel_handle`, `published_at`, `duration_seconds`, `ingest_status`, `live_status`, `channel_selected`, `last_attempt_*`) force a two-stage plan through SQLite.
-- Search results from LanceDB are validated and enriched against SQLite active transcript rows; stale LanceDB rows are dropped.
+- Former search results from LanceDB were validated and enriched against SQLite active transcript rows; stale LanceDB rows were dropped.
 
-The tests encode this split. `tests/test_fts5_escape.py` protects SQLite FTS5 phrase escaping and raw FTS5 operator behavior. `tests/test_retrieval_exports.py` protects hybrid fallback to lexical when Voyage/LanceDB is unavailable and stale LanceDB schema detection. `tests/test_config_paths_db.py` asserts the SQLite catalog/FTS tables exist.
+Replace tests that encoded this split with Postgres + VectorChord tests for BM25 lexical search, dense-vector recall, hybrid fusion, schema/extension checks, and no legacy SQLite/LanceDB stores.
 
 ### Hosted Product Requirements Matrix
 
@@ -640,11 +639,11 @@ Important distinction: the `fts()` SQL table function is **not** the same surfac
 
 But replacing SQLite with LanceDB alone would still require a substantial rewrite and would lose exact behavior unless we reimplement it:
 
-- **Relational integrity:** current SQLite uses primary keys, foreign keys, triggers, uniqueness, indexes, and WAL behavior. LanceDB tables can store rows and be updated, but LanceDB OSS is not a relational database with SQLite-style foreign keys, cascading deletes, triggers, or transactional catalog semantics.
-- **Catalog queries:** video/channel listing, active transcript joins, latest transcript attempt subqueries, status breakdowns, counts, and selected library-source logic are ordinary SQLite today. LanceDB SQL FTS can combine FTS results with surrounding SQL joins, grouping, and filters, but that page is marked Enterprise-only and beta. Relying on it would make "LanceDB-only" a dependency on LanceDB Enterprise FlightSQL behavior, not a simplification of the current local OSS product.
+- **Relational integrity:** the former SQLite path used primary keys, foreign keys, triggers, uniqueness, indexes, and WAL behavior. LanceDB tables can store rows and be updated, but LanceDB OSS is not a relational database with SQLite-style foreign keys, cascading deletes, triggers, or transactional catalog semantics.
+- **Catalog queries:** video/channel listing, active transcript joins, latest transcript attempt subqueries, status breakdowns, counts, and selected library-source logic were ordinary SQL catalog queries. LanceDB SQL FTS can combine FTS results with surrounding SQL joins, grouping, and filters, but that page is marked Enterprise-only and beta. Relying on it would make "LanceDB-only" a dependency on LanceDB Enterprise FlightSQL behavior, not a simplification.
 - **FTS5 raw mode:** Yutome exposes raw SQLite FTS5 syntax for power users and tests special behavior around `AND`/`OR`/`NOT`, column scoping, prefix operators, phrase escaping, and snippets. LanceDB's SQL FTS page supports boolean queries through JSON query objects built by `MatchQuery`, `PhraseQuery`, `BoostQuery`, and `MultiMatchQuery`, but it is not SQLite FTS5 raw syntax. Supporting current `--raw` semantics would still require a parser/translator or a documented behavior change.
 - **Video title/description FTS:** SQLite has a dedicated `videos_fts` table and column-scoped `title:(...)` / `description:(...)` search. LanceDB can index multiple text columns and use `fts_columns`, but query syntax, scoring, highlighting/snippet behavior, and raw mode will drift.
-- **Ordering and pagination:** current SQLite plans order by `published_at`, `duration_seconds`, `title`, `ingest_status`, `sequence`, `start_ms`, and `last_attempt_created_at`, then paginate. LanceDB Enterprise SQL can express ordinary SQL ordering around `fts()`, but the OSS table-query path Yutome currently uses does not give us the same general relational query surface without moving to SQL/FlightSQL or application-side sorting.
+- **Ordering and pagination:** the former SQL plans ordered by `published_at`, `duration_seconds`, `title`, `ingest_status`, `sequence`, `start_ms`, and `last_attempt_created_at`, then paginated. LanceDB Enterprise SQL can express ordinary SQL ordering around `fts()`, but the OSS table-query path does not provide the same general relational query surface without moving to SQL/FlightSQL or application-side sorting.
 - **Active transcript logic:** current indexing selects only `tv.active = 1`; writes atomically deactivate old transcript versions, insert the new active version, replace chunks, and update ingest status. LanceDB-only would need either materialized `active_chunks` tables or careful multi-table update choreography.
 - **Job/attempt state:** `jobs` and `transcript_attempts` are operational state, not retrieval documents. They need idempotent enqueue/resume, lock ownership, retry windows, latest-attempt projections, and admin status queries. LanceDB can store such rows, but it is not the obvious queue/catalog substrate.
 - **Rebuild/resume:** today SQLite is canonical and LanceDB can be dropped/rebuilt. A LanceDB-only design makes the vector index and the source of truth the same system, so failed embedding batches, stale indexes, compaction, and partial updates become higher-risk.
@@ -662,7 +661,7 @@ Minimum work:
 4. Add scalar indexes for every metadata filter used by `QueryRequest`.
 5. Add explicit `optimize()` scheduling and index health checks.
 6. Rebuild consistency checks: active transcript uniqueness, stale chunk removal, embedding status, and failed/resumable jobs.
-7. Build parity tests comparing current SQLite + LanceDB results against the new backend for lexical, semantic, hybrid, group-by-video, status, list, show, and raw query behavior.
+7. Build parity tests comparing product-level Postgres + VectorChord behavior for lexical, semantic, hybrid, group-by-video, status, list, show, and advanced query behavior.
 
 This does not simplify noob onboarding enough to justify doing before hosted V1.
 
@@ -670,7 +669,7 @@ This does not simplify noob onboarding enough to justify doing before hosted V1.
 
 | Option | Feature fit | What remains lacking |
 |---|---|---|
-| Keep SQLite + LanceDB | Best current local parity. SQLite owns catalog/FTS/jobs; LanceDB owns semantic/hybrid chunk search. | Not the hosted target under the one-substrate assumption. Hosted mode needs a service/container or replica path and still leaves two stores. |
+| Keep SQLite + LanceDB | Former local parity path. SQLite owned catalog/FTS/jobs; LanceDB owned semantic/hybrid chunk search. | Not the target under the one-substrate assumption. It needs a service/container or replica path and still leaves two stores. |
 | Cloudflare D1 + Vectorize | Operationally easiest Cloudflare-native fallback. D1 gives managed SQLite-like catalog, FTS5, foreign keys, batch transactions, Time Travel, and rows-read/written metrics; Vectorize gives managed vector search and metadata filters. | Not one substrate. No native hybrid lexical+vector search, so Workers must dual-write and fuse D1 FTS + Vectorize. D1 and Vectorize have separate APIs, limits, consistency behavior, and billing units. Vectorize metadata indexes are capped at 10 properties, metadata filters are compact JSON under 2048 bytes, indexed strings only use the first 64B, upserts/deletes are async, and topK is capped at 100 or 50 when returning full metadata. Ranking will drift from LanceDB/Postgres. Sources: [D1 SQL/FTS5](https://developers.cloudflare.com/d1/sql-api/sql-statements/), [D1 Worker API](https://developers.cloudflare.com/d1/worker-api/d1-database/), [D1 Time Travel](https://developers.cloudflare.com/d1/platform/time-travel/), [D1 limits](https://developers.cloudflare.com/d1/platform/limits/), [Vectorize metadata filtering](https://developers.cloudflare.com/vectorize/reference/metadata-filtering/), [Vectorize API](https://developers.cloudflare.com/vectorize/reference/client-api/). |
 | DuckDB + LanceDB | Strong for SQL analytics over Lance tables. LanceDB docs show DuckDB's Lance extension can run SQL, vector search, FTS, and hybrid search over Lance tables. | Adds another native engine, not Cloudflare-native, and DuckDB FTS docs warn the FTS index does not update automatically when the input table changes. Better for batch/admin analytics than hosted noob infra. Sources: [LanceDB DuckDB integration](https://docs.lancedb.com/integrations/data/duckdb), [DuckDB FTS](https://duckdb.org/docs/current/core_extensions/full_text_search.html). |
 | SQLite + sqlite-vec | Attractive local single-file direction: keep SQLite catalog, FTS5, jobs, and add vector KNN in SQL. | `sqlite-vec` docs are still marked work-in-progress; hybrid/rerank behavior would be custom; Cloudflare D1 cannot load arbitrary native SQLite extensions. Source: [sqlite-vec docs](https://alexgarcia.xyz/sqlite-vec/). |
@@ -706,7 +705,7 @@ Prefer the first option if retrieval quality is acceptable. Run the bakeoff with
 Required feature gates:
 
 - **Search modes:** lexical, semantic, hybrid, semantic-with-lexical-fallback, video/title-description search, grouped results by video, neighboring context lookup.
-- **Lexical quality:** phrase queries, exact technical terms, boolean-ish query behavior, snippets/highlights, field boosts for title/description/text, and a documented replacement for current SQLite FTS5 raw mode.
+- **Lexical quality:** phrase queries, exact technical terms, boolean-ish query behavior, snippets/highlights, field boosts for title/description/text, and a documented replacement for former SQLite FTS5 raw mode.
 - **Hybrid quality:** built-in fusion or reproducible RRF/weighted fusion; stable scores enough for tests; optional reranking path.
 - **Filters:** `workspace_id`, `video_id`, `channel_id`, `source`, `language`, `is_generated`, `published_at`, `duration_seconds`, `ingest_status`, `live_status`, `selected`, `sequence`, `start_ms`, and `token_count`.
 - **Mutation behavior:** idempotent upsert, delete-by-video/workspace, active transcript replacement, rebuild/resume, stale-row detection, backup/restore.
@@ -727,11 +726,11 @@ Evaluate in this order:
 
 Near-term implementation shape for the bakeoff:
 
-1. Export a representative Yutome corpus from current SQLite + LanceDB: videos, active chunks, chunk metadata, title/description text, and existing LanceDB vectors if compatible.
+1. Export or synthesize a representative Yutome corpus from the Postgres + VectorChord schema: videos, active chunks, chunk metadata, title/description text, BM25 rows, and dense vectors.
 2. Re-embed with `voyage-4-lite` where needed and store model/dimension/version on every backend row.
 3. Implement a thin `HostedSearchStore` adapter for each candidate with `upsert_catalog`, `replace_active_transcript`, `index_chunks`, `delete_video`, `lexical_search`, `semantic_search`, `hybrid_search`, `group_by_video`, `context_neighbors`, `enqueue_job`, `claim_job`, `record_usage`, and `health`.
 4. Build eval queries from real Yutome usage: exact names, quoted phrases, acronym/code-ish terms, broad natural-language questions, recency filters, generated-vs-official transcript filters, and channel/video scoping.
-5. Compare against current SQLite + LanceDB on recall@k, MRR/NDCG where labels exist, latency p50/p95, RAM/disk, operational steps, cost model, and failure/rebuild behavior.
+5. Compare against the Postgres + VectorChord retrieval contract on recall@k, MRR/NDCG where labels exist, latency p50/p95, RAM/disk, operational steps, cost model, and failure/rebuild behavior.
 6. Pick the hosted V1 substrate only after the bakeoff. Until then, treat Postgres + VectorChord Suite as the implementation default and managed Postgres + pgvector + Postgres FTS as the production fallback if VectorChord database operations are not ready. D1 + Vectorize remains a Cloudflare-only fallback, not the final architecture.
 
 ### Hosted Cloudflare Implication
@@ -779,7 +778,7 @@ Primary docs for this addendum: [Fly Managed Postgres](https://fly.io/docs/mpg/)
 
 ### Decision
 
-Use **Postgres + VectorChord Suite** as the hosted V1 default unless the bakeoff disproves it. Keep SQLite + LanceDB as the current local implementation, not the hosted architectural target.
+Use **Postgres + VectorChord Suite** as the database/search substrate for every mode unless the bakeoff disproves it. Do not keep a SQLite + LanceDB local mode.
 
 Current candidate order:
 
@@ -811,7 +810,7 @@ Claude / ChatGPT / MCP client
   -> YutomeRelay Durable Object named "default"
   -> /relay/connect WebSocket from local `yutome serve bridge`
   -> local contract.py handlers
-  -> local SQLite + LanceDB + transcript artifacts
+  -> Postgres + VectorChord + transcript artifacts
 ```
 
 Important implementation facts:
@@ -950,7 +949,7 @@ Hosted Yutome should support two modes behind the same `/mcp` URL.
 
 #### Mode 1: Laptop Bridge
 
-Bridge mode is the fastest hosted MVP because it reuses the current local retrieval stack.
+Bridge mode is the fastest hosted MVP because it reuses the same Postgres-backed retrieval stack through a local process.
 
 ```text
 /mcp authenticated request
@@ -958,7 +957,7 @@ Bridge mode is the fastest hosted MVP because it reuses the current local retrie
   -> choose active install/bridge for workspace
   -> Durable Object relay for workspace_id + install_id
   -> local yutome serve bridge
-  -> local SQLite + LanceDB
+  -> Postgres + VectorChord
 ```
 
 Properties:
@@ -1181,11 +1180,11 @@ The key principle is to store provider-native units exactly while showing produc
 
 ## Section E: Implementation Roadmap
 
-### Phase 0: Keep Local/BYO Stable
+### Phase 0: Cut Over Local/BYO To Postgres
 
-- Do not break current local-first setup.
-- Keep local SQLite + LanceDB working.
-- Keep `yutome setup`, local MCP, and user-owned Cloudflare Worker path available for advanced users and migration fallback.
+- Require local/BYO setups to use the same Postgres + VectorChord schema as hosted mode.
+- Remove SQLite + LanceDB config, dependency, and runtime branches instead of preserving compatibility.
+- Keep `yutome setup`, local MCP, and user-owned Cloudflare Worker paths available only as clients/operators of the Postgres-backed runtime.
 
 ### Phase 1: Hosted Account, Billing, And Usage Ledger
 
@@ -1212,7 +1211,7 @@ The key principle is to store provider-native units exactly while showing produc
 ### Phase 4: Hosted DB, Scheduler, And Runtime
 
 - Run the Section B bakeoff with `voyage-4-lite` embeddings before committing to the hosted search substrate.
-- Start implementation from Postgres + VectorChord Suite, then compare it against managed Postgres + pgvector + built-in FTS, ParadeDB Enterprise/BYOC, Typesense, Weaviate, Turbopuffer, OpenSearch/Elasticsearch, Qdrant, Meilisearch, D1 + Vectorize, and containerized SQLite + LanceDB.
+- Start implementation from Postgres + VectorChord Suite, then compare it against managed Postgres + pgvector + built-in FTS, ParadeDB Enterprise/BYOC, Typesense, Weaviate, Turbopuffer, OpenSearch/Elasticsearch, Qdrant, Meilisearch, and D1 + Vectorize.
 - Treat Railway custom VectorChord Postgres as the first hosted database path; treat Railway Postgres/pgvector and other managed Postgres + FTS deployments as production fallbacks if the VectorChord operations checklist is not ready.
 - Build the first hosted replica on the winning substrate, with D1 + Vectorize acceptable only if "Cloudflare-only" becomes more important than one-substrate feature parity.
 - Sync indexed corpus data into the hosted canonical store: users/workspaces, videos, channels, active transcript metadata, chunks, artifact pointers, vectors, jobs, and usage events.
@@ -1221,7 +1220,7 @@ The key principle is to store provider-native units exactly while showing produc
 - Keep a Modal executor interface for future burst/backfill jobs, but defer implementation until Railway worker data proves it is needed.
 - Keep a Fly Machines worker smoke path only if hoster demand appears; do not rely on Fly scheduled Machines for dynamic per-user schedules.
 - Make laptop-off queries work from ChatGPT/Claude.
-- Maintain product parity tests against local SQLite + LanceDB behavior, while allowing the hosted backend to use Postgres query syntax and different internal ranking.
+- Maintain product parity tests against the Postgres + VectorChord retrieval contract while allowing ranking to evolve through evals.
 - Track ranking drift explicitly; do not promise identical ordering until evals prove it. Run any Workers AI/Gemini embedding switch as an A/B benchmark against `voyage-4-lite`, not as a default simplification.
 
 ### Phase 5: Noob Product Polishing

@@ -1,6 +1,6 @@
 # yutome Project Guide
 
-`yutome` is a local-first YouTube channel knowledge base indexer. It discovers channel videos without the YouTube Data API, captures transcripts and metadata, stores durable artifacts, builds retrieval indexes, and exposes compact commands that agents, humans, and later applications can use.
+`yutome` is a Postgres-backed YouTube channel knowledge base indexer. It discovers channel videos without the YouTube Data API, captures transcripts and metadata, stores durable artifacts, builds retrieval indexes in Postgres with VectorChord Suite, and exposes compact commands that agents, humans, and later applications can use.
 
 The project is optimized for:
 
@@ -9,7 +9,7 @@ The project is optimized for:
 - Timestamped source citations.
 - Plain text and Markdown artifacts that remain useful outside the CLI.
 - Agent-safe retrieval that avoids dumping entire transcripts into context.
-- Rebuildable vector indexes backed by canonical SQLite and disk artifacts.
+- Rebuildable lexical and vector indexes backed by canonical Postgres rows and disk artifacts.
 
 Default corpus scope:
 
@@ -31,7 +31,7 @@ The current primary test corpus is Leo and Longevity:
 - Transcript attempts recorded: `1062`
 - Chunks: `9080`
 - Embedding records: `9080`
-- LanceDB rows: `9080`
+- Dense-vector rows: `9080`
 - Portable Markdown exports: `737`
 - Obsidian exports: `737`
 
@@ -63,7 +63,7 @@ Non-goals for the current slice:
 - No dependency on Obsidian Web Clipper internals.
 - No automatic ASR as the normal path for videos that already have usable captions or subtitle files.
 - No comments, Shorts, or related-site crawling in the current slice.
-- No Postgres/pgvector, Qdrant, or hosted service-mode vector backend in the current slice.
+- No alternate split catalog/vector backend in the current slice.
 
 ## Product Shape
 
@@ -73,13 +73,13 @@ The system has four useful surfaces.
 
    Raw metadata, raw provider transcripts, normalized timestamped segments, plain transcripts, subtitle files, chunks, and exports are written to disk. This keeps the corpus portable and inspectable even if the indexes are rebuilt.
 
-2. SQLite catalog
+2. Postgres catalog and search store
 
-   SQLite is the canonical structured catalog. It tracks videos, transcript versions, chunks, attempts, embeddings, statuses, and SQLite FTS rows.
+   Postgres is the canonical structured catalog and search store. It tracks videos, transcript versions, chunks, attempts, embeddings, statuses, jobs, usage records, BM25 rows, and dense vectors.
 
-3. LanceDB retrieval index
+3. VectorChord retrieval indexes
 
-   LanceDB is the rebuildable vector and hybrid search index. It stores chunk text, embeddings, and enough metadata to return useful results without extra joins for every field.
+   VectorChord Suite provides BM25 lexical search and dense-vector recall inside the same Postgres database.
 
 4. Query API
 
@@ -112,7 +112,7 @@ Optional ingest dependencies:
 Optional retrieval dependencies:
 
 - `voyageai` for embeddings.
-- `lancedb` for vector and hybrid retrieval.
+- Postgres + VectorChord Suite (`vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`) for lexical, vector, and hybrid retrieval.
 
 Optional fallbacks:
 
@@ -123,7 +123,7 @@ Planned optional retrieval/enrichment dependencies:
 
 - Provider-backed reranker, disabled unless configured.
 - Additional ASR providers behind one interface: `mlx-whisper`, OpenAI, Gemini, and Deepgram.
-- Future service-mode vector adapters such as Postgres/pgvector or Qdrant, not v1 defaults.
+- Future retrieval controls such as pgvector-only Postgres or Qdrant, not v1 defaults.
 
 Scheduler target:
 
@@ -144,7 +144,7 @@ Implemented commands:
 | Command | Purpose |
 | --- | --- |
 | `yutome setup [SOURCE]` | Guided first-run setup: config, `.env`, Webshare proxy secrets, semantic search, YouTube subscription import, source picker, and optional first sync. |
-| `yutome doctor local` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
+| `yutome doctor local` | Check runtime, config, Postgres connectivity, VectorChord Suite extensions, and optional dependency availability. |
 | `yutome corpus add SOURCE` | Add a YouTube channel or video source to the local library. |
 | `yutome corpus import FILE` | Import source entries from CSV, OPML/XML, or a plain URL list. |
 | `yutome corpus import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
@@ -166,7 +166,7 @@ Implemented commands:
 | `yutome serve remote mcp` | Serve the authenticated MCP streamable HTTP endpoint for remote agent clients. |
 | `yutome doctor remote URL` | Verify remote liveness and authenticated readiness from a client machine. |
 | `yutome corpus rebuild chunks` | Rebuild chunk rows/artifacts from active normalized transcripts. |
-| `yutome corpus rebuild vectors` | Rebuild or resume embeddings and LanceDB rows from canonical chunks. |
+| `yutome corpus rebuild vectors` | Rebuild or resume embeddings and VectorChord dense-vector rows from canonical chunks. |
 | `yutome doctor proxy --info-only` | Show proxy policy and supported env config. |
 | `yutome doctor proxy` | Test transcript API and yt-dlp subtitle paths through configured proxy. |
 | `yutome doctor gemini` | Test Gemini video-understanding fallback on one video. |
@@ -180,7 +180,7 @@ Target command surface not yet implemented:
 | --- | --- |
 | `yutome corpus sync --channel ID` | Sync one registered channel by local/channel id. |
 | `yutome backfill --channel ID --limit N --workers N` | Controlled historical ingest for an existing channel. Current `sync --use-catalog --max-process --workers` covers part of this need. |
-| `yutome index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `yutome corpus rebuild chunks` and `yutome corpus rebuild vectors`. |
+| `yutome index --lexical --vectors` | Rebuild Postgres BM25 and/or dense-vector indexes from artifacts. Current implementation has `yutome corpus rebuild chunks` and `yutome corpus rebuild vectors`. |
 | `yutome scheduler install` | Install a cron/launchd schedule for bounded recurring syncs. |
 | `yutome inspect video VIDEO_ID` | Inspect one video, active transcript version, artifacts, chunks, and status. |
 | `yutome inspect chunk CHUNK_ID` | Inspect one chunk, text, timestamps, source, and neighboring chunks. |
@@ -219,9 +219,9 @@ Important `find` options:
 
 | Option | Use |
 | --- | --- |
-| `--mode lexical` | SQLite FTS only. Best for exact strings, acronyms, names, and drug terms. |
-| `--mode semantic` | LanceDB vector search only. Best for paraphrase and conceptual recall. |
-| `--mode hybrid` | LanceDB vector + text hybrid. Default. |
+| `--mode lexical` | VectorChord BM25 only. Best for exact strings, acronyms, names, and drug terms. |
+| `--mode semantic` | VectorChord dense-vector search only. Best for paraphrase and conceptual recall. |
+| `--mode hybrid` | BM25 + dense-vector fusion. Default. |
 | `--in chunks` | Search transcript chunks. Default. |
 | `--in titles` | Search video titles lexically. |
 | `--in descriptions` | Search video descriptions lexically. |
@@ -250,8 +250,10 @@ Core defaults in `src/yutome/config.py`:
 [storage]
 data_dir = "data"
 artifact_root = "artifacts"
-catalog_path = "indexes/catalog.sqlite"
-lancedb_path = "indexes/lancedb"
+
+[database]
+postgres_url_env = "YUTOME_POSTGRES_URL"
+required_extensions = ["vchord", "vchord_bm25", "pg_tokenizer", "vector"]
 
 [backfill]
 workers = 2
@@ -290,10 +292,6 @@ concurrency = 4
 max_retries = 5
 retry_base_seconds = 2.0
 
-[vectors]
-backend = "lancedb"
-enabled = true
-
 [proxy]
 enabled = false
 kind = "generic"
@@ -331,6 +329,7 @@ subprocess_timeout_seconds = 300.0
 
 Secrets and local provider credentials should live in `.env`, not in checked-in docs or config. Supported environment-style inputs include:
 
+- Postgres URL through `YUTOME_POSTGRES_URL`.
 - Voyage API key through the provider's normal environment variable.
 - Gemini API key through `GEMINI_API_KEY`.
 - Webshare credentials through `YUTOME_WEBSHARE_USERNAME` and `YUTOME_WEBSHARE_PASSWORD`.
@@ -338,7 +337,7 @@ Secrets and local provider credentials should live in `.env`, not in checked-in 
 
 ## Architecture
 
-The canonical source of truth is the artifact store plus SQLite catalog. LanceDB is a rebuildable retrieval index.
+The canonical source of truth is Postgres plus durable transcript artifacts. Postgres stores catalog rows, jobs, usage records, BM25 lexical rows, and dense vectors through VectorChord Suite.
 
 ```text
 YouTube channel
@@ -349,9 +348,9 @@ YouTube channel
   -> normalized timestamped segments
   -> plain transcript and subtitle artifacts
   -> timestamp-aware chunks
-  -> SQLite catalog + SQLite FTS5
+  -> Postgres catalog + jobs + usage records
   -> Voyage embeddings
-  -> LanceDB vector + FTS index
+  -> VectorChord BM25 + dense-vector indexes
   -> find/list/show/q/export commands
 ```
 
@@ -360,9 +359,9 @@ Main boundaries:
 - `src/yutome/youtube.py` owns YouTube discovery, metadata fetches, transcript API calls, subtitle fetches, proxy selection, and ASR audio download.
 - `src/yutome/transcripts.py` owns transcript normalization and transcript artifacts.
 - `src/yutome/chunking.py` owns chunk construction.
-- `src/yutome/store.py` owns catalog persistence and FTS writes.
-- `src/yutome/embeddings.py` owns Voyage embedding calls and LanceDB writes.
-- `src/yutome/query.py` owns QueryRequest compile/execute and SQL/LanceDB dispatch.
+- `src/yutome/store.py` owns Postgres catalog persistence and lexical writes.
+- `src/yutome/embeddings.py` owns Voyage embedding calls and VectorChord writes.
+- `src/yutome/query.py` owns QueryRequest compile/execute and Postgres/VectorChord dispatch.
 - `src/yutome/api.py` owns transport-neutral `find`, `list`, `show`, and `q` verbs.
 - `src/yutome/retrieval.py` owns shared citation/context helper functions.
 - `src/yutome/exports.py` owns portable and Obsidian Markdown output.
@@ -386,15 +385,15 @@ Read these files first:
 - Configuration: `src/yutome/config.py`
 - Environment overrides: `src/yutome/env.py`
 - Path layout: `src/yutome/paths.py`
-- SQLite schema/bootstrap: `src/yutome/db.py`
+- Postgres schema/bootstrap: `src/yutome/hosted/postgres.py`
 - Ingest orchestration: `src/yutome/indexer.py`
 - YouTube/transcript providers: `src/yutome/youtube.py`
 - Gemini fallback: `src/yutome/gemini.py`
 - ASR fallback: `src/yutome/asr.py`
 - Transcript normalization/artifacts: `src/yutome/transcripts.py`
 - Chunking: `src/yutome/chunking.py`
-- Catalog writes and FTS rebuild: `src/yutome/store.py`
-- Embeddings and LanceDB: `src/yutome/embeddings.py`
+- Catalog writes and BM25 rebuild: `src/yutome/store.py`
+- Embeddings and VectorChord: `src/yutome/embeddings.py`
 - Retrieval and context expansion: `src/yutome/retrieval.py`
 - Markdown exports: `src/yutome/exports.py`
 - Maintenance rebuilds: `src/yutome/maintenance.py`
@@ -420,9 +419,6 @@ data/
     videos/{video_id}/transcripts/{transcript_version_id}/transcript.srt
     videos/{video_id}/chunks/{chunker_version}.jsonl
     videos/{video_id}/summaries/{summary_version}.json
-  indexes/
-    catalog.sqlite
-    lancedb/
   exports/
     portable-md/
     obsidian/
@@ -452,31 +448,32 @@ Snapshot/versioning policy:
 - Chunk artifacts are versioned by `chunker_version`; changing chunking strategy should create a rebuildable new view, not silently mutate the meaning of old chunk ids.
 - Tool/provider versions should be recorded in future manifest files so broken extractor/provider runs can be audited.
 
-## SQLite Model
+## Postgres Model
 
-SQLite is the canonical catalog and status store.
+Postgres is the canonical catalog, status, search, and job store. VectorChord Suite must be installed with `vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`.
 
 Core tables:
 
 | Table | Role |
 | --- | --- |
-| `schema_migrations` | Tracks catalog schema version. |
+| `schema_migrations` | Tracks schema version. |
 | `channels` | Channel identity, handle, source URL, uploads URL, title, description, sync timestamps. |
 | `videos` | Video metadata, description, duration, published date, thumbnail, live status, ingest status. |
 | `transcript_versions` | Versioned transcript source, language, generated/manual flag, artifact paths, text hash, segment count, active flag. |
 | `chunks` | Active transcript chunk rows with sequence, timestamps, text, text hash, token count, and chunker version. |
-| `chunks_fts` | SQLite FTS5 virtual table over `chunks.text`. |
-| `embeddings` | Per-chunk provider/model/dimension status for embedding and index completion. |
+| `chunk_embeddings` | Per-chunk provider/model/dimension status and dense vector values. |
+| `search_index_profiles` | Tokenizer, BM25, embedding, VectorChord, and schema/index health metadata. |
 | `transcript_attempts` | Per-video provider attempts, status, error class, retryable flag, and error text. |
-| `jobs` | Reserved table for future durable scheduling. |
+| `jobs` | Durable scheduling and worker-claim queue. |
+| `usage_events` | Append-only provider and search-store usage records. |
 
-Important SQLite invariants:
+Important Postgres invariants:
 
 - Active retrieval should only use active transcript versions.
 - `chunks` are rebuildable from active `normalized.jsonl` transcript artifacts.
-- `chunks_fts` is rebuildable from `chunks`.
+- BM25 rows and dense-vector indexes are rebuildable from `chunks` and `chunk_embeddings`.
 - `embeddings` records should match the active chunk ids, provider, model, and dimension.
-- Deferred/rate-limited videos remain in the catalog and are explicitly retried later.
+- Deferred/rate-limited videos remain in Postgres and are explicitly retried later.
 
 Target job invariants:
 
@@ -499,9 +496,9 @@ Planned manifest metadata:
 Useful consistency SQL:
 
 ```bash
-sqlite3 data/indexes/catalog.sqlite "
+psql "$YUTOME_POSTGRES_URL" -c "
 SELECT COUNT(*) AS chunks FROM chunks;
-SELECT COUNT(*) AS indexed_embeddings FROM embeddings WHERE index_status='indexed';
+SELECT COUNT(*) AS indexed_embeddings FROM chunk_embeddings;
 SELECT chunker_version, COUNT(*) AS chunks, MAX(token_count) AS max_tokens
 FROM chunks
 GROUP BY chunker_version;
@@ -510,58 +507,14 @@ FROM videos
 GROUP BY ingest_status
 ORDER BY COUNT(*) DESC;
 "
+
+psql "$YUTOME_POSTGRES_URL" -c "
+SELECT extname
+FROM pg_extension
+WHERE extname IN ('vchord', 'vchord_bm25', 'pg_tokenizer', 'vector')
+ORDER BY extname;
+"
 ```
-
-## LanceDB Model
-
-LanceDB table: `chunks`
-
-Required columns:
-
-- `chunk_id`
-- `channel_id`
-- `video_id`
-- `transcript_version_id`
-- `source`
-- `language`
-- `is_generated`
-- `sequence`
-- `start_ms`
-- `end_ms`
-- `text`
-- `token_count`
-- `text_hash`
-- `chunker_version`
-- `active`
-- `embedding_model`
-- `embedding_dim`
-- `vector`
-
-Required text index:
-
-- FTS index on `text`, named by LanceDB as `text_idx`.
-
-Why LanceDB is rebuildable:
-
-- SQLite and artifacts are the source of truth.
-- Embeddings are deterministic enough for a selected provider/model/dimension.
-- If LanceDB table shape is missing required columns, `find --mode hybrid` and semantic retrieval fail with a clear message to run `yutome corpus rebuild vectors`.
-- If hybrid search fails because the LanceDB FTS index is not ready, the error tells the user to run `yutome corpus rebuild vectors`.
-
-Why SQLite is still needed when LanceDB exists:
-
-- It owns canonical video/transcript state.
-- It records provider attempts and failures.
-- It supports cheap exact lexical fallback through SQLite FTS5.
-- It lets the system rebuild LanceDB without re-fetching YouTube data.
-- It is easier to inspect, migrate, and debug than treating a vector table as the catalog.
-
-Why LanceDB is still needed when SQLite exists:
-
-- SQLite FTS is lexical only.
-- Vector search finds paraphrases and concepts.
-- Hybrid retrieval can combine semantic recall with BM25-style text matching.
-- LanceDB can later support incremental vector index maintenance and metadata filtering.
 
 ## Transcript Acquisition
 
@@ -777,22 +730,22 @@ Embedding behavior:
 - Fetch embeddings in bounded concurrent batches.
 - Retry transient and rate-limit provider errors with exponential backoff.
 - Leave failed batches pending so `yutome corpus rebuild vectors --resume` can continue.
-- Write LanceDB rows and SQLite embedding status after successful batches.
-- Create or refresh the LanceDB FTS index on `text` when vectors are ingested.
+- Write Postgres embedding status and VectorChord dense-vector rows after successful batches.
+- Create or refresh the relevant VectorChord vector indexes when vectors are ingested.
 
 Important implementation detail:
 
 - Embedding API calls are parallelized.
-- LanceDB/SQLite writes are kept controlled so one failed batch does not corrupt the whole rebuild.
-- Full `yutome corpus rebuild vectors` drops the existing LanceDB table and clears matching embedding records.
+- Postgres writes are kept controlled so one failed batch does not corrupt the whole rebuild.
+- Full `yutome corpus rebuild vectors` rebuilds VectorChord dense-vector rows and clears matching embedding records.
 - `yutome corpus rebuild vectors --resume` preserves existing indexed rows and embeds only pending chunks.
 
 Future embedding work:
 
 - Add provider abstraction for OpenAI-compatible and local embeddings.
 - Add richer progress output per batch.
-- Add merge-insert/upsert behavior for incremental LanceDB maintenance.
-- Add scalar indexes if LanceDB filtering or update patterns require them.
+- Add merge-insert/upsert behavior for incremental VectorChord maintenance.
+- Add scalar indexes if Postgres filtering or update patterns require them.
 
 ## Citation Model
 
@@ -851,9 +804,9 @@ Defaults:
 
 Modes:
 
-- `lexical`: SQLite FTS5 using `chunks_fts`.
-- `semantic`: LanceDB vector search.
-- `hybrid`: LanceDB vector + text hybrid search.
+- `lexical`: VectorChord BM25 over chunk text.
+- `semantic`: VectorChord dense-vector search.
+- `hybrid`: BM25 + dense-vector fusion.
 
 Projection levels:
 
@@ -997,10 +950,10 @@ Returning full descriptions by default would also bloat context. Descriptions ar
 
 Current search behavior:
 
-- Lexical search uses SQLite FTS5 and BM25 score.
-- Semantic search embeds the query with Voyage and searches LanceDB vectors.
-- Hybrid search uses LanceDB native hybrid search with vector and text query.
-- LanceDB search filters to `active = true`.
+- Lexical search uses VectorChord BM25 score.
+- Semantic search embeds the query with Voyage and searches VectorChord dense vectors.
+- Hybrid search combines BM25 and dense-vector recall with a documented fusion rule.
+- Search filters to active transcript chunks.
 - Retrieval joins or enriches video metadata as needed.
 
 Known ranking gaps:
@@ -1063,7 +1016,7 @@ Design constraints:
 
 - Portable YouTube timestamp links are the primary citation format.
 - Obsidian output may add wikilink/block-id conveniences, but should not require Obsidian URI links or Web Clipper internals.
-- Exports should be deterministic and rebuildable from SQLite plus transcript artifacts.
+- Exports should be deterministic and rebuildable from Postgres plus transcript artifacts.
 - Exports should work even without generated summaries/topic cards.
 
 ## Obsidian Notes
@@ -1159,7 +1112,7 @@ yutome CLI ────────────┐
                      │
 MCP server (stdio) ──┼──> api.py verbs: find/list/show/q
                      │       query.py compiler/executor
-HTTP API (localhost) ┘        SQLite + LanceDB + retrieval helpers
+HTTP API (localhost) ┘        Postgres + VectorChord + retrieval helpers
 ```
 
 `QueryRequest` is the raw contract. Connector adapters must not invent new query semantics; they expose the same `find`, `list`, `show`, and `q` verbs so behavior stays consistent across CLI, MCP, and HTTP.
@@ -1219,11 +1172,11 @@ Per the product-design split, connector outputs follow the same two-register rul
 Shipped (query/API slice):
 
 1. `mcp` optional dependency group pinned to `mcp[cli]>=1.20,<2` in `pyproject.toml`.
-2. `src/yutome/query.py` defines `QueryRequest`, projections, compiler, SQL/FTS/LanceDB execution, two-stage pushdown, and status breakdowns.
+2. `src/yutome/query.py` defines `QueryRequest`, projections, compiler, Postgres/VectorChord execution, pushdown, and status breakdowns.
 3. `src/yutome/api.py` exposes transport-neutral `find`, `list`, `show`, and `q` verbs plus resources.
 4. `src/yutome/mcp_server.py` implements four tools and four resources wired through `api.py`.
 5. `src/yutome/http_server.py` exposes the same verbs/resources as REST endpoints: `POST /find`, `POST /list`, `POST /show`, `POST /q`, `GET /chunks/{id}`, `GET /videos/{id}`, `GET /channels/{id}`, `GET /transcripts/{id}`, plus unauthenticated `GET /healthz` and authenticated `GET /readyz`.
-6. `yutome serve mcp` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, LanceDB, and Voyage credentials are inherited.
+6. `yutome serve mcp` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, Postgres, VectorChord, and Voyage configuration are inherited.
 7. `yutome --config yutome.toml serve http --port 8765` CLI entrypoint runs uvicorn on `127.0.0.1`.
 8. Optional bearer auth via the `YUTOME_HTTP_TOKEN` env var for loopback HTTP; required for non-loopback remote serving.
 9. Tests: `tests/test_mcp_server.py`, `tests/test_http_server.py`, `tests/test_retrieval_exports.py`, plus subprocess smoke helpers.
@@ -1262,7 +1215,7 @@ For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_
 
 ### Why Not Just HTTP, And Why Not Remote First
 
-- Local MCP over stdio is what current daily-driver agent clients (Claude Desktop, Claude Code, Cursor) launch directly against a local binary, with no port exposure and no auth surface. It matches the local-first trust boundary.
+- Local MCP over stdio is what current daily-driver agent clients (Claude Desktop, Claude Code, Cursor) launch directly against a local binary, with no port exposure and no auth surface. It uses the same Postgres-backed retrieval contract as remote MCP and HTTP.
 - Plain HTTP alone does not give an agent a tool/resource catalog; the agent does not know what `/find` or `/q` mean unless something teaches it. MCP carries that catalog by design.
 - Remote MCP (the ChatGPT connector shape) requires a public endpoint, OAuth, and per-user isolation. It is the right second adapter, not the first.
 
@@ -1385,34 +1338,35 @@ Expected tests:
 65 passed
 ```
 
-LanceDB inspection:
+Postgres + VectorChord inspection:
 
 ```bash
-uv run python - <<'PY'
-import lancedb
-t = lancedb.connect("data/indexes/lancedb").open_table("chunks")
-print("rows", t.count_rows())
-print("columns", t.schema.names)
-print("indices", [getattr(i, "name", str(i)) for i in t.list_indices()])
-PY
+psql "$YUTOME_POSTGRES_URL" -c "
+SELECT COUNT(*) AS chunks FROM chunks;
+SELECT COUNT(*) AS indexed_embeddings FROM chunk_embeddings;
+SELECT extname
+FROM pg_extension
+WHERE extname IN ('vchord', 'vchord_bm25', 'pg_tokenizer', 'vector')
+ORDER BY extname;
+"
 ```
 
 Expected:
 
-- LanceDB row count agrees with the rebuilt vector corpus.
-- Required columns listed in the LanceDB model section.
-- FTS index present for `text`, typically `text_idx`.
+- Chunk and indexed embedding counts agree for active chunks.
+- Required VectorChord Suite extensions are installed.
+- BM25 and dense-vector indexes are present for chunk search.
 
 ## Test Plan
 
 Current tests:
 
 - Config parsing and path layout.
-- SQLite schema/bootstrap.
+- Postgres schema/bootstrap.
 - Thin retrieval result shape does not include full chunk text.
 - Chunk detail includes full chunk text.
 - Context expansion returns neighboring chunks within budget and dedupes overlaps.
-- Hybrid retrieval errors cleanly when LanceDB schema/index is not ready.
+- Hybrid retrieval errors cleanly when VectorChord extensions or indexes are not ready.
 - Oversized transcript segments are split under the max token cap.
 - Portable and Obsidian Markdown exports produce timestamp links and YAML frontmatter.
 
@@ -1422,7 +1376,7 @@ Unit tests to add:
 - Transcript normalization for `youtube-transcript-api`, `yt-dlp` JSON3, Gemini, and ASR-like segments.
 - VTT/SRT/TXT/Markdown transcript rendering.
 - Citation roundtrip from chunk to timestamp URL and back through `context`.
-- SQLite FTS rebuild from chunks.
+- VectorChord BM25 rebuild from chunks.
 - Provider error classification for no captions, transient failures, language unavailable, rate limit, and bad captions.
 - Proxy URL redaction and deterministic generic proxy pool selection.
 - `yt-dlp` timeout classification.
@@ -1435,7 +1389,7 @@ Integration tests to add:
 - Export both Markdown modes.
 - Search with JSON citations.
 - Rebuild chunks from transcript artifacts.
-- Rebuild vectors from SQLite chunks using a fake embedding provider.
+- Rebuild vectors from Postgres chunks using a fake embedding provider.
 - Simulate interrupted embedding rebuild and resume.
 
 Failure tests to add:
@@ -1448,7 +1402,7 @@ Failure tests to add:
 - Stale or missing `yt-dlp`.
 - Transcript API 429/block.
 - Proxy misconfiguration.
-- Stale LanceDB schema.
+- Stale Postgres/VectorChord schema.
 - Missing Voyage credentials.
 - Missing Gemini credentials when fallback is requested.
 
@@ -1456,30 +1410,30 @@ Scale tests to add:
 
 - Synthetic thousands-video catalog.
 - Millions-scale chunk metadata simulation.
-- SQLite FTS query latency.
-- LanceDB rebuild behavior.
+- Postgres BM25 query latency.
+- VectorChord rebuild behavior.
 - Export runtime and file count behavior for large channels.
 
 ## Design Decisions
 
-### SQLite plus LanceDB
+### Postgres Plus VectorChord Suite
 
-Use both because they solve different problems.
+Use one database because catalog state, jobs, usage records, lexical search, and dense-vector search need one transactional source of truth.
 
-SQLite:
+Postgres:
 
 - Canonical metadata and status.
-- Easy local inspection.
-- FTS fallback.
+- SQL inspection and migrations.
+- Durable jobs and usage ledger.
 - Attempt history.
-- Rebuild source for chunks and vectors.
+- Rebuild source for chunks, BM25 rows, and vectors.
 
-LanceDB:
+VectorChord Suite:
 
-- Vector search.
-- Native hybrid search.
+- Dense-vector search.
+- Native BM25 lexical search.
 - Fast retrieval over embeddings.
-- Rebuildable from SQLite and artifacts.
+- Rebuildable from Postgres rows and artifacts.
 
 ### Thin Retrieval plus Explicit Context
 
@@ -1558,10 +1512,9 @@ Summaries, topic cards, entities, claims, supplement lists, diagnostic framework
 - No Shorts in the default corpus.
 - No related website crawl in the current product.
 - No durable audio/video storage by default.
-- LanceDB is the default local vector backend.
-- SQLite remains the canonical catalog and job/status store.
+- Postgres + VectorChord Suite is the only catalog/search/job/status substrate.
 - All vector indexes are rebuildable.
-- Postgres/pgvector and Qdrant are later service-mode adapters.
+- pgvector-only Postgres and Qdrant are later evaluation controls, not default adapters.
 - Summaries, topic cards, and extraction lenses require explicit schemas, prompts, provenance, and evaluation.
 - Obsidian exports are plain Markdown/YAML first; Web Clipper behavior can inspire UX but should not be a dependency.
 
@@ -1613,7 +1566,7 @@ Scheduler and catalog:
 
 - Should channel registration be a first-class command before scheduler work?
 - Should RSS be used only as a new-upload hint, or should it feed a separate lightweight watch path?
-- Should jobs remain SQLite-only, or should long-running workers use an external queue in service mode?
+- Should long-running workers use only Postgres `FOR UPDATE SKIP LOCKED`, or should an external wakeup/queue be added later?
 - What manifest format should store extractor/tool versions?
 
 ## Next Work
@@ -1671,13 +1624,13 @@ Later slices:
 
 ## External References
 
-LanceDB:
+Postgres + VectorChord:
 
-- Hybrid search: [https://docs.lancedb.com/search/hybrid-search](https://docs.lancedb.com/search/hybrid-search)
-- Full-text search: [https://docs.lancedb.com/search/full-text-search](https://docs.lancedb.com/search/full-text-search)
-- Filtering: [https://docs.lancedb.com/search/filtering](https://docs.lancedb.com/search/filtering)
-- Query optimization: [https://docs.lancedb.com/search/optimize-queries](https://docs.lancedb.com/search/optimize-queries)
-- Table updates / merge-insert: [https://docs.lancedb.com/tables/update](https://docs.lancedb.com/tables/update)
+- VectorChord Suite: [https://docs.vectorchord.ai/vectorchord/getting-started/vectorchord-suite.html](https://docs.vectorchord.ai/vectorchord/getting-started/vectorchord-suite.html)
+- VectorChord indexing: [https://docs.vectorchord.ai/vectorchord/usage/indexing.html](https://docs.vectorchord.ai/vectorchord/usage/indexing.html)
+- VectorChord hybrid search: [https://docs.vectorchord.ai/vectorchord/use-case/hybrid-search.html](https://docs.vectorchord.ai/vectorchord/use-case/hybrid-search.html)
+- PostgreSQL full-text search controls: [https://www.postgresql.org/docs/current/textsearch-controls.html](https://www.postgresql.org/docs/current/textsearch-controls.html)
+- PostgreSQL `SKIP LOCKED`: [https://www.postgresql.org/docs/current/sql-select.html](https://www.postgresql.org/docs/current/sql-select.html)
 
 Agent/RAG/tool design:
 

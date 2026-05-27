@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3878.95 292" width="3878.95" height="292" style="--bg:#ffffff;--fg:#1f2328;--line:#d1d9e0;--accent:#0969da;--muted:#59636e;background:var(--bg)">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap');
+  text { font-family: 'Inter', system-ui, sans-serif; }
+  svg {
+    /* Derived from --bg and --fg (overridable via --line, --accent, etc.) */
+    --_text:          var(--fg);
+    --_text-sec:      var(--muted, color-mix(in srgb, var(--fg) 60%, var(--bg)));
+    --_text-muted:    var(--muted, color-mix(in srgb, var(--fg) 40%, var(--bg)));
+    --_text-faint:    color-mix(in srgb, var(--fg) 25%, var(--bg));
+    --_line:          var(--line, color-mix(in srgb, var(--fg) 30%, var(--bg)));
+    --_arrow:         var(--accent, color-mix(in srgb, var(--fg) 50%, var(--bg)));
+    --_node-fill:     var(--surface, color-mix(in srgb, var(--fg) 3%, var(--bg)));
+    --_node-stroke:   var(--border, color-mix(in srgb, var(--fg) 20%, var(--bg)));
+    --_group-fill:    var(--bg);
+    --_group-hdr:     color-mix(in srgb, var(--fg) 5%, var(--bg));
+    --_inner-stroke:  color-mix(in srgb, var(--fg) 12%, var(--bg));
+    --_key-badge:     color-mix(in srgb, var(--fg) 10%, var(--bg));
+  }
+</style>
+<defs>
+  <marker id="arrowhead" markerWidth="8" markerHeight="4.8" refX="8" refY="2.4" orient="auto">
+    <polygon points="0 0, 8 2.4, 0 4.8" fill="var(--_arrow)" />
+  </marker>
+  <marker id="arrowhead-start" markerWidth="8" markerHeight="4.8" refX="0" refY="2.4" orient="auto-start-reverse">
+    <polygon points="8 0, 0 2.4, 8 4.8" fill="var(--_arrow)" />
+  </marker>
+</defs>
+<rect x="40" y="140" width="612.25" height="112" rx="0" ry="0" fill="var(--_group-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="40" y="140" width="612.25" height="28" rx="0" ry="0" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="52" y="154" dy="0.35em" font-size="12" font-weight="600" fill="var(--_text-sec)">&quot;Identity / Auth&quot;</text>
+<rect x="672.25" y="140" width="976.8999999999996" height="112" rx="0" ry="0" fill="var(--_group-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="672.25" y="140" width="976.8999999999996" height="28" rx="0" ry="0" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="684.25" y="154" dy="0.35em" font-size="12" font-weight="600" fill="var(--_text-sec)">&quot;Entitlements / Billing&quot;</text>
+<rect x="1669.1499999999996" y="140" width="841.0500000000002" height="112" rx="0" ry="0" fill="var(--_group-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="1669.1499999999996" y="140" width="841.0500000000002" height="28" rx="0" ry="0" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="1681.1499999999996" y="154" dy="0.35em" font-size="12" font-weight="600" fill="var(--_text-sec)">&quot;Usage / Metering (append-only)&quot;</text>
+<rect x="2530.2000000000003" y="140" width="512.1499999999997" height="112" rx="0" ry="0" fill="var(--_group-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="2530.2000000000003" y="140" width="512.1499999999997" height="28" rx="0" ry="0" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="2542.2000000000003" y="154" dy="0.35em" font-size="12" font-weight="600" fill="var(--_text-sec)">&quot;Ingest / Jobs&quot;</text>
+<rect x="3062.35" y="140" width="676.6000000000001" height="112" rx="0" ry="0" fill="var(--_group-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="3062.35" y="140" width="676.6000000000001" height="28" rx="0" ry="0" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="3074.35" y="154" dy="0.35em" font-size="12" font-weight="600" fill="var(--_text-sec)">&quot;Search / Transcripts&quot;</text>
+<polyline points="2089.6749999999997,76 2089.6749999999997,96 346.125,96 346.125,196" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#arrowhead)" />
+<polyline points="2089.6749999999997,76 2089.6749999999997,96 1160.6999999999998,96 1160.6999999999998,196" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#arrowhead)" />
+<polyline points="2089.6749999999997,76 2089.6749999999997,196" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#arrowhead)" />
+<polyline points="2089.6749999999997,76 2089.6749999999997,96 2786.275,96 2786.275,196" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#arrowhead)" />
+<polyline points="2089.6749999999997,76 2089.6749999999997,96 3400.65,96 3400.65,196" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#arrowhead)" />
+<rect x="1948.5499999999997" y="40" width="282.25" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<rect x="62" y="196" width="568.25" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<rect x="694.2499999999998" y="196" width="932.9000000000001" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<rect x="1691.1499999999996" y="196" width="797.0500000000001" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<rect x="2552.2000000000003" y="196" width="468.15000000000003" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<rect x="3084.35" y="196" width="632.6" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+<text x="2089.6749999999997" y="58" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;workspaces&lt;br/&gt;(+ users, members)&quot;</text>
+<text x="346.125" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;account_sessions · account_grants&lt;br/&gt;email_login_tokens · youtube_grants&quot;</text>
+<text x="1160.6999999999998" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;provider_allocations · service_allocations&lt;br/&gt;entitlement_policies · workspace_balances&lt;br/&gt;price_books · billing_customers&quot;</text>
+<text x="2089.6749999999997" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;usage_reservations · usage_events&lt;br/&gt;credit_ledger_entries · billing_exports&lt;br/&gt;polar_webhook_snapshots&quot;</text>
+<text x="2786.275" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;sources · source_refresh_policies&lt;br/&gt;jobs · job_operations&quot;</text>
+<text x="3400.65" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;videos · transcript_versions&lt;br/&gt;search_index_profiles · chunks · chunk_embeddings&quot;</text>
+</svg>

@@ -10,7 +10,7 @@ from yutome.api import q as api_q
 from yutome.api import show as api_show
 from yutome.query import QueryRequest
 
-from . import _legacy
+from . import actions
 from .context import get_context
 from .render import echo_json, render_query_result
 
@@ -21,7 +21,6 @@ app = typer.Typer(add_completion=False, no_args_is_help=True, help="Search and r
 def find_command(
     ctx: typer.Context,
     text: str = typer.Argument(..., help="Search text."),
-    in_: str = typer.Option("chunks", "--in", help="Search corpus: chunks, titles, or descriptions."),
     mode: str | None = typer.Option(None, "--mode", help="Search mode: lexical, semantic, hybrid, or none."),
     channel: str | None = typer.Option(None, "--channel", help="Filter by channel id or handle."),
     since: str | None = typer.Option(None, "--since", help="Filter videos published on/after this date string."),
@@ -32,17 +31,15 @@ def find_command(
     limit: int = typer.Option(10, "--limit", min=1, max=200, help="Maximum rows to return."),
     offset: int = typer.Option(0, "--offset", min=0, help="Rows to skip."),
     project: str | None = typer.Option(None, "--project", help="Projection name."),
-    raw: bool = typer.Option(False, "--raw", help="Pass search text through to SQLite FTS5 verbatim."),
     json_output: bool = typer.Option(False, "--json", help="Emit the full QueryResult envelope."),
 ) -> None:
-    """Rank transcript chunks or video metadata by relevance."""
+    """Rank transcript chunks by relevance."""
     runtime = get_context(ctx).runtime()
     try:
         result = api_find(
             config=runtime.config,
             paths=runtime.paths,
             text=text,
-            in_=in_,  # type: ignore[arg-type]
             mode=mode,  # type: ignore[arg-type]
             channel=channel,
             since=since,
@@ -53,7 +50,6 @@ def find_command(
             limit=limit,
             offset=offset,
             project=project,
-            raw=raw,
         )
     except (RuntimeError, ValueError) as exc:
         typer.echo(str(exc), err=True)
@@ -64,7 +60,7 @@ def find_command(
 @app.command("list")
 def list_command(
     ctx: typer.Context,
-    entity: str = typer.Argument(..., help="videos, channels, attention, or status."),
+    entity: str = typer.Argument(..., help="videos, channels, or status."),
     channel: str | None = typer.Option(None, "--channel", help="Filter by channel id or handle."),
     since: str | None = typer.Option(None, "--since", help="Filter videos published on/after this date string."),
     until: str | None = typer.Option(None, "--until", help="Filter videos published on/before this date string."),
@@ -80,8 +76,8 @@ def list_command(
 ) -> None:
     """Enumerate corpus objects."""
     normalized = entity.lower()
-    if normalized not in {"video", "videos", "channel", "channels", "attention", "status"}:
-        raise typer.BadParameter("entity must be one of: videos, channels, attention, status")
+    if normalized not in {"video", "videos", "channel", "channels", "status"}:
+        raise typer.BadParameter("entity must be one of: videos, channels, status")
     runtime = get_context(ctx).runtime()
     result = api_list(
         config=runtime.config,
@@ -146,7 +142,7 @@ def q_command(
 ) -> None:
     """Execute a raw QueryRequest JSON object."""
     runtime = get_context(ctx).runtime()
-    payload = _legacy._read_query_request(request, file)
+    payload = actions._read_query_request(request, file)
     try:
         result = api_q(config=runtime.config, paths=runtime.paths, request=QueryRequest.model_validate(payload))
     except (RuntimeError, ValueError) as exc:

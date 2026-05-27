@@ -4,7 +4,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, PositiveInt
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 
 
 DEFAULT_CONFIG_FILENAME = "yutome.toml"
@@ -14,8 +14,10 @@ DEFAULT_CONFIG_TOML = """# yutome project configuration
 [storage]
 data_dir = "data"
 artifact_root = "artifacts"
-catalog_path = "indexes/catalog.sqlite"
-lancedb_path = "indexes/lancedb"
+
+[database]
+postgres_url_env = "YUTOME_POSTGRES_URL"
+required_extensions = ["vchord", "vchord_bm25", "pg_tokenizer", "vector"]
 
 [backfill]
 workers = 2
@@ -69,10 +71,6 @@ batch_size = 128
 concurrency = 4
 max_retries = 5
 retry_base_seconds = 2.0
-
-[vectors]
-backend = "lancedb"
-enabled = true
 
 [exports]
 portable_markdown = true
@@ -132,44 +130,44 @@ subprocess_timeout_seconds = 300.0
 
 [find]
 # Default search mode when `yutome search find` is invoked without --mode.
-# "hybrid" combines lexical (SQLite FTS) and semantic (LanceDB + Voyage)
-# recall and is the most powerful — but needs VOYAGE_API_KEY and a
-# populated vector index. "lexical" uses FTS only and works without any
-# embedding setup. `yutome setup` rewrites this to "lexical" when no
-# VOYAGE_API_KEY is configured. "semantic" forces vectors only.
+# "hybrid" combines VectorChord BM25 lexical recall and Voyage semantic
+# recall inside Postgres. "lexical" uses VectorChord BM25 only. "semantic"
+# forces vector recall only.
 default_mode = "hybrid"
 
 [hosted]
-enabled = false
-# Hosted mode is opt-in and uses the same CLI entry points with a hosted
-# provider/search-store broker behind them.
 workspace_id = ""
 app_url = "https://app.getyutome.com"
 api_url = "https://api-production-e072.up.railway.app"
-usage_ledger_path = "data/hosted/usage_events.jsonl"
-postgres_url_env = "YUTOME_POSTGRES_URL"
 """
 
 
-class StorageConfig(BaseModel):
+class ConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class StorageConfig(ConfigModel):
     data_dir: Path = Path("data")
     artifact_root: Path = Path("artifacts")
-    catalog_path: Path = Path("indexes/catalog.sqlite")
-    lancedb_path: Path = Path("indexes/lancedb")
 
 
-class BackfillConfig(BaseModel):
+class DatabaseConfig(ConfigModel):
+    postgres_url_env: str = "YUTOME_POSTGRES_URL"
+    required_extensions: tuple[str, ...] = ("vchord", "vchord_bm25", "pg_tokenizer", "vector")
+
+
+class BackfillConfig(ConfigModel):
     workers: PositiveInt = 8
     batch_size: PositiveInt = 25
     max_videos_per_run: PositiveInt = 50
 
 
-class SchedulerConfig(BaseModel):
+class SchedulerConfig(ConfigModel):
     enabled: bool = False
     cadence_hours: PositiveInt = 3
 
 
-class YouTubeConfig(BaseModel):
+class YouTubeConfig(ConfigModel):
     oauth_client_secrets: Path | None = None
     api_key_env: str = "YUTOME_YOUTUBE_API_KEY"
     browser_cookie_browsers: list[str] = Field(
@@ -177,7 +175,7 @@ class YouTubeConfig(BaseModel):
     )
 
 
-class TranscriptConfig(BaseModel):
+class TranscriptConfig(ConfigModel):
     preferred_languages: list[str] = Field(default_factory=lambda: ["en"])
     include_srt: bool = True
     include_markdown: bool = True
@@ -187,7 +185,7 @@ class TranscriptConfig(BaseModel):
     prefer_ytdlp_subtitles: bool = False
 
 
-class TranscriptCleanupConfig(BaseModel):
+class TranscriptCleanupConfig(ConfigModel):
     enabled: bool = True
     auto_after_sync: bool = True
     video_workers: PositiveInt = 1
@@ -197,14 +195,14 @@ class TranscriptCleanupConfig(BaseModel):
     max_patch_retries: int = Field(default=2, ge=0, le=5)
 
 
-class AsrConfig(BaseModel):
+class AsrConfig(ConfigModel):
     provider: Literal["faster-whisper", "mlx-whisper", "openai", "gemini", "deepgram"] = "faster-whisper"
     model: str = "small.en"
     device: str = "cpu"
     compute_type: str = "int8"
 
 
-class EmbeddingsConfig(BaseModel):
+class EmbeddingsConfig(ConfigModel):
     enabled: bool = False
     provider: Literal["voyage", "openai-compatible", "local"] = "voyage"
     model: str = "voyage-4-lite"
@@ -215,17 +213,12 @@ class EmbeddingsConfig(BaseModel):
     retry_base_seconds: float = Field(default=2.0, ge=0)
 
 
-class VectorConfig(BaseModel):
-    backend: Literal["lancedb", "sqlite-vec", "none"] = "lancedb"
-    enabled: bool = True
-
-
-class ExportConfig(BaseModel):
+class ExportConfig(ConfigModel):
     portable_markdown: bool = True
     obsidian: bool = True
 
 
-class ProxyConfig(BaseModel):
+class ProxyConfig(ConfigModel):
     enabled: bool = False
     kind: Literal["generic", "webshare"] = "generic"
     use_for_discovery: bool = False
@@ -242,7 +235,7 @@ class ProxyConfig(BaseModel):
     webshare_retries_when_blocked: PositiveInt = 10
 
 
-class YtDlpConfig(BaseModel):
+class YtDlpConfig(ConfigModel):
     profile: Literal["current", "python-no-js", "player-skip-js"] = "python-no-js"
     fallback_profile: Literal["current", "python-no-js", "player-skip-js"] | None = "current"
     profile_fallback_enabled: bool = True
@@ -262,20 +255,17 @@ class YtDlpConfig(BaseModel):
     subprocess_timeout_seconds: float = Field(default=300.0, gt=0)
 
 
-class FindConfig(BaseModel):
+class FindConfig(ConfigModel):
     default_mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
 
 
-class HostedConfig(BaseModel):
-    enabled: bool = False
+class HostedConfig(ConfigModel):
     workspace_id: str = ""
     app_url: str = "https://app.getyutome.com"
     api_url: str = "https://api-production-e072.up.railway.app"
-    usage_ledger_path: Path = Path("data/hosted/usage_events.jsonl")
-    postgres_url_env: str = "YUTOME_POSTGRES_URL"
 
 
-class GeminiConfig(BaseModel):
+class GeminiConfig(ConfigModel):
     enabled: bool = False
     model: str = "gemini-3.1-flash-lite"
     fallback_enabled: bool = False
@@ -290,8 +280,9 @@ class GeminiConfig(BaseModel):
     window_seconds: PositiveInt = 900
 
 
-class AppConfig(BaseModel):
+class AppConfig(ConfigModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     youtube: YouTubeConfig = Field(default_factory=YouTubeConfig)
@@ -299,7 +290,6 @@ class AppConfig(BaseModel):
     transcript_cleanup: TranscriptCleanupConfig = Field(default_factory=TranscriptCleanupConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
-    vectors: VectorConfig = Field(default_factory=VectorConfig)
     exports: ExportConfig = Field(default_factory=ExportConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     yt_dlp: YtDlpConfig = Field(default_factory=YtDlpConfig)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, Computed, DateTime, ForeignKey, Index, Integer, MetaData, Numeric, Table, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, MetaData, Numeric, Table, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.types import UserDefinedType
 
@@ -23,13 +23,6 @@ class Vector(UserDefinedType):
 
     def get_col_spec(self, **_kw: object) -> str:
         return f"vector({self.dimensions})"
-
-
-class TSVector(UserDefinedType):
-    cache_ok = True
-
-    def get_col_spec(self, **_kw: object) -> str:
-        return "tsvector"
 
 
 users = Table(
@@ -564,7 +557,6 @@ chunks = Table(
     Column("end_seconds", Numeric),
     Column("text", Text, nullable=False),
     Column("bm25_document", BM25Vector(), nullable=False),
-    Column("fts_document", TSVector(), Computed("to_tsvector('english', coalesce(text, ''))", persisted=True)),
     Column("metadata_json", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     UniqueConstraint("workspace_id", "transcript_version_id", "index_profile_id", "chunk_index"),
@@ -572,7 +564,6 @@ chunks = Table(
 
 Index("idx_chunks_bm25_document", chunks.c.bm25_document, postgresql_using="bm25", postgresql_ops={"bm25_document": "bm25_ops"})
 Index("idx_chunks_workspace_video", chunks.c.workspace_id, chunks.c.video_id, chunks.c.chunk_index)
-Index("idx_chunks_fts", chunks.c.fts_document, postgresql_using="gin")
 
 chunk_embeddings = Table(
     "chunk_embeddings",

@@ -7,7 +7,6 @@ import typer
 
 from yutome import runtime
 from yutome.config import DEFAULT_CONFIG_FILENAME
-from yutome.db import bootstrap_catalog
 
 
 @dataclass
@@ -18,7 +17,6 @@ class InvocationContext:
     def runtime(self) -> runtime.Runtime:
         if self._runtime is None:
             self._runtime = runtime.configure(self.config_path)
-            bootstrap_catalog(self._runtime.paths.catalog_db)
         return self._runtime
 
 

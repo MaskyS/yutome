@@ -1,7 +1,8 @@
-"""Local MCP server exposing yutome's tools and resources over stdio (or
-optionally over streamable HTTP for power users). Tool/resource definitions
-come from :mod:`yutome.contract`; this module is just an adapter that wires
-the registry into a FastMCP server."""
+"""MCP server exposing yutome's tools and resources over stdio or HTTP.
+
+Tool/resource definitions come from :mod:`yutome.contract`; this module wires
+the registry into a FastMCP server.
+"""
 from __future__ import annotations
 
 import base64
@@ -21,9 +22,6 @@ from yutome.contract import AUTH_SCOPE
 SERVER_NAME = "Yutome (My YouTube Library)"
 SERVER_WEBSITE_URL = "https://github.com/MaskyS/yutome"
 REMOTE_TOKEN_ENV_VAR = "YUTOME_HTTP_TOKEN"
-REMOTE_READ_SCOPE = AUTH_SCOPE  # kept for back-compat with callers that imported the old name
-# Re-exported for adapters that still import from mcp_server. The single
-# source of truth is contract.SERVER_INSTRUCTIONS.
 SERVER_INSTRUCTIONS = contract.SERVER_INSTRUCTIONS
 
 # Sizes shipped under src/yutome/assets/yutome-icon-<size>.png. Offered to
@@ -71,7 +69,7 @@ class _StaticBearerVerifier:
         return AccessToken(
             token=token,
             client_id="yutome-remote",
-            scopes=[REMOTE_READ_SCOPE],
+            scopes=[AUTH_SCOPE],
         )
 
 
@@ -111,7 +109,7 @@ def build_server(
         server_kwargs["auth"] = AuthSettings(
             issuer_url=base_url,
             resource_server_url=base_url,
-            required_scopes=[REMOTE_READ_SCOPE],
+            required_scopes=[AUTH_SCOPE],
         )
         server_kwargs["token_verifier"] = _StaticBearerVerifier(auth_token)
 
@@ -208,24 +206,3 @@ def _default_remote_base_url(host: str, port: int) -> str:
 def _is_loopback_host(host: str) -> bool:
     normalized = host.strip().lower()
     return normalized in {"127.0.0.1", "localhost", "::1"} or normalized.startswith("127.")
-
-
-# ---------- Back-compat re-exports for callers that imported wrappers ----------
-# These existed in the pre-refactor mcp_server.py. Some HTTP/CLI code still
-# imports them directly; preserve them as thin aliases so we don't have to
-# touch every call site in this PR.
-
-tool_find = contract.tool_find
-tool_list = contract.tool_list
-tool_show = contract.tool_show
-tool_q = contract.tool_q
-
-resource_chunk = contract.resource_chunk
-resource_video = contract.resource_video
-resource_channel = contract.resource_channel
-resource_transcript = contract.resource_transcript
-
-
-def _runtime() -> runtime.Runtime:
-    """Back-compat shim for callers that imported the private name."""
-    return runtime.current()

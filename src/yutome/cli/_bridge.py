@@ -21,9 +21,7 @@ from typing import Any
 import typer
 
 from yutome import contract, runtime, setup_prompts
-from yutome.api import list_ as api_list
 from yutome.config import DEFAULT_CONFIG_FILENAME, AppConfig, load_config
-from yutome.db import bootstrap_catalog
 from yutome.env import apply_env_to_config, load_dotenv
 from yutome.paths import ProjectPaths
 from yutome.remote_connection import (
@@ -55,7 +53,6 @@ def _load_runtime(config_path: Path) -> tuple[AppConfig, ProjectPaths]:
     load_dotenv(_project_root(config_path) / ".env")
     app_config = apply_env_to_config(_load_config_or_exit(config_path))
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config_path))
-    bootstrap_catalog(paths.catalog_db)
     return app_config, paths
 
 def _remote_bridge_headers(token: str) -> dict[str, str]:
@@ -303,13 +300,11 @@ def _list_resources(params: dict[str, Any]) -> dict[str, Any]:
         return {"resources": []}
 
     if host == "channel":
-        rows = api_list(
-            config=runtime.current().config,
-            paths=runtime.current().paths,
+        rows = contract.tool_list(
             entity="channels",
             limit=limit,
             offset=offset,
-        ).model_dump()
+        )
         return {
             "resources": [
                 {
@@ -323,14 +318,12 @@ def _list_resources(params: dict[str, Any]) -> dict[str, Any]:
         }
 
     if host == "video":
-        rows = api_list(
-            config=runtime.current().config,
-            paths=runtime.current().paths,
+        rows = contract.tool_list(
             entity="videos",
             order_by="newest",
             limit=limit,
             offset=offset,
-        ).model_dump()
+        )
         return {
             "resources": [
                 {

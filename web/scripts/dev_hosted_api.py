@@ -32,7 +32,7 @@ DSN = os.environ.get("YUTOME_E2E_PG_DSN", "postgresql://postgres:postgres@127.0.
 # read endpoints never touch them, so skip them to run on a plain Postgres.
 _VECTORCHORD = (
     "EXTENSION", "create_tokenizer", "bm25", "vchord", "vector(", "tokenize(",
-    "chunk", "search_index_profiles", "transcript_versions", "fts_document", "$yutome$",
+    "chunk", "search_index_profiles", "transcript_versions", "$yutome$",
 )
 
 

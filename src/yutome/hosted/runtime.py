@@ -30,11 +30,7 @@ from yutome.hosted.billing import (
 from yutome.hosted.indexing import (
     HostedIndexingExecutor,
     HostedSourceDiscoveryExecutor,
-    HostedVideoInput,
-    TranscriptChunkInput,
     enqueue_index_video_job_sql,
-    mock_embedding_vector,
-    plan_mock_hosted_public_indexing,
     source_from_public_youtube_input,
 )
 from yutome.hosted.gate import UsageGate
@@ -67,25 +63,6 @@ class HostedTickResult(BaseModel):
     affected_rows: int | None = None
     sql: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-
-
-class HostedIndexingSmokeResult(BaseModel):
-    ok: bool
-    dev_only: bool = True
-    migrated: bool
-    migration_phase: MigrationPhase | None = None
-    applied_migrations: int = 0
-    workspace_id: str
-    source_id: str
-    job_id: str
-    youtube_video_id: str
-    hosted_video_id: str
-    transcript_version_id: str
-    query: str
-    operations_executed: int
-    operation_names: list[str]
-    rows: list[dict[str, Any]]
-    usage: dict[str, Any]
 
 
 class HostedJobSeedResult(BaseModel):
@@ -132,7 +109,7 @@ class HostedCommandRunner:
         # Per-thread connections: the hosted API serves concurrent requests from a
         # threadpool over this handle, so a single shared psycopg connection would
         # let transactions from different requests interleave on one connection.
-        url_env = self.config.hosted.postgres_url_env
+        url_env = self.config.database.postgres_url_env
         self.connection = ThreadLocalConnection(lambda: connect_postgres(url_env=url_env))
         return self.connection
 
@@ -154,7 +131,7 @@ class HostedCommandRunner:
         return PostgresUsageLedger(self.connect())
 
     def db_check(self) -> HostedDbCheck:
-        url_env = self.config.hosted.postgres_url_env
+        url_env = self.config.database.postgres_url_env
         url = postgres_url_from_env(url_env=url_env)
         if url is None:
             return HostedDbCheck(ok=False, url_env=url_env, url_configured=False, error="postgres_url_missing")
@@ -279,52 +256,6 @@ class HostedCommandRunner:
             job_id=seeded.job_id or "",
             youtube_video_id=seeded.youtube_video_id or "",
             worker=worker.model_dump(mode="json"),
-        )
-
-    def mock_indexing_smoke(
-        self,
-        *,
-        workspace_id: str,
-        migrate: bool = False,
-        migration_phase: MigrationPhase = "hosted",
-        query: str | None = None,
-        limit: int = 3,
-        source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
-    ) -> HostedIndexingSmokeResult:
-        """Development-only smoke that writes deterministic fake transcript rows."""
-        _validate_positive("limit", limit)
-        connection = self.connect()
-        applied_migrations = self.migrate(phase=migration_phase) if migrate else 0
-        plan = mock_hosted_public_indexing_plan(workspace_id=workspace_id, source_url=source_url, query=query)
-        for statement in mock_hosted_public_indexing_bootstrap_statements(plan.source, plan.job):
-            connection.execute(statement.sql, statement.params)
-        for operation in plan.sql_operations:
-            connection.execute(operation.statement.sql, operation.statement.params)
-
-        search_query = query or str(plan.search_operations[0].statement.params["query"])
-        store = PostgresVectorChordSearchStore(connection, index_profile_ref=plan.index_profile.id)
-        rows, usage = store.hybrid_search(
-            workspace_id=workspace_id,
-            query=search_query,
-            query_vector=mock_embedding_vector(search_query, dimension=plan.index_profile.embedding_dimension),
-            limit=limit,
-        )
-        return HostedIndexingSmokeResult(
-            ok=True,
-            migrated=migrate,
-            migration_phase=migration_phase if migrate else None,
-            applied_migrations=applied_migrations,
-            workspace_id=workspace_id,
-            source_id=plan.source.id,
-            job_id=plan.job.id,
-            youtube_video_id=plan.video.youtube_video_id,
-            hosted_video_id=plan.hosted_video_id,
-            transcript_version_id=plan.transcript_version_id,
-            query=search_query,
-            operations_executed=len(plan.sql_operations),
-            operation_names=[operation.name for operation in plan.sql_operations],
-            rows=rows,
-            usage=usage.model_dump(mode="json"),
         )
 
     def worker_once(
@@ -716,60 +647,6 @@ SELECT 'source_refresh_policy' AS target, id FROM released_source_locks;
     )
 
 
-def mock_hosted_public_indexing_plan(
-    *,
-    workspace_id: str,
-    source_url: str = "https://www.youtube.com/watch?v=OEDoJyhQhXs",
-    query: str | None = None,
-    now: datetime | None = None,
-):
-    created_at = now or datetime.now(timezone.utc)
-    source = source_from_public_youtube_input(
-        workspace_id=workspace_id,
-        source_id="src_mock_pending",
-        value=source_url,
-        import_source="cli",
-        display_name="Hosted mock indexing smoke",
-    )
-    source_hash = input_hash({"workspace_id": workspace_id, "source_url": source.source_url}, prefix="").lstrip("_")[:16]
-    source = source.model_copy(update={"id": f"src_mock_{source_hash}"})
-    video_id = source.canonical_video_id or "OEDoJyhQhXs"
-    job_hash = input_hash({"workspace_id": workspace_id, "source_id": source.id, "video_id": video_id}, prefix="").lstrip("_")[:16]
-    job = Job(
-        id=f"job_mock_{job_hash}",
-        workspace_id=workspace_id,
-        source_id=source.id,
-        job_type="index_video",
-        status="queued",
-        idempotency_key=f"{workspace_id}:{source.id}:index_video:mock",
-        created_at=created_at,
-        metadata_jsonb={"smoke": "hosted_mock_indexing"},
-    )
-    video = HostedVideoInput(
-        youtube_video_id=video_id,
-        title="Mocked hosted public indexing smoke",
-        url=f"https://www.youtube.com/watch?v={video_id}",
-        channel_id="UCleoandlongevity",
-        duration_seconds=1200,
-        metadata={"source": "hosted_mock_indexing_smoke"},
-    )
-    chunks = (
-        TranscriptChunkInput(
-            chunk_index=0,
-            start_seconds=0,
-            end_seconds=12.5,
-            text="Hosted indexing should write transcript chunks and embeddings.",
-        ),
-        TranscriptChunkInput(
-            chunk_index=1,
-            start_seconds=12.5,
-            end_seconds=25,
-            text="Hybrid search should be queryable from generated Postgres operations.",
-        ),
-    )
-    return plan_mock_hosted_public_indexing(source=source, job=job, video=video, chunks=chunks, search_query=query)
-
-
 def ensure_workspace_sql(*, workspace_id: str, name: str | None = None) -> SqlStatement:
     return SqlStatement(
         sql="""
@@ -865,101 +742,6 @@ RETURNING *;
             "max_index_jobs_per_day": policy.max_index_jobs_per_day,
             "policy_snapshot_json": _json_param(policy.policy_snapshot_jsonb),
         },
-    )
-
-
-def mock_hosted_public_indexing_bootstrap_statements(source: Source, job: Job) -> tuple[SqlStatement, ...]:
-    return (
-        SqlStatement(
-            sql="""
-INSERT INTO workspaces (id, name, status)
-VALUES (%(workspace_id)s, %(name)s, 'active')
-ON CONFLICT (id) DO UPDATE
-SET name = EXCLUDED.name,
-    status = EXCLUDED.status
-RETURNING *;
-""".strip(),
-            params={"workspace_id": source.workspace_id, "name": f"Hosted smoke {source.workspace_id}"},
-        ),
-        SqlStatement(
-            sql="""
-INSERT INTO sources (
-    id, workspace_id, source_type, source_url, canonical_channel_id,
-    canonical_playlist_id, canonical_video_id, display_name, selected,
-    auto_index_allowed, import_source, auth_grant_id, metadata_json, status
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_type)s, %(source_url)s,
-    %(canonical_channel_id)s, %(canonical_playlist_id)s, %(canonical_video_id)s,
-    %(display_name)s, %(selected)s, %(auto_index_allowed)s, %(import_source)s,
-    %(auth_grant_id)s, %(metadata_json)s::jsonb, %(status)s
-)
-ON CONFLICT (id) DO UPDATE
-SET source_type = EXCLUDED.source_type,
-    source_url = EXCLUDED.source_url,
-    canonical_channel_id = EXCLUDED.canonical_channel_id,
-    canonical_playlist_id = EXCLUDED.canonical_playlist_id,
-    canonical_video_id = EXCLUDED.canonical_video_id,
-    display_name = EXCLUDED.display_name,
-    selected = EXCLUDED.selected,
-    auto_index_allowed = EXCLUDED.auto_index_allowed,
-    import_source = EXCLUDED.import_source,
-    auth_grant_id = EXCLUDED.auth_grant_id,
-    metadata_json = EXCLUDED.metadata_json,
-    status = EXCLUDED.status,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-            params={
-                "id": source.id,
-                "workspace_id": source.workspace_id,
-                "source_type": source.source_type,
-                "source_url": source.source_url,
-                "canonical_channel_id": source.canonical_channel_id,
-                "canonical_playlist_id": source.canonical_playlist_id,
-                "canonical_video_id": source.canonical_video_id,
-                "display_name": source.display_name,
-                "selected": source.selected,
-                "auto_index_allowed": source.auto_index_allowed,
-                "import_source": source.import_source,
-                "auth_grant_id": source.auth_grant_id,
-                "metadata_json": _json_param(source.metadata_jsonb),
-                "status": source.status,
-            },
-        ),
-        SqlStatement(
-            sql="""
-INSERT INTO jobs (
-    id, workspace_id, source_id, job_type, status, priority,
-    idempotency_key, run_after, executor_kind, executor_ref, metadata_json, created_at
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_id)s, %(job_type)s, %(status)s,
-    %(priority)s, %(idempotency_key)s, %(run_after)s, %(executor_kind)s,
-    %(executor_ref)s, %(metadata_json)s::jsonb, %(created_at)s
-)
-ON CONFLICT (workspace_id, idempotency_key) DO UPDATE
-SET status = EXCLUDED.status,
-    priority = EXCLUDED.priority,
-    source_id = EXCLUDED.source_id,
-    metadata_json = EXCLUDED.metadata_json
-RETURNING *;
-""".strip(),
-            params={
-                "id": job.id,
-                "workspace_id": job.workspace_id,
-                "source_id": job.source_id,
-                "job_type": job.job_type,
-                "status": job.status,
-                "priority": job.priority,
-                "idempotency_key": job.idempotency_key,
-                "run_after": job.run_after,
-                "executor_kind": job.executor_kind,
-                "executor_ref": job.executor_ref,
-                "metadata_json": _json_param(job.metadata_jsonb),
-                "created_at": job.created_at,
-            },
-        ),
     )
 
 
@@ -1130,7 +912,6 @@ def _json_value(value: Any) -> Any:
 __all__ = [
     "HostedCommandRunner",
     "HostedDbCheck",
-    "HostedIndexingSmokeResult",
     "HostedJobSeedResult",
     "HostedPostgresSettings",
     "HostedRealIndexingSmokeResult",
@@ -1140,8 +921,6 @@ __all__ = [
     "connect_postgres",
     "ensure_workspace_sql",
     "maintenance_tick_sql",
-    "mock_hosted_public_indexing_bootstrap_statements",
-    "mock_hosted_public_indexing_plan",
     "postgres_url_from_env",
     "redact_postgres_url",
     "source_refresh_tick_sql",

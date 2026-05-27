@@ -1,4 +1,4 @@
-"""Local HTTP API for yutome query verbs."""
+"""HTTP API for yutome query verbs."""
 from __future__ import annotations
 
 import os
@@ -8,12 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from yutome.api import find as api_find
-from yutome.api import list_ as api_list
-from yutome.api import q as api_q
-from yutome.api import show as api_show
-from yutome.mcp_server import configure, resource_channel, resource_chunk, resource_transcript, resource_video
-from yutome.query import QueryRequest
+from yutome import contract
+from yutome.mcp_server import configure
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -24,7 +20,6 @@ CORS_ENV_VAR = "YUTOME_HTTP_CORS_ORIGINS"
 
 class FindRequest(BaseModel):
     text: str
-    in_: Literal["chunks", "titles", "descriptions"] = Field("chunks", alias="in")
     mode: Literal["lexical", "semantic", "hybrid", "none"] | None = None
     channel: str | None = None
     since: str | None = None
@@ -38,7 +33,7 @@ class FindRequest(BaseModel):
 
 
 class ListRequest(BaseModel):
-    entity: Literal["video", "videos", "channel", "channels", "attention", "status"]
+    entity: Literal["video", "videos", "channel", "channels", "status"]
     channel: str | None = None
     since: str | None = None
     until: str | None = None
@@ -86,11 +81,10 @@ def _cors_origins_from_env() -> list[str]:
 def build_app() -> Any:
     """Build and return the FastAPI app. Runtime config must already be loaded."""
     from fastapi import Depends, FastAPI, HTTPException
-    from yutome.mcp_server import _runtime
 
     app = FastAPI(
         title="yutome",
-        description="Local-first YouTube channel knowledge base HTTP API.",
+        description="Postgres+VectorChord YouTube corpus HTTP API.",
         version="0.1.0",
     )
     cors_origins = _cors_origins_from_env()
@@ -126,8 +120,7 @@ def build_app() -> Any:
 
     @app.get("/readyz", dependencies=auth)
     def readyz() -> dict[str, Any]:
-        runtime = _runtime()
-        status = api_list(config=runtime.config, paths=runtime.paths, entity="status").model_dump()
+        status = contract.tool_list(entity="status")
         row = status["rows"][0] if status.get("rows") else {}
         return {
             "ok": True,
@@ -140,13 +133,9 @@ def build_app() -> Any:
 
     @app.post("/find", dependencies=auth)
     def find(req: FindRequest) -> dict[str, Any]:
-        runtime = _runtime()
         try:
-            return api_find(
-                config=runtime.config,
-                paths=runtime.paths,
+            return contract.tool_find(
                 text=req.text,
-                in_=req.in_,
                 mode=req.mode,
                 channel=req.channel,
                 since=req.since,
@@ -157,17 +146,14 @@ def build_app() -> Any:
                 limit=req.limit,
                 offset=req.offset,
                 project=req.project,
-            ).model_dump()
+            )
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/list", dependencies=auth)
     def list_endpoint(req: ListRequest) -> dict[str, Any]:
-        runtime = _runtime()
         try:
-            return api_list(
-                config=runtime.config,
-                paths=runtime.paths,
+            return contract.tool_list(
                 entity=req.entity,
                 channel=req.channel,
                 since=req.since,
@@ -180,17 +166,14 @@ def build_app() -> Any:
                 limit=req.limit,
                 offset=req.offset,
                 project=req.project,
-            ).model_dump()
+            )
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/show", dependencies=auth)
     def show(req: ShowRequest) -> dict[str, Any]:
-        runtime = _runtime()
         try:
-            return api_show(
-                config=runtime.config,
-                paths=runtime.paths,
+            return contract.tool_show(
                 kind=req.kind,
                 id_=req.id,
                 token_budget=req.token_budget,
@@ -205,38 +188,37 @@ def build_app() -> Any:
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @app.post("/q", dependencies=auth)
-    def raw_query(req: QueryRequest) -> dict[str, Any]:
-        runtime = _runtime()
+    def raw_query(req: dict[str, Any]) -> dict[str, Any]:
         try:
-            return api_q(config=runtime.config, paths=runtime.paths, request=req).model_dump()
+            return contract.tool_q(request=req)
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/chunks/{chunk_id}", dependencies=auth)
     def chunk(chunk_id: str) -> dict[str, Any]:
         try:
-            return resource_chunk(chunk_id)
+            return contract.resource_chunk(chunk_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/videos/{video_id}", dependencies=auth)
     def video(video_id: str) -> dict[str, Any]:
         try:
-            return resource_video(video_id)
+            return contract.resource_video(video_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/channels/{channel_id}", dependencies=auth)
     def channel(channel_id: str) -> dict[str, Any]:
         try:
-            return resource_channel(channel_id)
+            return contract.resource_channel(channel_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/transcripts/{transcript_version_id}", dependencies=auth)
     def transcript(transcript_version_id: str) -> dict[str, Any]:
         try:
-            return resource_transcript(transcript_version_id)
+            return contract.resource_transcript(transcript_version_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

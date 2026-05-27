@@ -3,8 +3,10 @@
 [storage]
 data_dir = "data"
 artifact_root = "artifacts"
-catalog_path = "indexes/catalog.sqlite"
-lancedb_path = "indexes/lancedb"
+
+[database]
+postgres_url_env = "YUTOME_POSTGRES_URL"
+required_extensions = ["vchord", "vchord_bm25", "pg_tokenizer", "vector"]
 
 [backfill]
 workers = 8
@@ -47,10 +49,6 @@ enabled = true
 provider = "voyage"
 model = "voyage-4-lite"
 dimension = 1024
-
-[vectors]
-backend = "lancedb"
-enabled = true
 
 [exports]
 portable_markdown = true

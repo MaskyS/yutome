@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
-from pathlib import Path
 
-from typer.testing import CliRunner
-
-from yutome.cli import app
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.errors import classify_provider_http_error
 from yutome.hosted.events import denied_usage_event, usage_event_from_normalization
 from yutome.hosted.ids import idempotency_key, input_hash
-from yutome.hosted.ledger import JsonlUsageLedger, PostgresUsageGate, PostgresUsageLedger, reconcile_reservation_usage
+from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger, reconcile_reservation_usage
 from yutome.hosted.models import (
     EntitlementPolicy,
     ProviderAllocation,
@@ -680,37 +676,3 @@ def test_provider_http_failure_classification() -> None:
     assert rate_limit.retryable is True
     assert transient.kind == "transient"
     assert transient.retryable is True
-
-
-def test_jsonl_usage_ledger_and_cli_usage_command(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "usage_events.jsonl"
-    ledger = JsonlUsageLedger(ledger_path)
-    ledger.append(
-        UsageEvent(
-            reservation_id="res_1",
-            workspace_id="ws_alice",
-            subject="search_store",
-            operation="lexical_query",
-            event_type="service_operation_succeeded",
-            status="succeeded",
-            actual_units={"queries": 1, "result_count": 12},
-        )
-    )
-
-    events = ledger.recent(limit=1)
-    assert events[0].workspace_id == "ws_alice"
-    assert events[0].actual_units["result_count"] == 12
-
-    result = CliRunner().invoke(app, ["hosted", "usage", "--ledger", str(ledger_path), "--json"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload[0]["subject"] == "search_store"
-    assert payload[0]["actual_units"]["queries"] == 1
-
-
-def test_usage_command_reports_empty_ledger(tmp_path: Path) -> None:
-    result = CliRunner().invoke(app, ["hosted", "usage", "--ledger", str(tmp_path / "missing.jsonl")])
-
-    assert result.exit_code == 0
-    assert "No hosted usage events recorded" in result.output

@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 485.6 510" width="485.6" height="510" style="--bg:#ffffff;--fg:#1f2328;--line:#d1d9e0;--accent:#0969da;--muted:#59636e;background:var(--bg)">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap');
+  text { font-family: 'Inter', system-ui, sans-serif; }
+  svg {
+    /* Derived from --bg and --fg (overridable via --line, --accent, etc.) */
+    --_text:          var(--fg);
+    --_text-sec:      var(--muted, color-mix(in srgb, var(--fg) 60%, var(--bg)));
+    --_text-muted:    var(--muted, color-mix(in srgb, var(--fg) 40%, var(--bg)));
+    --_text-faint:    color-mix(in srgb, var(--fg) 25%, var(--bg));
+    --_line:          var(--line, color-mix(in srgb, var(--fg) 30%, var(--bg)));
+    --_arrow:         var(--accent, color-mix(in srgb, var(--fg) 50%, var(--bg)));
+    --_node-fill:     var(--surface, color-mix(in srgb, var(--fg) 3%, var(--bg)));
+    --_node-stroke:   var(--border, color-mix(in srgb, var(--fg) 20%, var(--bg)));
+    --_group-fill:    var(--bg);
+    --_group-hdr:     color-mix(in srgb, var(--fg) 5%, var(--bg));
+    --_inner-stroke:  color-mix(in srgb, var(--fg) 12%, var(--bg));
+    --_key-badge:     color-mix(in srgb, var(--fg) 10%, var(--bg));
+  }
+</style>
+<defs>
+  <marker id="seq-arrow" markerWidth="8" markerHeight="4.8" refX="8" refY="2.4" orient="auto-start-reverse">
+    <polygon points="0 0, 8 2.4, 0 4.8" fill="var(--_arrow)" />
+  </marker>
+  <marker id="seq-arrow-open" markerWidth="8" markerHeight="4.8" refX="8" refY="2.4" orient="auto-start-reverse">
+    <polyline points="0 0, 8 2.4, 0 4.8" fill="none" stroke="var(--_arrow)" stroke-width="1" />
+  </marker>
+</defs>
+<rect x="199.25" y="256" width="256.35" height="164" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="199.25" y="256" width="130.83999999999997" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="205.25" y="265" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">alt [single video]</text>
+<line x1="199.25" y1="324" x2="455.6" y2="324" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<text x="207.25" y="338" font-size="11" font-weight="400" fill="var(--_text-muted)">[channel / playlist]</text>
+<rect x="199.25" y="188" width="256.35" height="232" rx="0" ry="0" fill="none" stroke="var(--_node-stroke)" stroke-width="1" />
+<rect x="199.25" y="188" width="130.83999999999997" height="18" fill="var(--_group-hdr)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="205.25" y="197" dy="0.35em" font-size="11" font-weight="600" fill="var(--_text-sec)">loop [each source]</text>
+<line x1="99.625" y1="70" x2="99.625" y2="480" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="261" y1="70" x2="261" y2="480" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="401" y1="70" x2="401" y2="480" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line x1="99.625" y1="90" x2="261" y2="90" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="180.3125" y="84" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">POST /account/sources (or /account/sources/import)</text>
+<polyline points="261,130 291,130 291,150 261,150" fill="none" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="297" y="140" dy="0.35em" font-size="11" font-weight="400" fill="var(--_text-muted)">reject any credential-shaped descriptor</text>
+<line x1="261" y1="228" x2="401" y2="228" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="331" y="222" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">upsert sources row</text>
+<line x1="261" y1="296" x2="401" y2="296" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="331" y="290" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">enqueue index_video job (priority 100)</text>
+<line x1="261" y1="360" x2="401" y2="360" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="331" y="354" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">create source_refresh_policy</text>
+<line x1="261" y1="400" x2="401" y2="400" stroke="var(--_line)" stroke-width="0.75" marker-end="url(#seq-arrow)" />
+<text x="331" y="394" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">enqueue discover_source job (priority 100)</text>
+<line x1="261" y1="440" x2="99.625" y2="440" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" marker-end="url(#seq-arrow)" />
+<text x="180.3125" y="434" text-anchor="middle" font-size="11" font-weight="400" fill="var(--_text-muted)">imported sources + jobs + policies</text>
+<rect x="30" y="30" width="139.25" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="99.625" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">Dashboard / CLI</text>
+<rect x="209.25" y="30" width="103.5" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="261" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">Hosted API</text>
+<rect x="356.4" y="30" width="89.2" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+<text x="401" y="50" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">Postgres</text>
+</svg>
