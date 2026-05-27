@@ -910,7 +910,11 @@ def fetch_subtitle_transcript_with_ytdlp(
 ) -> TranscriptFetchResult:
     language_candidates = [language]
     if language == "en":
-        language_candidates = ["en-orig", "en"] if allow_translated_captions else ["en-orig"]
+        # YouTube/yt-dlp may expose native English captions as either
+        # plain `en` or `en-orig`. Try both before declaring English
+        # unavailable; translated-caption policy is handled by upstream
+        # provider ordering and this fallback remains English-only.
+        language_candidates = ["en", "en-orig"]
     last_error: str | None = None
     for candidate in language_candidates:
         attempts = 1

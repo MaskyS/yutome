@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,7 @@ class BenchmarkCase:
     video_id: str
     run_order: int
     warmup: bool
-    language: str = "en-orig"
+    language: str = "en"
     target: str | None = None
 
 
@@ -48,10 +48,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     load_dotenv(Path(args.env_file))
     config = _load_app_config(Path(args.config))
+    if args.production_webshare:
+        _proxy_modes("webshare", config)
+        proxy_modes = ["webshare"]
+    else:
+        proxy_modes = _proxy_modes(args.proxy_mode, config)
     cases = build_cases(
         video_ids=args.video_id,
         operations=args.operation,
-        proxy_modes=_proxy_modes(args.proxy_mode, config),
+        proxy_modes=proxy_modes,
         variants=args.variant,
         repetitions=args.repetitions,
         warmups=args.warmups,
@@ -63,7 +68,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     sink = output.open("w", encoding="utf-8") if output else sys.stdout
     try:
         for case in cases:
-            metric = run_case(case, config=config, timeout_seconds=args.timeout_seconds)
+            if args.production_webshare:
+                metric = run_production_case(
+                    case,
+                    config=config,
+                    max_attempts=args.production_attempts or (config.yt_dlp.subtitle_retries_when_blocked + 1),
+                    retry_sleep_seconds=args.production_retry_sleep_seconds,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            else:
+                metric = run_case(case, config=config, timeout_seconds=args.timeout_seconds)
             print(json.dumps(metric, sort_keys=True, default=str), file=sink, flush=True)
     finally:
         if output:
@@ -81,11 +95,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--proxy-mode", choices=("auto", "direct", "webshare", "both"), default="auto")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--language", default="en-orig")
+    parser.add_argument("--language", default="en")
     parser.add_argument("--discovery-target", default="https://www.youtube.com/@leoandlongevity/videos")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--timeout-seconds", type=float, default=None)
     parser.add_argument("--output", help="Write JSONL metrics to this path instead of stdout.")
+    parser.add_argument(
+        "--production-webshare",
+        action="store_true",
+        help="Run Webshare-only production-style attempts with bounded retry and usability criteria.",
+    )
+    parser.add_argument(
+        "--production-attempts",
+        type=int,
+        default=None,
+        help="Maximum subprocess attempts per production case. Defaults to yt-dlp subtitle retry policy + 1.",
+    )
+    parser.add_argument(
+        "--production-retry-sleep-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep between unsuccessful production attempts.",
+    )
     parsed = parser.parse_args(argv)
     parsed.video_id = parsed.video_id or ["OEDoJyhQhXs"]
     parsed.operation = parsed.operation or ["metadata", "subtitles"]
@@ -202,6 +233,127 @@ def run_case(
         elif case.operation == "discovery":
             metric.update(discovery_metrics(result.stdout))
         return metric
+
+
+def run_production_case(
+    case: BenchmarkCase,
+    *,
+    config: AppConfig,
+    max_attempts: int,
+    retry_sleep_seconds: float = 0.0,
+    timeout_seconds: float | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    if case.proxy_mode != "webshare":
+        raise ValueError("production benchmark only supports Webshare cases")
+    if max_attempts < 1:
+        raise ValueError("production benchmark requires at least one attempt")
+
+    started = time.perf_counter()
+    attempts: list[dict[str, Any]] = []
+    success_reason: str | None = None
+    subtitle_languages = _production_subtitle_language_candidates(case.language)
+    subtitle_language_index = 0
+    for attempt_number in range(1, max_attempts + 1):
+        attempt_case = _production_attempt_case(
+            case,
+            subtitle_language=subtitle_languages[subtitle_language_index],
+        )
+        metric = run_case(
+            attempt_case,
+            config=config,
+            timeout_seconds=timeout_seconds,
+            runner=runner,
+        )
+        metric["attempt_number"] = attempt_number
+        metric["success_reason"] = production_success_reason(metric)
+        metric["failure_reason"] = production_failure_reason(metric)
+        attempts.append(metric)
+        success_reason = metric["success_reason"]
+        if success_reason:
+            break
+        if (
+            case.operation == "subtitles"
+            and _should_try_next_subtitle_language(metric)
+            and subtitle_language_index < len(subtitle_languages) - 1
+        ):
+            subtitle_language_index += 1
+        if attempt_number < max_attempts and retry_sleep_seconds > 0:
+            time.sleep(retry_sleep_seconds)
+
+    elapsed = time.perf_counter() - started
+    final = attempts[-1]
+    succeeded = success_reason is not None
+    summary = {
+        "environment": final["environment"],
+        "operation": case.operation,
+        "variant": case.variant,
+        "proxy_mode": case.proxy_mode,
+        "video_id": case.video_id,
+        "run_order": case.run_order,
+        "warmup": case.warmup,
+        "production_webshare": True,
+        "production_max_attempts": max_attempts,
+        "attempts_used": len(attempts),
+        "succeeded": succeeded,
+        "success_reason": success_reason,
+        "failure_reason": None if succeeded else final.get("failure_reason"),
+        "wall_time_seconds": elapsed,
+        "attempt_wall_time_seconds": sum(float(attempt["wall_time_seconds"]) for attempt in attempts),
+        "returncode": 0 if succeeded else final["returncode"],
+        "error_class": None if succeeded else final["error_class"],
+        "stdout_bytes": sum(int(attempt["stdout_bytes"]) for attempt in attempts),
+        "stderr_bytes": sum(int(attempt["stderr_bytes"]) for attempt in attempts),
+        "proxy_applied": True,
+        "attempts": [_production_attempt_summary(attempt) for attempt in attempts],
+    }
+    summary.update(_final_operation_metrics(final))
+    if not succeeded:
+        summary.update(
+            {
+                key: final[key]
+                for key in ("stderr_tail", "stdout_tail", "signal_name", "diagnostic_markers")
+                if key in final
+            }
+        )
+    return summary
+
+
+def production_success_reason(metric: dict[str, Any]) -> str | None:
+    if metric.get("returncode") != 0:
+        return None
+    if metric["operation"] == "metadata":
+        if metric.get("metadata_complete_core") and metric.get("published_date_present"):
+            return "metadata_complete_with_published_date"
+        return None
+    if metric["operation"] == "subtitles":
+        if metric.get("subtitle_json3_files", 0) > 0 and metric.get("subtitle_segments", 0) > 0:
+            return "subtitle_json3_with_segments"
+        return None
+    if metric["operation"] == "discovery":
+        if metric.get("discovery_rows_with_id", 0) > 0:
+            return "discovery_rows_with_id"
+        return None
+    return None
+
+
+def production_failure_reason(metric: dict[str, Any]) -> str | None:
+    if metric.get("returncode") != 0:
+        error_class = metric.get("error_class") or "yt_dlp_failed"
+        return f"process_failed:{error_class}"
+    if metric["operation"] == "metadata":
+        if not metric.get("metadata_complete_core"):
+            return "metadata_missing_core_fields"
+        if not metric.get("published_date_present"):
+            return "metadata_missing_published_date"
+    if metric["operation"] == "subtitles":
+        if metric.get("subtitle_json3_files", 0) == 0:
+            return "subtitle_missing_json3_file"
+        if metric.get("subtitle_segments", 0) == 0:
+            return "subtitle_missing_text_segments"
+    if metric["operation"] == "discovery" and metric.get("discovery_rows_with_id", 0) == 0:
+        return "discovery_missing_rows"
+    return None
 
 
 def build_command(case: BenchmarkCase, *, config: AppConfig, output_dir: Path) -> tuple[list[str], str | None]:
@@ -327,6 +479,8 @@ def classify_error(result: subprocess.CompletedProcess[str]) -> str | None:
         return "youtube_rate_limited"
     if "captcha" in text or "not a bot" in text or "sign in" in text or "/sorry/" in text:
         return "youtube_block"
+    if "page needs to be reloaded" in text:
+        return "youtube_page_reload"
     return "yt_dlp_failed"
 
 
@@ -372,6 +526,8 @@ def diagnostic_markers(result: subprocess.CompletedProcess[str]) -> list[str]:
         markers.append("youtube_rate_limited")
     if "captcha" in text or "not a bot" in text or "sign in" in text or "/sorry/" in text:
         markers.append("youtube_block")
+    if "page needs to be reloaded" in text:
+        markers.append("youtube_page_reload")
     if "unable to download webpage" in text or "unable to download api page" in text:
         markers.append("youtube_download_failed")
     if "timed out" in text or "timeout" in text:
@@ -407,6 +563,74 @@ def redact_command(command: Sequence[str]) -> list[str]:
         if index > 0 and redacted[index - 1] == "--proxy":
             redacted[index] = redact_proxy_url(value)
     return redacted
+
+
+def _production_attempt_case(case: BenchmarkCase, *, subtitle_language: str) -> BenchmarkCase:
+    if case.operation != "subtitles":
+        return case
+    return replace(case, language=subtitle_language)
+
+
+def _production_subtitle_language_candidates(language: str) -> list[str]:
+    if language == "en":
+        return ["en", "en-orig"]
+    return [language]
+
+
+def _should_try_next_subtitle_language(metric: dict[str, Any]) -> bool:
+    return metric.get("returncode") == 0 and metric.get("failure_reason") in {
+        "subtitle_missing_json3_file",
+        "subtitle_missing_text_segments",
+    }
+
+
+def _production_attempt_summary(metric: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "attempt_number",
+        "operation",
+        "variant",
+        "proxy_mode",
+        "video_id",
+        "wall_time_seconds",
+        "returncode",
+        "error_class",
+        "success_reason",
+        "failure_reason",
+        "stdout_bytes",
+        "stderr_bytes",
+        "command",
+        "metadata_complete_core",
+        "published_date_present",
+        "subtitle_json3_files",
+        "subtitle_segments",
+        "output_file_bytes",
+        "discovery_rows",
+        "discovery_rows_with_id",
+        "stderr_tail",
+        "stdout_tail",
+        "signal_name",
+        "diagnostic_markers",
+    ]
+    return {key: metric[key] for key in keys if key in metric}
+
+
+def _final_operation_metrics(metric: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "metadata_present_fields",
+        "metadata_complete_core",
+        "published_date_present",
+        "metadata_type",
+        "formats_count",
+        "automatic_captions_count",
+        "subtitle_json3_files",
+        "subtitle_segments",
+        "output_file_bytes",
+        "discovery_rows",
+        "discovery_rows_with_id",
+        "discovery_rows_with_title",
+        "discovery_rows_with_published_date",
+    ]
+    return {key: metric[key] for key in keys if key in metric}
 
 
 def _tail_text(text: str, max_chars: int) -> str:
