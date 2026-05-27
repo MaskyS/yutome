@@ -1174,7 +1174,7 @@ def _display_channel_picker(channels: list[LibraryChannel], *, title: str, query
 
     typer.echo("")
     typer.echo(title)
-    for index, channel in visible[:30]:
+    for index, _channel in visible[:30]:
         typer.echo(f"  {index + 1:>3}. {labels[index]}")
     if len(visible) > 30:
         typer.echo(f"  ... {len(visible) - 30} more match; use /search text to narrow.")

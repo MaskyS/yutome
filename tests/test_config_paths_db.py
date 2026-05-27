@@ -1116,7 +1116,7 @@ def test_remote_status_uses_live_worker_relay_status(monkeypatch, tmp_path: Path
     def fake_urlopen(request: object, timeout: float | None = None) -> FakeResponse:
         seen.append(
             (
-                getattr(request, "full_url"),
+                request.full_url,  # type: ignore[attr-defined]
                 request.get_header("Authorization"),  # type: ignore[attr-defined]
                 timeout,
             )

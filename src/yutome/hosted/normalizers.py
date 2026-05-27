@@ -108,7 +108,7 @@ def normalize_voyage_embeddings_response(
 
 def normalize_webshare_subuser(payload: dict[str, Any]) -> dict[str, Any]:
     proxy_limit = _get(payload, "proxy_limit")
-    proxy_limit_gb = None if proxy_limit in {0, 0.0, "0", "0.0"} else _number(proxy_limit)
+    proxy_limit_gb = None if proxy_limit in {0, "0", "0.0"} else _number(proxy_limit)
     return {
         "subuser_id": str(_get(payload, "id", default="")),
         "label": _get(payload, "label"),

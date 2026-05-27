@@ -83,6 +83,9 @@ class Thresholds:
     branch_count: int = 20
 
 
+DEFAULT_THRESHOLDS = Thresholds()
+
+
 @dataclass(frozen=True)
 class BlockMetric:
     path: str
@@ -314,7 +317,7 @@ def duplicate_routes(routes: Iterable[dict[str, object]]) -> list[dict[str, obje
     return sorted(duplicates, key=lambda item: (str(item["route"]), str(item["method"])))
 
 
-def audit_project(root: Path, thresholds: Thresholds = Thresholds()) -> dict[str, object]:
+def audit_project(root: Path, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> dict[str, object]:
     root = root.resolve()
     files = discover_source_files(root)
 

@@ -114,4 +114,10 @@ line-length = 120
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E9", "F"]
+select = ["E9", "F", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer and FastAPI intentionally declare options/dependencies through default
+# values; B008 is useful elsewhere but noisy on those framework boundaries.
+"src/yutome/cli/*.py" = ["B008"]
+"src/yutome/hosted/http_api.py" = ["B008"]

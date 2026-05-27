@@ -538,7 +538,7 @@ def plan_mock_hosted_public_indexing(
             idempotency_key=job_operations[1].idempotency_key,
         )
     )
-    for chunk, vector in zip(normalized_chunks, embedding_vectors):
+    for chunk, vector in zip(normalized_chunks, embedding_vectors, strict=True):
         chunk_id = _stable_id("chk", source.workspace_id, transcript_version_id, str(chunk.chunk_index))
         sql_operations.append(
             PlannedSqlOperation(
