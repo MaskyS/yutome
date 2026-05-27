@@ -16,6 +16,7 @@ For usage and install, see the [top-level README](../README.md). The files in th
 These are not getting-started material. They explain *why* things are the way they are.
 
 - [`plan.md`](plan.md) — the full architecture and design history (long; predates parts of the current SDK rewrite).
+- [`ytdlp-webshare-decision-log.md`](ytdlp-webshare-decision-log.md) — current `yt-dlp`/Webshare indexing findings, benchmark results, and production-default decisions.
 - [`product-design.md`](product-design.md) — user model, design principles, scope decisions.
 - [`cloud-capsule-strategy.md`](cloud-capsule-strategy.md) — why the remote connector is a Cloudflare Worker, what milestones look like.
 - [`reviewer-handoff.md`](reviewer-handoff.md) — notes for review of the SDK rewrite branch.

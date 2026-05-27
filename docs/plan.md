@@ -603,9 +603,11 @@ The implementation includes a caption-language check path and records `caption-l
 - optional impersonation
 - optional proxy
 
-For English, the default language candidate is `en-orig` when translated captions are disabled. This avoids silently using translated captions as the main transcript. If translated captions are explicitly enabled, `en` is also considered.
+For English, the default language candidate is `en`, with `en-orig` as a fallback only after `yt-dlp` exits successfully but writes no usable JSON3 text. Live Webshare testing found that some videos expose native English captions under plain `en`, so using only `en-orig` can produce successful-but-empty subtitle attempts. Process failures such as `429`, bot checks, or page reload errors should retry the same language through another Webshare attempt before changing language.
 
 `yt-dlp` is important because it can sometimes access subtitle files when `youtube-transcript-api` is blocked or returns no useful transcript.
+
+See [`ytdlp-webshare-decision-log.md`](ytdlp-webshare-decision-log.md) for the current hosted Webshare benchmark and runtime-profile decision.
 
 ### Gemini Fallback
 
