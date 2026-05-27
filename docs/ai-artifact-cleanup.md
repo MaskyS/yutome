@@ -356,7 +356,40 @@ The critical rule is that steps 4 and 5 must not be separated by hidden callback
 or inheritance behavior. A future reviewer should be able to prove from the code
 that a paid call cannot happen before the reservation.
 
-### 4. Retired terms and compatibility shims remain active
+### 4. Local indexing has the worst control-flow concentration
+
+`src/yutome/indexer.py` is local-first published behavior, so it cannot be
+reshaped as aggressively as hosted pre-production code. But conservative is not
+the same as unscheduled. The audit identified `sync_channel()` as the highest
+branch-count function in the repository, and `src/yutome/youtube.py` is another
+top module hotspot in the same local acquisition path.
+
+Why this is risky:
+
+- Channel sync owns source selection, staged provider policy, per-video
+  processing, fallback gating, metadata backfill, status transitions, and output
+  reporting in one control-flow object.
+- Transcript acquisition mixes provider choice, retry classification, fallback
+  eligibility, proxy diagnostics, and transcript normalization.
+- YouTube/yt-dlp/Webshare behavior is operationally sensitive and has recent
+  real-world tuning. A future local fix should not require reading hosted
+  provider-broker code, and a hosted fix should not accidentally change local
+  CLI behavior.
+
+What to do:
+
+- Add a dedicated local-path slice for `indexer.py` and `youtube.py`.
+- Preserve published local CLI and MCP behavior.
+- Split along behavior boundaries: sync orchestration, provider/fallback
+  policy, transcript acquisition, metadata backfill, yt-dlp command/profile
+  construction, proxy diagnostics, and error classification.
+- Keep tests focused on observed local behavior rather than chasing a lower
+  branch-count number.
+
+This slice is required for the epic done criteria. The local path may move more
+slowly than hosted cleanup, but it is not out of scope.
+
+### 5. Retired terms and compatibility shims remain active
 
 The hosted glossary retires "capsule" as a current concept and says greenfield
 renames should have no alias shims. The repo still has active package paths,
@@ -382,7 +415,7 @@ rename must account for `pyproject.toml` force-includes, package resource
 lookup, contract export, docs, and tests in the same slice. Until then, new code
 must not introduce more conceptual uses of "capsule."
 
-### 5. Quality gates are too weak for this risk profile
+### 6. Quality gates are too weak for this risk profile
 
 `pyproject.toml` currently configures Ruff with only `E9` and `F`. That catches
 syntax errors and undefined names, but it does not catch broad exceptions,
@@ -500,7 +533,14 @@ First code edits:
    `doctor.py`, `hosted.py`, and `export.py`.
 3. Keep plain helper functions importable through `yutome.cli.__getattr__` until
    tests are moved to import from narrower modules.
-4. Move remote connector deployment helpers into a new private module only after
+4. Preserve direct `yutome.cli._legacy.<symbol>` patch paths until the tests are
+   updated in the same PR. `tests/test_setup_helpers.py` and
+   `tests/test_config_paths_db.py` monkeypatch many bridge/setup symbols through
+   the `_legacy` module namespace; `yutome.cli.__getattr__` does not cover those
+   dotted string paths. If a helper moves, either re-import it in `_legacy.py` as
+   a temporary compatibility bridge for tests or update the tests to patch the
+   new module in the same commit.
+5. Move remote connector deployment helpers into a new private module only after
    the ghost command tree is gone; otherwise the extraction hides the stale
    command surface instead of removing it.
 
@@ -610,7 +650,57 @@ Primary tests:
 uv run pytest tests/test_hosted_indexing_smoke.py tests/test_hosted_mcp_query.py tests/test_hosted_usage.py tests/test_hosted_search_store.py -q
 ```
 
-### Slice 5: Retired terminology and stale shim removal
+### Slice 5: Local indexing and YouTube acquisition split
+
+Beads: `yt-indexer-sk6.9`
+
+Target modules:
+
+- `src/yutome/indexer.py`
+- `src/yutome/youtube.py`
+- local tests around staged sync, yt-dlp runtime, metadata validation, retrieval,
+  and CLI corpus sync
+
+Precondition:
+
+- Do not mix this with hosted provider-broker changes. Local-first behavior is a
+  published path; hosted search-store and UsageGate contracts should not be
+  rewritten in the same slice.
+
+First code edits:
+
+1. Extract the channel-sync stage plan from `sync_channel()`: discovery/source
+   selection, primary transcript pass, fallback pass, metadata backfill, and
+   quality cleanup should be named phases.
+2. Extract provider/fallback policy from transcript acquisition. The code should
+   make it obvious when transcript API, yt-dlp subtitle fallback, Gemini, or ASR
+   is allowed.
+3. Keep recent yt-dlp/Webshare retry decisions intact: python-no-js default,
+   current/full fallback, `en` before `en-orig`, and same-language retries for
+   retryable process failures.
+4. Move YouTube command/profile construction and error classification toward
+   pure helpers with targeted tests.
+5. Preserve local database writes and status values unless a separate Beads
+   issue changes the public behavior.
+
+Acceptance:
+
+- `sync_channel()` no longer owns provider policy, metadata backfill, and output
+  reporting as one monolithic control-flow object.
+- `youtube.py` separates command/profile construction from error
+  classification and transcript parsing.
+- Published local CLI/MCP behavior remains stable.
+- The audit no longer reports `sync_channel()` as the worst branch-count hotspot,
+  or the remaining branches are justified because splitting would hide the
+  actual sync phase order.
+
+Primary tests:
+
+```bash
+uv run pytest tests/test_indexer_stages.py tests/test_youtube_ytdlp.py tests/test_ytdlp_benchmark_script.py tests/test_config_paths_db.py tests/test_retrieval_exports.py -q
+```
+
+### Slice 6: Retired terminology and stale shim removal
 
 Beads: `yt-indexer-sk6.5`
 
@@ -646,7 +736,7 @@ uv run pytest tests/test_contract_parity.py tests/test_config_paths_db.py -q
 cd cloudflare/yutome-capsule && npx tsc --noEmit
 ```
 
-### Slice 6: Quality gate expansion
+### Slice 7: Quality gate expansion
 
 Beads: `yt-indexer-sk6.6`
 
@@ -724,7 +814,8 @@ The epic is done when:
 
 - The audit script exists and remains green.
 - The biggest hotspot modules have been split along actual responsibility
-  boundaries.
+  boundaries, including the local `indexer.py`/`youtube.py` acquisition path and
+  hosted route/query/indexing paths.
 - Hosted terminology matches the glossary.
 - Hosted pre-production shims are removed unless explicitly justified.
 - Public local CLI and MCP contracts remain stable.
