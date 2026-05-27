@@ -94,35 +94,6 @@ from yutome.youtube import (
     redact_proxy_url,
 )
 
-app = typer.Typer(
-    add_completion=False,
-    no_args_is_help=True,
-    help="Local-first YouTube source knowledge base indexer.",
-)
-export_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Export indexed artifacts.")
-list_app = typer.Typer(add_completion=False, no_args_is_help=True, help="List indexed corpus objects.")
-show_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Show indexed corpus objects.")
-quality_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Transcript quality tools.")
-mcp_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local MCP server (for Claude Desktop, Cursor, Claude Code, and other MCP-aware apps on this machine).")
-http_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local HTTP API server.")
-eval_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run retrieval quality checks.")
-remote_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the authenticated HTTP / MCP server for private-network or reverse-proxy access.")
-bridge_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the long-lived bridge that lets remote MCP clients reach this laptop's corpus.")
-contract_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Inspect and export the MCP contract.")
-hosted_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Hosted Postgres runtime commands.")
-app.add_typer(export_app, name="export")
-app.add_typer(list_app, name="list")
-app.add_typer(show_app, name="show")
-app.add_typer(quality_app, name="quality")
-app.add_typer(mcp_app, name="mcp")
-app.add_typer(http_app, name="http")
-app.add_typer(eval_app, name="eval")
-app.add_typer(remote_app, name="remote")
-app.add_typer(bridge_app, name="bridge")
-app.add_typer(contract_app, name="contract")
-app.add_typer(hosted_app, name="hosted")
-
-
 def _version_callback(value: bool) -> None:
     if not value:
         return
@@ -130,21 +101,6 @@ def _version_callback(value: bool) -> None:
 
     typer.echo(f"yutome {__version__}")
     raise typer.Exit()
-
-
-@app.callback()
-def _root(
-    version: bool = typer.Option(
-        False,
-        "--version",
-        "-V",
-        is_eager=True,
-        callback=_version_callback,
-        help="Print the installed yutome version and exit.",
-    ),
-) -> None:
-    """Local-first YouTube source knowledge base indexer."""
-    del version  # handled by callback
 
 
 ENV_TEMPLATE = """# Local secrets and proxy configuration. This file is ignored by git.
@@ -3251,7 +3207,6 @@ def _disconnect_remote(
     typer.echo("[OK] Disconnect complete.")
 
 
-@app.command()
 def setup(
     channel: str | None = typer.Argument(
         None,
@@ -3567,7 +3522,6 @@ def setup(
                 typer.echo("Save the endpoint manually with `yutome connect --endpoint <url>`.")
 
 
-@app.command("connect")
 def connect_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -3710,7 +3664,6 @@ def connect_command(
             _finalize_remote_bridge_setup(config_path=config, paths=paths)
 
 
-@app.command("disconnect")
 def disconnect_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -3743,7 +3696,6 @@ def disconnect_command(
     )
 
 
-@app.command()
 def init(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -3772,7 +3724,6 @@ def init(
     typer.echo(f"Initialized catalog: {paths.catalog_db}")
 
 
-@app.command("status")
 def status_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -3818,7 +3769,6 @@ def status_command(
         typer.echo("  run: yutome connect")
 
 
-@app.command("usage")
 def usage_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4014,7 +3964,6 @@ def _echo_billing_status(result: Mapping[str, Any]) -> None:
             typer.echo("    billing_exports: none")
 
 
-@hosted_app.command("api")
 def hosted_api(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4034,7 +3983,6 @@ def hosted_api(
         _hosted_error(str(exc), json_output=False)
 
 
-@hosted_app.command("migrate")
 def hosted_migrate(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4055,7 +4003,6 @@ def hosted_migrate(
     _echo_hosted_result(payload, json_output=json_output, message=f"Applied {applied} hosted migration statements ({phase_value}).")
 
 
-@hosted_app.command("db-check")
 def hosted_db_check(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4084,7 +4031,6 @@ def hosted_db_check(
         typer.echo(f"  error={result.error}")
 
 
-@hosted_app.command("billing-status")
 def hosted_billing_status(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4112,7 +4058,6 @@ def hosted_billing_status(
     _echo_billing_status(result)
 
 
-@hosted_app.command("billing-export-worker")
 def hosted_billing_export_worker(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4144,7 +4089,6 @@ def hosted_billing_export_worker(
         time.sleep(poll_interval)
 
 
-@hosted_app.command("reconcile-balance")
 def hosted_reconcile_balance(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4175,7 +4119,6 @@ def hosted_reconcile_balance(
     _echo_hosted_result(result, json_output=json_output, message=f"Reconciled balance for workspace {workspace}.")
 
 
-@hosted_app.command("search-smoke")
 def hosted_search_smoke(
     query: str = typer.Argument(..., help="Lexical search query to smoke test."),
     config: Path = typer.Option(
@@ -4200,7 +4143,6 @@ def hosted_search_smoke(
     _echo_hosted_result(result, json_output=json_output, message=f"Search smoke returned {len(result.get('rows', []))} rows.")
 
 
-@hosted_app.command("login")
 def hosted_login(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4231,7 +4173,6 @@ def hosted_login(
     typer.echo(f"[OK] Hosted CLI connected to workspace {result['workspace_id']}.")
 
 
-@hosted_app.command("jobs")
 def hosted_jobs(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4259,7 +4200,6 @@ def hosted_jobs(
     _echo_hosted_result(result, json_output=json_output, message=f"Fetched {len(result.get('jobs', []))} hosted job(s).")
 
 
-@hosted_app.command("source-add")
 def hosted_source_add(
     source_url: str = typer.Argument(..., help="Public YouTube channel, handle, playlist, or video URL."),
     config: Path = typer.Option(
@@ -4295,7 +4235,6 @@ def hosted_source_add(
     _echo_hosted_result(result, json_output=json_output, message=f"Seeded hosted source {source_id}.")
 
 
-@hosted_app.command("enqueue-index-video")
 def hosted_enqueue_index_video(
     source_url: str = typer.Argument(..., help="Public YouTube video URL or 11-character video id."),
     config: Path = typer.Option(
@@ -4327,7 +4266,6 @@ def hosted_enqueue_index_video(
     _echo_hosted_result(result, json_output=json_output, message=f"Queued hosted index job {job_id}.")
 
 
-@hosted_app.command("real-indexing-smoke")
 def hosted_real_indexing_smoke(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4367,7 +4305,6 @@ def hosted_real_indexing_smoke(
     _echo_hosted_result(result, json_output=json_output, message=f"Real indexing smoke job {job_id}: ok={ok}.")
 
 
-@hosted_app.command("mock-indexing-smoke")
 def hosted_mock_indexing_smoke(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4411,7 +4348,6 @@ def hosted_mock_indexing_smoke(
     )
 
 
-@hosted_app.command("worker")
 def hosted_worker(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4446,7 +4382,6 @@ def hosted_worker(
         time.sleep(poll_interval)
 
 
-@hosted_app.command("source-refresh-tick")
 def hosted_source_refresh_tick(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4471,7 +4406,6 @@ def hosted_source_refresh_tick(
     _echo_hosted_result(result, json_output=json_output, message=f"Source refresh tick claimed {result.affected_rows or 0} policies.")
 
 
-@hosted_app.command("maintenance-tick")
 def hosted_maintenance_tick(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4490,7 +4424,6 @@ def hosted_maintenance_tick(
     _echo_hosted_result(result, json_output=json_output, message=f"Maintenance tick released {result.affected_rows or 0} rows.")
 
 
-@app.command()
 def doctor(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4575,7 +4508,6 @@ def doctor(
         raise typer.Exit(code=1)
 
 
-@app.command("add")
 def add_sources(
     targets: list[str] = typer.Argument(..., help="YouTube channel or video URL, handle, or id."),
     config: Path = typer.Option(
@@ -4622,7 +4554,6 @@ def add_sources(
     typer.echo(f"Added {imported} source{'s' if imported != 1 else ''}.")
 
 
-@app.command("import")
 def import_command(
     path: Path = typer.Argument(..., exists=True, readable=True, help="CSV, OPML/XML, or plain URL list."),
     config: Path = typer.Option(
@@ -4663,7 +4594,6 @@ def import_command(
     typer.echo(f"Imported {len(sources)} source{'s' if len(sources) != 1 else ''}.")
 
 
-@app.command("import-youtube")
 def import_youtube(
     target: str | None = typer.Argument(
         None,
@@ -4732,7 +4662,6 @@ def import_youtube(
     )
 
 
-@app.command("select")
 def select_source(
     selector: str = typer.Argument(..., help="Source id, URL, handle, title, or 'all'."),
     config: Path = typer.Option(
@@ -4752,7 +4681,6 @@ def select_source(
     typer.echo(f"Selected {count} source{'s' if count != 1 else ''}.")
 
 
-@app.command("unselect")
 def unselect_source(
     selector: str = typer.Argument(..., help="Source id, URL, handle, title, or 'all'."),
     config: Path = typer.Option(
@@ -4772,7 +4700,6 @@ def unselect_source(
     typer.echo(f"Unselected {count} source{'s' if count != 1 else ''}.")
 
 
-@quality_app.command("upgrade")
 def quality_upgrade(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -4875,7 +4802,6 @@ def quality_upgrade(
         typer.echo("Vector index note: run `yutome corpus rebuild vectors` to refresh semantic/hybrid retrieval.")
 
 
-@app.command()
 def sync(
     target: str | None = typer.Argument(
         None,
@@ -5078,7 +5004,6 @@ def sync(
     )
 
 
-@app.command("find")
 def find_command(
     text: str = typer.Argument(..., help="Search text."),
     config: Path = typer.Option(
@@ -5133,7 +5058,6 @@ def find_command(
     _echo_query_result(result, json_output=json_output)
 
 
-@list_app.command("videos")
 def list_videos(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5175,7 +5099,6 @@ def list_videos(
     _echo_query_result(result, json_output=json_output)
 
 
-@list_app.command("channels")
 def list_channels(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5203,7 +5126,6 @@ def list_channels(
     _echo_query_result(result, json_output=json_output)
 
 
-@list_app.command("attention")
 def list_attention(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5233,7 +5155,6 @@ def list_attention(
     _echo_query_result(result, json_output=json_output)
 
 
-@list_app.command("status")
 def list_status(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5249,7 +5170,6 @@ def list_status(
     _echo_query_result(result, json_output=json_output)
 
 
-@show_app.command("chunk")
 def show_chunk(
     chunk_id: str = typer.Argument(..., help="Chunk id."),
     config: Path = typer.Option(
@@ -5268,7 +5188,6 @@ def show_chunk(
         raise typer.Exit(code=1) from exc
 
 
-@show_app.command("video")
 def show_video(
     video_id: str = typer.Argument(..., help="Video id."),
     config: Path = typer.Option(
@@ -5287,7 +5206,6 @@ def show_video(
         raise typer.Exit(code=1) from exc
 
 
-@show_app.command("channel")
 def show_channel(
     selector: str = typer.Argument(..., help="Channel id or handle."),
     config: Path = typer.Option(
@@ -5306,7 +5224,6 @@ def show_channel(
         raise typer.Exit(code=1) from exc
 
 
-@show_app.command("transcript")
 def show_transcript(
     transcript_id_or_video_id: str = typer.Argument(..., help="Transcript version id or video id."),
     config: Path = typer.Option(
@@ -5336,7 +5253,6 @@ def show_transcript(
         raise typer.Exit(code=1) from exc
 
 
-@show_app.command("context")
 def show_context(
     anchor: str | None = typer.Argument(None, help="Chunk id or timestamped YouTube URL."),
     config: Path = typer.Option(
@@ -5374,7 +5290,6 @@ def show_context(
         raise typer.Exit(code=1) from exc
 
 
-@show_app.command("source")
 def show_source(
     anchor: str | None = typer.Argument(None, help="Chunk id or timestamped YouTube URL."),
     config: Path = typer.Option(
@@ -5410,7 +5325,6 @@ def show_source(
         raise typer.Exit(code=1) from exc
 
 
-@app.command("q")
 def q_command(
     request: str | None = typer.Argument(None, help="JSON QueryRequest, or '-' to read from stdin."),
     config: Path = typer.Option(
@@ -5432,7 +5346,6 @@ def q_command(
     _echo_json(result.model_dump())
 
 
-@eval_app.command("run")
 def eval_run(
     suite: Path = typer.Argument(..., exists=True, readable=True, help="JSON eval suite file."),
     config: Path = typer.Option(
@@ -5470,7 +5383,6 @@ def eval_run(
         raise typer.Exit(code=1)
 
 
-@app.command("rebuild-vectors")
 def rebuild_vectors(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5514,7 +5426,6 @@ def rebuild_vectors(
         typer.echo(stats.message)
 
 
-@app.command("rebuild-chunks")
 def rebuild_chunks(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5533,7 +5444,6 @@ def rebuild_chunks(
     typer.echo(f"Skipped videos: {stats.skipped}")
 
 
-@export_app.command("portable-md")
 def export_portable_markdown(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5550,7 +5460,6 @@ def export_portable_markdown(
     typer.echo(f"Exported {stats.exported} Markdown files to {stats.output_dir}")
 
 
-@export_app.command("obsidian")
 def export_obsidian(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5567,7 +5476,6 @@ def export_obsidian(
     typer.echo(f"Exported {stats.exported} Obsidian Markdown files to {stats.output_dir}")
 
 
-@app.command("proxy-info")
 def proxy_info() -> None:
     """Show practical proxy guidance for transcript fetching."""
     typer.echo("Default: use no proxy, local residential IP, low concurrency, and cached resumes.")
@@ -5579,7 +5487,6 @@ def proxy_info() -> None:
     typer.echo("yt-dlp fallback receives configured proxies through --proxy.")
 
 
-@app.command("proxy-test")
 def proxy_test(
     video_id: str = typer.Option(
         "lwH29W1M57A",
@@ -5651,7 +5558,6 @@ def proxy_test(
         raise typer.Exit(code=1)
 
 
-@app.command("gemini-test")
 def gemini_test(
     video_id: str = typer.Option(
         "lwH29W1M57A",
@@ -5672,7 +5578,6 @@ def gemini_test(
     _status(True, "Gemini video understanding", f"{len(result.raw_snippets)} segments from {result.source}")
 
 
-@mcp_app.command("serve")
 def mcp_serve(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5687,7 +5592,6 @@ def mcp_serve(
     run_stdio_server(config_path=config)
 
 
-@http_app.command("serve")
 def http_serve(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -5737,7 +5641,6 @@ def http_serve(
         raise typer.Exit(code=1) from exc
 
 
-@remote_app.command("prepare")
 def remote_prepare(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -6580,7 +6483,6 @@ def _finalize_remote_bridge_setup(
     _offer_bridge_persistence(config_path)
 
 
-@bridge_app.command("start")
 def bridge_start_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -6661,7 +6563,6 @@ def bridge_start_command(
     typer.echo("     Want it to survive reboots? Run: yutome serve bridge install")
 
 
-@bridge_app.command("stop")
 def bridge_stop_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
@@ -6720,7 +6621,6 @@ def bridge_stop_command(
     typer.echo(f"[OK] Stopped bridge (PID {pid}).")
 
 
-@bridge_app.command("status")
 def bridge_status_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
@@ -6938,7 +6838,6 @@ def _offer_bridge_persistence(config_path: Path) -> None:
         typer.echo("       You can retry later with: yutome serve bridge install")
 
 
-@bridge_app.command("install")
 def bridge_install_command(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME), "--config", "-c", help="Path to the yutome TOML config."
@@ -6957,7 +6856,6 @@ def bridge_install_command(
     typer.echo("     Uninstall with: yutome serve bridge uninstall")
 
 
-@bridge_app.command("uninstall")
 def bridge_uninstall_command() -> None:
     """Remove the launchd / systemd auto-start configuration."""
     if sys.platform == "darwin":
@@ -6985,7 +6883,6 @@ def bridge_uninstall_command() -> None:
     typer.echo(f"Nothing to uninstall on platform {sys.platform!r}.")
 
 
-@remote_app.command("sync")
 def remote_sync(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -7015,7 +6912,6 @@ def remote_sync(
         typer.echo(f"  - {label}")
 
 
-@remote_app.command("serve")
 def remote_serve(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -7047,7 +6943,6 @@ def remote_serve(
         raise typer.Exit(code=1) from exc
 
 
-@remote_app.command("mcp")
 def remote_mcp(
     config: Path = typer.Option(
         Path(DEFAULT_CONFIG_FILENAME),
@@ -7081,7 +6976,6 @@ def remote_mcp(
         raise typer.Exit(code=1) from exc
 
 
-@remote_app.command("check")
 def remote_check(
     base_url: str = typer.Argument(..., help="Base URL, e.g. https://yutome.example.com or http://127.0.0.1:8765."),
     config: Path = typer.Option(
@@ -7123,7 +7017,6 @@ def _http_json(method: str, url: str, *, timeout: float, headers: dict[str, str]
         return json.loads(response.read().decode("utf-8"))
 
 
-@contract_app.command("emit")
 def contract_emit(
     output: Path = typer.Option(
         Path("cloudflare/yutome-capsule/src/contract.json"),
