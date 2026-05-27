@@ -70,7 +70,7 @@ The first snapshot reported:
 | Metric | Count |
 |---|---:|
 | Scanned source files | 177 |
-| Scanned source lines | 64,696 |
+| Scanned source lines | 64,719 |
 | Python files | 127 |
 | TypeScript files | 50 |
 | Module hotspots at 600+ lines | 29 |
@@ -115,7 +115,7 @@ Marker totals from the snapshot:
 |---|---:|---|
 | `Any` / TypeScript `any` | 974 | Many are framework/test/JSON boundaries, but hosted domain logic needs review |
 | `legacy` | 248 | Expected around `_legacy.py`, suspicious where it preserves removed behavior |
-| `capsule` | 139 | Current-use retired terminology; should be renamed or isolated as historical |
+| `capsule` | 183 | Current-use retired terminology; should be renamed or isolated as historical |
 | `noqa` | 134 | Mostly tests, but each production suppression should be justified |
 | `type: ignore` / TypeScript ignore | 33 | Acceptable at boundary shims; suspicious in core logic |
 | compatibility terms | 7 | Needs review because hosted is pre-production |
