@@ -209,6 +209,21 @@ class AccountShowRequest(BaseModel):
     transcript_limit: int | None = Field(default=None, ge=1, le=5000)
 
 
+class AccountListRequest(BaseModel):
+    """Dashboard browse request. Mirrors the `list` tool arguments. The adapter
+    enforces which (entity, filter) combinations are valid — e.g. `selected` is
+    channels-only and `order_by` is videos-only — and surfaces 501 for the rest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity: str
+    channel: str | None = None
+    selected: bool | None = None
+    order_by: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=200)
+    offset: int | None = Field(default=None, ge=0)
+
+
 class AccountApiContext(BaseModel):
     """Authenticated dashboard caller. workspace_id is derived from the verified
     session token, never from a client-supplied header."""
@@ -1125,6 +1140,21 @@ def build_app(
             result = adapter.call_tool(
                 auth=_account_query_auth(context),
                 name="show",
+                arguments=request.model_dump(exclude_none=True),
+            )
+        except HostedMcpError as exc:
+            raise _http_error(exc) from exc
+        return {"ok": True, "result": result}
+
+    @app.post("/account/list")
+    def account_list(
+        request: AccountListRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            result = adapter.call_tool(
+                auth=_account_query_auth(context),
+                name="list",
                 arguments=request.model_dump(exclude_none=True),
             )
         except HostedMcpError as exc:

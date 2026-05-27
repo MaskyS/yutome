@@ -40,6 +40,9 @@ export default function DashboardLayout({ loaderData }: Route.ComponentProps) {
             <Link to="/dashboard/search" className="hover:underline">
               Search
             </Link>
+            <Link to="/dashboard/library" className="hover:underline">
+              Library
+            </Link>
             <Link to="/dashboard/connect" className="hover:underline">
               Connect
             </Link>

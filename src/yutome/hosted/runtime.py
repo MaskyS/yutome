@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -128,7 +129,11 @@ class HostedCommandRunner:
     def connect(self) -> Any:
         if self.connection is not None:
             return self.connection
-        self.connection = connect_postgres(url_env=self.config.hosted.postgres_url_env)
+        # Per-thread connections: the hosted API serves concurrent requests from a
+        # threadpool over this handle, so a single shared psycopg connection would
+        # let transactions from different requests interleave on one connection.
+        url_env = self.config.hosted.postgres_url_env
+        self.connection = ThreadLocalConnection(lambda: connect_postgres(url_env=url_env))
         return self.connection
 
     def migrate(self, phase: MigrationPhase = "hosted") -> int:
@@ -990,6 +995,38 @@ def connect_postgres(*, url: str | None = None, url_env: str = "YUTOME_POSTGRES_
     from psycopg.rows import dict_row
 
     return psycopg.connect(resolved, autocommit=True, row_factory=dict_row)
+
+
+class ThreadLocalConnection:
+    """A connection handle that hands each thread its own psycopg connection.
+
+    The hosted API runs sync request handlers in FastAPI's threadpool, and the
+    gate/ledger wrap work in ``connection.transaction()``. A single shared
+    psycopg connection is not safe for concurrent use across threads — overlapping
+    transactions raise ``OutOfOrderTransactionNesting`` and an error on one request
+    can poison the next. This proxy keeps the connection object stable for the
+    adapter/gate/ledger/search-store (so nothing else changes) while routing every
+    call to a connection owned by the calling thread. Concurrency is bounded by the
+    threadpool, so the open-connection count is bounded too. Single-threaded callers
+    (CLI migrate/worker) transparently get exactly one connection, as before.
+    """
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._local = threading.local()
+
+    def _connection(self) -> Any:
+        conn = getattr(self._local, "conn", None)
+        if conn is None or getattr(conn, "closed", False):
+            conn = self._factory()
+            self._local.conn = conn
+        return conn
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for names not defined on the proxy itself, so every real
+        # connection method/attribute (execute, transaction, cursor, pgconn, ...)
+        # resolves against the calling thread's connection.
+        return getattr(self._connection(), name)
 
 
 def _rows_from_result(result: Any) -> list[dict[str, Any]]:

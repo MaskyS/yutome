@@ -1185,3 +1185,88 @@ def test_account_show_reads_resource_for_session_workspace() -> None:
     assert body["ok"] is True
     assert body["result"]["resource_uri"] == "yutome://chunk/chunk_http"
     assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]
+
+
+def test_account_list_videos_scoped_to_session_workspace() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/list",
+        json={"entity": "videos", "order_by": "newest", "limit": 5},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["rows"][0]["video_id"] == "vid_http"
+    assert store.calls == [
+        {
+            "list": "videos",
+            "workspace_id": "ws_http",
+            "limit": 5,
+            "offset": 0,
+            "channel": None,
+            "video_id": None,
+            "order_by": "newest",
+        }
+    ]
+
+
+def test_account_list_channels_and_status_scoped_to_session_workspace() -> None:
+    client, store = _account_search_client()
+    headers = _account_headers(_account_session_token("ws_bob"))
+
+    channels = client.post("/account/list", json={"entity": "channels"}, headers=headers)
+    status = client.post("/account/list", json={"entity": "status"}, headers=headers)
+
+    assert channels.status_code == 200
+    assert channels.json()["result"]["rows"][0]["channel_id"] == "chan_http"
+    assert status.status_code == 200
+    assert status.json()["result"]["rows"][0]["videos"] == 1
+    assert {call.get("list") for call in store.calls} == {"channels", "status"}
+    assert all(call["workspace_id"] == "ws_bob" for call in store.calls)
+
+
+def test_account_list_requires_session_token() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/list",
+        json={"entity": "videos"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_session_required"
+    assert store.calls == []
+
+
+def test_account_list_rejects_workspace_argument_injection() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/list",
+        json={"entity": "videos", "workspace_id": "ws_admin"},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 422
+    assert store.calls == []
+
+
+def test_account_list_surfaces_adapter_rejected_combinations() -> None:
+    client, store = _account_search_client()
+    headers = _account_headers(_account_session_token("ws_http"))
+
+    videos_selected = client.post("/account/list", json={"entity": "videos", "selected": True}, headers=headers)
+    channels_order = client.post("/account/list", json={"entity": "channels", "order_by": "newest"}, headers=headers)
+    status_filtered = client.post("/account/list", json={"entity": "status", "channel": "chan_http"}, headers=headers)
+
+    assert videos_selected.status_code == 501
+    assert error_body(videos_selected.json())["code"] == "unsupported_list_filter"
+    assert channels_order.status_code == 501
+    assert error_body(channels_order.json())["code"] == "unsupported_list_order"
+    assert status_filtered.status_code == 501
+    assert error_body(status_filtered.json())["code"] == "unsupported_list_filter"
+    assert store.calls == []  # rejected during argument validation, before any store read

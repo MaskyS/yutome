@@ -9,6 +9,8 @@ export default [
   route("dashboard", "routes/dashboard.tsx", [
     index("routes/dashboard.home.tsx"),
     route("search", "routes/dashboard.search.tsx"),
+    route("library", "routes/dashboard.library.tsx"),
+    route("channel/:channelId", "routes/dashboard.channel.$channelId.tsx"),
     route("video/:videoId", "routes/dashboard.video.$videoId.tsx"),
     route("connect", "routes/dashboard.connect.tsx"),
   ]),

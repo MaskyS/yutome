@@ -2,6 +2,8 @@
 // the dashboard service token and forwards the verified-by-the-API session
 // token. The Python API derives the workspace from the session token, so this
 // BFF never trusts a client-supplied workspace id.
+import { z } from "zod";
+
 import type { YutomeWebEnv } from "./env.server";
 
 export class HostedApiError extends Error {
@@ -318,68 +320,115 @@ export async function getSourceJobs(
   return Array.isArray(json.jobs) ? (json.jobs as SourceJob[]) : [];
 }
 
-// --- Retrieval (session-authenticated dashboard search/read) ---------------
-// These call /account/search and /account/show, which the hosted API serves
-// from the same query adapter as the MCP endpoint, scoped to the session's
-// workspace. The agent-facing /tools/call contract is untouched.
+// --- Retrieval & browse (session-authenticated dashboard search/read) -------
+// These call /account/{search,show,list}, served from the same query adapter as
+// the MCP endpoint, scoped to the session's workspace. Responses are parsed with
+// zod into inferred types, so hosted-API contract drift fails here with a clear
+// 502 instead of surfacing as `undefined` deep inside a route. Requests stay
+// plain typed objects — the Python API is the authoritative validator for inputs.
 
 export type SearchMode = "lexical" | "semantic" | "hybrid";
 
-export interface SearchHit {
-  chunk_id: string;
-  resource_uri: string;
-  video_id: string;
-  youtube_url: string;
-  start_ms?: number;
-  end_ms?: number;
-  snippet?: string;
-  transcript_version_id?: string;
-  match_type?: string;
-  scores?: Record<string, number>;
-  title?: string;
-  channel_id?: string;
-  channel_handle?: string;
-  channel_title?: string;
-  published_at?: string;
-  duration_seconds?: number;
-  thumbnail_url?: string;
+function parseResult<S extends z.ZodTypeAny>(
+  schema: S,
+  json: Record<string, unknown>,
+  context: string,
+): z.infer<S> {
+  const parsed = schema.safeParse(json.result);
+  if (!parsed.success) {
+    throw new HostedApiError(502, "invalid_hosted_api_response", `Unexpected ${context} response from the hosted API.`);
+  }
+  return parsed.data;
 }
 
-export interface SearchResult {
-  rows: SearchHit[];
-  notes?: unknown;
-  total?: number | null;
-}
+const searchHitSchema = z.object({
+  chunk_id: z.string(),
+  resource_uri: z.string().optional(),
+  video_id: z.string(),
+  youtube_url: z.string(),
+  start_ms: z.number().optional(),
+  end_ms: z.number().optional(),
+  snippet: z.string().optional(),
+  transcript_version_id: z.string().optional(),
+  match_type: z.string().optional(),
+  scores: z.record(z.string(), z.number()).optional(),
+  title: z.string().optional(),
+  channel_id: z.string().optional(),
+  channel_handle: z.string().optional(),
+  channel_title: z.string().optional(),
+  published_at: z.string().optional(),
+  duration_seconds: z.number().optional(),
+  thumbnail_url: z.string().optional(),
+});
 
-export interface VideoResource {
-  video_id: string;
-  youtube_video_id?: string;
-  youtube_url: string;
-  active_transcript_version_id?: string;
-  channel_id?: string;
-  channel_title?: string;
-  channel_handle?: string;
-  title?: string;
-  description?: string;
-  published_at?: string;
-  duration_seconds?: number;
-  thumbnail_url?: string;
-  active_chunk_count?: number;
-}
+const searchResultSchema = z.object({
+  rows: z.array(searchHitSchema).default([]),
+  notes: z.unknown().optional(),
+  total: z.number().nullish(),
+});
 
-export interface TranscriptResource {
-  transcript_version_id: string;
-  video_id?: string;
-  youtube_video_id?: string;
-  language?: string;
-  segment_count: number;
-  offset: number;
-  limit: number | null;
-  returned_segments: number;
-  next_offset: number | null;
-  text: string;
-  text_truncated?: boolean;
-}
+const videoResourceSchema = z.object({
+  video_id: z.string(),
+  youtube_video_id: z.string().optional(),
+  youtube_url: z.string().optional(),
+  active_transcript_version_id: z.string().optional(),
+  channel_id: z.string().optional(),
+  channel_title: z.string().optional(),
+  channel_handle: z.string().optional(),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  published_at: z.string().optional(),
+  duration_seconds: z.number().optional(),
+  thumbnail_url: z.string().optional(),
+  active_chunk_count: z.number().optional(),
+});
+
+// `.default()` so a `_compact`-stripped field (the hosted API drops nulls)
+// becomes a stable value the transcript reader can rely on.
+const transcriptResourceSchema = z.object({
+  transcript_version_id: z.string().optional(),
+  video_id: z.string().optional(),
+  youtube_video_id: z.string().optional(),
+  language: z.string().optional(),
+  segment_count: z.number().default(0),
+  offset: z.number().default(0),
+  limit: z.number().nullable().default(null),
+  returned_segments: z.number().default(0),
+  next_offset: z.number().nullable().default(null),
+  text: z.string().default(""),
+  text_truncated: z.boolean().optional(),
+});
+
+const channelListItemSchema = z.object({
+  channel_id: z.string(),
+  resource_uri: z.string().optional(),
+  title: z.string().nullish(),
+  channel_handle: z.string().nullish(),
+  selected: z.boolean().nullish(),
+  video_count: z.number().nullish(),
+  latest_published_at: z.string().nullish(),
+  source_count: z.number().nullish(),
+});
+
+const channelResourceSchema = z.object({
+  channel_id: z.string(),
+  resource_uri: z.string().optional(),
+  title: z.string().nullish(),
+  channel_handle: z.string().nullish(),
+  video_count: z.number().nullish(),
+  latest_published_at: z.string().nullish(),
+  source_ids: z.array(z.string()).optional(),
+});
+
+const videoListSchema = z.object({ rows: z.array(videoResourceSchema).default([]) });
+const channelListSchema = z.object({ rows: z.array(channelListItemSchema).default([]) });
+
+export type SearchHit = z.infer<typeof searchHitSchema>;
+export type SearchResult = z.infer<typeof searchResultSchema>;
+export type VideoResource = z.infer<typeof videoResourceSchema>;
+export type TranscriptResource = z.infer<typeof transcriptResourceSchema>;
+export type ChannelListItem = z.infer<typeof channelListItemSchema>;
+export type ChannelResource = z.infer<typeof channelResourceSchema>;
 
 export async function searchFind(
   env: YutomeWebEnv,
@@ -400,13 +449,12 @@ export async function searchFind(
   },
 ): Promise<SearchResult> {
   const json = await authedPost(env, sessionToken, "/account/search", args as Record<string, unknown>);
-  const result = (json.result ?? {}) as Partial<SearchResult>;
-  return { rows: Array.isArray(result.rows) ? result.rows : [], notes: result.notes, total: result.total ?? null };
+  return parseResult(searchResultSchema, json, "search");
 }
 
 export async function showVideo(env: YutomeWebEnv, sessionToken: string, videoId: string): Promise<VideoResource> {
   const json = await authedPost(env, sessionToken, "/account/show", { kind: "video", id: videoId });
-  return json.result as VideoResource;
+  return parseResult(videoResourceSchema, json, "video");
 }
 
 export async function showTranscript(
@@ -421,16 +469,47 @@ export async function showTranscript(
     transcript_offset: opts.offset,
     transcript_limit: opts.limit,
   });
-  const result = (json.result ?? {}) as Partial<TranscriptResource>;
-  return {
-    ...result,
-    transcript_version_id:
-      typeof result.transcript_version_id === "string" ? result.transcript_version_id : transcriptVersionId,
-    segment_count: typeof result.segment_count === "number" ? result.segment_count : 0,
-    offset: typeof result.offset === "number" ? result.offset : opts.offset ?? 0,
-    limit: typeof result.limit === "number" ? result.limit : null,
-    returned_segments: typeof result.returned_segments === "number" ? result.returned_segments : 0,
-    next_offset: typeof result.next_offset === "number" ? result.next_offset : null,
-    text: typeof result.text === "string" ? result.text : "",
-  };
+  const transcript = parseResult(transcriptResourceSchema, json, "transcript");
+  return { ...transcript, transcript_version_id: transcript.transcript_version_id ?? transcriptVersionId };
+}
+
+// `list` has no total count, so callers fetch limit+1 to detect a next page.
+// The hosted adapter caps limit at 200.
+export async function listVideos(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  opts: { channel?: string; order_by?: string; limit?: number; offset?: number } = {},
+): Promise<VideoResource[]> {
+  const json = await authedPost(env, sessionToken, "/account/list", {
+    entity: "videos",
+    channel: opts.channel,
+    order_by: opts.order_by,
+    limit: opts.limit,
+    offset: opts.offset,
+  });
+  return parseResult(videoListSchema, json, "video list").rows;
+}
+
+export async function listChannels(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  opts: { channel?: string; selected?: boolean; limit?: number; offset?: number } = {},
+): Promise<ChannelListItem[]> {
+  const json = await authedPost(env, sessionToken, "/account/list", {
+    entity: "channels",
+    channel: opts.channel,
+    selected: opts.selected,
+    limit: opts.limit,
+    offset: opts.offset,
+  });
+  return parseResult(channelListSchema, json, "channel list").rows;
+}
+
+export async function showChannel(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  channelId: string,
+): Promise<ChannelResource> {
+  const json = await authedPost(env, sessionToken, "/account/show", { kind: "channel", id: channelId });
+  return parseResult(channelResourceSchema, json, "channel");
 }
