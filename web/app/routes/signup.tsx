@@ -13,10 +13,48 @@ export function meta(_: Route.MetaArgs) {
   return [{ title: "Sign in to Yutome" }];
 }
 
-function safeNextPath(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed || !trimmed.startsWith("/") || trimmed.startsWith("//")) return null;
-  return trimmed;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const ENCODED_SLASH_OR_BACKSLASH = /%(?:2f|5c)/i;
+const INTERNAL_URL_BASE = "https://app.yutome.invalid";
+
+function safeNextPath(value: string | null): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (
+    !trimmed ||
+    CONTROL_CHARACTERS.test(trimmed) ||
+    trimmed.includes("\\") ||
+    !trimmed.startsWith("/") ||
+    trimmed.startsWith("//")
+  ) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed, INTERNAL_URL_BASE);
+    if (
+      parsed.origin !== INTERNAL_URL_BASE ||
+      !parsed.pathname.startsWith("/") ||
+      parsed.pathname.startsWith("//") ||
+      ENCODED_SLASH_OR_BACKSLASH.test(parsed.pathname)
+    ) {
+      return null;
+    }
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return null;
+  }
+}
+
+function loginStartErrorMessage(error: unknown): string {
+  if (!(error instanceof HostedApiError)) {
+    return "Could not send your sign-in link. Please try again.";
+  }
+  if (error.code === "account_login_invalid_email") {
+    return "Enter a valid email address.";
+  }
+  if (error.status === 502 || error.status === 503) {
+    return "Sign-in is temporarily unavailable. Please try again later.";
+  }
+  return "Could not send your sign-in link. Please try again.";
 }
 
 export async function action({ request, context }: Route.ActionArgs) {
@@ -39,9 +77,7 @@ export async function action({ request, context }: Route.ActionArgs) {
     });
     return { ok: true as const, email: result.email, verifyLink: result.verify_link ?? null };
   } catch (error) {
-    const message =
-      error instanceof HostedApiError ? error.message : "Could not send your sign-in link. Please try again.";
-    return { ok: false as const, error: message };
+    return { ok: false as const, error: loginStartErrorMessage(error) };
   }
 }
 
@@ -56,7 +92,9 @@ export default function Signup() {
       ? "That sign-in link is invalid or has expired. Request a new one below."
       : searchParams.get("error") === "missing_token"
         ? "That sign-in link was incomplete. Request a new one below."
-        : null;
+        : searchParams.get("error") === "service_unavailable"
+          ? "Sign-in is temporarily unavailable. Request a new link later."
+          : null;
 
   if (actionData?.ok) {
     return (

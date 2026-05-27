@@ -1041,6 +1041,58 @@ def test_account_login_start_issues_token_and_emails_link_without_session() -> N
     assert raw_token not in json.dumps(connection.calls, default=str)  # only the hash is stored
 
 
+def test_account_login_start_does_not_return_link_without_dev_flag() -> None:
+    connection = RecordingConnection()
+    sender = RecordingEmailSender()
+    client = _login_app(connection, sender, dev_link=False)
+
+    response = client.post(
+        "/account/login/start",
+        json={"email": "alice@example.com"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "verify_link" not in body
+    assert len(sender.messages) == 1
+    assert "https://app.example.test/auth/verify?token=" in sender.messages[0].text
+
+
+@pytest.mark.parametrize(
+    "redirect_path",
+    ["https://evil.example/", "//evil.example/", "/\\evil.example/", "/%2fevil.example/"],
+)
+def test_account_login_start_drops_unsafe_redirect_paths(redirect_path: str) -> None:
+    connection = RecordingConnection()
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post(
+        "/account/login/start",
+        json={"email": "alice@example.com", "redirect_path": redirect_path},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    inserts = [params for sql, params in connection.calls if "INSERT INTO email_login_tokens" in sql]
+    assert inserts[0]["redirect_path"] is None
+
+
+def test_account_login_start_keeps_safe_redirect_path() -> None:
+    connection = RecordingConnection()
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post(
+        "/account/login/start",
+        json={"email": "alice@example.com", "redirect_path": "/dashboard/search?q=crohn#top"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    inserts = [params for sql, params in connection.calls if "INSERT INTO email_login_tokens" in sql]
+    assert inserts[0]["redirect_path"] == "/dashboard/search?q=crohn#top"
+
+
 def test_account_login_start_requires_bearer_token() -> None:
     connection = RecordingConnection()
     sender = RecordingEmailSender()
@@ -1075,6 +1127,22 @@ def test_account_login_verify_consumes_token_and_mints_session() -> None:
     consume_calls = [params for sql, params in connection.calls if "UPDATE email_login_tokens" in sql]
     assert len(consume_calls) == 1
     assert "now" in consume_calls[0]
+
+
+def test_account_login_verify_rechecks_stored_redirect_path() -> None:
+    connection = _LoginVerifyConnection(
+        [{"normalized_email": "alice@example.com", "name": "Alice", "workspace_name": "Alice WS", "redirect_path": "/%5cevil"}]
+    )
+    client = _login_app(connection, RecordingEmailSender())
+
+    response = client.post(
+        "/account/login/verify",
+        json={"token": "raw-login-token"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["redirect_path"] is None
 
 
 def test_account_login_verify_rejects_unknown_or_expired_token() -> None:

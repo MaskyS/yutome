@@ -375,18 +375,17 @@ def test_verify_account_session_token_roundtrip_and_rejections() -> None:
         verify_account_session_token("not.a.token", secret=HMAC_SECRET, now=now)
 
 
-def test_account_bootstrap_accepts_dashboard_token() -> None:
-    client = build_account_app(RoutingConnection())
+def test_account_bootstrap_rejects_dashboard_token() -> None:
+    connection = RoutingConnection()
+    client = build_account_app(connection)
     response = client.post(
         "/account/bootstrap",
         json={"email": "new@example.com", "name": "New", "workspace_name": "New Workspace"},
         headers={"Authorization": f"Bearer {DASHBOARD_TOKEN}"},
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["ok"] is True
-    assert body["session"]["token"]
-    assert body["session"]["cookie_name"] == "yutome_account_session"
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_invalid"
+    assert connection.calls == []
 
 
 def test_account_bootstrap_also_accepts_mcp_token() -> None:

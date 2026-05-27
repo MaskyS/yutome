@@ -78,7 +78,7 @@ class ResendEmailSender:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 status = getattr(response, "status", 200)
                 if status >= 300:
-                    raise EmailSendError(f"Resend returned HTTP {status}.")
+                    raise EmailSendError("Email provider request failed.")
         except EmailSendError:
             raise
         except Exception as exc:  # network/HTTP errors; do not leak provider detail upstream

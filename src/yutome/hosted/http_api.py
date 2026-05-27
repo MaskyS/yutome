@@ -92,6 +92,8 @@ LOGIN_TOKEN_TTL_SECONDS_ENV_VAR = "YUTOME_AUTH_LOGIN_TTL_SECONDS"
 AUTH_DEV_RETURN_LINK_ENV_VAR = "YUTOME_AUTH_DEV_RETURN_LINK"
 _SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_ENCODED_SLASH_OR_BACKSLASH = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
 
 
 class ToolCallRequest(BaseModel):
@@ -452,11 +454,12 @@ def build_app(
         request: AccountBootstrapRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        # Account creation is performed by either the MCP edge worker (MCP token)
-        # or the dashboard BFF (separate dashboard token); accept either.
-        _verify_bearer_token_any(
+        # Kept for the MCP edge worker's OAuth/pairing flow. The dashboard uses
+        # /account/login/start + /account/login/verify so its bearer cannot mint
+        # an unverified account session through this legacy bootstrap endpoint.
+        _verify_bearer_token(
             authorization=authorization,
-            expected_tokens=(normalized_api_token, normalized_account_api_token),
+            expected_api_token=normalized_api_token,
         )
         if billing_connection is None:
             raise _http_error(
@@ -527,8 +530,8 @@ def build_app(
         user_agent: str | None = Header(default=None, alias="User-Agent"),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        # Same trusted callers as bootstrap (web BFF / MCP edge), but this only
-        # records a single-use token and emails a link — it never mints a session.
+        # The web BFF and MCP edge may request a sign-in link, but this only
+        # records a single-use token and emails a link - it never mints a session.
         _verify_bearer_token_any(
             authorization=authorization,
             expected_tokens=(normalized_api_token, normalized_account_api_token),
@@ -1217,7 +1220,25 @@ def _safe_redirect_path(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     trimmed = value.strip()
-    if not trimmed.startswith("/") or trimmed.startswith("//"):
+    if (
+        not trimmed
+        or _CONTROL_CHARACTERS.search(trimmed)
+        or "\\" in trimmed
+        or not trimmed.startswith("/")
+        or trimmed.startswith("//")
+    ):
+        return None
+    try:
+        parts = urlsplit(trimmed)
+    except ValueError:
+        return None
+    if (
+        parts.scheme
+        or parts.netloc
+        or not parts.path.startswith("/")
+        or parts.path.startswith("//")
+        or _ENCODED_SLASH_OR_BACKSLASH.search(parts.path)
+    ):
         return None
     return trimmed
 
