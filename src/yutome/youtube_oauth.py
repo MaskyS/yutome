@@ -176,6 +176,10 @@ def _authorization_url(*, client: OAuthClient, redirect_uri: str, state: str, ch
     return f"{client.auth_uri}?{urllib.parse.urlencode(params)}"
 
 
+def authorization_url(*, client: OAuthClient, redirect_uri: str, state: str, challenge: str) -> str:
+    return _authorization_url(client=client, redirect_uri=redirect_uri, state=state, challenge=challenge)
+
+
 def _exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
     fields = {
         "client_id": client.client_id,
@@ -189,6 +193,10 @@ def _exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifie
     return _token_request(client.token_uri, fields)
 
 
+def exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
+    return _exchange_code(client=client, code=code, redirect_uri=redirect_uri, verifier=verifier)
+
+
 def _refresh_token(*, client: OAuthClient, refresh_token: str) -> dict[str, Any]:
     fields = {
         "client_id": client.client_id,
@@ -198,6 +206,10 @@ def _refresh_token(*, client: OAuthClient, refresh_token: str) -> dict[str, Any]
     if client.client_secret:
         fields["client_secret"] = client.client_secret
     return _token_request(client.token_uri, fields)
+
+
+def refresh_token(*, client: OAuthClient, refresh_token: str) -> dict[str, Any]:
+    return _refresh_token(client=client, refresh_token=refresh_token)
 
 
 def _token_request(token_uri: str, fields: dict[str, str]) -> dict[str, Any]:
@@ -236,3 +248,7 @@ def _token_is_valid(token: dict[str, Any]) -> bool:
 def _pkce_challenge(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def pkce_challenge(verifier: str) -> str:
+    return _pkce_challenge(verifier)

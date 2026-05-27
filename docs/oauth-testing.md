@@ -52,6 +52,28 @@ uv run yutome --config yutome.toml corpus import-youtube \
 
 Open the printed URL manually in a browser.
 
+## Hosted Dashboard Smoke Test
+
+Use a Google Cloud OAuth client configured as a Web application. Add the hosted dashboard callback as an authorized redirect URI:
+
+```text
+https://app.getyutome.com/dashboard/youtube/callback
+```
+
+For local development, add the matching localhost callback for the dev server you use. Configure the hosted Python API with:
+
+```bash
+YUTOME_YOUTUBE_OAUTH_CLIENT_ID=...
+YUTOME_YOUTUBE_OAUTH_CLIENT_SECRET=...
+```
+
+Expected result:
+
+- Dashboard shows the YouTube subscriptions card as connectable.
+- Google consent requests only `https://www.googleapis.com/auth/youtube.readonly`.
+- Returning to `/dashboard/youtube/callback` stores a YouTube grant.
+- Selecting subscribed channels imports them as public channel sources and queues `discover_source` jobs.
+
 ## What We Do Not Mock
 
 The Google consent page, account policy, quota behavior, and real subscription listing should be verified with a live smoke test. Mocking those gives false confidence because most OAuth breakage is in redirect URI setup, consent-screen publishing state, account restrictions, or API enablement.

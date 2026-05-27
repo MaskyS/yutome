@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 
+from yutome.channels import channel_from_input
 from yutome.hosted.account import DEFAULT_ACCOUNT_SESSION_AUDIENCE, sign_account_session_token
 from yutome.hosted.account_cli import code_challenge_for_verifier, new_code_verifier
 from yutome.hosted.http_api import ACCOUNT_SESSION_TOKEN_HEADER, build_app, error_body
 from yutome.hosted.mcp_query import HostedMcpQueryAdapter
+from yutome.hosted.youtube_oauth_service import YouTubeOAuthSettings
+from yutome.youtube_oauth import OAuthClient
 
 
 MCP_TOKEN = "mcp-test-token"
@@ -25,6 +30,7 @@ class StatefulAccountConnection:
     def __init__(self) -> None:
         self.workspace = {"id": "ws_cli", "name": "CLI Workspace", "status": "active"}
         self.grants: dict[str, dict[str, Any]] = {}
+        self.youtube_grants: dict[str, dict[str, Any]] = {}
         self.sources: dict[str, dict[str, Any]] = {}
         self.policies: dict[str, dict[str, Any]] = {}
         self.jobs: dict[str, dict[str, Any]] = {}
@@ -55,9 +61,9 @@ class StatefulAccountConnection:
             }
             self.grants[row["id"]] = row
             return [dict(row)]
-        if "FROM account_grants" in statement and "install_id" in statement:
+        if "FROM account_grants" in statement and "code_hash" in params:
             return [dict(row) for row in self.grants.values() if row["install_id"] == params["code_hash"]]
-        if statement.startswith("UPDATE account_grants") and "status = 'active'" in statement:
+        if statement.startswith("UPDATE account_grants") and params.get("status") == "active":
             row = self.grants.get(params["grant_id"])
             if row is None or row["status"] != "pending" or row["install_id"] != params["code_hash"]:
                 return []
@@ -72,13 +78,90 @@ class StatefulAccountConnection:
             )
             row["metadata_json"].update(json.loads(params["metadata_json"]))
             return [dict(row)]
-        if "FROM account_grants" in statement and "id = %(grant_id)s" in statement:
+        if "FROM account_grants" in statement and "grant_id" in params:
             row = self.grants.get(params["grant_id"])
             return [dict(row)] if row else []
-        if statement.startswith("UPDATE account_grants") and "last_used_at" in statement:
+        if statement.startswith("UPDATE account_grants") and "last_used_at" in statement and "status" not in params:
             row = self.grants.get(params["grant_id"])
             if row:
                 row["last_used_at"] = datetime.now(timezone.utc)
+            return []
+        if statement.startswith("INSERT INTO youtube_grants"):
+            row = {
+                "id": params["id"],
+                "user_id": params["user_id"],
+                "workspace_id": params["workspace_id"],
+                "scopes": params["scopes"],
+                "status": "pending",
+                "metadata_json": json.loads(params["metadata_json"]),
+                "created_at": params["created_at"],
+                "updated_at": params["updated_at"],
+                "last_used_at": None,
+                "expires_at": params["expires_at"],
+                "revoked_at": None,
+            }
+            self.youtube_grants[row["id"]] = row
+            return [dict(row)]
+        if "FROM youtube_grants" in statement and "grant_id" in params:
+            row = self.youtube_grants.get(params["grant_id"])
+            return [dict(row)] if row else []
+        if "FROM youtube_grants" in statement and "workspace_id" in params and "user_id" in params:
+            rows = [
+                dict(row)
+                for row in self.youtube_grants.values()
+                if row["workspace_id"] == params["workspace_id"]
+                and row["user_id"] == params["user_id"]
+                and row["status"] == "active"
+                and row["revoked_at"] is None
+            ]
+            return sorted(rows, key=lambda row: row["updated_at"], reverse=True)[:1]
+        if statement.startswith("UPDATE youtube_grants") and "state_hash" in params:
+            row = self.youtube_grants.get(params["grant_id"])
+            if (
+                row is None
+                or row["workspace_id"] != params["workspace_id"]
+                or row["user_id"] != params["user_id"]
+                or row["status"] != "pending"
+                or row["metadata_json"].get("state_hash") != params["state_hash"]
+            ):
+                return []
+            row.update(
+                {
+                    "status": "active",
+                    "scopes": params["scopes"],
+                    "metadata_json": json.loads(params["metadata_json"]),
+                    "expires_at": params["grant_expires_at"],
+                    "updated_at": datetime.now(timezone.utc),
+                    "last_used_at": datetime.now(timezone.utc),
+                }
+            )
+            return [dict(row)]
+        if statement.startswith("UPDATE youtube_grants") and "metadata_json" in params:
+            row = self.youtube_grants.get(params["grant_id"])
+            if row is None or row["status"] != "active":
+                return []
+            row["metadata_json"] = json.loads(params["metadata_json"])
+            row["expires_at"] = params["grant_expires_at"]
+            row["updated_at"] = datetime.now(timezone.utc)
+            row["last_used_at"] = datetime.now(timezone.utc)
+            return [dict(row)]
+        if statement.startswith("UPDATE youtube_grants") and "revoked_at" in params:
+            row = self.youtube_grants.get(params["grant_id"])
+            if row:
+                row["status"] = "revoked"
+                row["revoked_at"] = params["revoked_at"]
+            return []
+        if statement.startswith("UPDATE youtube_grants") and "status" in params:
+            row = self.youtube_grants.get(params["grant_id"])
+            if row:
+                row["status"] = params["status"]
+                row["expires_at"] = datetime.now(timezone.utc)
+            return []
+        if statement.startswith("UPDATE youtube_grants"):
+            row = self.youtube_grants.get(params["grant_id"])
+            if row:
+                row["last_used_at"] = datetime.now(timezone.utc)
+                row["updated_at"] = datetime.now(timezone.utc)
             return []
         if statement.startswith("INSERT INTO sources"):
             row = {
@@ -138,7 +221,11 @@ class StatefulAccountConnection:
         return []
 
 
-def build_client(connection: StatefulAccountConnection) -> TestClient:
+def build_client(
+    connection: StatefulAccountConnection,
+    *,
+    youtube_oauth_settings: YouTubeOAuthSettings | None = None,
+) -> TestClient:
     return TestClient(
         build_app(
             adapter=HostedMcpQueryAdapter(search_store=_NoopSearchStore()),
@@ -147,6 +234,7 @@ def build_client(connection: StatefulAccountConnection) -> TestClient:
             expected_account_api_token=DASHBOARD_TOKEN,
             account_session_secret=HMAC_SECRET,
             account_session_audience=DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+            youtube_oauth_settings=youtube_oauth_settings,
         )
     )
 
@@ -269,6 +357,89 @@ def test_dashboard_source_import_derives_workspace_and_enqueues_jobs() -> None:
     assert jobs.status_code == 200, jobs.text
     assert jobs.json()["workspace_id"] == "ws_cli"
     assert {job["job_type"] for job in jobs.json()["jobs"]} == {"index_video", "discover_source"}
+
+
+def test_dashboard_youtube_oauth_lists_and_imports_selected_subscriptions(monkeypatch: Any) -> None:
+    connection = StatefulAccountConnection()
+    client = build_client(
+        connection,
+        youtube_oauth_settings=YouTubeOAuthSettings(
+            client=OAuthClient(client_id="youtube-client", client_secret="youtube-secret")
+        ),
+    )
+
+    def fake_exchange_code(**_: Any) -> dict[str, Any]:
+        return {
+            "access_token": "youtube-access",
+            "refresh_token": "youtube-refresh",
+            "token_type": "Bearer",
+            "expires_at": time.time() + 3600,
+        }
+
+    channels = [
+        channel_from_input("UC_x5XG1OV2P6uZZ5FSM9Ttw", title="Google Developers", import_source="youtube-oauth"),
+        channel_from_input("UC29ju8bIPH5as8OGnQzwJyA", title="Traversy Media", import_source="youtube-oauth"),
+    ]
+    monkeypatch.setattr("yutome.hosted.youtube_oauth_service.exchange_code", fake_exchange_code)
+    monkeypatch.setattr(
+        "yutome.hosted.youtube_oauth_service.fetch_subscription_channels",
+        lambda access_token: [channel for channel in channels if channel is not None],
+    )
+
+    redirect_uri = "http://localhost:3000/dashboard/youtube/callback"
+    authorize = client.post(
+        "/account/youtube/authorize",
+        json={"redirect_uri": redirect_uri},
+        headers=account_headers(),
+    )
+    assert authorize.status_code == 200, authorize.text
+    state = parse_qs(urlsplit(authorize.json()["authorization_url"]).query)["state"][0]
+
+    callback = client.post(
+        "/account/youtube/callback",
+        json={"code": "google-code", "state": state, "redirect_uri": redirect_uri},
+        headers=account_headers(),
+    )
+    assert callback.status_code == 200, callback.text
+    assert callback.json()["connected"] is True
+
+    subscriptions = client.get("/account/youtube/subscriptions", headers=account_headers())
+    assert subscriptions.status_code == 200, subscriptions.text
+    assert [channel["channel_id"] for channel in subscriptions.json()["channels"]] == [
+        "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "UC29ju8bIPH5as8OGnQzwJyA",
+    ]
+
+    imported = client.post(
+        "/account/youtube/subscriptions/import",
+        json={"channel_ids": ["UC_x5XG1OV2P6uZZ5FSM9Ttw"]},
+        headers=account_headers(),
+    )
+    assert imported.status_code == 200, imported.text
+    body = imported.json()
+    assert body["workspace_id"] == "ws_cli"
+    assert body["imported"][0]["canonical_channel_id"] == "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+    assert body["jobs"][0]["job_type"] == "discover_source"
+
+    source = next(iter(connection.sources.values()))
+    assert source["import_source"] == "public_api"
+    assert source["auth_grant_id"] is None
+    assert source["metadata_json"]["selected_from"] == "youtube_oauth_subscriptions"
+    job = next(iter(connection.jobs.values()))
+    assert job["metadata_json"]["seeded_by"] == "youtube_oauth_subscriptions"
+
+
+def test_dashboard_youtube_oauth_authorize_requires_configuration() -> None:
+    client = build_client(StatefulAccountConnection())
+
+    response = client.post(
+        "/account/youtube/authorize",
+        json={"redirect_uri": "http://localhost:3000/dashboard/youtube/callback"},
+        headers=account_headers(),
+    )
+
+    assert response.status_code == 503
+    assert error_body(response.json())["code"] == "youtube_oauth_unconfigured"
 
 
 def test_dashboard_source_import_requires_account_session_and_dashboard_token() -> None:

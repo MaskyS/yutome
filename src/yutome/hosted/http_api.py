@@ -70,6 +70,17 @@ from yutome.hosted.source_import import (
     job_row_json,
     list_source_jobs,
 )
+from yutome.hosted.youtube_oauth_service import (
+    HostedYouTubeOAuthError,
+    YouTubeOAuthSettings,
+    complete_youtube_authorization,
+    import_youtube_subscription_channels,
+    list_youtube_subscription_channels,
+    revoke_youtube_connection,
+    start_youtube_authorization,
+    youtube_connection_status,
+    youtube_oauth_settings_from_env,
+)
 
 
 WORKSPACE_HEADER = "X-Yutome-Workspace-Id"
@@ -149,6 +160,29 @@ class AccountCliTokenRequest(BaseModel):
     code: str
     code_verifier: str
     redirect_uri: str
+
+
+class AccountYouTubeAuthorizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    redirect_uri: str
+
+
+class AccountYouTubeCallbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    state: str
+    redirect_uri: str
+
+
+class AccountYouTubeSubscriptionsImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_ids: list[str]
+    refresh_enabled: bool = True
+    max_new_videos: int = Field(default=25, ge=1, le=250)
+    cadence_seconds: int = Field(default=900, ge=60, le=86400)
 
 
 AccountSourceImportDescriptor = HostedSourceImportDescriptor
@@ -249,6 +283,7 @@ def build_postgres_app(
     app_base_url: str | None = None,
     login_token_ttl_seconds: int | None = None,
     dev_return_login_link: bool | None = None,
+    youtube_oauth_settings: YouTubeOAuthSettings | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -279,6 +314,7 @@ def build_postgres_app(
         dev_return_login_link=dev_return_login_link
         if dev_return_login_link is not None
         else _auth_dev_return_link_from_env(),
+        youtube_oauth_settings=youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -302,6 +338,7 @@ def build_app(
     app_base_url: str | None = None,
     login_token_ttl_seconds: int | None = None,
     dev_return_login_link: bool | None = None,
+    youtube_oauth_settings: YouTubeOAuthSettings | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
@@ -331,11 +368,13 @@ def build_app(
     resolved_app_base_url = (app_base_url or "").strip().rstrip("/")
     login_token_ttl = _positive_int(login_token_ttl_seconds, DEFAULT_LOGIN_TOKEN_TTL_SECONDS)
     resolved_dev_return_login_link = bool(dev_return_login_link)
+    resolved_youtube_oauth_settings = youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
     app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
     app.state.account_session_signing_configured = bool(normalized_account_session_secret)
     app.state.hosted_account_api_configured = bool(normalized_account_api_token)
+    app.state.youtube_oauth_configured = resolved_youtube_oauth_settings.configured
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -1064,6 +1103,97 @@ def build_app(
             ),
         )
 
+    @app.get("/account/youtube/status")
+    def account_youtube_status(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        return youtube_connection_status(
+            billing_connection,
+            workspace_id=context.workspace_id,
+            user_id=context.user_id,
+            configured=resolved_youtube_oauth_settings.configured,
+        )
+
+    @app.post("/account/youtube/authorize")
+    def account_youtube_authorize(
+        request: AccountYouTubeAuthorizeRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return start_youtube_authorization(
+                billing_connection,
+                settings=resolved_youtube_oauth_settings,
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                redirect_uri=request.redirect_uri,
+                state_secret=normalized_account_session_secret or "",
+            )
+        except HostedYouTubeOAuthError as exc:
+            raise _youtube_oauth_http_error(exc) from exc
+
+    @app.post("/account/youtube/callback")
+    def account_youtube_callback(
+        request: AccountYouTubeCallbackRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return complete_youtube_authorization(
+                billing_connection,
+                settings=resolved_youtube_oauth_settings,
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                code=request.code,
+                state=request.state,
+                redirect_uri=request.redirect_uri,
+                state_secret=normalized_account_session_secret or "",
+            )
+        except HostedYouTubeOAuthError as exc:
+            raise _youtube_oauth_http_error(exc) from exc
+
+    @app.get("/account/youtube/subscriptions")
+    def account_youtube_subscriptions(
+        limit: int = 250,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return list_youtube_subscription_channels(
+                billing_connection,
+                settings=resolved_youtube_oauth_settings,
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                limit=limit,
+            )
+        except HostedYouTubeOAuthError as exc:
+            raise _youtube_oauth_http_error(exc) from exc
+
+    @app.post("/account/youtube/subscriptions/import")
+    def account_youtube_subscriptions_import(
+        request: AccountYouTubeSubscriptionsImportRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return import_youtube_subscription_channels(
+                billing_connection,
+                settings=resolved_youtube_oauth_settings,
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                channel_ids=request.channel_ids,
+                refresh_enabled=request.refresh_enabled,
+                max_new_videos=request.max_new_videos,
+                cadence_seconds=request.cadence_seconds,
+            )
+        except HostedYouTubeOAuthError as exc:
+            raise _youtube_oauth_http_error(exc) from exc
+
+    @app.post("/account/youtube/revoke")
+    def account_youtube_revoke(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        try:
+            return revoke_youtube_connection(
+                billing_connection,
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+            )
+        except HostedYouTubeOAuthError as exc:
+            raise _youtube_oauth_http_error(exc) from exc
+
     @app.get("/account/source-jobs")
     def account_source_jobs(
         limit: int = 25,
@@ -1447,6 +1577,17 @@ def _http_error(error: HostedMcpError) -> Exception:
     from fastapi import HTTPException
 
     return HTTPException(status_code=error.status_code, detail=error.to_dict()["error"])
+
+
+def _youtube_oauth_http_error(error: HostedYouTubeOAuthError) -> Exception:
+    return _http_error(
+        HostedMcpError(
+            code=error.code,
+            message=error.message,
+            status_code=error.status_code,
+            data=error.data,
+        )
+    )
 
 
 def _jsonable(value: Any) -> Any:

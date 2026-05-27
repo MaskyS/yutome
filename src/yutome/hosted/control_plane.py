@@ -19,7 +19,7 @@ WorkspaceStatus = Literal["active", "disabled", "suspended"]
 WorkspaceRole = Literal["owner", "admin", "member", "viewer"]
 AccountGrantKind = Literal["mcp_client", "cli_install", "account_session"]
 AccountGrantStatus = Literal["pending", "active", "expired", "revoked", "disabled"]
-YouTubeGrantStatus = Literal["active", "expired", "revoked", "invalid"]
+YouTubeGrantStatus = Literal["pending", "active", "expired", "revoked", "invalid"]
 SourceType = Literal["subscriptions", "subscription_collection", "channel", "handle", "playlist", "video", "url"]
 SourceImport = Literal[
     "youtube_oauth",

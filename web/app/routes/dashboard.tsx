@@ -6,13 +6,14 @@ import { getSummary } from "~/lib/hosted-api.server";
 import { isUnauthorized, requireSessionToken, signupRedirect } from "~/lib/session.server";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { McpMenu } from "~/components/mcp-menu";
 
 export async function loader({ request, context }: Route.LoaderArgs) {
   const env = getEnv(context);
   const token = requireSessionToken(request);
   try {
     const summary = await getSummary(env, token);
-    return { summary };
+    return { summary, mcpUrl: env.YUTOME_MCP_URL };
   } catch (error) {
     if (isUnauthorized(error)) {
       signupRedirect(env);
@@ -22,7 +23,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
 }
 
 export default function DashboardLayout({ loaderData }: Route.ComponentProps) {
-  const { summary } = loaderData;
+  const { summary, mcpUrl } = loaderData;
   return (
     <div className="min-h-svh">
       <header className="border-b">
@@ -35,7 +36,7 @@ export default function DashboardLayout({ loaderData }: Route.ComponentProps) {
           </div>
           <nav className="flex items-center gap-4 text-sm">
             <Link to="/dashboard" className="hover:underline">
-              Overview
+              Home
             </Link>
             <Link to="/dashboard/search" className="hover:underline">
               Search
@@ -43,9 +44,7 @@ export default function DashboardLayout({ loaderData }: Route.ComponentProps) {
             <Link to="/dashboard/library" className="hover:underline">
               Library
             </Link>
-            <Link to="/dashboard/connect" className="hover:underline">
-              Connect
-            </Link>
+            <McpMenu mcpUrl={mcpUrl} />
             <span className="text-muted-foreground hidden sm:inline">
               {summary.workspace.name ?? summary.workspace.id}
             </span>

@@ -297,6 +297,54 @@ export interface SourceJob {
   error_code: string | null;
   error_message: string | null;
   metadata: Record<string, unknown>;
+  // Human context joined in by /account/source-jobs (sources + videos) for the
+  // Activity feed; null when the job has no source row or isn't an index_video.
+  source_display_name?: string | null;
+  source_type?: string | null;
+  source_url?: string | null;
+  video_title?: string | null;
+}
+
+export interface YoutubeGrantSummary {
+  grant_id: string;
+  status: string;
+  scopes: string[];
+  created_at: string | null;
+  updated_at: string | null;
+  last_used_at: string | null;
+  expires_at: string | null;
+  connected_at: string | null;
+  access_token_expires_at: string | null;
+}
+
+export interface YoutubeConnectionStatus {
+  ok: true;
+  configured: boolean;
+  connected: boolean;
+  scope: string;
+  grant: YoutubeGrantSummary | null;
+}
+
+export interface YoutubeSubscriptionChannel {
+  channel_id: string;
+  title: string | null;
+  source_url: string;
+  selected: boolean;
+}
+
+export interface YoutubeSubscriptionsResult {
+  ok: true;
+  workspace_id: string;
+  grant: YoutubeGrantSummary;
+  channels: YoutubeSubscriptionChannel[];
+}
+
+export interface YoutubeAuthorizationResult {
+  ok: true;
+  authorization_url: string;
+  grant_id: string;
+  scope: string;
+  expires_at: string;
 }
 
 export function getSummary(env: YutomeWebEnv, sessionToken: string): Promise<WorkspaceSummary> {
@@ -332,6 +380,57 @@ export async function getSourceJobs(
 ): Promise<SourceJob[]> {
   const json = await authedGet(env, sessionToken, `/account/source-jobs?limit=${encodeURIComponent(String(limit))}`);
   return Array.isArray(json.jobs) ? (json.jobs as SourceJob[]) : [];
+}
+
+export function getYoutubeStatus(
+  env: YutomeWebEnv,
+  sessionToken: string,
+): Promise<YoutubeConnectionStatus> {
+  return authedGet(env, sessionToken, "/account/youtube/status") as unknown as Promise<YoutubeConnectionStatus>;
+}
+
+export function startYoutubeAuthorization(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  redirectUri: string,
+): Promise<YoutubeAuthorizationResult> {
+  return authedPost(env, sessionToken, "/account/youtube/authorize", {
+    redirect_uri: redirectUri,
+  }) as unknown as Promise<YoutubeAuthorizationResult>;
+}
+
+export function completeYoutubeAuthorization(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  body: { code: string; state: string; redirect_uri: string },
+): Promise<YoutubeConnectionStatus> {
+  return authedPost(env, sessionToken, "/account/youtube/callback", body) as unknown as Promise<YoutubeConnectionStatus>;
+}
+
+export async function getYoutubeSubscriptions(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  limit = 250,
+): Promise<YoutubeSubscriptionChannel[]> {
+  const json = (await authedGet(
+    env,
+    sessionToken,
+    `/account/youtube/subscriptions?limit=${encodeURIComponent(String(limit))}`,
+  )) as unknown as YoutubeSubscriptionsResult;
+  return Array.isArray(json.channels) ? json.channels : [];
+}
+
+export function importYoutubeSubscriptions(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  body: {
+    channel_ids: string[];
+    cadence_seconds?: number;
+    max_new_videos?: number;
+    refresh_enabled?: boolean;
+  },
+): Promise<SourceImportResult> {
+  return authedPost(env, sessionToken, "/account/youtube/subscriptions/import", body) as unknown as Promise<SourceImportResult>;
 }
 
 // --- Retrieval & browse (session-authenticated dashboard search/read) -------
