@@ -35,11 +35,14 @@ NOW = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
 
 
 class RecordingGate(UsageGate):
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.order = order
 
     def reserve(self, **kwargs):  # noqa: ANN003, ANN201
         self.calls.append(dict(kwargs))
+        if self.order is not None:
+            self.order.append(f"reserve:{kwargs['subject']}.{kwargs['operation']}")
         return super().reserve(**kwargs)
 
 
@@ -650,6 +653,65 @@ def test_real_hosted_executor_orders_provider_calls_before_transactional_writes(
     index_events = [event for event in ledger.events if event.operation_key == "search_store.index_write"]
     assert index_events[-1].status == "succeeded"
     assert index_events[-1].event_type == "service_operation_succeeded"
+
+
+def test_real_hosted_executor_reserves_usage_before_paid_calls_and_index_writes() -> None:
+    order: list[str] = []
+
+    class OrderedConnection(HostedExecutorConnection):
+        def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            if statement.startswith("INSERT INTO videos"):
+                order.append("write:videos")
+            return super().execute(statement, params)
+
+    def cleaner(transcript, _video: HostedVideoInput, context: ProviderCallContext):  # noqa: ANN001, ANN202
+        def call():
+            order.append("call:gemini.cleanup_transcript")
+            return transcript
+
+        return execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda _result: UsageNormalization(
+                subject="gemini",
+                operation="cleanup_transcript",
+                actual_units={"total_tokens": 8},
+            ),
+        )
+
+    def embedder(chunks: list[TranscriptChunkInput], _video: HostedVideoInput, context: ProviderCallContext) -> list[list[float]]:
+        def call() -> list[list[float]]:
+            order.append("call:voyage.embed_documents")
+            return [[0.001 * (index + 1)] * DEFAULT_EMBEDDING_DIMENSION for index, _chunk in enumerate(chunks)]
+
+        return execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda result: UsageNormalization(
+                subject="voyage",
+                operation="embed_documents",
+                actual_units={"total_tokens": 12, "vectors": len(result)},
+            ),
+        )
+
+    connection = OrderedConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=RecordingGate(order),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=cleaner,
+        voyage_embedder=embedder,
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "succeeded"
+    assert order.index("reserve:gemini.cleanup_transcript") < order.index("call:gemini.cleanup_transcript")
+    assert order.index("reserve:voyage.embed_documents") < order.index("call:voyage.embed_documents")
+    assert order.index("reserve:search_store.index_write") < order.index("write:videos")
 
 
 def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() -> None:

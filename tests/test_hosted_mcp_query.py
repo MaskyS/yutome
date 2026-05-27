@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from yutome.hosted.allocation_policy import default_search_store_allocation
+from yutome.hosted.gate import UsageGate
 from yutome.hosted.mcp_query import (
     HostedMcpAuthContext,
     HostedMcpError,
@@ -185,6 +186,15 @@ class RecordingLedger:
         self.events.append(event)
 
 
+class OrderingGate(UsageGate):
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+
+    def reserve(self, **kwargs):  # noqa: ANN003, ANN201
+        self.order.append(f"reserve:{kwargs['subject']}.{kwargs['operation']}")
+        return super().reserve(**kwargs)
+
+
 @dataclass
 class FakeVoyageResponse:
     embeddings: list[list[float]]
@@ -296,6 +306,81 @@ def test_usage_denial_prevents_search_store_execution() -> None:
     assert ledger.events[0].event_type == "reservation_created"
     assert ledger.events[0].status == "denied"
     assert ledger.events[0].error_code == "insufficient_balance"
+
+
+def test_lexical_search_reserves_before_search_store_execution() -> None:
+    order: list[str] = []
+
+    class OrderedSearchStore(RecordingSearchStore):
+        def lexical_search(self, *, workspace_id: str, query: str, limit: int) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            order.append("call:search_store.lexical_query")
+            return super().lexical_search(workspace_id=workspace_id, query=query, limit=limit)
+
+    adapter = HostedMcpQueryAdapter(
+        search_store=OrderedSearchStore(),
+        gate=OrderingGate(order),
+        usage_context_provider=_usage_context_provider(),
+    )
+
+    adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn", "mode": "lexical", "limit": 5},
+    )
+
+    assert order == ["reserve:search_store.lexical_query", "call:search_store.lexical_query"]
+
+
+def test_semantic_search_reserves_search_and_embedding_before_paid_calls() -> None:
+    order: list[str] = []
+
+    class OrderedSearchStore(RecordingSearchStore):
+        def semantic_search(
+            self,
+            *,
+            workspace_id: str,
+            query_vector: list[float],
+            limit: int,
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+            order.append("call:search_store.semantic_query")
+            return super().semantic_search(workspace_id=workspace_id, query_vector=query_vector, limit=limit)
+
+    def embedder(_query: str, context: ProviderCallContext) -> list[float]:
+        def call() -> FakeVoyageResponse:
+            order.append("call:voyage.embed_query")
+            return FakeVoyageResponse(embeddings=[[0.1, 0.2]], usage={"total_tokens": 6})
+
+        result = execute_provider_call(
+            context,
+            call,
+            normalize_usage=lambda response: UsageNormalization(
+                subject="voyage",
+                operation="embed_query",
+                actual_units={"total_tokens": response.usage["total_tokens"], "vectors": len(response.embeddings)},
+            ),
+        )
+        return result.embeddings[0]
+
+    adapter = HostedMcpQueryAdapter(
+        search_store=OrderedSearchStore(),
+        gate=OrderingGate(order),
+        usage_context_provider=_usage_context_provider(),
+        voyage_usage_context_provider=_voyage_usage_context_provider(),
+        query_embedder=embedder,
+    )
+
+    adapter.call_tool(
+        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+        name="find",
+        arguments={"text": "Crohn", "mode": "semantic", "limit": 5},
+    )
+
+    assert order == [
+        "reserve:search_store.semantic_query",
+        "reserve:voyage.embed_query",
+        "call:voyage.embed_query",
+        "call:search_store.semantic_query",
+    ]
 
 
 def test_semantic_search_denial_prevents_embedding_and_search_store_execution() -> None:
