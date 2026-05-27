@@ -450,7 +450,7 @@ export async function handleRevokeRequest(ctx: {
 
 export function hostedGrantProps(grant: HostedAccountGrant): YutomeAuthProps {
   return withoutUndefined({
-    capsule: "hosted",
+    connector_mode: "hosted",
     workspace_id: grant.workspace_id,
     connector_grant_id: grant.grant_id,
     grant_id: grant.grant_id,

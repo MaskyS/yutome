@@ -83,7 +83,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     props: Record<string, unknown>;
   };
   assert.deepEqual(authorization.props, {
-    capsule: "hosted",
+    connector_mode: "hosted",
     workspace_id: "ws_alice",
     connector_grant_id: grantId,
     grant_id: grantId,
@@ -102,6 +102,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
   assert.equal(Number.isNaN(Date.parse(authorization.props.expires_at as string)), false);
   assert.equal(Date.parse(authorization.props.expires_at as string) > Date.parse(authorization.props.paired_at as string), true);
   assert.deepEqual(authorization.metadata, {
+    connector_mode: "hosted",
     workspace_id: "ws_alice",
     connector_grant_id: grantId,
     grant_id: grantId,
@@ -876,7 +877,7 @@ test("connector-only OAuth pairing keeps local defaults explicit", async () => {
   const authorization = completed as { userId: string; props: Record<string, unknown> };
   assert.equal(response.status, 302);
   assert.equal(authorization.userId, "yutome-owner");
-  assert.equal(authorization.props.capsule, "owner");
+  assert.equal(authorization.props.connector_mode, "local_bridge");
   assert.equal(authorization.props.workspace_id, "local");
   assert.equal(authorization.props.install_id, "desktop");
   assert.equal(authorization.props.connector_grant_id, grantId);
@@ -992,7 +993,7 @@ test("hosted revoke endpoint revokes current staged grant and OAuth grant", asyn
           audience: "https://mcp.getyutome.com/mcp",
           grant: {
             props: {
-              capsule: "hosted",
+              connector_mode: "hosted",
               workspace_id: "ws_alice",
               grant_id: grantId,
               user_id: "user_alice",

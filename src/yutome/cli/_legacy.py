@@ -2614,10 +2614,10 @@ def _cloudflare_bearer_token() -> str | None:
     return _read_wrangler_oauth_token()
 
 
-def _wrangler_account_id(capsule: Path) -> str | None:
+def _wrangler_account_id(worker_project: Path) -> str | None:
     if env_id := os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
         return env_id
-    completed = _run_wrangler_capture(capsule, ["whoami"])
+    completed = _run_wrangler_capture(worker_project, ["whoami"])
     if completed.returncode != 0:
         return None
     matches = re.findall(r"\b([0-9a-f]{32})\b", completed.stdout or "")
@@ -2688,7 +2688,7 @@ def _suggest_workers_dev_subdomain_name() -> str:
     return f"yutome-{secrets.token_hex(4)}"
 
 
-def _ensure_workers_dev_subdomain(capsule: Path) -> None:
+def _ensure_workers_dev_subdomain(worker_project: Path) -> None:
     """Best-effort: make sure the user's account has a workers.dev subdomain.
 
     If we can't tell or can't create one (missing token, multi-account ambiguity,
@@ -2699,7 +2699,7 @@ def _ensure_workers_dev_subdomain(capsule: Path) -> None:
     token = _cloudflare_bearer_token()
     if not token:
         return
-    account_id = _wrangler_account_id(capsule)
+    account_id = _wrangler_account_id(worker_project)
     if not account_id:
         return
     exists, _ = _workers_dev_subdomain_state(account_id, token)
@@ -2715,10 +2715,10 @@ def _ensure_workers_dev_subdomain(capsule: Path) -> None:
             return
 
 
-def _run_wrangler_capture(capsule: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_wrangler_capture(worker_project: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["npx", "--yes", "wrangler", *args],
-        cwd=capsule,
+        cwd=worker_project,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2740,10 +2740,10 @@ def _wrangler_whoami_authenticated(completed: subprocess.CompletedProcess[str]) 
     return completed.returncode == 0
 
 
-def _ensure_wrangler_authenticated(capsule: Path) -> None:
+def _ensure_wrangler_authenticated(worker_project: Path) -> None:
     if os.environ.get("CLOUDFLARE_API_TOKEN"):
         return
-    completed = _run_wrangler_capture(capsule, ["whoami"])
+    completed = _run_wrangler_capture(worker_project, ["whoami"])
     if _wrangler_whoami_authenticated(completed):
         return
     if not setup_prompts.is_interactive():
@@ -2760,11 +2760,11 @@ def _ensure_wrangler_authenticated(capsule: Path) -> None:
     typer.echo("")
     typer.echo(_wrangler_auth_message())
     typer.echo("Starting Cloudflare browser sign-in with Wrangler...")
-    login = subprocess.run(["npx", "--yes", "wrangler", "login"], cwd=capsule, check=False)
+    login = subprocess.run(["npx", "--yes", "wrangler", "login"], cwd=worker_project, check=False)
     if login.returncode != 0:
         typer.echo("Cloudflare sign-in failed. Rerun `yutome connect --deploy` after signing in.", err=True)
         raise typer.Exit(code=login.returncode)
-    verified = _run_wrangler_capture(capsule, ["whoami"])
+    verified = _run_wrangler_capture(worker_project, ["whoami"])
     if not _wrangler_whoami_authenticated(verified):
         typer.echo("Cloudflare sign-in did not complete successfully.", err=True)
         if verified.stdout:
@@ -2774,29 +2774,29 @@ def _ensure_wrangler_authenticated(capsule: Path) -> None:
 
 # ---------- Tracked TypeScript Worker (cloudflare/yutome-capsule) ----------
 
-CAPSULE_PROJECT_NAME = "yutome-remote-mcp"  # matches name in wrangler.toml
+WORKER_PROJECT_NAME = "yutome-remote-mcp"  # matches name in wrangler.toml
 GENERATED_WRANGLER_FILENAME = "wrangler.generated.toml"
 
 
-def _tracked_capsule_path() -> Path:
+def _tracked_worker_path() -> Path:
     """Path to the tracked TypeScript Worker project.
 
     Editable checkouts use the repo-level cloudflare/ tree. Wheels include the
     same files under yutome/cloudflare/ so uv/pipx installs can deploy too.
     """
     here = Path(__file__).resolve()
-    repo_capsule = here.parents[2] / "cloudflare" / "yutome-capsule"
-    if repo_capsule.exists():
-        return repo_capsule
+    repo_worker_project = here.parents[2] / "cloudflare" / "yutome-capsule"
+    if repo_worker_project.exists():
+        return repo_worker_project
     return here.parent / "cloudflare" / "yutome-capsule"
 
 
-def _ensure_capsule_node_modules(capsule: Path) -> None:
-    if (capsule / "node_modules").exists():
+def _ensure_worker_node_modules(worker_project: Path) -> None:
+    if (worker_project / "node_modules").exists():
         return
     _require_cloudflare_deploy_runtime()
-    typer.echo(f"Installing TypeScript Worker dependencies in {capsule}")
-    returncode, _ = _run_command_streamed(["npm", "install"], cwd=capsule)
+    typer.echo(f"Installing TypeScript Worker dependencies in {worker_project}")
+    returncode, _ = _run_command_streamed(["npm", "install"], cwd=worker_project)
     if returncode != 0:
         typer.echo("npm install failed. Fix the error above and rerun `yutome connect --deploy`.", err=True)
         raise typer.Exit(code=returncode)
@@ -2842,10 +2842,10 @@ def _strip_oauth_kv_binding(content: str) -> str:
     return "\n".join(output).rstrip() + "\n"
 
 
-def _write_generated_wrangler_config(capsule: Path, paths: ProjectPaths, namespace_id: str) -> Path:
-    source_config = capsule / "wrangler.toml"
+def _write_generated_wrangler_config(worker_project: Path, paths: ProjectPaths, namespace_id: str) -> Path:
+    source_config = worker_project / "wrangler.toml"
     content = _strip_oauth_kv_binding(source_config.read_text(encoding="utf-8"))
-    absolute_main = str((capsule / "src" / "index.ts").resolve()).replace("\\", "\\\\")
+    absolute_main = str((worker_project / "src" / "index.ts").resolve()).replace("\\", "\\\\")
     content = re.sub(r'^main\s*=\s*"[^"]+"', f'main = "{absolute_main}"', content, count=1, flags=re.MULTILINE)
     content = (
         content.rstrip()
@@ -2864,8 +2864,8 @@ def _write_generated_wrangler_config(capsule: Path, paths: ProjectPaths, namespa
     return generated_path
 
 
-def _existing_oauth_kv_namespace_id(capsule: Path) -> str | None:
-    completed = _run_wrangler_capture(capsule, ["kv", "namespace", "list"])
+def _existing_oauth_kv_namespace_id(worker_project: Path) -> str | None:
+    completed = _run_wrangler_capture(worker_project, ["kv", "namespace", "list"])
     if completed.returncode != 0:
         return None
     try:
@@ -2882,7 +2882,7 @@ def _existing_oauth_kv_namespace_id(capsule: Path) -> str | None:
     return None
 
 
-def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
+def _ensure_oauth_kv_namespace(worker_project: Path, paths: ProjectPaths) -> Path:
     """Create or reuse an account-local OAUTH_KV binding in ignored state.
 
     The tracked Worker config deliberately does not contain a real KV id because
@@ -2893,26 +2893,26 @@ def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
     if generated_config.exists():
         existing_id = _active_oauth_kv_id(generated_config.read_text(encoding="utf-8"))
         if existing_id:
-            current_namespace_id = _existing_oauth_kv_namespace_id(capsule)
+            current_namespace_id = _existing_oauth_kv_namespace_id(worker_project)
             if current_namespace_id is None or current_namespace_id == existing_id:
                 return generated_config
             typer.echo(
                 f"[WARN] Refreshing stale OAUTH_KV namespace id={existing_id}; "
                 f"current account has id={current_namespace_id}"
             )
-            generated_config = _write_generated_wrangler_config(capsule, paths, current_namespace_id)
+            generated_config = _write_generated_wrangler_config(worker_project, paths, current_namespace_id)
             typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
             return generated_config
 
-    existing_namespace_id = _existing_oauth_kv_namespace_id(capsule)
+    existing_namespace_id = _existing_oauth_kv_namespace_id(worker_project)
     if existing_namespace_id:
         typer.echo(f"[OK] Reusing existing OAUTH_KV namespace id={existing_namespace_id}")
-        generated_config = _write_generated_wrangler_config(capsule, paths, existing_namespace_id)
+        generated_config = _write_generated_wrangler_config(worker_project, paths, existing_namespace_id)
         typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
         return generated_config
 
     typer.echo("Creating Cloudflare KV namespace OAUTH_KV (one-time setup)…")
-    completed = _run_wrangler_capture(capsule, ["kv", "namespace", "create", "OAUTH_KV"])
+    completed = _run_wrangler_capture(worker_project, ["kv", "namespace", "create", "OAUTH_KV"])
     if completed.returncode != 0:
         typer.echo("Failed to create OAUTH_KV namespace.", err=True)
         if completed.stdout:
@@ -2931,7 +2931,7 @@ def _ensure_oauth_kv_namespace(capsule: Path, paths: ProjectPaths) -> Path:
         raise typer.Exit(code=1)
     namespace_id = match.group(1)
     typer.echo(f"[OK] Created OAUTH_KV namespace id={namespace_id}")
-    generated_config = _write_generated_wrangler_config(capsule, paths, namespace_id)
+    generated_config = _write_generated_wrangler_config(worker_project, paths, namespace_id)
     typer.echo(f"[OK] Wrote account-local Wrangler config: {generated_config}")
     return generated_config
 
@@ -2996,7 +2996,7 @@ def _wait_for_worker_online(
     return False
 
 
-def _push_wrangler_secret(capsule: Path, name: str, value: str, *, wrangler_config: Path | None = None) -> None:
+def _push_wrangler_secret(worker_project: Path, name: str, value: str, *, wrangler_config: Path | None = None) -> None:
     """Push a secret to the deployed Worker via `wrangler secret put`."""
     typer.echo(f"Setting Cloudflare secret {name}")
     command = ["npx", "--yes", "wrangler", "secret", "put", name]
@@ -3004,7 +3004,7 @@ def _push_wrangler_secret(capsule: Path, name: str, value: str, *, wrangler_conf
         command.extend(["--config", str(wrangler_config)])
     completed = subprocess.run(
         command,
-        cwd=capsule,
+        cwd=worker_project,
         input=f"{value}\n",
         text=True,
         stdout=subprocess.PIPE,
@@ -3018,7 +3018,7 @@ def _push_wrangler_secret(capsule: Path, name: str, value: str, *, wrangler_conf
         raise typer.Exit(code=completed.returncode)
 
 
-def _deploy_tracked_capsule(
+def _deploy_tracked_worker(
     *,
     paths: ProjectPaths,
     refresh_contract: bool = True,
@@ -3032,10 +3032,10 @@ def _deploy_tracked_capsule(
     ``(deployed_url, worker_name, relay_token, pairing_code)`` so the caller
     can persist them to local state.
     """
-    capsule = _tracked_capsule_path()
-    if not capsule.exists():
+    worker_project = _tracked_worker_path()
+    if not worker_project.exists():
         typer.echo(
-            f"Expected bundled TypeScript Worker project at {capsule}, but it is missing.",
+            f"Expected bundled TypeScript Worker project at {worker_project}, but it is missing.",
             err=True,
         )
         typer.echo(
@@ -3052,19 +3052,19 @@ def _deploy_tracked_capsule(
     if refresh_contract:
         from yutome.contract_export import emit_contract_json
 
-        contract_path = capsule / "src" / "contract.json"
+        contract_path = worker_project / "src" / "contract.json"
         emit_contract_json(contract_path)
         typer.echo(f"[OK] Refreshed contract: {contract_path}")
 
-    _ensure_capsule_node_modules(capsule)
-    _ensure_wrangler_authenticated(capsule)
-    _ensure_workers_dev_subdomain(capsule)
-    wrangler_config = _ensure_oauth_kv_namespace(capsule, paths)
+    _ensure_worker_node_modules(worker_project)
+    _ensure_wrangler_authenticated(worker_project)
+    _ensure_workers_dev_subdomain(worker_project)
+    wrangler_config = _ensure_oauth_kv_namespace(worker_project, paths)
 
-    typer.echo(f"Deploying Cloudflare Worker from {capsule}")
+    typer.echo(f"Deploying Cloudflare Worker from {worker_project}")
     command = ["npx", "--yes", "wrangler", "deploy", "--config", str(wrangler_config)]
     while True:
-        returncode, output = _run_command_streamed(command, cwd=capsule)
+        returncode, output = _run_command_streamed(command, cwd=worker_project)
         if returncode == 0:
             break
         if _is_email_unverified_error(output):
@@ -3089,8 +3089,8 @@ def _deploy_tracked_capsule(
         raise typer.Exit(code=returncode)
 
     # Worker is up. Push secrets so OAuth pairing + bridge auth work.
-    _push_wrangler_secret(capsule, "YUTOME_RELAY_TOKEN", effective_relay_token, wrangler_config=wrangler_config)
-    _push_wrangler_secret(capsule, "YUTOME_PAIRING_CODE", effective_pairing_code, wrangler_config=wrangler_config)
+    _push_wrangler_secret(worker_project, "YUTOME_RELAY_TOKEN", effective_relay_token, wrangler_config=wrangler_config)
+    _push_wrangler_secret(worker_project, "YUTOME_PAIRING_CODE", effective_pairing_code, wrangler_config=wrangler_config)
 
     deployed_url = _extract_worker_url(output)
     # Bridge the gap between `wrangler deploy` returning and the Cloudflare
@@ -3100,21 +3100,21 @@ def _deploy_tracked_capsule(
     if deployed_url:
         if _wait_for_worker_online(deployed_url):
             typer.secho(f"[OK] Worker responding at {deployed_url}", fg="green")
-    return deployed_url, CAPSULE_PROJECT_NAME, effective_relay_token, effective_pairing_code
+    return deployed_url, WORKER_PROJECT_NAME, effective_relay_token, effective_pairing_code
 
 
-def _delete_tracked_capsule(worker_name: str) -> None:
+def _delete_tracked_worker(worker_name: str) -> None:
     """Run `wrangler delete` from the tracked Worker project directory."""
-    capsule = _tracked_capsule_path()
+    worker_project = _tracked_worker_path()
     problem = _cloudflare_deploy_runtime_problem()
     if problem is not None:
         typer.echo(f"{problem} Delete the Worker manually in the Cloudflare dashboard.", err=True)
         typer.echo(f"Cloudflare Workers dashboard: {CLOUDFLARE_WORKERS_DASHBOARD_URL}", err=True)
         raise typer.Exit(code=1)
     command = ["npx", "--yes", "wrangler", "delete", worker_name, "--force"]
-    typer.echo(f"Removing Cloudflare Worker {worker_name!r} via wrangler in {capsule}")
+    typer.echo(f"Removing Cloudflare Worker {worker_name!r} via wrangler in {worker_project}")
     completed = subprocess.run(
-        command, cwd=capsule, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        command, cwd=worker_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
     )
     if completed.stdout:
         typer.echo(completed.stdout.rstrip())
@@ -3195,7 +3195,7 @@ def _disconnect_remote(
         if not yes and not typer.confirm("Remove the Yutome Cloudflare Worker from your Cloudflare account too?", default=True):
             remove_cloudflare = False
         if remove_cloudflare:
-            _delete_tracked_capsule(effective_worker)
+            _delete_tracked_worker(effective_worker)
 
     if state_path.exists() and not keep_state:
         state_path.unlink()
@@ -3456,7 +3456,7 @@ def setup(
                         config,
                         endpoint=endpoint,
                         mode="connector_only",
-                        worker_name=CAPSULE_PROJECT_NAME,
+                        worker_name=WORKER_PROJECT_NAME,
                         relay_token=relay_token or None,
                         pairing_code=pairing_code or None,
                         assistant_apps=assistant_apps,
@@ -3495,7 +3495,7 @@ def setup(
                 deployed_worker_name,
                 deployed_relay_token,
                 deployed_pairing_code,
-            ) = _deploy_tracked_capsule(paths=paths)
+            ) = _deploy_tracked_worker(paths=paths)
             if deployed_url:
                 _save_deployed_worker_endpoint(
                     config,
@@ -3602,14 +3602,14 @@ def connect_command(
         if not deploy:
             typer.echo("")
             typer.echo("Tracked TypeScript Worker project lives at:")
-            typer.echo(f"  {_tracked_capsule_path()}")
+            typer.echo(f"  {_tracked_worker_path()}")
             typer.echo("")
             typer.echo("Run the assisted deploy with:")
             typer.echo("  yutome connect --deploy")
             return
 
         deployed_url, deployed_worker_name, deployed_relay_token, deployed_pairing_code = (
-            _deploy_tracked_capsule(paths=paths)
+            _deploy_tracked_worker(paths=paths)
         )
         if deployed_url is None:
             typer.echo("Deploy succeeded, but no workers.dev URL was detected in Wrangler output.")

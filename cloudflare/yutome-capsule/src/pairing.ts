@@ -294,7 +294,7 @@ function buildConnectorOAuthGrantProps({
   const pairedAt = new Date();
   const tokenTtlSeconds = configuredTokenTtlSeconds(env);
   return {
-    capsule: "owner",
+    connector_mode: "local_bridge",
     workspace_id: bridgeIdentity.workspace_id,
     install_id: bridgeIdentity.install_id,
     connector_grant_id: authRequestId,
@@ -310,6 +310,7 @@ function buildConnectorOAuthGrantProps({
 
 function oauthGrantMetadata(props: YutomeAuthProps): Record<string, unknown> {
   return withoutUndefined({
+    connector_mode: props.connector_mode,
     workspace_id: props.workspace_id,
     install_id: props.install_id,
     connector_grant_id: props.connector_grant_id,

@@ -53,7 +53,7 @@ export interface Env {
 
 /** OAuth grant props attached to each access token. */
 export interface YutomeAuthProps extends Record<string, unknown> {
-  capsule?: "owner" | "hosted";
+  connector_mode?: "local_bridge" | "hosted";
   workspace_id: string;
   install_id?: string;
   connector_grant_id?: string;

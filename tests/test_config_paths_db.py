@@ -24,7 +24,7 @@ from yutome.cli import (
     _cloudflare_deploy_runtime_problem,
     _bridge_pid_path,
     _bridge_start_detached,
-    _deploy_tracked_capsule,
+    _deploy_tracked_worker,
     _ensure_oauth_kv_namespace,
     _ensure_workers_dev_subdomain,
     _ensure_wrangler_authenticated,
@@ -41,7 +41,7 @@ from yutome.cli import (
     _prompt_public_subscription_target,
     _run_command_streamed,
     _strip_oauth_kv_binding,
-    _tracked_capsule_path,
+    _tracked_worker_path,
     _wrangler_whoami_authenticated,
     _write_generated_wrangler_config,
     _yutome_mcpb_manifest,
@@ -977,27 +977,27 @@ def test_connect_without_endpoint_prints_deploy_instructions_without_provider_ke
     assert "YUTOME_WEBSHARE" not in result.output
 
 
-def test_tracked_capsule_path_uses_packaged_bundle_when_repo_sibling_missing(
+def test_tracked_worker_path_uses_packaged_bundle_when_repo_sibling_missing(
     monkeypatch, tmp_path: Path
 ) -> None:  # noqa: ANN001
     package_dir = tmp_path / "tools" / "yutome" / "lib" / "python3.13" / "site-packages" / "yutome"
-    capsule = package_dir / "cloudflare" / "yutome-capsule"
-    capsule.mkdir(parents=True)
+    worker_project = package_dir / "cloudflare" / "yutome-capsule"
+    worker_project.mkdir(parents=True)
     fake_cli = package_dir / "cli.py"
     fake_cli.write_text("", encoding="utf-8")
 
     monkeypatch.setattr("yutome.cli._legacy.__file__", str(fake_cli))
 
-    assert _tracked_capsule_path() == capsule
+    assert _tracked_worker_path() == worker_project
 
 
-def test_connect_deploy_invokes_tracked_capsule(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+def test_connect_deploy_invokes_tracked_worker(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
     finalized: list[Path] = []
 
     monkeypatch.setattr(
-        "yutome.cli._legacy._deploy_tracked_capsule",
+        "yutome.cli._legacy._deploy_tracked_worker",
         lambda paths, refresh_contract=True, relay_token=None, pairing_code=None: (
             "https://example.workers.dev",
             "yutome-remote-mcp",
@@ -1193,9 +1193,9 @@ def test_bridge_connection_error_message_explains_401() -> None:
 
 
 def test_generated_wrangler_config_keeps_oauth_kv_account_local(tmp_path: Path) -> None:
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text(
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text(
         "\n".join(
             [
                 'name = "yutome-remote-mcp"',
@@ -1213,21 +1213,21 @@ def test_generated_wrangler_config_keeps_oauth_kv_account_local(tmp_path: Path) 
     write_default_config(config_path)
     paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
 
-    stripped = _strip_oauth_kv_binding((capsule / "wrangler.toml").read_text(encoding="utf-8"))
+    stripped = _strip_oauth_kv_binding((worker_project / "wrangler.toml").read_text(encoding="utf-8"))
     assert 'binding = "OAUTH_KV"' not in stripped
 
-    generated = _write_generated_wrangler_config(capsule, paths, "22222222222222222222222222222222")
+    generated = _write_generated_wrangler_config(worker_project, paths, "22222222222222222222222222222222")
     assert generated == tmp_path / "data/remote/cloudflare/wrangler.generated.toml"
     generated_text = generated.read_text(encoding="utf-8")
     assert _active_oauth_kv_id(generated_text) == "22222222222222222222222222222222"
-    assert f'main = "{capsule.resolve()}/src/index.ts"' in generated_text
-    assert _active_oauth_kv_id((capsule / "wrangler.toml").read_text(encoding="utf-8")) == "11111111111111111111111111111111"
+    assert f'main = "{worker_project.resolve()}/src/index.ts"' in generated_text
+    assert _active_oauth_kv_id((worker_project / "wrangler.toml").read_text(encoding="utf-8")) == "11111111111111111111111111111111"
 
 
 def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text(
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text(
         "\n".join(
             [
                 'name = "yutome-remote-mcp"',
@@ -1245,7 +1245,7 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        assert kwargs["cwd"] == capsule
+        assert kwargs["cwd"] == worker_project
         if command[-1] == "list":
             return subprocess.CompletedProcess(
                 command,
@@ -1257,7 +1257,7 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    generated = _ensure_oauth_kv_namespace(capsule, paths)
+    generated = _ensure_oauth_kv_namespace(worker_project, paths)
 
     assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
     assert _active_oauth_kv_id(generated.read_text(encoding="utf-8")) == "33333333333333333333333333333333"
@@ -1266,9 +1266,9 @@ def test_connect_deploy_reuses_existing_oauth_kv_namespace(monkeypatch, tmp_path
 def test_connect_deploy_refreshes_stale_generated_oauth_kv_namespace(
     monkeypatch, tmp_path: Path
 ) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text(
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text(
         "\n".join(
             [
                 'name = "yutome-remote-mcp"',
@@ -1282,12 +1282,12 @@ def test_connect_deploy_refreshes_stale_generated_oauth_kv_namespace(
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
-    stale = _write_generated_wrangler_config(capsule, paths, "22222222222222222222222222222222")
+    stale = _write_generated_wrangler_config(worker_project, paths, "22222222222222222222222222222222")
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        assert kwargs["cwd"] == capsule
+        assert kwargs["cwd"] == worker_project
         if command[-1] == "list":
             return subprocess.CompletedProcess(
                 command,
@@ -1299,7 +1299,7 @@ def test_connect_deploy_refreshes_stale_generated_oauth_kv_namespace(
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    generated = _ensure_oauth_kv_namespace(capsule, paths)
+    generated = _ensure_oauth_kv_namespace(worker_project, paths)
 
     assert generated == stale
     assert commands == [["npx", "--yes", "wrangler", "kv", "namespace", "list"]]
@@ -1310,23 +1310,23 @@ def test_connect_deploy_explains_missing_workers_dev_subdomain(
     monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:  # noqa: ANN001
     account_id = "440c16ec06f5321075e4eadf38d4cc6d"
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
     generated = tmp_path / "wrangler.generated.toml"
 
-    monkeypatch.setattr("yutome.cli._legacy._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._legacy._tracked_worker_path", lambda: worker_project)
     monkeypatch.setattr("yutome.cli._legacy._require_cloudflare_deploy_runtime", lambda: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_capsule_node_modules", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_worker_node_modules", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _worker_project, _paths: generated)
 
     def fake_stream(command: list[str], *, cwd: Path) -> tuple[int, str]:
         assert command == ["npx", "--yes", "wrangler", "deploy", "--config", str(generated)]
-        assert cwd == capsule
+        assert cwd == worker_project
         return (
             1,
             "\n".join(
@@ -1340,7 +1340,7 @@ def test_connect_deploy_explains_missing_workers_dev_subdomain(
     monkeypatch.setattr("yutome.cli._legacy._run_command_streamed", fake_stream)
 
     with pytest.raises(typer.Exit) as exc:
-        _deploy_tracked_capsule(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
+        _deploy_tracked_worker(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
 
     assert exc.value.exit_code == 1
     captured = capsys.readouterr()
@@ -1353,19 +1353,19 @@ def test_connect_deploy_retries_after_recoverable_error_when_interactive(
     monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:  # noqa: ANN001
     account_id = "1d653327475a6351fab5cbea055baf7c"
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
     generated = tmp_path / "wrangler.generated.toml"
 
-    monkeypatch.setattr("yutome.cli._legacy._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._legacy._tracked_worker_path", lambda: worker_project)
     monkeypatch.setattr("yutome.cli._legacy._require_cloudflare_deploy_runtime", lambda: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_capsule_node_modules", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_worker_node_modules", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _worker_project, _paths: generated)
     monkeypatch.setattr("yutome.cli._legacy._push_wrangler_secret", lambda *a, **k: None)
     # Skip the post-deploy /healthz probe — example.workers.dev doesn't
     # exist, so the real probe would loop for ~60s waiting for DNS.
@@ -1393,7 +1393,7 @@ def test_connect_deploy_retries_after_recoverable_error_when_interactive(
 
     monkeypatch.setattr("yutome.cli._legacy._run_command_streamed", fake_stream)
 
-    deployed_url, worker_name, _relay, _pair = _deploy_tracked_capsule(
+    deployed_url, worker_name, _relay, _pair = _deploy_tracked_worker(
         paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair"
     )
 
@@ -1408,23 +1408,23 @@ def test_connect_deploy_explains_unverified_email(
     monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:  # noqa: ANN001
     account_id = "1d653327475a6351fab5cbea055baf7c"
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
-    (capsule / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
+    (worker_project / "wrangler.toml").write_text('name = "yutome-remote-mcp"\nmain = "src/index.ts"\n', encoding="utf-8")
     config_path = tmp_path / "yutome.toml"
     write_default_config(config_path)
     paths = ProjectPaths.from_config(load_config(config_path), project_root=tmp_path)
     generated = tmp_path / "wrangler.generated.toml"
 
-    monkeypatch.setattr("yutome.cli._legacy._tracked_capsule_path", lambda: capsule)
+    monkeypatch.setattr("yutome.cli._legacy._tracked_worker_path", lambda: worker_project)
     monkeypatch.setattr("yutome.cli._legacy._require_cloudflare_deploy_runtime", lambda: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_capsule_node_modules", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _capsule: None)
-    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _capsule, _paths: generated)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_worker_node_modules", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_wrangler_authenticated", lambda _worker_project: None)
+    monkeypatch.setattr("yutome.cli._legacy._ensure_oauth_kv_namespace", lambda _worker_project, _paths: generated)
 
     def fake_stream(command: list[str], *, cwd: Path) -> tuple[int, str]:
         assert command == ["npx", "--yes", "wrangler", "deploy", "--config", str(generated)]
-        assert cwd == capsule
+        assert cwd == worker_project
         return (
             1,
             "\n".join(
@@ -1438,7 +1438,7 @@ def test_connect_deploy_explains_unverified_email(
     monkeypatch.setattr("yutome.cli._legacy._run_command_streamed", fake_stream)
 
     with pytest.raises(typer.Exit) as exc:
-        _deploy_tracked_capsule(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
+        _deploy_tracked_worker(paths=paths, refresh_contract=False, relay_token="relay", pairing_code="pair")
 
     assert exc.value.exit_code == 1
     captured = capsys.readouterr()
@@ -1452,8 +1452,8 @@ def test_ensure_workers_dev_subdomain_creates_when_missing(
     monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:  # noqa: ANN001
     account_id = "1d653327475a6351fab5cbea055baf7c"
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account_id)
 
@@ -1470,7 +1470,7 @@ def test_ensure_workers_dev_subdomain_creates_when_missing(
 
     monkeypatch.setattr("yutome.cli._legacy._cloudflare_api_call", fake_api)
 
-    _ensure_workers_dev_subdomain(capsule)
+    _ensure_workers_dev_subdomain(worker_project)
 
     assert calls[0] == ("GET", f"/accounts/{account_id}/workers/subdomain", None)
     assert calls[1][0] == "PUT"
@@ -1483,8 +1483,8 @@ def test_ensure_workers_dev_subdomain_creates_when_missing(
 def test_ensure_workers_dev_subdomain_skips_when_already_exists(
     monkeypatch, tmp_path: Path
 ) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "1d653327475a6351fab5cbea055baf7c")
 
@@ -1496,7 +1496,7 @@ def test_ensure_workers_dev_subdomain_skips_when_already_exists(
 
     monkeypatch.setattr("yutome.cli._legacy._cloudflare_api_call", fake_api)
 
-    _ensure_workers_dev_subdomain(capsule)
+    _ensure_workers_dev_subdomain(worker_project)
 
     assert methods == ["GET"]
 
@@ -1504,8 +1504,8 @@ def test_ensure_workers_dev_subdomain_skips_when_already_exists(
 def test_ensure_workers_dev_subdomain_silent_when_no_token(
     monkeypatch, tmp_path: Path
 ) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
     monkeypatch.setattr("yutome.cli._legacy._read_wrangler_oauth_token", lambda: None)
 
@@ -1517,7 +1517,7 @@ def test_ensure_workers_dev_subdomain_silent_when_no_token(
 
     monkeypatch.setattr("yutome.cli._legacy._cloudflare_api_call", fake_api)
 
-    _ensure_workers_dev_subdomain(capsule)
+    _ensure_workers_dev_subdomain(worker_project)
 
     assert called["hit"] is False
 
@@ -1525,8 +1525,8 @@ def test_ensure_workers_dev_subdomain_silent_when_no_token(
 def test_ensure_workers_dev_subdomain_retries_on_name_taken(
     monkeypatch, tmp_path: Path
 ) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "1d653327475a6351fab5cbea055baf7c")
 
@@ -1542,7 +1542,7 @@ def test_ensure_workers_dev_subdomain_retries_on_name_taken(
 
     monkeypatch.setattr("yutome.cli._legacy._cloudflare_api_call", fake_api)
 
-    _ensure_workers_dev_subdomain(capsule)
+    _ensure_workers_dev_subdomain(worker_project)
 
     assert len(put_attempts) == 2
     assert put_attempts[0] != put_attempts[1]  # different names on retry
@@ -1904,8 +1904,8 @@ def test_finalize_remote_bridge_setup_noops_without_relay_token(
 
 
 def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     calls: list[list[str]] = []
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
 
@@ -1915,14 +1915,14 @@ def test_wrangler_auth_skips_login_when_api_token_present(monkeypatch, tmp_path:
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    _ensure_wrangler_authenticated(capsule)
+    _ensure_wrangler_authenticated(worker_project)
 
     assert calls == []
 
 
 def test_wrangler_auth_runs_interactive_login_when_whoami_fails(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     calls: list[list[str]] = []
     monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: True)
@@ -1935,7 +1935,7 @@ def test_wrangler_auth_runs_interactive_login_when_whoami_fails(monkeypatch, tmp
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    _ensure_wrangler_authenticated(capsule)
+    _ensure_wrangler_authenticated(worker_project)
 
     assert calls == [
         ["npx", "--yes", "wrangler", "whoami"],
@@ -1945,8 +1945,8 @@ def test_wrangler_auth_runs_interactive_login_when_whoami_fails(monkeypatch, tmp
 
 
 def test_wrangler_auth_noninteractive_requires_api_token(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
     monkeypatch.setattr("yutome.setup_prompts.is_interactive", lambda: False)
 
@@ -1957,7 +1957,7 @@ def test_wrangler_auth_noninteractive_requires_api_token(monkeypatch, tmp_path: 
     monkeypatch.setattr("subprocess.run", fake_run)
 
     with pytest.raises(typer.Exit):
-        _ensure_wrangler_authenticated(capsule)
+        _ensure_wrangler_authenticated(worker_project)
 
 
 def test_wrangler_whoami_zero_exit_can_still_be_unauthenticated() -> None:
@@ -1972,8 +1972,8 @@ def test_wrangler_whoami_zero_exit_can_still_be_unauthenticated() -> None:
 
 
 def test_push_wrangler_secret_sends_newline_terminated_value(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    worker_project = tmp_path / "worker_project"
+    worker_project.mkdir()
     wrangler_config = tmp_path / "wrangler.generated.toml"
     calls: list[dict[str, object]] = []
 
@@ -1983,7 +1983,7 @@ def test_push_wrangler_secret_sends_newline_terminated_value(monkeypatch, tmp_pa
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    _push_wrangler_secret(capsule, "YUTOME_RELAY_TOKEN", "relay-secret", wrangler_config=wrangler_config)
+    _push_wrangler_secret(worker_project, "YUTOME_RELAY_TOKEN", "relay-secret", wrangler_config=wrangler_config)
 
     assert len(calls) == 1
     assert calls[0]["command"] == [
@@ -1996,7 +1996,7 @@ def test_push_wrangler_secret_sends_newline_terminated_value(monkeypatch, tmp_pa
         "--config",
         str(wrangler_config),
     ]
-    assert calls[0]["cwd"] == capsule
+    assert calls[0]["cwd"] == worker_project
     assert calls[0]["input"] == "relay-secret\n"
 
 
@@ -2023,7 +2023,7 @@ def test_disconnect_can_remove_local_state_after_cloud_delete(monkeypatch, tmp_p
     config_path = tmp_path / "yutome.toml"
     deleted: list[str] = []
 
-    monkeypatch.setattr("yutome.cli._legacy._delete_tracked_capsule", lambda name: deleted.append(name))
+    monkeypatch.setattr("yutome.cli._legacy._delete_tracked_worker", lambda name: deleted.append(name))
     connect_result = runner.invoke(
         app,
         ["--config", str(config_path), "connect", "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
@@ -2041,7 +2041,7 @@ def test_remote_disconnect_alias_uses_disconnect_language(monkeypatch, tmp_path:
     runner = CliRunner()
     config_path = tmp_path / "yutome.toml"
 
-    monkeypatch.setattr("yutome.cli._legacy._delete_tracked_capsule", lambda _name: None)
+    monkeypatch.setattr("yutome.cli._legacy._delete_tracked_worker", lambda _name: None)
     connect_result = runner.invoke(
         app,
         ["--config", str(config_path), "connect", "--endpoint", "https://example.workers.dev", "--worker-name", "worker-to-delete"],
@@ -2103,7 +2103,7 @@ def test_setup_deploy_path_finalizes_bridge_after_saving_state(
 
     monkeypatch.setattr("yutome.cli._legacy._can_run_cloudflare_deploy", lambda: True)
     monkeypatch.setattr(
-        "yutome.cli._legacy._deploy_tracked_capsule",
+        "yutome.cli._legacy._deploy_tracked_worker",
         lambda paths, refresh_contract=True, relay_token=None, pairing_code=None: (
             "https://example.workers.dev",
             "yutome-remote-mcp",
