@@ -75,6 +75,48 @@ export async function bootstrapAccount(
   return { session, principal: json.principal };
 }
 
+export interface CliAuthorizeResult {
+  code: string;
+  state?: string | null;
+  workspace_id: string;
+  expires_at: string;
+}
+
+export async function authorizeCli(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  body: {
+    code_challenge: string;
+    code_challenge_method: "S256";
+    redirect_uri: string;
+    state?: string | null;
+    scopes?: string[];
+    client_id?: string;
+  },
+): Promise<CliAuthorizeResult> {
+  const response = await fetch(apiUrl(env, "/account/cli/authorize"), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
+      "x-yutome-account-session": sessionToken,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await parseJson(response);
+  if (!response.ok || json.ok === false) throw toError(response.status, json);
+  if (typeof json.code !== "string" || typeof json.workspace_id !== "string" || typeof json.expires_at !== "string") {
+    throw new HostedApiError(502, "invalid_hosted_api_response", "CLI authorization response was missing a code.");
+  }
+  return {
+    code: json.code,
+    state: typeof json.state === "string" ? json.state : null,
+    workspace_id: json.workspace_id,
+    expires_at: json.expires_at,
+  };
+}
+
 async function authedGet(env: YutomeWebEnv, sessionToken: string, path: string): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl(env, path), {
     headers: {

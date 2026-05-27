@@ -356,6 +356,9 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_account_grants_workspace_status
     ON account_grants(workspace_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_grants_install_id
+    ON account_grants(install_id)
+    WHERE install_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sources_workspace_status
     ON sources(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_source_refresh_due

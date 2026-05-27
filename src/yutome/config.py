@@ -140,6 +140,8 @@ enabled = false
 # Hosted mode is opt-in and uses the same CLI entry points with a hosted
 # provider/search-store broker behind them.
 workspace_id = ""
+app_url = "https://app.getyutome.com"
+api_url = "https://api-production-e072.up.railway.app"
 usage_ledger_path = "data/hosted/usage_events.jsonl"
 postgres_url_env = "YUTOME_POSTGRES_URL"
 """
@@ -259,6 +261,8 @@ class FindConfig(BaseModel):
 class HostedConfig(BaseModel):
     enabled: bool = False
     workspace_id: str = ""
+    app_url: str = "https://app.getyutome.com"
+    api_url: str = "https://api-production-e072.up.railway.app"
     usage_ledger_path: Path = Path("data/hosted/usage_events.jsonl")
     postgres_url_env: str = "YUTOME_POSTGRES_URL"
 

@@ -1,4 +1,4 @@
-import { Form, redirect, useActionData, useNavigation } from "react-router";
+import { Form, redirect, useActionData, useNavigation, useSearchParams } from "react-router";
 
 import type { Route } from "./+types/signup";
 import { buildSessionCookie } from "~/lib/cookies.server";
@@ -16,10 +16,12 @@ export function meta(_: Route.MetaArgs) {
 
 export async function action({ request, context }: Route.ActionArgs) {
   const env = getEnv(context);
+  const url = new URL(request.url);
   const form = await request.formData();
   const email = String(form.get("email") ?? "").trim();
   const name = String(form.get("name") ?? "").trim();
   const workspaceName = String(form.get("workspace_name") ?? "").trim();
+  const next = safeNextPath(String(form.get("next") ?? url.searchParams.get("next") ?? ""));
   if (!email || !email.includes("@")) {
     return { error: "Enter a valid email address." };
   }
@@ -29,7 +31,7 @@ export async function action({ request, context }: Route.ActionArgs) {
       name: name || undefined,
       workspace_name: workspaceName || undefined,
     });
-    return redirect("/dashboard", {
+    return redirect(next || "/dashboard", {
       headers: {
         "set-cookie": buildSessionCookie(result.session.token, {
           domain: env.YUTOME_COOKIE_DOMAIN,
@@ -44,9 +46,17 @@ export async function action({ request, context }: Route.ActionArgs) {
   }
 }
 
+function safeNextPath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || !trimmed.startsWith("/") || trimmed.startsWith("//")) return null;
+  return trimmed;
+}
+
 export default function Signup() {
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
+  const [searchParams] = useSearchParams();
+  const next = safeNextPath(searchParams.get("next") ?? "");
   const busy = navigation.state !== "idle";
   return (
     <main className="mx-auto flex min-h-svh max-w-md flex-col justify-center px-4 py-12">
@@ -63,6 +73,7 @@ export default function Signup() {
             </Alert>
           ) : null}
           <Form method="post" className="grid gap-4">
+            {next ? <input type="hidden" name="next" value={next} /> : null}
             <div className="grid gap-2">
               <Label htmlFor="email">Email</Label>
               <Input id="email" name="email" type="email" autoComplete="email" required autoFocus />

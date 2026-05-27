@@ -185,6 +185,12 @@ account_grants = Table(
 )
 
 Index("idx_account_grants_workspace_status", account_grants.c.workspace_id, account_grants.c.status)
+Index(
+    "idx_account_grants_install_id",
+    account_grants.c.install_id,
+    unique=True,
+    postgresql_where=account_grants.c.install_id.is_not(None),
+)
 
 youtube_grants = Table(
     "youtube_grants",

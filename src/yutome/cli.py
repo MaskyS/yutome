@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.server
 import importlib.util
 import json
 import os
@@ -44,6 +45,7 @@ from yutome.evals import load_eval_suite, run_eval_suite
 from yutome.exports import export_markdown
 from yutome.gemini import transcribe_youtube_url_with_gemini
 from yutome.hosted.cli_helpers import append_demo_usage_events, summarize_usage_events
+from yutome.hosted.account_cli import code_challenge_for_verifier, new_code_verifier
 from yutome.hosted.ledger import JsonlUsageLedger, default_usage_ledger_path
 from yutome.hosted.runtime import HostedCommandRunner, HostedRuntimeError
 from yutome.indexer import sync_channel, sync_video
@@ -192,6 +194,10 @@ BACK_CHOICE = "Back"
 BACK = object()
 
 SETUP_TOTAL_STEPS = 6
+HOSTED_SETUP_TOTAL_STEPS = 4
+DEFAULT_HOSTED_APP_URL = "https://app.getyutome.com"
+DEFAULT_HOSTED_API_URL = "https://api-production-e072.up.railway.app"
+HOSTED_AUTH_FILENAME = "yutome-hosted-cli.json"
 
 
 def _step_header(step: int, total: int, title: str) -> None:
@@ -616,6 +622,339 @@ def _set_toml_value(config_path: Path, section: str, key: str, rendered_value: s
         output.extend([target_header, rendered_key])
 
     config_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+class HostedCliApiError(RuntimeError):
+    pass
+
+
+class HostedCliLoginError(RuntimeError):
+    pass
+
+
+def _hosted_auth_path(paths: ProjectPaths) -> Path:
+    return paths.data_dir / "auth" / HOSTED_AUTH_FILENAME
+
+
+def _normalize_url_base(value: str | None, *, fallback: str) -> str:
+    raw = (value or fallback).strip() or fallback
+    return raw.rstrip("/")
+
+
+def _hosted_api_url(app_config: AppConfig, override: str | None = None) -> str:
+    return _normalize_url_base(override or app_config.hosted.api_url, fallback=DEFAULT_HOSTED_API_URL)
+
+
+def _hosted_app_url(app_config: AppConfig, override: str | None = None) -> str:
+    return _normalize_url_base(override or app_config.hosted.app_url, fallback=DEFAULT_HOSTED_APP_URL)
+
+
+def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+        file.write("\n")
+    path.chmod(0o600)
+
+
+def _load_hosted_auth(paths: ProjectPaths) -> dict[str, Any]:
+    auth_path = _hosted_auth_path(paths)
+    if not auth_path.exists():
+        raise HostedCliLoginError("Run `yutome hosted login` before using hosted CLI source import.")
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HostedCliLoginError(f"Hosted CLI auth file is unreadable: {auth_path}") from exc
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        raise HostedCliLoginError("Hosted CLI auth file is missing an access token. Run `yutome hosted login` again.")
+    return payload
+
+
+def _hosted_api_request_json(
+    api_base: str,
+    path: str,
+    *,
+    method: str = "POST",
+    body: Mapping[str, Any] | None = None,
+    access_token: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    url = _normalize_url_base(api_base, fallback=DEFAULT_HOSTED_API_URL) + path
+    data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8") if body is not None else None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="replace")
+        raise HostedCliApiError(_hosted_api_error_message(raw_error, fallback=f"Hosted API returned HTTP {exc.code}.")) from exc
+    except urllib.error.URLError as exc:
+        raise HostedCliApiError(f"Could not reach hosted API at {api_base}: {exc.reason}") from exc
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise HostedCliApiError("Hosted API returned a non-JSON response.") from exc
+    if not isinstance(parsed, dict):
+        raise HostedCliApiError("Hosted API returned an unexpected response.")
+    if parsed.get("ok") is False:
+        raise HostedCliApiError(_hosted_api_error_message(json.dumps(parsed), fallback="Hosted API request failed."))
+    return parsed
+
+
+def _hosted_api_error_message(raw: str, *, fallback: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+    detail = parsed.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        code = detail.get("code")
+        if isinstance(message, str) and isinstance(code, str):
+            return f"{message} ({code})"
+        if isinstance(message, str):
+            return message
+    message = parsed.get("message")
+    return message if isinstance(message, str) else fallback
+
+
+def _run_hosted_login_flow(
+    *,
+    config_path: Path,
+    app_url: str | None = None,
+    api_url: str | None = None,
+    port: int = 0,
+    open_browser: bool = True,
+) -> dict[str, Any]:
+    write_default_config(config_path)
+    app_config = load_config(config_path)
+    project_root = _project_root(config_path)
+    paths = ProjectPaths.from_config(app_config, project_root=project_root)
+    paths.ensure_base_dirs()
+    app_base = _hosted_app_url(app_config, app_url)
+    api_base = _hosted_api_url(app_config, api_url)
+    verifier = new_code_verifier()
+    challenge = code_challenge_for_verifier(verifier)
+    state = secrets.token_urlsafe(24)
+    callback: dict[str, str] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib callback API
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            received_state = params.get("state", [""])[0]
+            code = params.get("code", [""])[0]
+            error = params.get("error", [""])[0]
+            if received_state != state:
+                callback["error"] = "Hosted CLI login returned an invalid state."
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Invalid hosted CLI login state.")
+                return
+            if error:
+                callback["error"] = error
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Hosted CLI login failed.")
+                return
+            callback["code"] = code
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Yutome CLI is connected. You can return to your terminal.")
+
+        def log_message(self, _format: str, *_args: Any) -> None:
+            return
+
+    with http.server.HTTPServer(("127.0.0.1", port), Handler) as server:
+        server.timeout = 300
+        redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
+        authorize_url = app_base + "/cli/authorize?" + urllib.parse.urlencode(
+            {
+                "client_id": "yutome-cli",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "redirect_uri": redirect_uri,
+                "state": state,
+            }
+        )
+        typer.echo(f"Opening hosted Yutome login: {authorize_url}")
+        if open_browser:
+            webbrowser.open(authorize_url)
+        else:
+            typer.echo(authorize_url)
+        server.handle_request()
+
+    if callback.get("error"):
+        raise HostedCliLoginError(callback["error"])
+    code = callback.get("code")
+    if not code:
+        raise HostedCliLoginError("Timed out waiting for hosted CLI login callback.")
+    token_response = _hosted_api_request_json(
+        api_base,
+        "/account/cli/token",
+        body={"code": code, "code_verifier": verifier, "redirect_uri": redirect_uri},
+    )
+    access_token = token_response.get("access_token")
+    workspace_id = token_response.get("workspace_id")
+    if not isinstance(access_token, str) or not isinstance(workspace_id, str):
+        raise HostedCliApiError("Hosted API token response was missing access_token/workspace_id.")
+    auth_payload = {
+        "access_token": access_token,
+        "token_type": token_response.get("token_type", "Bearer"),
+        "expires_at": token_response.get("expires_at"),
+        "workspace_id": workspace_id,
+        "grant_id": token_response.get("grant_id"),
+        "api_url": api_base,
+        "app_url": app_base,
+        "scopes": token_response.get("scopes", []),
+    }
+    _write_private_json(_hosted_auth_path(paths), auth_payload)
+    _set_toml_bool(config_path, "hosted", "enabled", True)
+    _set_toml_string(config_path, "hosted", "workspace_id", workspace_id)
+    _set_toml_string(config_path, "hosted", "api_url", api_base)
+    _set_toml_string(config_path, "hosted", "app_url", app_base)
+    return auth_payload
+
+
+def _hosted_import_sources(
+    *,
+    app_config: AppConfig,
+    paths: ProjectPaths,
+    descriptors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    auth = _load_hosted_auth(paths)
+    api_base = str(auth.get("api_url") or app_config.hosted.api_url or DEFAULT_HOSTED_API_URL)
+    return _hosted_api_request_json(
+        api_base,
+        "/account/sources/import",
+        body={"sources": descriptors},
+        access_token=str(auth["access_token"]),
+        timeout=60.0,
+    )
+
+
+def _channel_import_descriptor(channel: LibraryChannel, *, selected: bool) -> dict[str, Any]:
+    return {
+        "source_url": channel.source_url,
+        "source_type": "channel",
+        "channel_id": channel.channel_id,
+        "display_name": channel.title or channel.handle or channel.channel_id,
+        "selected": selected,
+        "import_source": channel.import_source or "cli",
+        "metadata": {"legacy_source": channel.source, "handle": channel.handle},
+    }
+
+
+def _library_source_import_descriptor(source: LibrarySource, *, selected: bool | None = None) -> dict[str, Any]:
+    source_type = {
+        "youtube_channel": "channel",
+        "youtube_video": "video",
+        "youtube_playlist": "playlist",
+    }.get(source.source_type, "url")
+    descriptor: dict[str, Any] = {
+        "source_url": source.source_url,
+        "source_type": source_type,
+        "display_name": source.title or source.handle or source.video_id or source.channel_id,
+        "selected": source.selected if selected is None else selected,
+        "import_source": source.import_source or "cli",
+        "metadata": {"legacy_source": source.source, "handle": source.handle},
+    }
+    if source.channel_id:
+        descriptor["channel_id"] = source.channel_id
+    if source.video_id:
+        descriptor["video_id"] = source.video_id
+    return descriptor
+
+
+def _run_hosted_setup_after_project_init(
+    *,
+    config: Path,
+    channel: str | None,
+    yes: bool,
+    app_config: AppConfig,
+    paths: ProjectPaths,
+    env_path: Path,
+) -> None:
+    _step_header(2, HOSTED_SETUP_TOTAL_STEPS, "Hosted Yutome account")
+    try:
+        auth = _run_hosted_login_flow(config_path=config, app_url=app_config.hosted.app_url, api_url=app_config.hosted.api_url)
+    except (HostedCliLoginError, HostedCliApiError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"[OK] Hosted CLI connected to workspace {auth['workspace_id']}.")
+
+    app_config = apply_env_to_config(load_config(config))
+    imported = 0
+    _step_header(3, HOSTED_SETUP_TOTAL_STEPS, "YouTube sources")
+    if channel:
+        source = source_from_input(channel, import_source="cli")
+        if source is None:
+            typer.echo("[WARN] Could not parse the source passed to setup.")
+        else:
+            try:
+                result = _hosted_import_sources(
+                    app_config=app_config,
+                    paths=paths,
+                    descriptors=[_library_source_import_descriptor(source, selected=True)],
+                )
+            except (HostedCliLoginError, HostedCliApiError) as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=1) from exc
+            imported = len(result.get("imported", []))
+            typer.echo(f"[OK] Uploaded {imported} hosted source{'s' if imported != 1 else ''}.")
+    elif not yes:
+        channels: list[LibraryChannel] = []
+        if typer.confirm("Import YouTube subscription channels from this machine now?", default=True):
+            try:
+                channels = _fetch_youtube_import_channels(
+                    target=None,
+                    app_config=app_config,
+                    paths=paths,
+                    project_root=_project_root(config),
+                    env_path=env_path,
+                    port=0,
+                    open_browser=True,
+                    status_callback=typer.echo,
+                )
+            except YouTubeImportError as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=1) from exc
+            if channels:
+                try:
+                    result = _hosted_import_sources(
+                        app_config=app_config,
+                        paths=paths,
+                        descriptors=[_channel_import_descriptor(channel, selected=True) for channel in channels],
+                    )
+                except (HostedCliLoginError, HostedCliApiError) as exc:
+                    typer.echo(str(exc), err=True)
+                    raise typer.Exit(code=1) from exc
+                imported = len(result.get("imported", []))
+        if imported:
+            typer.echo(f"[OK] Uploaded {imported} YouTube source{'s' if imported != 1 else ''} to hosted Yutome.")
+        else:
+            typer.echo("[OK] No hosted sources imported yet.")
+    else:
+        typer.echo("[OK] Hosted login saved. Import sources later with `yutome import-youtube --hosted`.")
+
+    _step_header(4, HOSTED_SETUP_TOTAL_STEPS, "Next steps")
+    typer.echo("  yutome import-youtube --hosted")
+    typer.echo("  yutome hosted jobs")
+    typer.echo("  https://app.getyutome.com/dashboard/connect")
 
 
 def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> bool:
@@ -2930,6 +3269,11 @@ def setup(
         "-y",
         help="Run non-interactively and print next steps instead of prompting.",
     ),
+    hosted: bool = typer.Option(
+        False,
+        "--hosted",
+        help="Configure hosted Yutome account mode instead of local provider keys.",
+    ),
 ) -> None:
     """Guided first-run setup for a local yutome project."""
     typer.secho("yutome · guided setup", fg="magenta", bold=True)
@@ -2965,6 +3309,17 @@ def setup(
     _status(ingest_ok, "Ingest dependencies", "uv sync" if not ingest_ok else "ready")
     _status(vectors_ok, "Vector database dependency", "uv sync" if not vectors_ok else "ready")
     _status(embeddings_ok, "Embedding client", "uv sync" if not embeddings_ok else "ready")
+
+    if hosted:
+        _run_hosted_setup_after_project_init(
+            config=config,
+            channel=channel,
+            yes=yes,
+            app_config=apply_env_to_config(load_config(config)),
+            paths=paths,
+            env_path=env_path,
+        )
+        return
 
     _step_header(2, SETUP_TOTAL_STEPS, "Webshare residential proxy")
     _setup_webshare(env_path, yes=yes)
@@ -3845,6 +4200,65 @@ def hosted_search_smoke(
     _echo_hosted_result(result, json_output=json_output, message=f"Search smoke returned {len(result.get('rows', []))} rows.")
 
 
+@hosted_app.command("login")
+def hosted_login(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    app_url: str | None = typer.Option(None, "--app-url", help="Hosted Yutome app URL."),
+    api_url: str | None = typer.Option(None, "--api-url", help="Hosted Yutome API URL."),
+    port: int = typer.Option(0, "--port", min=0, max=65535, help="Local callback port. 0 chooses a free port."),
+    open_browser: bool = typer.Option(True, "--open-browser/--print-url", help="Open the hosted login URL in a browser."),
+    json_output: bool = typer.Option(False, "--json", help="Emit hosted auth state as JSON."),
+) -> None:
+    """Authorize this CLI against your hosted Yutome account."""
+    try:
+        result = _run_hosted_login_flow(
+            config_path=config,
+            app_url=app_url,
+            api_url=api_url,
+            port=port,
+            open_browser=open_browser,
+        )
+    except (HostedCliLoginError, HostedCliApiError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    typer.echo(f"[OK] Hosted CLI connected to workspace {result['workspace_id']}.")
+
+
+@hosted_app.command("jobs")
+def hosted_jobs(
+    config: Path = typer.Option(
+        Path(DEFAULT_CONFIG_FILENAME),
+        "--config",
+        "-c",
+        help="Path to the yutome TOML config.",
+    ),
+    limit: int = typer.Option(25, "--limit", min=1, max=100, help="Maximum hosted jobs to return."),
+    json_output: bool = typer.Option(False, "--json", help="Emit hosted jobs as JSON."),
+) -> None:
+    """Read recent hosted jobs for the logged-in workspace."""
+    try:
+        app_config = load_config(config)
+        paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
+        auth = _load_hosted_auth(paths)
+        api_base = str(auth.get("api_url") or app_config.hosted.api_url or DEFAULT_HOSTED_API_URL)
+        result = _hosted_api_request_json(
+            api_base,
+            f"/account/jobs?{urllib.parse.urlencode({'limit': limit})}",
+            method="GET",
+            access_token=str(auth["access_token"]),
+        )
+    except (HostedCliLoginError, HostedCliApiError, ValueError) as exc:
+        _hosted_error(str(exc), json_output=json_output)
+    _echo_hosted_result(result, json_output=json_output, message=f"Fetched {len(result.get('jobs', []))} hosted job(s).")
+
+
 @hosted_app.command("source-add")
 def hosted_source_add(
     source_url: str = typer.Argument(..., help="Public YouTube channel, handle, playlist, or video URL."),
@@ -4172,10 +4586,29 @@ def add_sources(
     ),
     title: str | None = typer.Option(None, "--title", help="Optional display title for one source."),
     selected: bool = typer.Option(True, "--selected/--unselected", help="Include source in default sync runs."),
+    hosted: bool = typer.Option(False, "--hosted", help="Upload sources to hosted Yutome instead of local SQLite."),
 ) -> None:
     """Add YouTube sources to the local library."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
+    if hosted or app_config.hosted.enabled:
+        descriptors: list[dict[str, Any]] = []
+        for target in targets:
+            source = source_from_input(target, title=title if len(targets) == 1 else None, import_source="cli")
+            if source is not None:
+                descriptors.append(_library_source_import_descriptor(source, selected=selected))
+        if not descriptors:
+            typer.echo("Uploaded 0 hosted sources; queued 0 jobs.")
+            return
+        try:
+            result = _hosted_import_sources(app_config=app_config, paths=paths, descriptors=descriptors)
+        except (HostedCliLoginError, HostedCliApiError) as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        imported = len(result.get("imported", []))
+        jobs = len(result.get("jobs", []))
+        typer.echo(f"Uploaded {imported} hosted source{'s' if imported != 1 else ''}; queued {jobs} job{'s' if jobs != 1 else ''}.")
+        return
     bootstrap_catalog(paths.catalog_db)
     imported = 0
     with connect_catalog(paths.catalog_db) as connection:
@@ -4199,12 +4632,30 @@ def import_command(
         help="Path to the yutome TOML config.",
     ),
     selected: bool = typer.Option(True, "--selected/--unselected", help="Include imported sources in default sync runs."),
+    hosted: bool = typer.Option(False, "--hosted", help="Upload imported sources to hosted Yutome instead of local SQLite."),
 ) -> None:
     """Import sources from CSV, OPML/XML, or a plain list."""
     app_config = load_config(config)
     paths = ProjectPaths.from_config(app_config, project_root=_project_root(config))
-    bootstrap_catalog(paths.catalog_db)
     sources = import_sources_from_file(path, selected=selected)
+    if hosted or app_config.hosted.enabled:
+        if not sources:
+            typer.echo("Uploaded 0 hosted sources; queued 0 jobs.")
+            return
+        try:
+            result = _hosted_import_sources(
+                app_config=app_config,
+                paths=paths,
+                descriptors=[_library_source_import_descriptor(source, selected=selected) for source in sources],
+            )
+        except (HostedCliLoginError, HostedCliApiError) as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        imported = len(result.get("imported", []))
+        jobs = len(result.get("jobs", []))
+        typer.echo(f"Uploaded {imported} hosted source{'s' if imported != 1 else ''}; queued {jobs} job{'s' if jobs != 1 else ''}.")
+        return
+    bootstrap_catalog(paths.catalog_db)
     with connect_catalog(paths.catalog_db) as connection:
         for source in sources:
             upsert_library_source(connection, source, selected=selected)
@@ -4230,6 +4681,7 @@ def import_youtube(
     port: int = typer.Option(0, "--port", min=0, max=65535, help="Local OAuth callback port. 0 chooses a free port."),
     open_browser: bool = typer.Option(True, "--open-browser/--print-url", help="Open the OAuth URL in a browser."),
     selected: bool = typer.Option(True, "--selected/--unselected", help="Include imported channels in default sync runs."),
+    hosted: bool = typer.Option(False, "--hosted", help="Upload imported public sources to hosted Yutome instead of local SQLite."),
 ) -> None:
     """Import YouTube subscriptions from the signed-in user or a public channel."""
     project_root = _project_root(config)
@@ -4252,6 +4704,26 @@ def import_youtube(
     except YouTubeImportError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
+    if hosted:
+        try:
+            result = _hosted_import_sources(
+                app_config=app_config,
+                paths=paths,
+                descriptors=[_channel_import_descriptor(channel, selected=selected) for channel in channels],
+            )
+        except (HostedCliLoginError, HostedCliApiError) as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        imported = len(result.get("imported", []))
+        source = channels[0].import_source if channels else "youtube"
+        jobs = len(result.get("jobs", []))
+        policies = len(result.get("refresh_policies", []))
+        typer.echo(
+            f"Uploaded {imported} YouTube subscription channel{'s' if imported != 1 else ''} "
+            f"from {source} to hosted Yutome ({jobs} video job{'s' if jobs != 1 else ''}, "
+            f"{policies} refresh polic{'ies' if policies != 1 else 'y'})."
+        )
+        return
     imported = _save_imported_channels(paths, channels, selected=selected)
     source = channels[0].import_source if channels else "youtube"
     typer.echo(
