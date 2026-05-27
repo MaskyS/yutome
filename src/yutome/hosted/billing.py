@@ -686,6 +686,15 @@ def derive_workspace_balance_snapshot(
     used = normalize_unit_map(used_units or {})
     reserved = normalize_unit_map(reserved_units or {})
     available = add_unit_maps(opening, credits)
+    # The balance tracks only PROVISIONED units — those the plan includes, credits
+    # top up, or marks unlimited. Providers report far more (latency_ms,
+    # candidate_tokens, vector dimensions, request byte sizes, …); that usage stays
+    # in the usage ledger, but must not enter the balance, or each un-provisioned
+    # unit becomes a phantom quota that immediately goes negative.
+    tracked_units = set(available) | set(unlimited_units)
+    untracked_units = sorted((set(used) | set(reserved)) - tracked_units)
+    used = {unit: quantity for unit, quantity in used.items() if unit in tracked_units}
+    reserved = {unit: quantity for unit, quantity in reserved.items() if unit in tracked_units}
     net_remaining = {
         unit: quantity
         for unit, quantity in add_unit_maps(available, _negated_units(used), _negated_units(reserved)).items()
@@ -701,6 +710,9 @@ def derive_workspace_balance_snapshot(
     snapshot_metadata["remaining_units_clamped"] = bool(overdrawn)
     snapshot_metadata["net_remaining_units"] = net_remaining
     snapshot_metadata["overdrawn_units"] = overdrawn
+    # Units reported by providers but not provisioned by the plan: kept out of the
+    # balance, recorded here (and in the usage ledger) for cost visibility.
+    snapshot_metadata["untracked_units"] = untracked_units
     return WorkspaceBalanceSnapshot(
         workspace_id=workspace_id,
         entitlement_policy_id=entitlement_policy_id,

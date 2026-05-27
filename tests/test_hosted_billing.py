@@ -403,6 +403,30 @@ def test_workspace_balance_derives_from_starting_units_credits_usage_and_reserva
     }
 
 
+def test_workspace_balance_excludes_unprovisioned_telemetry_units() -> None:
+    snapshot = derive_workspace_balance_snapshot(
+        workspace_id="ws_alice",
+        entitlement_policy_id="policy_pro",
+        period_start_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        period_end_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        starting_units={"queries": 10_000, "total_tokens": 250_000},
+        # Providers report telemetry units the plan does not provision; they must
+        # not enter the balance.
+        used_units={"queries": 1_240, "total_tokens": 60_000, "latency_ms": 999, "candidate_tokens": 5_000},
+        reserved_units={"queries": 10, "query_vector_dimensions": 2_048_000},
+    )
+
+    assert set(snapshot.used_units) == {"queries", "total_tokens"}
+    assert set(snapshot.reserved_units) == {"queries"}
+    # Remaining covers only provisioned units; no phantom negative telemetry lines.
+    assert snapshot.remaining_units == {"queries": 8_750, "total_tokens": 190_000}
+    assert "latency_ms" not in snapshot.remaining_units
+    assert "candidate_tokens" not in snapshot.remaining_units
+    assert "query_vector_dimensions" not in snapshot.remaining_units
+    # Untracked usage is recorded (also in the usage ledger), not silently dropped.
+    assert snapshot.metadata["untracked_units"] == ["candidate_tokens", "latency_ms", "query_vector_dimensions"]
+
+
 def test_workspace_balance_overdraw_clamps_remaining_and_records_deficit() -> None:
     snapshot = derive_workspace_balance_snapshot(
         workspace_id="ws_alice",
