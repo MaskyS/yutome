@@ -51,7 +51,11 @@ from yutome.hosted.account_read import (
 )
 from yutome.hosted.control_plane import Source, SourceRefreshPolicy
 from yutome.hosted.ids import input_hash
-from yutome.hosted.indexing import enqueue_index_video_job_sql, source_from_public_youtube_input
+from yutome.hosted.indexing import (
+    enqueue_discover_source_job_sql,
+    enqueue_index_video_job_sql,
+    source_from_public_youtube_input,
+)
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpError, HostedMcpQueryAdapter
 from yutome.hosted.repositories import SqlStatement
 from yutome.hosted.runtime import upsert_hosted_source_sql, upsert_source_refresh_policy_sql
@@ -162,6 +166,16 @@ class AccountCliApiContext(BaseModel):
     scopes: set[str] = Field(default_factory=set)
     client_id: str | None = None
     install_id: str | None = None
+
+
+class AccountSourceImportActor(BaseModel):
+    """Internal source-import actor derived from either account-session auth or
+    hosted CLI auth. This is Yutome auth, not a YouTube OAuth grant."""
+
+    workspace_id: str
+    user_id: str
+    seeded_by: str
+    cli_grant_id: str | None = None
 
 
 AuthDependency = Callable[..., HostedMcpAuthContext]
@@ -741,13 +755,7 @@ def build_app(
             "scopes": list(scopes),
         }
 
-    @app.post("/account/sources/import")
-    def account_sources_import(
-        request: AccountSourcesImportRequest,
-        context: AccountCliApiContext = Depends(cli_auth_dependency),
-    ) -> dict[str, Any]:
-        _require_cli_scope(context, CLI_SOURCE_WRITE_SCOPE)
-        _require_cli_scope(context, CLI_JOB_WRITE_SCOPE)
+    def source_import_response(request: AccountSourcesImportRequest, actor: AccountSourceImportActor) -> dict[str, Any]:
         if not request.sources:
             raise _http_error(HostedMcpError(code="source_import_empty", message="At least one source is required.", status_code=400))
         if len(request.sources) > 250:
@@ -763,7 +771,7 @@ def build_app(
             _execute_source_import(
                 billing_connection,
                 request=request,
-                context=context,
+                actor=actor,
                 now=now,
                 imported=imported,
                 jobs=jobs,
@@ -774,7 +782,7 @@ def build_app(
                 _execute_source_import(
                     billing_connection,
                     request=request,
-                    context=context,
+                    actor=actor,
                     now=now,
                     imported=imported,
                     jobs=jobs,
@@ -782,11 +790,52 @@ def build_app(
                 )
         return {
             "ok": True,
-            "workspace_id": context.workspace_id,
+            "workspace_id": actor.workspace_id,
             "imported": imported,
             "jobs": jobs,
             "refresh_policies": policies,
         }
+
+    @app.post("/account/sources")
+    def account_sources_create(
+        request: AccountSourcesImportRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        return source_import_response(
+            request,
+            AccountSourceImportActor(
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                seeded_by="dashboard",
+            ),
+        )
+
+    @app.post("/account/sources/import")
+    def account_sources_import(
+        request: AccountSourcesImportRequest,
+        context: AccountCliApiContext = Depends(cli_auth_dependency),
+    ) -> dict[str, Any]:
+        _require_cli_scope(context, CLI_SOURCE_WRITE_SCOPE)
+        _require_cli_scope(context, CLI_JOB_WRITE_SCOPE)
+        return source_import_response(
+            request,
+            AccountSourceImportActor(
+                workspace_id=context.workspace_id,
+                user_id=context.user_id,
+                seeded_by="hosted_cli",
+                cli_grant_id=context.grant_id,
+            ),
+        )
+
+    @app.get("/account/source-jobs")
+    def account_source_jobs(
+        limit: int = 25,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, 100))
+        statement = _account_jobs_sql(workspace_id=context.workspace_id, limit=limit)
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        return {"ok": True, "workspace_id": context.workspace_id, "jobs": [_job_row_json(row) for row in rows]}
 
     @app.get("/account/jobs")
     def account_jobs(
@@ -981,7 +1030,7 @@ def _execute_source_import(
     connection: Any,
     *,
     request: AccountSourcesImportRequest,
-    context: AccountCliApiContext,
+    actor: AccountSourceImportActor,
     now: datetime,
     imported: list[dict[str, Any]],
     jobs: list[dict[str, Any]],
@@ -997,7 +1046,7 @@ def _execute_source_import(
                     status_code=400,
                 )
             )
-        source = _source_from_import_descriptor(workspace_id=context.workspace_id, descriptor=descriptor)
+        source = _source_from_import_descriptor(workspace_id=actor.workspace_id, descriptor=descriptor)
         if provider_credentials_in_source(source):
             raise _http_error(
                 HostedMcpError(
@@ -1020,13 +1069,16 @@ def _execute_source_import(
             }
         )
         if source.canonical_video_id:
+            metadata = {"seeded_by": actor.seeded_by, "user_id": actor.user_id}
+            if actor.cli_grant_id:
+                metadata["cli_grant_id"] = actor.cli_grant_id
             job_statement = enqueue_index_video_job_sql(
-                workspace_id=context.workspace_id,
+                workspace_id=actor.workspace_id,
                 source_id=source.id,
                 video_id=source.canonical_video_id,
                 priority=100,
                 now=now,
-                metadata={"seeded_by": "hosted_cli", "cli_grant_id": context.grant_id},
+                metadata=metadata,
             )
             job_rows = _rows_from_result(connection.execute(job_statement.sql, job_statement.params))
             job_row = job_rows[0] if job_rows else {}
@@ -1040,10 +1092,10 @@ def _execute_source_import(
                 }
             )
             continue
-        policy_id = f"srp_{input_hash({'workspace_id': context.workspace_id, 'source_id': source.id}, prefix='').lstrip('_')[:24]}"
+        policy_id = f"srp_{input_hash({'workspace_id': actor.workspace_id, 'source_id': source.id}, prefix='').lstrip('_')[:24]}"
         policy = SourceRefreshPolicy(
             id=policy_id,
-            workspace_id=context.workspace_id,
+            workspace_id=actor.workspace_id,
             source_id=source.id,
             enabled=request.refresh_enabled,
             cadence_seconds=request.cadence_seconds,
@@ -1059,6 +1111,34 @@ def _execute_source_import(
                 "source_id": source.id,
                 "enabled": bool(policy_row.get("enabled") if "enabled" in policy_row else policy.enabled),
                 "cadence_seconds": int(policy_row.get("cadence_seconds") or policy.cadence_seconds),
+            }
+        )
+        job_metadata = {
+            "seeded_by": actor.seeded_by,
+            "user_id": actor.user_id,
+            "source_type": source.source_type,
+        }
+        if actor.cli_grant_id:
+            job_metadata["cli_grant_id"] = actor.cli_grant_id
+        discover_statement = enqueue_discover_source_job_sql(
+            workspace_id=actor.workspace_id,
+            source_id=source.id,
+            priority=100,
+            now=now,
+            policy_id=policy.id,
+            max_new_videos_per_run=request.max_new_videos,
+            trigger="source_import",
+            metadata=job_metadata,
+        )
+        discover_rows = _rows_from_result(connection.execute(discover_statement.sql, discover_statement.params))
+        discover_row = discover_rows[0] if discover_rows else {}
+        jobs.append(
+            {
+                "job_id": str(discover_row.get("id") or discover_statement.params["id"]),
+                "job_type": str(discover_row.get("job_type") or "discover_source"),
+                "status": str(discover_row.get("status") or "queued"),
+                "source_id": source.id,
+                "youtube_video_id": None,
             }
         )
 

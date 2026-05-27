@@ -2237,6 +2237,71 @@ def enqueue_index_video_job_sql(
     return _sql_statement(statement)
 
 
+def enqueue_discover_source_job_sql(
+    *,
+    workspace_id: str,
+    source_id: str,
+    priority: int,
+    now: Any,
+    policy_id: str | None = None,
+    max_new_videos_per_run: int | None = None,
+    trigger: str = "manual_source_import",
+    metadata: Mapping[str, Any] | None = None,
+) -> SqlStatement:
+    request_bucket = _job_request_bucket(now)
+    idempotency_payload = {
+        "workspace_id": workspace_id,
+        "source_id": source_id,
+        "job_type": "discover_source",
+        "trigger": trigger,
+        "request_bucket": request_bucket,
+    }
+    job_hash = input_hash(idempotency_payload, prefix="").lstrip("_")[:24]
+    idempotency = job_operation_idempotency_key(
+        workspace_id=workspace_id,
+        operation="jobs.discover_source",
+        input_hash_value=input_hash(idempotency_payload),
+        source_id=source_id,
+        extras=(trigger, request_bucket),
+    )
+    metadata_payload = {
+        "source_refresh_policy_id": policy_id,
+        "max_new_videos_per_run": max_new_videos_per_run,
+        "trigger": trigger,
+        **dict(metadata or {}),
+    }
+    statement = insert(jobs).values(
+        id=f"job_{job_hash}",
+        workspace_id=workspace_id,
+        source_id=source_id,
+        job_type="discover_source",
+        status="queued",
+        priority=priority,
+        idempotency_key=idempotency,
+        run_after=now,
+        executor_kind="railway",
+        executor_ref="source_discovery",
+        metadata_json=_json_param(metadata_payload),
+        created_at=now,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[jobs.c.workspace_id, jobs.c.idempotency_key],
+        set_={
+            "source_id": statement.excluded.source_id,
+            "status": case(
+                (
+                    jobs.c.status.in_(("denied", "failed", "succeeded", "cancelled")),
+                    jobs.c.status,
+                ),
+                else_=literal_column("'queued'"),
+            ),
+            "priority": func.least(jobs.c.priority, statement.excluded.priority),
+            "metadata_json": jobs.c.metadata_json.op("||")(statement.excluded.metadata_json),
+        },
+    ).returning(jobs)
+    return _sql_statement(statement)
+
+
 def finish_source_discovery_sql(
     *,
     workspace_id: str,
@@ -2513,6 +2578,16 @@ def _real_index_profile_extras(workspace_id: str) -> tuple[str, str]:
     return (profile.id, _index_profile_fingerprint(profile))
 
 
+def _job_request_bucket(now: Any) -> str:
+    try:
+        bucketed = now.replace(second=0, microsecond=0)
+    except (AttributeError, TypeError, ValueError):
+        return str(now)
+    if hasattr(bucketed, "isoformat"):
+        return bucketed.isoformat()
+    return str(bucketed)
+
+
 def _workspace_index_profile_id(workspace_id: str, profile: IndexProfileInput) -> str:
     return _stable_id(
         "sip",
@@ -2769,6 +2844,7 @@ __all__ = [
     "REAL_HOSTED_CHUNKING_VERSION",
     "TranscriptChunkInput",
     "extract_public_youtube_video_id",
+    "enqueue_discover_source_job_sql",
     "enqueue_index_video_job_sql",
     "finish_source_discovery_sql",
     "complete_job_operation_success_sql",

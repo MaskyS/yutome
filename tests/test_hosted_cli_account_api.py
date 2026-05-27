@@ -113,11 +113,14 @@ class StatefulAccountConnection:
             self.policies[row["id"]] = row
             return [dict(row)]
         if statement.startswith("INSERT INTO jobs"):
+            job_type = params.get("job_type")
+            if not job_type:
+                job_type = "discover_source" if "discover_source" in statement else "index_video"
             row = {
                 "id": params["id"],
                 "workspace_id": params["workspace_id"],
                 "source_id": params["source_id"],
-                "job_type": "index_video",
+                "job_type": job_type,
                 "status": "queued",
                 "priority": params["priority"],
                 "created_at": params["created_at"],
@@ -214,14 +217,78 @@ def test_cli_authorize_token_import_and_jobs_derive_workspace() -> None:
     body = response.json()
     assert body["workspace_id"] == "ws_cli"
     assert len(body["imported"]) == 2
-    assert body["jobs"][0]["job_type"] == "index_video"
+    assert {job["job_type"] for job in body["jobs"]} == {"index_video", "discover_source"}
     assert len(body["refresh_policies"]) == 1
     assert {row["workspace_id"] for row in connection.sources.values()} == {"ws_cli"}
     assert {row["workspace_id"] for row in connection.jobs.values()} == {"ws_cli"}
 
     jobs = client.get("/account/jobs", headers={"Authorization": f"Bearer {token['access_token']}"})
     assert jobs.status_code == 200, jobs.text
-    assert jobs.json()["jobs"][0]["job_type"] == "index_video"
+    assert {job["job_type"] for job in jobs.json()["jobs"]} == {"index_video", "discover_source"}
+
+
+def test_dashboard_source_import_derives_workspace_and_enqueues_jobs() -> None:
+    connection = StatefulAccountConnection()
+    client = build_client(connection)
+
+    response = client.post(
+        "/account/sources",
+        json={
+            "sources": [
+                {
+                    "source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+                    "workspace_id": "ws_evil",
+                    "display_name": "Manual video",
+                    "import_source": "manual_url",
+                },
+                {
+                    "source_url": "https://www.youtube.com/playlist?list=PLBCF2DAC6FFB574DE",
+                    "playlist_id": "PLBCF2DAC6FFB574DE",
+                    "display_name": "Manual playlist",
+                },
+            ],
+            "refresh_enabled": True,
+            "cadence_seconds": 900,
+            "max_new_videos": 25,
+        },
+        headers=account_headers(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["workspace_id"] == "ws_cli"
+    assert len(body["imported"]) == 2
+    assert {job["job_type"] for job in body["jobs"]} == {"index_video", "discover_source"}
+    assert len(body["refresh_policies"]) == 1
+    assert {row["workspace_id"] for row in connection.sources.values()} == {"ws_cli"}
+    assert {row["workspace_id"] for row in connection.jobs.values()} == {"ws_cli"}
+    dashboard_jobs = [row for row in connection.jobs.values() if row["metadata_json"].get("seeded_by") == "dashboard"]
+    assert {row["job_type"] for row in dashboard_jobs} == {"index_video", "discover_source"}
+
+    jobs = client.get("/account/source-jobs", headers=account_headers())
+    assert jobs.status_code == 200, jobs.text
+    assert jobs.json()["workspace_id"] == "ws_cli"
+    assert {job["job_type"] for job in jobs.json()["jobs"]} == {"index_video", "discover_source"}
+
+
+def test_dashboard_source_import_requires_account_session_and_dashboard_token() -> None:
+    client = build_client(StatefulAccountConnection())
+
+    missing_session = client.post(
+        "/account/sources",
+        json={"sources": [{"source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs"}]},
+        headers={"Authorization": f"Bearer {DASHBOARD_TOKEN}"},
+    )
+    assert missing_session.status_code == 401
+    assert error_body(missing_session.json())["code"] == "account_session_required"
+
+    wrong_token = client.post(
+        "/account/sources",
+        json={"sources": [{"source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs"}]},
+        headers={"Authorization": f"Bearer {MCP_TOKEN}", ACCOUNT_SESSION_TOKEN_HEADER: mint_session()},
+    )
+    assert wrong_token.status_code == 401
+    assert error_body(wrong_token.json())["code"] == "api_token_invalid"
 
 
 def test_cli_token_exchange_rejects_replay_wrong_verifier_and_expiry() -> None:
@@ -319,3 +386,18 @@ def test_source_import_rejects_credential_like_fields() -> None:
     assert response.status_code == 400
     assert error_body(response.json())["code"] == "source_import_credentials_rejected"
 
+    dashboard_response = client.post(
+        "/account/sources",
+        json={
+            "sources": [
+                {
+                    "source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+                    "metadata": {"refresh_token": "secret"},
+                }
+            ]
+        },
+        headers=account_headers(),
+    )
+
+    assert dashboard_response.status_code == 400
+    assert error_body(dashboard_response.json())["code"] == "source_import_credentials_rejected"

@@ -130,6 +130,27 @@ async function authedGet(env: YutomeWebEnv, sessionToken: string, path: string):
   return json;
 }
 
+async function authedPost(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(env, path), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
+      "x-yutome-account-session": sessionToken,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await parseJson(response);
+  if (!response.ok || json.ok === false) throw toError(response.status, json);
+  return json;
+}
+
 export interface WorkspaceUnit {
   unit: string;
   included: number | string | null;
@@ -172,6 +193,57 @@ export interface ConnectedAssistant {
   expires_at: string | null;
 }
 
+export interface SourceImportDescriptor {
+  source_url?: string;
+  url?: string;
+  value?: string;
+  source_type?: string;
+  display_name?: string;
+  title?: string;
+  channel_id?: string;
+  playlist_id?: string;
+  video_id?: string;
+  import_source?: string;
+  selected?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SourceImportResult {
+  ok: true;
+  workspace_id: string;
+  imported: Array<{
+    source_id: string;
+    source_type: string;
+    source_url: string;
+    canonical_video_id: string | null;
+    canonical_channel_id: string | null;
+    canonical_playlist_id: string | null;
+  }>;
+  jobs: SourceJob[];
+  refresh_policies: Array<{
+    refresh_policy_id: string;
+    source_id: string;
+    enabled: boolean;
+    cadence_seconds: number;
+  }>;
+}
+
+export interface SourceJob {
+  job_id: string;
+  workspace_id?: string;
+  source_id: string | null;
+  job_type: string;
+  status: string;
+  priority: number | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  cancelled_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  metadata: Record<string, unknown>;
+}
+
 export function getSummary(env: YutomeWebEnv, sessionToken: string): Promise<WorkspaceSummary> {
   return authedGet(env, sessionToken, "/account/summary") as unknown as Promise<WorkspaceSummary>;
 }
@@ -183,4 +255,26 @@ export function getLibrary(env: YutomeWebEnv, sessionToken: string): Promise<Lib
 export async function getAssistants(env: YutomeWebEnv, sessionToken: string): Promise<ConnectedAssistant[]> {
   const json = await authedGet(env, sessionToken, "/account/assistants");
   return Array.isArray(json.assistants) ? (json.assistants as ConnectedAssistant[]) : [];
+}
+
+export function createSources(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  body: {
+    sources: SourceImportDescriptor[];
+    cadence_seconds?: number;
+    max_new_videos?: number;
+    refresh_enabled?: boolean;
+  },
+): Promise<SourceImportResult> {
+  return authedPost(env, sessionToken, "/account/sources", body) as unknown as Promise<SourceImportResult>;
+}
+
+export async function getSourceJobs(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  limit = 25,
+): Promise<SourceJob[]> {
+  const json = await authedGet(env, sessionToken, `/account/source-jobs?limit=${encodeURIComponent(String(limit))}`);
+  return Array.isArray(json.jobs) ? (json.jobs as SourceJob[]) : [];
 }
