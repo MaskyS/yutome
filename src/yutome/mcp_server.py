@@ -3,6 +3,7 @@
 Tool/resource definitions come from :mod:`yutome.contract`; this module wires
 the registry into a FastMCP server.
 """
+
 from __future__ import annotations
 
 import base64
@@ -37,11 +38,7 @@ def _server_icons() -> list[Any]:
     icons: list[Icon] = []
     for size in _ICON_SIZES_PX:
         try:
-            data = (
-                resources.files("yutome")
-                .joinpath(f"assets/yutome-icon-{size}.png")
-                .read_bytes()
-            )
+            data = resources.files("yutome").joinpath(f"assets/yutome-icon-{size}.png").read_bytes()
         except (FileNotFoundError, ModuleNotFoundError):
             continue
         encoded = base64.b64encode(data).decode("ascii")
@@ -122,6 +119,8 @@ def build_server(
         annotations = ToolAnnotations(
             title=tool.title,
             readOnlyHint=tool.read_only,
+            destructiveHint=tool.destructive,
+            idempotentHint=tool.idempotent,
             openWorldHint=tool.open_world,
         )
         server.tool(
@@ -183,9 +182,7 @@ def run_streamable_http_server(
     configure(config_path)
     token = os.environ.get(REMOTE_TOKEN_ENV_VAR)
     if require_token_for_non_loopback and not _is_loopback_host(host) and not token:
-        raise RuntimeError(
-            f"{REMOTE_TOKEN_ENV_VAR} is required when binding remote MCP to non-loopback host {host!r}"
-        )
+        raise RuntimeError(f"{REMOTE_TOKEN_ENV_VAR} is required when binding remote MCP to non-loopback host {host!r}")
     server = build_server(
         host=host,
         port=port,

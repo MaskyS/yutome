@@ -48,7 +48,13 @@ interface ToolEntry {
   title: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  annotations: { title: string; readOnlyHint: boolean; openWorldHint: boolean };
+  annotations: {
+    title: string;
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
 }
 
 interface ResourceTemplateEntry {

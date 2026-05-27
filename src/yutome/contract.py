@@ -6,6 +6,7 @@ Handler functions carry the Python signatures that FastMCP introspects to
 derive JSON Schema; the Worker JSON export serializes the same set with
 hand-curated metadata for the TypeScript runtime.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ from yutome import runtime
 
 
 AUTH_SCOPE = "yutome.search.read"
+SOURCE_WRITE_SCOPE = "yutome.source.write"
+JOB_WRITE_SCOPE = "yutome.job.write"
+DEFAULT_MCP_SCOPES = (AUTH_SCOPE, SOURCE_WRITE_SCOPE, JOB_WRITE_SCOPE)
 
 
 # Sent as the MCP server `instructions` field at initialize. This is the
@@ -30,7 +34,10 @@ SERVER_INSTRUCTIONS = (
     "Use `find` for topic/phrase/citation search inside transcripts, `list` for "
     "newest videos and channel/library browsing, `show` for citation/timestamp "
     "expansion (chunk, video, channel, transcript, context, source), and `q` only "
-    "for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each "
+    "for advanced raw QueryRequest JSON. Use `index` only after the user explicitly "
+    "asks to add or index a public YouTube video, channel, playlist, or handle; do "
+    "not index private, OAuth-only, or credential-bearing sources. Use `jobs` to "
+    "check recent indexing status after enqueueing. Citations come from `youtube_url` on each "
     "hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, "
     "yutome://channel/{id}, and yutome://transcript/{id} let the host expand "
     "citations without another tool call. For long-video chaptering, page through "
@@ -50,6 +57,8 @@ class ToolSpec:
     description: str
     handler: Callable[..., dict[str, Any]]
     read_only: bool = True
+    destructive: bool = False
+    idempotent: bool = True
     open_world: bool = False
 
 
@@ -178,6 +187,54 @@ def tool_q(request: dict[str, Any]) -> dict[str, Any]:
     return api_q(config=rt.config, paths=rt.paths, request=request).model_dump()
 
 
+def tool_index(
+    source: str,
+    refresh_enabled: bool = True,
+    max_new_videos: int = 25,
+    cadence_seconds: int = 900,
+) -> dict[str, Any]:
+    """Use this only after the user explicitly asks to index a public YouTube
+    video, channel, playlist, or handle into their Yutome hosted workspace."""
+    from yutome.hosted.runtime import HostedCommandRunner
+    from yutome.hosted.source_import import (
+        HostedSourceImportActor,
+        HostedSourceImportDescriptor,
+        HostedSourcesImportRequest,
+        import_sources,
+    )
+
+    rt = runtime.current()
+    workspace_id = rt.config.hosted.workspace_id.strip()
+    if not workspace_id:
+        raise RuntimeError("Set [hosted].workspace_id before using the Yutome MCP index tool.")
+    request = HostedSourcesImportRequest(
+        sources=[HostedSourceImportDescriptor(source_url=source)],
+        refresh_enabled=refresh_enabled,
+        max_new_videos=max(1, min(max_new_videos, 250)),
+        cadence_seconds=max(1, min(cadence_seconds, 86_400)),
+    )
+    actor = HostedSourceImportActor(workspace_id=workspace_id, seeded_by="local_mcp")
+    return import_sources(HostedCommandRunner(rt.config).connect(), request=request, actor=actor)
+
+
+def tool_jobs(limit: int = 10, source_id: str | None = None) -> dict[str, Any]:
+    """Use this to inspect recent hosted indexing jobs after source import or
+    when the user asks about indexing progress."""
+    from yutome.hosted.runtime import HostedCommandRunner
+    from yutome.hosted.source_import import list_source_jobs
+
+    rt = runtime.current()
+    workspace_id = rt.config.hosted.workspace_id.strip()
+    if not workspace_id:
+        raise RuntimeError("Set [hosted].workspace_id before using the Yutome MCP jobs tool.")
+    return list_source_jobs(
+        HostedCommandRunner(rt.config).connect(),
+        workspace_id=workspace_id,
+        limit=max(1, min(limit, 100)),
+        source_id=source_id,
+    )
+
+
 # ---------- Resource handlers (URI-template params arrive as kwargs) ----------
 
 
@@ -261,6 +318,32 @@ TOOLS: tuple[ToolSpec, ...] = (
             "including long videos that need chaptering."
         ),
         handler=tool_show,
+    ),
+    ToolSpec(
+        name="index",
+        title="Index a public YouTube source",
+        description=(
+            "Use this only after the user explicitly asks to add or index a public "
+            "YouTube video, channel, playlist, or handle into their Yutome library. "
+            "Single videos enqueue `index_video`; channels, playlists, and handles "
+            "enqueue `discover_source` with a refresh policy. Do not pass tenant "
+            "identity, tokens, cookies, API keys, private subscriptions, or other "
+            "credentials."
+        ),
+        handler=tool_index,
+        read_only=False,
+        destructive=False,
+        idempotent=True,
+        open_world=True,
+    ),
+    ToolSpec(
+        name="jobs",
+        title="Check indexing jobs",
+        description=(
+            "Use this to inspect recent Yutome indexing job status, especially after "
+            "`index` enqueues a video, channel, playlist, or handle."
+        ),
+        handler=tool_jobs,
     ),
     ToolSpec(
         name="q",

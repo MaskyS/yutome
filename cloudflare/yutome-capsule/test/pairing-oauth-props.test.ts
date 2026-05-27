@@ -14,6 +14,7 @@ import {
   revokeHostedAccountGrant,
   resolveActiveHostedAccountGrantFromProps,
   resolveHostedMcpAuthContextFromStoredGrant,
+  YUTOME_MCP_DEFAULT_SCOPES,
 } from "../src/account-grants.ts";
 import { HostedMcpApiClient, resolveHostedMcpAuthContext } from "../src/tenant-routing.ts";
 
@@ -90,7 +91,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     user_id: "user_alice",
     client_id: "client-1",
     session_id: "acct_session_alice",
-    scopes: ["yutome.search.read"],
+    scopes: YUTOME_MCP_DEFAULT_SCOPES,
     audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     paired_at: authorization.props.paired_at,
@@ -109,7 +110,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     user_id: "user_alice",
     client_id: "client-1",
     session_id: "acct_session_alice",
-    scopes: ["yutome.search.read"],
+    scopes: YUTOME_MCP_DEFAULT_SCOPES,
     audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     paired_at: authorization.props.paired_at,
@@ -118,7 +119,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
 
   assert.deepEqual(resolveHostedMcpAuthContext(authorization.props, { requiredScope: "yutome.search.read" }), {
     workspace_id: "ws_alice",
-    scopes: ["yutome.search.read"],
+    scopes: YUTOME_MCP_DEFAULT_SCOPES,
     user_id: "user_alice",
     grant_id: grantId,
     client_id: "client-1",
@@ -135,7 +136,7 @@ test("OAuth props carry hosted tenant ids without provider credentials", async (
     user_id: "user_alice",
     workspace_id: "ws_alice",
     client_id: "client-1",
-    scopes: ["yutome.search.read"],
+    scopes: YUTOME_MCP_DEFAULT_SCOPES,
     audience: "https://mcp.getyutome.com/mcp",
     token_version: "v2",
     status: "active",
@@ -356,7 +357,7 @@ test("hosted account grant resolver rejects expired stored grants and accepts fu
   const active = await resolveActiveHostedAccountGrantFromProps(env, {
     workspace_id: "ws_alice",
     grant_id: activeGrantId,
-    scopes: ["yutome.search.read"],
+    scopes: YUTOME_MCP_DEFAULT_SCOPES,
   });
   assert.equal(active.grant_id, activeGrantId);
   assert.equal(active.status, "active");
@@ -431,6 +432,21 @@ test("hosted grant auth rejects token prop mismatches before hosted routing", as
   assert.match((caught as Error).message, /audience/);
   assert.match((caught as Error).message, /token_version/);
   assert.equal(routed, false);
+});
+
+test("old read-only MCP props fail clearly when a write scope is required", () => {
+  assert.throws(
+    () =>
+      resolveHostedMcpAuthContext(
+        { workspace_id: "ws_alice", scopes: ["yutome.search.read"] },
+        { requiredScope: "yutome.source.write" },
+      ),
+    (err: unknown) => {
+      assert.equal((err as { code?: unknown }).code, "insufficient_scope");
+      assert.match((err as Error).message, /yutome\.source\.write/);
+      return true;
+    },
+  );
 });
 
 test("hosted grant auth derives routing from stored grant when token only identifies the grant", async () => {
@@ -895,11 +911,11 @@ test("OAuth metadata advertises canonical MCP resource, scope, DCR, S256 PKCE, a
   assert.match(source, /tokenEndpoint:\s*"\/token"/);
   assert.match(source, /clientRegistrationEndpoint:\s*"\/register"/);
   assert.match(source, /allowPlainPKCE:\s*false/);
-  assert.match(source, /scopesSupported:\s*\[YUTOME_MCP_SCOPE\]/);
+  assert.match(source, /scopesSupported:\s*YUTOME_MCP_DEFAULT_SCOPES/);
   assert.match(source, /resourceMetadata:\s*{/);
   assert.match(source, /resource:\s*DEFAULT_MCP_AUDIENCE/);
   assert.match(source, /authorization_servers:\s*\[defaultAuthorizationServer\]/);
-  assert.match(source, /scopes_supported:\s*\[YUTOME_MCP_SCOPE\]/);
+  assert.match(source, /scopes_supported:\s*YUTOME_MCP_DEFAULT_SCOPES/);
   assert.match(source, /bearer_methods_supported:\s*\["header"\]/);
   assert.match(source, /resource_name:\s*"Yutome MCP"/);
   assert.match(source, /url\.pathname === "\/revoke"/);

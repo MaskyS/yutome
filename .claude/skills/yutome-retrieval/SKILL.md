@@ -7,17 +7,19 @@ description: Use whenever the user asks a question that should be answered from 
 
 `yutome` is a local-first YouTube knowledge base over channels the user chose to index. The corpus is whatever they have indexed — never assume topics or specific channels. Call `list(entity="channels")` and `list(entity="status")` first when scope is unclear.
 
-## Local Claude Code indexing
+## Indexing sources
 
-If the user gives a YouTube channel/video URL and asks to add it, index it, or answer from it in a local Claude Code repo session, use the CLI. The MCP server is read-only and exposes retrieval tools only.
+If the user gives a public YouTube channel, video, playlist, or handle and explicitly asks to add it, index it, or answer from it, use the best available write path.
 
-1. Register the source: `uv run yutome corpus add SOURCE`.
-2. Ingest/index it: `uv run yutome corpus sync SOURCE`.
-3. Query with `uv run yutome search find "question terms" --limit 10 --json`.
-4. Expand only the promising hits with `uv run yutome search show context CHUNK_ID --token-budget 2000`.
-5. Answer with timestamped `youtube_url` citations.
+- Hosted MCP: call `index(source=SOURCE)` only after that explicit request. Then call `jobs(limit=10)` if the user asks about progress or you need to confirm enqueue status. Do not pass workspace/user/client/session ids, OAuth tokens, cookies, API keys, private subscriptions, or other credentials.
+- Local Claude Code with shell access: use the CLI when MCP write access is unavailable.
+  1. Register the source: `uv run yutome corpus add SOURCE`.
+  2. Ingest/index it: `uv run yutome corpus sync SOURCE`.
+  3. Query with `uv run yutome search find "question terms" --limit 10 --json`.
+  4. Expand only the promising hits with `uv run yutome search show context CHUNK_ID --token-budget 2000`.
+  5. Answer with timestamped `youtube_url` citations.
 
-Use exact-video sync for old or specific episodes. `SOURCE` may be a YouTube channel URL, handle, channel id, video URL, Shorts URL, or raw video id. Playlist URLs are detected but may not be supported yet; report that clearly instead of guessing.
+Use exact-video sync for old or specific episodes. `SOURCE` may be a YouTube channel URL, handle, channel id, video URL, Shorts URL, playlist URL, or raw video id.
 
 If `sync` fails because a global `yt-dlp` executable is broken, stay inside the uv environment. Prefer `uv run yutome corpus sync SOURCE`; if diagnosing, check `uv run python -m yt_dlp --version` before relying on `yt-dlp` from the shell `PATH`.
 
@@ -164,7 +166,7 @@ Be honest about this in any answer where it matters.
 
 The same handlers are exposed over two transports — pick whichever is available:
 
-- **MCP tools**: `find`, `list`, `show`, `q`. Resources: `yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`.
+- **MCP tools**: `find`, `list`, `show`, `index`, `jobs`, `q`. Resources: `yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`.
 - **Local HTTP** (default `http://127.0.0.1:8765`): `POST /find`, `POST /list`, `POST /show`, `POST /q`, `GET /chunks/{id}`, `GET /videos/{id}`, `GET /channels/{id}`, `GET /transcripts/{id}`.
 
 Prefer MCP when registered in the current session; fall back to HTTP only if MCP tools aren't available.

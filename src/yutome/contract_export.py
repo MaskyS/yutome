@@ -6,6 +6,7 @@ with ``McpAgent`` from the same single source of truth used by the local
 Python adapters. The public CLI checks drift with ``yutome doctor contract``;
 deployment flows refresh the JSON internally when needed.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +36,8 @@ def build_contract_payload() -> dict[str, Any]:
             annotations = {
                 "title": spec.title,
                 "readOnlyHint": spec.read_only,
+                "destructiveHint": spec.destructive,
+                "idempotentHint": spec.idempotent,
                 "openWorldHint": spec.open_world,
             }
             result.append(

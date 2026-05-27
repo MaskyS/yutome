@@ -81,7 +81,15 @@ export class HostedAccountGrantError extends Error {
 }
 
 const ACCOUNT_GRANT_PREFIX = "yutome:account-grant:";
-export const YUTOME_MCP_SCOPE = "yutome.search.read";
+export const YUTOME_MCP_READ_SCOPE = "yutome.search.read";
+export const YUTOME_MCP_SOURCE_WRITE_SCOPE = "yutome.source.write";
+export const YUTOME_MCP_JOB_WRITE_SCOPE = "yutome.job.write";
+export const YUTOME_MCP_SCOPE = YUTOME_MCP_READ_SCOPE;
+export const YUTOME_MCP_DEFAULT_SCOPES = [
+  YUTOME_MCP_READ_SCOPE,
+  YUTOME_MCP_SOURCE_WRITE_SCOPE,
+  YUTOME_MCP_JOB_WRITE_SCOPE,
+];
 export const DEFAULT_MCP_AUDIENCE = "https://mcp.getyutome.com/mcp";
 export const DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth";
 export const DEFAULT_ACCOUNT_SESSION_MAX_AGE_SECONDS = 60 * 60;
@@ -912,7 +920,7 @@ function normalizeRequiredScopes(value: unknown): string[] {
       400,
     );
   }
-  return scopes;
+  return [...new Set([...scopes, ...YUTOME_MCP_DEFAULT_SCOPES])];
 }
 
 function normalizeScopes(value: unknown): string[] {
@@ -1003,7 +1011,7 @@ function revokeErrorHeaders(status: number, audience: string, error: string, des
       `Bearer realm="OAuth"`,
       `resource_metadata="${resourceMetadataUrl(audience)}"`,
       `error="${headerQuoted(error)}"`,
-      `scope="${YUTOME_MCP_SCOPE}"`,
+      `scope="${YUTOME_MCP_DEFAULT_SCOPES.join(" ")}"`,
     ];
     if (description) {
       parts.push(`error_description="${headerQuoted(description)}"`);

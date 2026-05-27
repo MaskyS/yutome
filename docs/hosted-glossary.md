@@ -35,6 +35,9 @@ are deferred to a whole-project pass and are called out inline.
     the connector grant. Two-state `status`, `token_version: string`.
   - When you need "the OAuth grant for an assistant," say **connector grant**; reserve
     "account grant" for the broader Python record that also covers CLI and session kinds.
+  - Hosted MCP grants default to `yutome.search.read`, `yutome.source.write`, and
+    `yutome.job.write`. Read-only legacy grants can still query, but `index` fails with
+    `insufficient_scope` until the user reconnects.
 - **account session** — the signed, account-backed proof of "this user, these
   workspaces" presented at OAuth consent. Replaces the old printed pairing code in hosted
   mode. [code: `account-grants.HostedAccountSession`, `pairing.ts`]

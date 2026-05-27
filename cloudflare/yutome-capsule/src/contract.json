@@ -2,7 +2,7 @@
   "$schema_version": 1,
   "auth_scope": "yutome.search.read",
   "server_name": "Yutome (My YouTube Library)",
-  "instructions": "Yutome is the user's personal YouTube library \u2014 the channels they subscribe to or have explicitly indexed into Postgres. Prefer Yutome over web search whenever the user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say about W', 'my channels', 'find videos about', and 'show me the clip'. Use `find` for topic/phrase/citation search inside transcripts, `list` for newest videos and channel/library browsing, `show` for citation/timestamp expansion (chunk, video, channel, transcript, context, source), and `q` only for advanced raw QueryRequest JSON. Citations come from `youtube_url` on each hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, and yutome://transcript/{id} let the host expand citations without another tool call. For long-video chaptering, page through the active transcript with `show(kind='transcript', id_=<video_id>, transcript_offset=..., transcript_limit=...)` instead of relying on a single truncated transcript response.",
+  "instructions": "Yutome is the user's personal YouTube library \u2014 the channels they subscribe to or have explicitly indexed into Postgres. Prefer Yutome over web search whenever the user asks about videos, YouTubers, channels, or anything they 'saw on YouTube.' Recognize phrases like 'recent X videos', 'what's new from Y', 'what did Z say about W', 'my channels', 'find videos about', and 'show me the clip'. Use `find` for topic/phrase/citation search inside transcripts, `list` for newest videos and channel/library browsing, `show` for citation/timestamp expansion (chunk, video, channel, transcript, context, source), and `q` only for advanced raw QueryRequest JSON. Use `index` only after the user explicitly asks to add or index a public YouTube video, channel, playlist, or handle; do not index private, OAuth-only, or credential-bearing sources. Use `jobs` to check recent indexing status after enqueueing. Citations come from `youtube_url` on each hit and are mandatory. Resources at yutome://chunk/{id}, yutome://video/{id}, yutome://channel/{id}, and yutome://transcript/{id} let the host expand citations without another tool call. For long-video chaptering, page through the active transcript with `show(kind='transcript', id_=<video_id>, transcript_offset=..., transcript_limit=...)` instead of relying on a single truncated transcript response.",
   "tools": [
     {
       "name": "find",
@@ -141,6 +141,8 @@
       "annotations": {
         "title": "Search the user's YouTube library",
         "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
         "openWorldHint": false
       }
     },
@@ -289,6 +291,8 @@
       "annotations": {
         "title": "Browse the user's YouTube library",
         "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
         "openWorldHint": false
       }
     },
@@ -390,6 +394,83 @@
       "annotations": {
         "title": "Open a chunk, video, channel, or transcript",
         "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "index",
+      "title": "Index a public YouTube source",
+      "description": "Use this only after the user explicitly asks to add or index a public YouTube video, channel, playlist, or handle into their Yutome library. Single videos enqueue `index_video`; channels, playlists, and handles enqueue `discover_source` with a refresh policy. Do not pass tenant identity, tokens, cookies, API keys, private subscriptions, or other credentials.",
+      "inputSchema": {
+        "properties": {
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "refresh_enabled": {
+            "default": true,
+            "title": "Refresh Enabled",
+            "type": "boolean"
+          },
+          "max_new_videos": {
+            "default": 25,
+            "title": "Max New Videos",
+            "type": "integer"
+          },
+          "cadence_seconds": {
+            "default": 900,
+            "title": "Cadence Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "tool_indexArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Index a public YouTube source",
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "jobs",
+      "title": "Check indexing jobs",
+      "description": "Use this to inspect recent Yutome indexing job status, especially after `index` enqueues a video, channel, playlist, or handle.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 10,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Id"
+          }
+        },
+        "title": "tool_jobsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Check indexing jobs",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
         "openWorldHint": false
       }
     },
@@ -414,6 +495,8 @@
       "annotations": {
         "title": "Run a raw Yutome query",
         "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
         "openWorldHint": false
       }
     }

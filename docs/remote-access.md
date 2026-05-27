@@ -1,6 +1,6 @@
 # Remote Access
 
-Remote access means authenticated read access to the same retrieval surface used by the CLI, local MCP server, and local HTTP API. It is intended for multiple devices, agents, and hosted clients that need to query an already-indexed corpus.
+Remote access means authenticated access to the same retrieval surface used by the CLI, local MCP server, and local HTTP API. In hosted mode, MCP can also enqueue source-indexing work when the user explicitly asks to add a public YouTube video, channel, playlist, or handle.
 
 There are now two remote surfaces:
 
@@ -41,7 +41,7 @@ Setup is account-level, not device-level. You should not need a new Yutome endpo
 
 Laptop on (bridge running):
 
-- Claude/ChatGPT can call `find`, `list`, `show`, and `q` through the Worker.
+- Claude/ChatGPT can call `find`, `list`, `show`, `index`, `jobs`, and `q` through the Worker.
 - Results come from the configured Postgres + VectorChord database and local artifacts via a long-lived WebSocket from the bridge to the Worker's Durable Object (Cloudflare WebSocket Hibernation).
 - Resources (`yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`) are reachable via `resources/read` — host UIs can render citations inline without burning a tool call.
 
@@ -166,7 +166,7 @@ uv run yutome serve remote mcp \
   --server-url https://yutome.example.com
 ```
 
-The MCP server exposes the same `find`, `list`, `show`, and `q` tools and `yutome://...` resources as the local stdio MCP server. It is a transport adapter over the same in-process API, not a second retrieval implementation.
+The MCP server exposes the same `find`, `list`, `show`, `index`, `jobs`, and `q` tools and `yutome://...` resources as the local stdio MCP server. It is a transport adapter over the same in-process API, not a second retrieval implementation.
 
 ## Local Claude / Agent Setup
 
@@ -185,12 +185,13 @@ For local Claude-style clients that read an MCP config, this repo includes `.mcp
 
 Use it from the repo root, or convert `yutome.toml` to an absolute path if the client launches from a different working directory. The local MCP server is stdio and does not need `YUTOME_HTTP_TOKEN`.
 
-The yutome retrieval skill lives at `.claude/skills/yutome-retrieval/SKILL.md`. It teaches agents to use `find`, `list`, `show`, and `q` with timestamped citations and full-transcript escalation. In Claude Code/local repo sessions it also teaches the indexing workflow: `uv run yutome corpus add SOURCE`, `uv run yutome corpus sync SOURCE`, then retrieve and cite.
+The yutome retrieval skill lives at `.claude/skills/yutome-retrieval/SKILL.md`. It teaches agents to use `find`, `list`, `show`, `index`, `jobs`, and `q` with timestamped citations and full-transcript escalation. In Claude Code/local repo sessions it also teaches the CLI indexing workflow: `uv run yutome corpus add SOURCE`, `uv run yutome corpus sync SOURCE`, then retrieve and cite.
 
 Keep the split clear:
 
-- MCP exposes capabilities. Yutome's current MCP surface is read-only retrieval.
-- The CLI owns local mutation and indexing until remote job queues exist.
+- MCP exposes capabilities. Retrieval tools remain read-only; `index` is the narrow hosted write tool for source import/job enqueue.
+- Hosted MCP exposes `index`/`jobs` for explicit public YouTube source indexing. Existing read-only connector grants will get `insufficient_scope` for `index` until the user reconnects.
+- The CLI still owns local batch/admin mutation and local corpus sync workflows.
 - Skills teach Claude Code workflow and failure recovery.
 - A Claude Code plugin can bundle both a skill and MCP config for distribution. Remote Claude.ai custom connectors only receive the remote MCP surface and its tool/server instructions; they do not automatically receive this project skill.
 
@@ -199,5 +200,5 @@ Before public hosted remote MCP:
 - Add user accounts or app-issued tokens.
 - Add corpus ownership/ACL checks.
 - Add rate limits and audit logging.
-- Decide whether remote clients are read-only or can enqueue sync/quality jobs.
+- Decide whether remote clients can enqueue sync/quality jobs beyond V1 public source indexing.
 - Decide where the Postgres + VectorChord database is operated: local development stack, private server, or hosted Yutome infrastructure.

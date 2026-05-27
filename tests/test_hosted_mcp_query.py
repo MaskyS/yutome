@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from yutome import contract
 from yutome.hosted.allocation_policy import default_search_store_allocation
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.mcp_query import (
@@ -57,7 +58,12 @@ class RecordingSearchStore:
         offset: int = 0,
         filters: SearchFilters | None = None,
     ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-        call: dict[str, Any] = {"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit}
+        call: dict[str, Any] = {
+            "mode": "semantic",
+            "workspace_id": workspace_id,
+            "query_vector": query_vector,
+            "limit": limit,
+        }
         if offset:
             call["offset"] = offset
         if filters is not None:
@@ -67,7 +73,12 @@ class RecordingSearchStore:
             operation="semantic_query",
             backend="postgres_vectorchord",
             index_profile_ref="sip_default",
-            units={"queries": 1, "candidate_limit": limit, "query_vector_dimensions": len(query_vector), "latency_ms": 3.5},
+            units={
+                "queries": 1,
+                "candidate_limit": limit,
+                "query_vector_dimensions": len(query_vector),
+                "latency_ms": 3.5,
+            },
             metadata={"storage_backend": "postgres_vectorchord"},
         )
 
@@ -81,7 +92,13 @@ class RecordingSearchStore:
         offset: int = 0,
         filters: SearchFilters | None = None,
     ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-        call = {"mode": "hybrid", "workspace_id": workspace_id, "query": query, "query_vector": query_vector, "limit": limit}
+        call = {
+            "mode": "hybrid",
+            "workspace_id": workspace_id,
+            "query": query,
+            "query_vector": query_vector,
+            "limit": limit,
+        }
         if offset:
             call["offset"] = offset
         if filters is not None:
@@ -193,7 +210,13 @@ class RecordingSearchStore:
             "video_id": video_id,
             "order_by": order_by,
         }
-        for key, value in {"since": since, "until": until, "status": status, "source": source, "language": language}.items():
+        for key, value in {
+            "since": since,
+            "until": until,
+            "status": status,
+            "source": source,
+            "language": language,
+        }.items():
             if value is not None:
                 call[key] = value
         self.calls.append(call)
@@ -223,7 +246,13 @@ class RecordingSearchStore:
             "channel": channel,
             "selected": selected,
         }
-        for key, value in {"since": since, "until": until, "status": status, "source": source, "language": language}.items():
+        for key, value in {
+            "since": since,
+            "until": until,
+            "status": status,
+            "source": source,
+            "language": language,
+        }.items():
             if value is not None:
                 call[key] = value
         self.calls.append(call)
@@ -271,6 +300,7 @@ def _allowing_adapter(
     usage_context_provider=None,
     voyage_usage_context_provider=None,
     query_embedder=None,
+    source_connection=None,
 ) -> HostedMcpQueryAdapter:
     kwargs: dict[str, Any] = {
         "search_store": search_store,
@@ -281,7 +311,233 @@ def _allowing_adapter(
         kwargs["ledger"] = ledger
     if query_embedder is not None:
         kwargs["query_embedder"] = query_embedder
+    if source_connection is not None:
+        kwargs["source_connection"] = source_connection
     return HostedMcpQueryAdapter(**kwargs)
+
+
+class RecordingSourceImportConnection:
+    def __init__(self) -> None:
+        self.sources: dict[str, dict[str, Any]] = {}
+        self.source_url_index: dict[tuple[str, str], str] = {}
+        self.policies: dict[tuple[str, str], dict[str, Any]] = {}
+        self.jobs: dict[tuple[str, str], dict[str, Any]] = {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        params = dict(params or {})
+        self.calls.append((statement, params))
+        if statement.startswith("INSERT INTO sources"):
+            source_key = (params["workspace_id"], params["source_url"])
+            source_id = self.source_url_index.get(source_key, params["id"])
+            row = {
+                "id": source_id,
+                "workspace_id": params["workspace_id"],
+                "source_type": params["source_type"],
+                "source_url": params["source_url"],
+                "canonical_channel_id": params["canonical_channel_id"],
+                "canonical_playlist_id": params["canonical_playlist_id"],
+                "canonical_video_id": params["canonical_video_id"],
+                "display_name": params["display_name"],
+                "selected": params["selected"],
+                "auto_index_allowed": params["auto_index_allowed"],
+                "import_source": params["import_source"],
+                "auth_grant_id": params["auth_grant_id"],
+                "metadata_json": json.loads(params["metadata_json"]),
+                "status": params["status"],
+            }
+            self.source_url_index[source_key] = source_id
+            self.sources[source_id] = row
+            return [dict(row)]
+        if statement.startswith("INSERT INTO source_refresh_policies"):
+            key = (params["workspace_id"], params["source_id"])
+            row = {
+                "id": self.policies.get(key, {}).get("id", params["id"]),
+                "workspace_id": params["workspace_id"],
+                "source_id": params["source_id"],
+                "enabled": params["enabled"],
+                "cadence_seconds": params["cadence_seconds"],
+                "next_run_at": params["next_run_at"],
+                "max_new_videos_per_run": params["max_new_videos_per_run"],
+            }
+            self.policies[key] = row
+            return [dict(row)]
+        if statement.startswith("INSERT INTO jobs"):
+            key = (params["workspace_id"], params["idempotency_key"])
+            metadata = json.loads(params["metadata_json"])
+            row = self.jobs.get(key)
+            if row is None:
+                row = {
+                    "id": params["id"],
+                    "workspace_id": params["workspace_id"],
+                    "source_id": params["source_id"],
+                    "job_type": params.get("job_type")
+                    or ("discover_source" if "discover_source" in statement else "index_video"),
+                    "status": "queued",
+                    "priority": params["priority"],
+                    "created_at": params["created_at"],
+                    "started_at": None,
+                    "finished_at": None,
+                    "cancelled_at": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "metadata_json": metadata,
+                }
+                self.jobs[key] = row
+            else:
+                row["metadata_json"] = {**row["metadata_json"], **metadata}
+            return [dict(row)]
+        if "FROM jobs" in statement:
+            source_id = params.get("source_id")
+            rows = [dict(row) for row in self.jobs.values() if source_id is None or row["source_id"] == source_id]
+            return sorted(rows, key=lambda row: row["created_at"], reverse=True)[: params.get("limit", 100)]
+        return []
+
+
+WRITE_SCOPES = frozenset({contract.AUTH_SCOPE, contract.SOURCE_WRITE_SCOPE, contract.JOB_WRITE_SCOPE})
+
+
+def _write_auth() -> HostedMcpAuthContext:
+    return HostedMcpAuthContext(
+        workspace_id="ws_alice",
+        scopes=WRITE_SCOPES,
+        user_id="usr_alice",
+        grant_id="grant_alice",
+        client_id="client_alice",
+        session_id="session_alice",
+    )
+
+
+def test_index_video_enqueues_index_job_with_mcp_audit_metadata_idempotently() -> None:
+    connection = RecordingSourceImportConnection()
+    adapter = _allowing_adapter(search_store=RecordingSearchStore(), source_connection=connection)
+
+    payload = adapter.call_tool(
+        auth=_write_auth(),
+        name="index",
+        arguments={"source": "https://www.youtube.com/watch?v=OEDoJyhQhXs"},
+    )
+    duplicate = adapter.call_tool(
+        auth=_write_auth(),
+        name="index",
+        arguments={"source": "https://www.youtube.com/watch?v=OEDoJyhQhXs"},
+    )
+
+    assert payload["workspace_id"] == "ws_alice"
+    assert payload["imported"][0]["canonical_video_id"] == "OEDoJyhQhXs"
+    assert payload["jobs"][0]["job_type"] == "index_video"
+    assert payload["jobs"][0]["job_id"] == duplicate["jobs"][0]["job_id"]
+    assert len(connection.jobs) == 1
+    metadata = next(iter(connection.jobs.values()))["metadata_json"]
+    assert metadata["seeded_by"] == "hosted_mcp"
+    assert metadata["user_id"] == "usr_alice"
+    assert metadata["mcp_grant_id"] == "grant_alice"
+    assert metadata["mcp_client_id"] == "client_alice"
+    assert metadata["mcp_session_id"] == "session_alice"
+
+
+def test_index_channel_enqueues_discovery_job_and_refresh_policy() -> None:
+    connection = RecordingSourceImportConnection()
+    adapter = _allowing_adapter(search_store=RecordingSearchStore(), source_connection=connection)
+
+    payload = adapter.call_tool(
+        auth=_write_auth(),
+        name="index",
+        arguments={
+            "source": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw",
+            "refresh_enabled": True,
+            "max_new_videos": 12,
+            "cadence_seconds": 1800,
+        },
+    )
+
+    assert payload["imported"][0]["source_type"] == "channel"
+    assert payload["jobs"][0]["job_type"] == "discover_source"
+    assert payload["refresh_policies"][0]["enabled"] is True
+    assert payload["refresh_policies"][0]["cadence_seconds"] == 1800
+    assert len(connection.policies) == 1
+    metadata = next(iter(connection.jobs.values()))["metadata_json"]
+    assert metadata["seeded_by"] == "hosted_mcp"
+    assert metadata["source_type"] == "channel"
+
+
+def test_index_requires_write_scopes_with_reconnect_guidance() -> None:
+    adapter = _allowing_adapter(
+        search_store=RecordingSearchStore(), source_connection=RecordingSourceImportConnection()
+    )
+
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice", scopes=frozenset({contract.AUTH_SCOPE})),
+            name="index",
+            arguments={"source": "https://www.youtube.com/watch?v=OEDoJyhQhXs"},
+        )
+
+    assert exc_info.value.code == "insufficient_scope"
+    assert exc_info.value.data["missing_scopes"] == [contract.JOB_WRITE_SCOPE, contract.SOURCE_WRITE_SCOPE]
+    assert exc_info.value.data["reconnect"] is True
+
+
+def test_index_rejects_tenant_and_credential_arguments() -> None:
+    adapter = _allowing_adapter(
+        search_store=RecordingSearchStore(), source_connection=RecordingSourceImportConnection()
+    )
+
+    with pytest.raises(HostedMcpError) as tenant_exc:
+        adapter.call_tool(
+            auth=_write_auth(),
+            name="index",
+            arguments={"source": "https://www.youtube.com/watch?v=OEDoJyhQhXs", "workspace_id": "ws_evil"},
+        )
+    assert tenant_exc.value.code == "workspace_argument_not_allowed"
+
+    with pytest.raises(HostedMcpError) as credential_exc:
+        adapter.call_tool(
+            auth=_write_auth(),
+            name="index",
+            arguments={
+                "source": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+                "metadata": {"access_token": "secret"},
+            },
+        )
+    assert credential_exc.value.code == "source_import_credentials_rejected"
+
+
+def test_index_rejects_non_youtube_sources() -> None:
+    adapter = _allowing_adapter(
+        search_store=RecordingSearchStore(), source_connection=RecordingSourceImportConnection()
+    )
+
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(auth=_write_auth(), name="index", arguments={"source": "https://example.com/watch?v=abc"})
+
+    assert exc_info.value.code == "source_import_invalid"
+
+
+def test_jobs_lists_recent_indexing_jobs_for_authenticated_workspace() -> None:
+    connection = RecordingSourceImportConnection()
+    adapter = _allowing_adapter(search_store=RecordingSearchStore(), source_connection=connection)
+    first = adapter.call_tool(
+        auth=_write_auth(),
+        name="index",
+        arguments={"source": "https://www.youtube.com/watch?v=OEDoJyhQhXs"},
+    )
+    adapter.call_tool(
+        auth=_write_auth(),
+        name="index",
+        arguments={"source": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"},
+    )
+
+    payload = adapter.call_tool(auth=_write_auth(), name="jobs", arguments={"limit": 10})
+    filtered = adapter.call_tool(
+        auth=_write_auth(),
+        name="jobs",
+        arguments={"limit": 10, "source_id": first["imported"][0]["source_id"]},
+    )
+
+    assert payload["workspace_id"] == "ws_alice"
+    assert {job["job_type"] for job in payload["jobs"]} == {"index_video", "discover_source"}
+    assert [job["job_type"] for job in filtered["jobs"]] == ["index_video"]
 
 
 def test_lexical_find_maps_search_rows_to_contract_response_and_records_usage() -> None:
@@ -374,7 +630,9 @@ def test_lexical_search_reserves_before_search_store_execution() -> None:
     order: list[str] = []
 
     class OrderedSearchStore(RecordingSearchStore):
-        def lexical_search(self, *, workspace_id: str, query: str, limit: int) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
+        def lexical_search(
+            self, *, workspace_id: str, query: str, limit: int
+        ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
             order.append("call:search_store.lexical_query")
             return super().lexical_search(workspace_id=workspace_id, query=query, limit=limit)
 
@@ -850,7 +1108,13 @@ def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> Non
             limit: int,
         ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
             self.calls.append(
-                {"mode": "hybrid", "workspace_id": workspace_id, "query": query, "query_vector": query_vector, "limit": limit}
+                {
+                    "mode": "hybrid",
+                    "workspace_id": workspace_id,
+                    "query": query,
+                    "query_vector": query_vector,
+                    "limit": limit,
+                }
             )
             raise RuntimeError("vector extension unavailable")
 
@@ -922,7 +1186,9 @@ def test_semantic_vector_store_availability_failure_does_not_fall_back_to_lexica
             query_vector: list[float],
             limit: int,
         ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            self.calls.append(
+                {"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit}
+            )
             raise RuntimeError("vector extension unavailable")
 
     store = VectorUnavailableStore()
@@ -992,7 +1258,9 @@ def test_vector_store_tenant_error_does_not_fall_back_to_lexical() -> None:
             query_vector: list[float],
             limit: int,
         ) -> tuple[list[dict[str, Any]], SearchStoreUsage]:
-            self.calls.append({"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit})
+            self.calls.append(
+                {"mode": "semantic", "workspace_id": workspace_id, "query_vector": query_vector, "limit": limit}
+            )
             raise PermissionError("permission denied by tenant policy")
 
     store = TenantDeniedStore()
@@ -1180,7 +1448,7 @@ def test_unsupported_tool_and_resource_return_clear_errors() -> None:
         adapter.call_tool(auth=auth, name="unknown", arguments={})
 
     assert tool_exc.value.code == "unsupported_tool"
-    assert tool_exc.value.to_dict()["error"]["data"]["supported"] == ["find", "list", "q", "show"]
+    assert tool_exc.value.to_dict()["error"]["data"]["supported"] == ["find", "index", "jobs", "list", "q", "show"]
 
     with pytest.raises(HostedMcpError) as resource_exc:
         adapter.read_resource(auth=auth, uri="yutome://unknown/chunk_1")
@@ -1481,7 +1749,9 @@ def test_non_find_reads_are_denied_before_search_store_when_usage_context_is_unc
     adapter = HostedMcpQueryAdapter(search_store=store, ledger=ledger)
 
     with pytest.raises(HostedMcpError) as exc_info:
-        adapter.call_tool(auth=HostedMcpAuthContext(workspace_id="ws_alice"), name="list", arguments={"entity": "status"})
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"), name="list", arguments={"entity": "status"}
+        )
 
     assert exc_info.value.code == "usage_denied"
     assert exc_info.value.to_dict()["error"]["data"]["operation"] == "search_store.list_read"
@@ -1539,7 +1809,9 @@ def _usage_context_provider(
     policy: EntitlementPolicy | None = None,
     balance: WorkspaceBalance | None = None,
 ):
-    def _provider(auth: HostedMcpAuthContext, operation: str, estimated_units: dict[str, float]) -> HostedMcpUsageContext:
+    def _provider(
+        auth: HostedMcpAuthContext, operation: str, estimated_units: dict[str, float]
+    ) -> HostedMcpUsageContext:
         return HostedMcpUsageContext(
             allocation=default_search_store_allocation(workspace_id=auth.workspace_id, operation=operation),
             policy=policy
@@ -1563,7 +1835,9 @@ def _voyage_usage_context_provider(
     policy: EntitlementPolicy | None = None,
     balance: WorkspaceBalance | None = None,
 ):
-    def _provider(auth: HostedMcpAuthContext, operation: str, estimated_units: dict[str, float]) -> HostedMcpUsageContext:
+    def _provider(
+        auth: HostedMcpAuthContext, operation: str, estimated_units: dict[str, float]
+    ) -> HostedMcpUsageContext:
         return HostedMcpUsageContext(
             allocation=ProviderAllocation(
                 id=f"alloc_{auth.workspace_id}_voyage",

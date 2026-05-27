@@ -523,12 +523,13 @@ sequenceDiagram
 Anchors: `/account/cli/authorize` (`http_api.py:871`, dashboard session), `/account/cli/token`
 (`:921`, public PKCE exchange).
 
-### 4.3 MCP query auth
+### 4.3 MCP auth
 
 The assistant call carries the symmetric `YUTOME_HOSTED_API_TOKEN` plus `X-Yutome-Workspace-Id`;
 `HostedMcpAuthContext.validated()` requires a non-empty workspace and the `yutome.search.read` scope
-(`mcp_query.py:101-130`). Tenant scope comes only from this context — never from tool arguments
-(see §7).
+(`mcp_query.py:101-130`). Hosted source writes additionally require `yutome.source.write` and
+`yutome.job.write`. Tenant scope, connector grant, assistant client, session, and user identity come
+only from this context — never from tool arguments (see §7).
 
 ---
 
@@ -538,10 +539,10 @@ The assistant call carries the symmetric `YUTOME_HOSTED_API_TOKEN` plus `X-Yutom
 
 ```mermaid
 sequenceDiagram
-    participant C as Dashboard / CLI
+    participant C as "Dashboard / CLI / MCP index"
     participant API as Hosted API
     participant DB as Postgres
-    C->>API: POST /account/sources (or /account/sources/import)
+    C->>API: POST /account/sources, /account/sources/import, or tools/call index
     API->>API: reject any credential-shaped descriptor
     loop each source
         API->>DB: upsert sources row
@@ -556,7 +557,7 @@ sequenceDiagram
 ```
 
 Anchors: dashboard import `/account/sources` (`http_api.py:1048`), CLI import
-`/account/sources/import` (`:1062`).
+`/account/sources/import` (`:1062`), hosted MCP `index` (`mcp_query.py`).
 
 ### 5.2 Job lifecycle
 
@@ -610,7 +611,7 @@ Grouped by auth dependency. Method/path anchored to `http_api.py`.
 **MCP token** (`default_auth_dependency`)
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/tools/call`, `/mcp/tools/call` (`:439`) | invoke `find`/`list`/`show`/`q` |
+| POST | `/tools/call`, `/mcp/tools/call` (`:439`) | invoke `find`/`list`/`show`/`index`/`jobs`/`q` |
 | POST | `/resources/read`, `/mcp/resources/read` (`:455`) | read a `yutome://` resource |
 
 **MCP or dashboard token**

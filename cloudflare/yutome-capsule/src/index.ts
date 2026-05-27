@@ -22,7 +22,7 @@ import { iconResponse } from "./icon-asset.ts";
 import {
   DEFAULT_MCP_AUDIENCE,
   handleRevokeRequest,
-  YUTOME_MCP_SCOPE,
+  YUTOME_MCP_DEFAULT_SCOPES,
 } from "./account-grants.ts";
 import {
   deriveBridgeRelayObjectName,
@@ -135,13 +135,13 @@ const provider = new OAuthProvider<DefaultHandlerEnv>({
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/token",
   clientRegistrationEndpoint: "/register",
-  scopesSupported: [YUTOME_MCP_SCOPE],
+  scopesSupported: YUTOME_MCP_DEFAULT_SCOPES,
   allowPlainPKCE: false,
   clientIdMetadataDocumentEnabled: true,
   resourceMetadata: {
     resource: DEFAULT_MCP_AUDIENCE,
     authorization_servers: [defaultAuthorizationServer],
-    scopes_supported: [YUTOME_MCP_SCOPE],
+    scopes_supported: YUTOME_MCP_DEFAULT_SCOPES,
     bearer_methods_supported: ["header"],
     resource_name: "Yutome MCP",
   },

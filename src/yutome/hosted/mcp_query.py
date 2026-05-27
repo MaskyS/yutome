@@ -31,6 +31,14 @@ from yutome.hosted.normalizers import normalize_search_store_usage
 from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied
 from yutome.hosted.resources import HostedResourceNotFound
 from yutome.hosted.search_store import SearchFilters, SearchStore
+from yutome.hosted.source_import import (
+    HostedSourceImportActor,
+    HostedSourceImportDescriptor,
+    HostedSourceImportError,
+    HostedSourcesImportRequest,
+    import_sources,
+    list_source_jobs,
+)
 from yutome.query import QueryResult
 
 
@@ -61,7 +69,7 @@ FORBIDDEN_TOOL_ARGUMENT_KEYS = frozenset(
         "session_id",
     }
 )
-SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "list", "q", "show"})
+SUPPORTED_TOOLS: frozenset[str] = frozenset({"find", "index", "jobs", "list", "q", "show"})
 SUPPORTED_TOOL = "find"
 SUPPORTED_RESOURCE_HOSTS: frozenset[str] = frozenset({"channel", "chunk", "transcript", "video"})
 SEARCH_STORE_READ_BACKEND = "hosted_search_store"
@@ -80,13 +88,11 @@ class UsageGateLike(Protocol):
         policy: EntitlementPolicy,
         balance: WorkspaceBalance,
         idempotency_key: str,
-    ) -> UsageReservation:
-        ...
+    ) -> UsageReservation: ...
 
 
 class UsageLedgerWriter(Protocol):
-    def append(self, event: UsageEvent) -> Any:
-        ...
+    def append(self, event: UsageEvent) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,7 @@ class HostedMcpQueryAdapter:
         query_embedder: QueryEmbeddingCallable | None = None,
         embedding_model: str = HOSTED_DEFAULT_EMBEDDING_MODEL,
         embedding_dimension: int = HOSTED_DEFAULT_EMBEDDING_DIMENSION,
+        source_connection: Any | None = None,
     ) -> None:
         self.search_store = search_store
         self.gate = gate or UsageGate()
@@ -193,6 +200,7 @@ class HostedMcpQueryAdapter:
         self.query_embedder = query_embedder or self._embed_query_with_voyage
         self.embedding_model = embedding_model
         self.embedding_dimension = embedding_dimension
+        self.source_connection = source_connection
 
     def call_tool(
         self,
@@ -206,6 +214,10 @@ class HostedMcpQueryAdapter:
         if normalized_name not in SUPPORTED_TOOLS:
             _raise_unsupported_tool(normalized_name)
         normalized_arguments = _normalize_tool_arguments(arguments or {})
+        if normalized_name == "index":
+            return self._index(auth=auth, arguments=normalized_arguments)
+        if normalized_name == "jobs":
+            return self._jobs(auth=auth, arguments=normalized_arguments)
         if normalized_name == "show":
             return self._show(auth=auth, arguments=normalized_arguments)
         if normalized_name == "list":
@@ -223,6 +235,61 @@ class HostedMcpQueryAdapter:
             return self._read_resource(auth=auth, host=host, params=params)
         except HostedResourceNotFound as exc:
             raise _resource_not_found(kind=exc.kind, id_=exc.id) from exc
+
+    def _index(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        _require_scopes(
+            auth,
+            {contract.SOURCE_WRITE_SCOPE, contract.JOB_WRITE_SCOPE},
+            tool="index",
+        )
+        _reject_workspace_argument_injection(arguments)
+        _reject_credential_argument_shapes(arguments)
+        request = HostedIndexRequest.from_arguments(arguments)
+        connection = self._source_connection()
+        try:
+            return import_sources(
+                connection,
+                request=HostedSourcesImportRequest(
+                    sources=[HostedSourceImportDescriptor(source_url=request.source)],
+                    refresh_enabled=request.refresh_enabled,
+                    max_new_videos=request.max_new_videos,
+                    cadence_seconds=request.cadence_seconds,
+                ),
+                actor=HostedSourceImportActor(
+                    workspace_id=auth.workspace_id,
+                    seeded_by="hosted_mcp",
+                    user_id=auth.user_id,
+                    mcp_grant_id=auth.grant_id,
+                    mcp_client_id=auth.client_id,
+                    mcp_session_id=auth.session_id,
+                ),
+            )
+        except HostedSourceImportError as exc:
+            raise HostedMcpError(
+                code=exc.code,
+                message=exc.message,
+                status_code=exc.status_code,
+                data=exc.data,
+            ) from exc
+
+    def _jobs(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        _reject_workspace_argument_injection(arguments)
+        request = HostedJobsRequest.from_arguments(arguments)
+        return list_source_jobs(
+            self._source_connection(),
+            workspace_id=auth.workspace_id,
+            limit=request.limit,
+            source_id=request.source_id,
+        )
+
+    def _source_connection(self) -> Any:
+        if self.source_connection is None:
+            raise HostedMcpError(
+                code="source_import_connection_unconfigured",
+                message="Hosted MCP source indexing is not configured on this server.",
+                status_code=503,
+            )
+        return self.source_connection
 
     def _find(self, *, auth: HostedMcpAuthContext, arguments: dict[str, Any]) -> QueryResult:
         _reject_workspace_argument_injection(arguments)
@@ -332,7 +399,9 @@ class HostedMcpQueryAdapter:
                 },
             ) from exc
         except Exception as exc:
-            failure = classify_provider_http_error(provider="voyage", status_code=_status_code_from_exception(exc), message=str(exc))
+            failure = classify_provider_http_error(
+                provider="voyage", status_code=_status_code_from_exception(exc), message=str(exc)
+            )
             if request.mode == "hybrid" and _provider_failure_allows_lexical_fallback(failure=failure, exc=exc):
                 fallback_metadata = _provider_fallback_metadata(
                     request=request,
@@ -958,7 +1027,9 @@ class HostedMcpQueryAdapter:
             elif host == "video":
                 result = self.search_store.resource_video(workspace_id=auth.workspace_id, video_id=params["video_id"])
             elif host == "channel":
-                result = self.search_store.resource_channel(workspace_id=auth.workspace_id, channel_id=params["channel_id"])
+                result = self.search_store.resource_channel(
+                    workspace_id=auth.workspace_id, channel_id=params["channel_id"]
+                )
             elif host == "transcript":
                 result = self.search_store.resource_transcript(
                     workspace_id=auth.workspace_id,
@@ -989,6 +1060,45 @@ class HostedMcpQueryAdapter:
             metadata={"resource_kind": host, "resource_id": resource_id},
         )
         return result
+
+
+@dataclass(frozen=True)
+class HostedIndexRequest:
+    source: str
+    refresh_enabled: bool = True
+    max_new_videos: int = 25
+    cadence_seconds: int = 900
+
+    @classmethod
+    def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedIndexRequest:
+        source = str(arguments.get("source") or "").strip()
+        if not source:
+            raise HostedMcpError(
+                code="invalid_arguments",
+                message="index requires a non-empty source argument.",
+                status_code=400,
+            )
+        return cls(
+            source=source,
+            refresh_enabled=_coerce_bool(arguments.get("refresh_enabled", True), name="refresh_enabled"),
+            max_new_videos=max(1, min(_coerce_int(arguments.get("max_new_videos", 25), name="max_new_videos"), 250)),
+            cadence_seconds=max(
+                1, min(_coerce_int(arguments.get("cadence_seconds", 900), name="cadence_seconds"), 86_400)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class HostedJobsRequest:
+    limit: int = 10
+    source_id: str | None = None
+
+    @classmethod
+    def from_arguments(cls, arguments: Mapping[str, Any]) -> HostedJobsRequest:
+        return cls(
+            limit=max(1, min(_coerce_int(arguments.get("limit", 10), name="limit"), 100)),
+            source_id=_optional_str(arguments.get("source_id")),
+        )
 
 
 @dataclass(frozen=True)
@@ -1098,7 +1208,11 @@ class HostedShowRequest:
         id_ = str(raw_id or "").strip()
         video_id = _optional_str(arguments.get("video_id"))
         youtube_url = _optional_str(arguments.get("youtube_url"))
-        time_seconds = None if arguments.get("time_seconds") is None else _coerce_int(arguments.get("time_seconds"), name="time_seconds")
+        time_seconds = (
+            None
+            if arguments.get("time_seconds") is None
+            else _coerce_int(arguments.get("time_seconds"), name="time_seconds")
+        )
         if not id_ and not (kind == "context" and (video_id or youtube_url)):
             raise HostedMcpError(
                 code="invalid_arguments",
@@ -1161,12 +1275,24 @@ class HostedListRequest:
                 code="unsupported_list_entity",
                 message="Hosted MCP list supports status, videos, and channels.",
                 status_code=400,
-                data=_capability_data(capability="list", requested=raw_entity, supported={"channels", "status", "videos"}),
+                data=_capability_data(
+                    capability="list", requested=raw_entity, supported={"channels", "status", "videos"}
+                ),
             )
         if entity == "status":
             extra = [
                 key
-                for key in ("channel", "selected", "order_by", "project", "since", "until", "status", "source", "language")
+                for key in (
+                    "channel",
+                    "selected",
+                    "order_by",
+                    "project",
+                    "since",
+                    "until",
+                    "status",
+                    "source",
+                    "language",
+                )
                 if arguments.get(key) is not None
             ]
             if extra:
@@ -1278,14 +1404,22 @@ class HostedQRequest:
             )
 
         if project == "status_breakdown":
-            if entity not in {"chunk", "video", "channel"} or raw_request.get("search") is not None or _nonempty_filter_keys(filter_obj):
+            if (
+                entity not in {"chunk", "video", "channel"}
+                or raw_request.get("search") is not None
+                or _nonempty_filter_keys(filter_obj)
+            ):
                 raise _unsupported_q("status_breakdown only supports an otherwise empty QueryRequest.")
             return cls(kind="status", limit=1)
 
         if entity == "video":
             if raw_request.get("search") is not None:
-                raise _unsupported_q("Hosted MCP q video entities use filters and order_by; transcript search uses entity='chunk'.")
-            _reject_unknown_filter_keys(filter_obj, {"channel_id", "video_id", "published_at", "transcript_source", "language"})
+                raise _unsupported_q(
+                    "Hosted MCP q video entities use filters and order_by; transcript search uses entity='chunk'."
+                )
+            _reject_unknown_filter_keys(
+                filter_obj, {"channel_id", "video_id", "published_at", "transcript_source", "language"}
+            )
             if project not in {"thin", "video_card"}:
                 raise _unsupported_q("Hosted MCP q video supports thin and video_card projections only.")
             filters = _search_filters_from_q_filter(filter_obj)
@@ -1302,7 +1436,9 @@ class HostedQRequest:
 
         if entity == "channel":
             if raw_request.get("search") is not None:
-                raise _unsupported_q("Hosted MCP q channel entities use filters; transcript search uses entity='chunk'.")
+                raise _unsupported_q(
+                    "Hosted MCP q channel entities use filters; transcript search uses entity='chunk'."
+                )
             _reject_unknown_filter_keys(
                 filter_obj,
                 {"channel_id", "channel_handle", "channel_selected", "published_at", "transcript_source", "language"},
@@ -1328,7 +1464,9 @@ class HostedQRequest:
                 raise _unsupported_q("Hosted MCP q chunk currently supports lexical chunk_text search only.")
             text = str(search.get("text") or "").strip()
             if not text:
-                raise HostedMcpError(code="invalid_arguments", message="q chunk lexical search requires search.text.", status_code=400)
+                raise HostedMcpError(
+                    code="invalid_arguments", message="q chunk lexical search requires search.text.", status_code=400
+                )
             _reject_unknown_filter_keys(
                 filter_obj,
                 {"channel_id", "channel_handle", "published_at", "transcript_source", "language"},
@@ -1438,6 +1576,63 @@ def _reject_workspace_argument_injection(arguments: Mapping[str, Any]) -> None:
             status_code=400,
             data={"arguments": forbidden},
         )
+
+
+def _require_scopes(auth: HostedMcpAuthContext, scopes: set[str], *, tool: str) -> None:
+    missing = sorted(scope for scope in scopes if scope not in auth.scopes)
+    if missing:
+        raise HostedMcpError(
+            code="insufficient_scope",
+            message=(
+                f"Hosted MCP tool {tool!r} requires write scopes: {', '.join(missing)}. "
+                "Reconnect the Yutome connector to grant write access."
+            ),
+            status_code=403,
+            data={
+                "tool": tool,
+                "missing_scopes": missing,
+                "reconnect": True,
+                "reconnect_message": "Reconnect the Yutome connector to grant write access.",
+            },
+        )
+
+
+def _reject_credential_argument_shapes(arguments: Mapping[str, Any]) -> None:
+    credential_paths = sorted(_credential_argument_paths(arguments))
+    if credential_paths:
+        raise HostedMcpError(
+            code="source_import_credentials_rejected",
+            message="Hosted MCP index accepts public YouTube sources only, not provider credentials.",
+            status_code=400,
+            data={"arguments": credential_paths},
+        )
+
+
+def _credential_argument_paths(value: Any, *, prefix: str = "") -> set[str]:
+    fragments = (
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "secret",
+        "password",
+        "credential",
+    )
+    paths: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_str = str(key)
+            path = f"{prefix}.{key_str}" if prefix else key_str
+            lowered = key_str.lower()
+            if lowered != "credential_mode" and any(fragment in lowered for fragment in fragments):
+                paths.add(path)
+            paths.update(_credential_argument_paths(item, prefix=path))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for index, item in enumerate(value):
+            path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            paths.update(_credential_argument_paths(item, prefix=path))
+    return paths
 
 
 def _forbidden_argument_paths(value: Any, *, prefix: str = "") -> set[str]:
@@ -1881,13 +2076,19 @@ def _usage_denial_fallback_metadata(
     error: HostedMcpError | None = None,
     reservation: UsageReservation | None = None,
 ) -> dict[str, Any]:
-    reason = reservation.decision.reason if reservation is not None else str(error.data.get("reason") if error else "usage_denied")
+    reason = (
+        reservation.decision.reason
+        if reservation is not None
+        else str(error.data.get("reason") if error else "usage_denied")
+    )
     denial_effect = (
         reservation.decision.denial_effect
         if reservation is not None
         else str(error.data.get("denial_effect") if error else "soft")
     )
-    reservation_id = reservation.id if reservation is not None else (error.data.get("reservation_id") if error else None)
+    reservation_id = (
+        reservation.id if reservation is not None else (error.data.get("reservation_id") if error else None)
+    )
     return {
         "fallback": True,
         "fallback_from": request.mode,
@@ -1984,9 +2185,7 @@ def _search_store_failure_metadata(
 
 def _fallback_metadata_note(metadata: Mapping[str, Any]) -> str:
     public_metadata = {
-        key: value
-        for key, value in metadata.items()
-        if key == "fallback" or key.startswith("fallback_")
+        key: value for key, value in metadata.items() if key == "fallback" or key.startswith("fallback_")
     }
     return "hosted_find_fallback_metadata:" + json.dumps(
         public_metadata,
@@ -2112,6 +2311,10 @@ def _optional_str(value: Any) -> str | None:
 def _optional_bool(value: Any) -> bool | None:
     if value is None:
         return None
+    return _coerce_bool(value, name="selected")
+
+
+def _coerce_bool(value: Any, *, name: str) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -2122,7 +2325,7 @@ def _optional_bool(value: Any) -> bool | None:
             return False
     raise HostedMcpError(
         code="invalid_arguments",
-        message="selected must be a boolean.",
+        message=f"{name} must be a boolean.",
         status_code=400,
     )
 
@@ -2291,7 +2494,14 @@ def _unsupported_q(message: str) -> HostedMcpError:
         data=_capability_data(
             capability="q",
             requested="unsupported_query_shape",
-            supported={"channel.thin", "channel.channel_card", "chunk.lexical", "status_breakdown", "video.thin", "video.video_card"},
+            supported={
+                "channel.thin",
+                "channel.channel_card",
+                "chunk.lexical",
+                "status_breakdown",
+                "video.thin",
+                "video.video_card",
+            },
             unsupported_reason="unsupported_query_shape",
         ),
     )

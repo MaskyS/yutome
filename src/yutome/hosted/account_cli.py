@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from yutome import contract
 from yutome.hosted.account import AccountSessionError
 from yutome.hosted.repositories import SqlStatement
 
@@ -19,8 +20,8 @@ DEFAULT_CLI_CLIENT_ID = "yutome-cli"
 CLI_AUTH_CODE_TTL_SECONDS = 5 * 60
 CLI_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60
 CLI_ACCOUNT_READ_SCOPE = "yutome.account.read"
-CLI_SOURCE_WRITE_SCOPE = "yutome.source.write"
-CLI_JOB_WRITE_SCOPE = "yutome.job.write"
+CLI_SOURCE_WRITE_SCOPE = contract.SOURCE_WRITE_SCOPE
+CLI_JOB_WRITE_SCOPE = contract.JOB_WRITE_SCOPE
 CLI_LIBRARY_READ_SCOPE = "yutome.library.read"
 DEFAULT_CLI_SCOPES: tuple[str, ...] = (
     CLI_ACCOUNT_READ_SCOPE,
@@ -246,7 +247,9 @@ def verify_cli_token(
     clock_skew_seconds: int = 60,
 ) -> CliTokenClaims:
     if not secret or not secret.strip():
-        raise AccountSessionError("cli_token_signing_unconfigured", "CLI token signing secret is required.", status_code=503)
+        raise AccountSessionError(
+            "cli_token_signing_unconfigured", "CLI token signing secret is required.", status_code=503
+        )
     parts = token.split(".") if token else []
     if len(parts) != 3 or parts[0] != "v1" or not parts[1] or not parts[2]:
         raise AccountSessionError("cli_token_malformed", "CLI token was not a signed v1 token.")
@@ -324,4 +327,3 @@ def _base64url(value: bytes) -> str:
 def _base64url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
-

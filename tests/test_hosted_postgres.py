@@ -206,7 +206,7 @@ def test_account_jobs_query_returns_enriched_source_and_video_context(live_postg
     import psycopg
     from psycopg.rows import dict_row
 
-    from yutome.hosted.http_api import _account_jobs_sql
+    from yutome.hosted.source_import import account_jobs_sql
 
     schema = f"yutome_jobs_{os.getpid()}"
     workspace_id = "ws_jobs_test"
@@ -256,7 +256,7 @@ def test_account_jobs_query_returns_enriched_source_and_video_context(live_postg
                 {"ws": workspace_id, "meta": '{"youtube_video_id": "abcdEFGHijk"}'},
             )
 
-            statement = _account_jobs_sql(workspace_id=workspace_id, limit=25)
+            statement = account_jobs_sql(workspace_id=workspace_id, limit=25)
             rows = connection.execute(statement.sql, statement.params).fetchall()
 
             assert len(rows) == 1
