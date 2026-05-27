@@ -278,3 +278,120 @@ export async function getSourceJobs(
   const json = await authedGet(env, sessionToken, `/account/source-jobs?limit=${encodeURIComponent(String(limit))}`);
   return Array.isArray(json.jobs) ? (json.jobs as SourceJob[]) : [];
 }
+
+// --- Retrieval (session-authenticated dashboard search/read) ---------------
+// These call /account/search and /account/show, which the hosted API serves
+// from the same query adapter as the MCP endpoint, scoped to the session's
+// workspace. The agent-facing /tools/call contract is untouched.
+
+export type SearchMode = "lexical" | "semantic" | "hybrid";
+
+export interface SearchHit {
+  chunk_id: string;
+  resource_uri: string;
+  video_id: string;
+  youtube_url: string;
+  start_ms?: number;
+  end_ms?: number;
+  snippet?: string;
+  transcript_version_id?: string;
+  match_type?: string;
+  scores?: Record<string, number>;
+  title?: string;
+  channel_id?: string;
+  channel_handle?: string;
+  channel_title?: string;
+  published_at?: string;
+  duration_seconds?: number;
+  thumbnail_url?: string;
+}
+
+export interface SearchResult {
+  rows: SearchHit[];
+  notes?: unknown;
+  total?: number | null;
+}
+
+export interface VideoResource {
+  video_id: string;
+  youtube_video_id?: string;
+  youtube_url: string;
+  active_transcript_version_id?: string;
+  channel_id?: string;
+  channel_title?: string;
+  channel_handle?: string;
+  title?: string;
+  description?: string;
+  published_at?: string;
+  duration_seconds?: number;
+  thumbnail_url?: string;
+  active_chunk_count?: number;
+}
+
+export interface TranscriptResource {
+  transcript_version_id: string;
+  video_id?: string;
+  youtube_video_id?: string;
+  language?: string;
+  segment_count: number;
+  offset: number;
+  limit: number | null;
+  returned_segments: number;
+  next_offset: number | null;
+  text: string;
+  text_truncated?: boolean;
+}
+
+export async function searchFind(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  args: {
+    text: string;
+    mode?: SearchMode;
+    in?: string;
+    channel?: string;
+    since?: string;
+    until?: string;
+    source?: string;
+    language?: string;
+    group_by?: string;
+    project?: string;
+    limit?: number;
+    offset?: number;
+  },
+): Promise<SearchResult> {
+  const json = await authedPost(env, sessionToken, "/account/search", args as Record<string, unknown>);
+  const result = (json.result ?? {}) as Partial<SearchResult>;
+  return { rows: Array.isArray(result.rows) ? result.rows : [], notes: result.notes, total: result.total ?? null };
+}
+
+export async function showVideo(env: YutomeWebEnv, sessionToken: string, videoId: string): Promise<VideoResource> {
+  const json = await authedPost(env, sessionToken, "/account/show", { kind: "video", id: videoId });
+  return json.result as VideoResource;
+}
+
+export async function showTranscript(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  transcriptVersionId: string,
+  opts: { offset?: number; limit?: number } = {},
+): Promise<TranscriptResource> {
+  const json = await authedPost(env, sessionToken, "/account/show", {
+    kind: "transcript",
+    id: transcriptVersionId,
+    transcript_offset: opts.offset,
+    transcript_limit: opts.limit,
+  });
+  const result = (json.result ?? {}) as Partial<TranscriptResource>;
+  return {
+    ...result,
+    transcript_version_id:
+      typeof result.transcript_version_id === "string" ? result.transcript_version_id : transcriptVersionId,
+    segment_count: typeof result.segment_count === "number" ? result.segment_count : 0,
+    offset: typeof result.offset === "number" ? result.offset : opts.offset ?? 0,
+    limit: typeof result.limit === "number" ? result.limit : null,
+    returned_segments: typeof result.returned_segments === "number" ? result.returned_segments : 0,
+    next_offset: typeof result.next_offset === "number" ? result.next_offset : null,
+    text: typeof result.text === "string" ? result.text : "",
+  };
+}

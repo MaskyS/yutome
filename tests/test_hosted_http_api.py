@@ -10,11 +10,18 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from datetime import datetime, timedelta, timezone
+
 from yutome.hosted.allocation_policy import default_search_store_allocation
-from yutome.hosted.account import DEFAULT_ACCOUNT_SESSION_AUDIENCE, session_token_hash
+from yutome.hosted.account import (
+    DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    session_token_hash,
+    sign_account_session_token,
+)
 from yutome.hosted.http_api import (
     ACCOUNT_SESSION_COOKIE_NAME,
     ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR,
+    ACCOUNT_SESSION_TOKEN_HEADER,
     ACCOUNT_SESSION_TTL_SECONDS,
     TOKEN_ENV_VAR,
     WORKSPACE_HEADER,
@@ -808,3 +815,175 @@ def test_resource_read_endpoint_hides_cross_workspace_resources_as_missing(
     assert detail["code"] == "resource_not_found"
     assert detail["data"]["kind"] == "chunk"
     assert store.calls == [{"resource": "chunk", "workspace_id": "ws_bob", "id": "chunk_http"}]
+
+
+# --- Dashboard (session-authenticated) retrieval ---------------------------
+
+ACCOUNT_DASHBOARD_TOKEN = "dashboard-test-token"
+ACCOUNT_SESSION_SECRET = "account-session-secret"
+
+
+def _account_session_token(
+    workspace_id: str = "ws_http",
+    user_id: str = "user_http",
+    *,
+    issued_at: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> str:
+    now = datetime.now(timezone.utc)
+    return sign_account_session_token(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        secret=ACCOUNT_SESSION_SECRET,
+        expires_at=expires_at or now + timedelta(seconds=ACCOUNT_SESSION_TTL_SECONDS),
+        issued_at=issued_at or now,
+        audience=DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    )
+
+
+def _account_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}",
+        ACCOUNT_SESSION_TOKEN_HEADER: token,
+    }
+
+
+def _account_search_client() -> tuple[TestClient, RecordingSearchStore]:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=RecordingLedger(),
+        usage_context_provider=_allow_search_usage_context,
+    )
+    connection = RecordingConnection(rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}])
+    app = build_app(
+        adapter=adapter,
+        billing_connection=connection,
+        expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+        account_session_secret=ACCOUNT_SESSION_SECRET,
+    )
+    return TestClient(app), store
+
+
+def test_account_search_uses_workspace_from_session_not_arguments() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical", "limit": 4},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["rows"][0]["chunk_id"] == "chunk_http"
+    assert store.calls == [{"workspace_id": "ws_http", "query": "Crohn", "limit": 4}]
+
+
+def test_account_search_scopes_to_session_workspace() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical", "limit": 2},
+        headers=_account_headers(_account_session_token("ws_bob")),
+    )
+
+    assert response.status_code == 200
+    assert store.calls == [{"workspace_id": "ws_bob", "query": "Crohn", "limit": 2}]
+
+
+def test_account_search_rejects_workspace_argument_injection() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical", "workspace_id": "ws_admin"},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 422
+    assert store.calls == []
+
+
+def test_account_search_requires_session_token() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_session_required"
+    assert store.calls == []
+
+
+def test_account_search_requires_dashboard_token_before_search_store() -> None:
+    client, store = _account_search_client()
+    session = _account_session_token("ws_http")
+
+    missing = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={ACCOUNT_SESSION_TOKEN_HEADER: session},
+    )
+    invalid = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={
+            "Authorization": "Bearer wrong-dashboard-token",
+            ACCOUNT_SESSION_TOKEN_HEADER: session,
+        },
+    )
+
+    assert missing.status_code == 401
+    assert error_body(missing.json())["code"] == "api_token_required"
+    assert invalid.status_code == 401
+    assert error_body(invalid.json())["code"] == "api_token_invalid"
+    assert store.calls == []
+
+
+def test_account_search_rejects_invalid_session_before_search_store() -> None:
+    client, store = _account_search_client()
+    issued_at = datetime.now(timezone.utc) - timedelta(seconds=ACCOUNT_SESSION_TTL_SECONDS + 120)
+    expired_session = _account_session_token(
+        "ws_http",
+        issued_at=issued_at,
+        expires_at=issued_at + timedelta(seconds=1),
+    )
+
+    malformed = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers=_account_headers("not-a-session-token"),
+    )
+    expired = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers=_account_headers(expired_session),
+    )
+
+    assert malformed.status_code == 401
+    assert error_body(malformed.json())["code"] == "account_session_malformed"
+    assert expired.status_code == 401
+    assert error_body(expired.json())["code"] == "account_session_expired"
+    assert store.calls == []
+
+
+def test_account_show_reads_resource_for_session_workspace() -> None:
+    client, store = _account_search_client()
+
+    response = client.post(
+        "/account/show",
+        json={"kind": "chunk", "id": "chunk_http"},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["resource_uri"] == "yutome://chunk/chunk_http"
+    assert store.calls == [{"resource": "chunk", "workspace_id": "ws_http", "id": "chunk_http"}]

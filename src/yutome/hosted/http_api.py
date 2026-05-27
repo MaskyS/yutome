@@ -147,6 +147,38 @@ class AccountSourcesImportRequest(BaseModel):
     refresh_enabled: bool = True
 
 
+class AccountSearchRequest(BaseModel):
+    """Dashboard retrieval request. Mirrors the `find` tool arguments, minus any
+    tenant identity: the workspace comes only from the verified session token."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    text: str
+    mode: str | None = None
+    in_: str | None = Field(default=None, alias="in")
+    channel: str | None = None
+    since: str | None = None
+    until: str | None = None
+    source: str | None = None
+    language: str | None = None
+    group_by: str | None = None
+    project: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=200)
+    offset: int | None = Field(default=None, ge=0)
+
+
+class AccountShowRequest(BaseModel):
+    """Dashboard citation/transcript expansion. Mirrors the `show` tool arguments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    id: str | None = None
+    token_budget: int | None = Field(default=None, ge=200, le=8000)
+    transcript_offset: int | None = Field(default=None, ge=0)
+    transcript_limit: int | None = Field(default=None, ge=1, le=5000)
+
+
 class AccountApiContext(BaseModel):
     """Authenticated dashboard caller. workspace_id is derived from the verified
     session token, never from a client-supplied header."""
@@ -864,6 +896,39 @@ def build_app(
         assistants = read_active_account_grants(billing_connection, workspace_id=context.workspace_id)
         return {"ok": True, "assistants": [item.model_dump(mode="json") for item in assistants]}
 
+    @app.post("/account/search")
+    def account_search(
+        request: AccountSearchRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        # Session-authenticated retrieval for the dashboard. Reuses the same
+        # adapter as the MCP query path; the agent-facing /tools/call contract is
+        # untouched. Tenant scope comes from the session, never from arguments.
+        try:
+            result = adapter.call_tool(
+                auth=_account_query_auth(context),
+                name="find",
+                arguments=request.model_dump(exclude_none=True, by_alias=True),
+            )
+        except HostedMcpError as exc:
+            raise _http_error(exc) from exc
+        return {"ok": True, "result": result}
+
+    @app.post("/account/show")
+    def account_show(
+        request: AccountShowRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        try:
+            result = adapter.call_tool(
+                auth=_account_query_auth(context),
+                name="show",
+                arguments=request.model_dump(exclude_none=True),
+            )
+        except HostedMcpError as exc:
+            raise _http_error(exc) from exc
+        return {"ok": True, "result": result}
+
     return app
 
 
@@ -871,6 +936,18 @@ def _parse_scopes(scopes_header: str | None) -> set[str]:
     if scopes_header is None:
         return {contract.AUTH_SCOPE}
     return {scope for scope in scopes_header.replace(",", " ").split() if scope}
+
+
+def _account_query_auth(context: AccountApiContext) -> HostedMcpAuthContext:
+    """Build a query auth context from a verified dashboard session. The workspace
+    and user come from the session claims; the adapter's `.validated()` enforces
+    workspace identity and the required scope."""
+
+    return HostedMcpAuthContext(
+        workspace_id=context.workspace_id,
+        scopes=frozenset({contract.AUTH_SCOPE}),
+        user_id=context.user_id,
+    ).validated()
 
 
 def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:

@@ -13,6 +13,7 @@ import {
   type WorkspaceSummary,
 } from "~/lib/hosted-api.server";
 import { isUnauthorized, requireSessionToken, signupRedirect } from "~/lib/session.server";
+import { formatClockTime, formatDate } from "~/lib/utils";
 import { Alert, AlertDescription } from "~/components/ui/alert";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
@@ -238,7 +239,7 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
                         <Badge variant={statusVariant(job.status)}>{job.status}</Badge>
                       </TableCell>
                       <TableCell className="text-muted-foreground text-right text-sm">
-                        {job.created_at ? new Date(job.created_at).toLocaleTimeString() : "-"}
+                        {job.created_at ? formatClockTime(job.created_at) : "-"}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -315,7 +316,7 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
                       <TableCell className="font-medium">{video.title ?? video.video_id}</TableCell>
                       <TableCell className="text-muted-foreground">{video.channel_id ?? "-"}</TableCell>
                       <TableCell className="text-muted-foreground text-right">
-                        {video.published_at ? new Date(video.published_at).toLocaleDateString() : "-"}
+                        {video.published_at ? formatDate(video.published_at) : "-"}
                       </TableCell>
                     </TableRow>
                   ))}
