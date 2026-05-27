@@ -1,8 +1,18 @@
 # Hosted Provider Broker Implementation Plan
 
-Last updated: 2026-05-25
+Last updated: 2026-05-27
 
-Status: planning document. This complements `docs/hosted-yutome-plan.md`; it assumes a cutover to a hosted Postgres search store. VectorChord Suite remains the default search/storage substrate, including on Railway via a custom Postgres service/image unless a managed VectorChord-capable host is selected. Railway Postgres/pgvector + Postgres FTS is the fallback if VectorChord database operations are not ready for paid production. Billing implementation target is Polar for V1. Runtime placement is now explicit for Phase 4: Railway is the default hosted deployment for API, workers, cron, and initial Postgres; durable jobs and schedules live in Postgres; Modal is an optional burst/backfill executor; Fly Machines are an alternate worker substrate.
+Status: implementation plan and historical decision record. This complements
+`docs/hosted-yutome-plan.md`; the storage cutover to a single Postgres +
+VectorChord search store is complete. VectorChord Suite remains the default
+search/storage substrate, including on Railway via a custom Postgres
+service/image unless a managed VectorChord-capable host is selected. Railway
+Postgres/pgvector + Postgres FTS is the fallback if VectorChord database
+operations are not ready for paid production. Billing implementation target is
+Polar for V1. Runtime placement is now explicit for Phase 4: Railway is the
+default hosted deployment for API, workers, cron, and initial Postgres; durable
+jobs and schedules live in Postgres; Modal is an optional burst/backfill
+executor; Fly Machines are an alternate worker substrate.
 
 ## Executive Summary
 

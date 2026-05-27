@@ -1,6 +1,12 @@
 # Hosted Yutome Plan: Polar + Gemini + Webshare + Cloudflare
 
-Last updated: 2026-05-25
+Last updated: 2026-05-27
+
+Status: product/background plan and historical decision record. The storage
+cutover is complete; current system architecture lives in
+[`docs/architecture/`](architecture/README.md). Section B is retained as the
+decision record for why the project standardized on one Postgres + VectorChord
+database instead of a split catalog/search design.
 
 ## Purpose
 
@@ -375,7 +381,7 @@ Track these Cloudflare units:
 - R2: storage GB-month, Class A operations, and Class B operations. Standard storage is $0.015/GB-month, Class A is $4.50/M requests, Class B is $0.36/M requests, and direct R2 egress is free. Source: [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
 - Vectorize: stored vector dimensions and queried vector dimensions. Paid includes 50M queried dimensions/mo and 10M stored dimensions, then $0.01/M queried dimensions and $0.05/100M stored dimensions. Source: [Vectorize pricing](https://developers.cloudflare.com/vectorize/platform/pricing/).
 - Durable Objects: requests, WebSocket message-equivalent requests, duration GB-seconds, and SQLite storage rows/storage if used. Paid includes 1M requests/mo and 400,000 GB-s/mo, then $0.15/M requests and $12.50/M GB-s. Incoming WebSocket messages are billed with a 20:1 ratio, and WebSocket hibernation is important for idle connector sessions. Source: [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/).
-- Containers: memory GiB-seconds, vCPU-seconds, disk GB-seconds, and container network egress if Section B chooses LanceDB-in-container. Workers Paid includes 25 GiB-hours memory/mo, 375 vCPU-min/mo, and 200 GB-hours disk/mo, then $0.0000025/GiB-second, $0.000020/vCPU-second, and $0.00000007/GB-second. Source: [Containers pricing](https://developers.cloudflare.com/containers/pricing/).
+- Containers: memory GiB-seconds, vCPU-seconds, disk GB-seconds, and container network egress if a future Cloudflare container workload is added. Workers Paid includes 25 GiB-hours memory/mo, 375 vCPU-min/mo, and 200 GB-hours disk/mo, then $0.0000025/GiB-second, $0.000020/vCPU-second, and $0.00000007/GB-second. Source: [Containers pricing](https://developers.cloudflare.com/containers/pricing/).
 - Workers AI, if used for embeddings/reranking instead of Gemini/Voyage: embeddings are priced per input token through neurons; examples include `@cf/baai/bge-small-en-v1.5` at $0.020/M input tokens, `@cf/baai/bge-m3` at $0.012/M input tokens, and `@cf/baai/bge-reranker-base` at $0.003/M input tokens. Source: [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/).
 
 For MVP billing, do not expose Cloudflare line items to users unless they exceed plan limits. Expose:
@@ -445,10 +451,14 @@ Refund policy:
 - Admin UI must show margin by workspace: revenue, included entitlement grants, consumed provider cost, retries, failed-provider cost, and remaining hard-cap headroom.
 <!-- SUBAGENT-BILLING-END -->
 
-## Section B: Storage And Search: Hosted DB Bakeoff
+## Section B: Storage And Search Decision Record
 
 <!-- SUBAGENT-STORAGE-START -->
 ### Recommendation
+
+Status: historical decision record. The recommendation has been implemented in
+the codebase: local and hosted modes now use the same Postgres + VectorChord
+search store, with no split local database mode.
 
 Assumption update: hosted Yutome does **not** need backward compatibility with SQLite + LanceDB internals. It does need product-level feature parity: catalog, jobs, active transcripts, chunks, lexical search, semantic search, hybrid search, grouped results, context expansion, billing attribution, and multi-tenant controls.
 

@@ -656,14 +656,17 @@ The dashboard `/account/{search,show,list}` endpoints derive the workspace from 
 `HostedMcpQueryAdapter.call_tool` validates auth, strips forbidden tenant-identifying arguments, and
 dispatches by tool name (`mcp_query.py:197-215`). `find` is the interesting one.
 
-- **Default mode is `lexical`** (`HostedFindRequest`, `mcp_query.py:954, 972-975`) — note the contrast
+- **Default mode is `lexical`** (`HostedFindRequest`, `mcp_query.py:1105, 1128-1135`) — note the contrast
   with the local engine's hybrid default.
 - `lexical` → `_find_lexical`; `semantic`/`hybrid` → `_find_vector`.
 - **Forbidden arguments**: any `workspace_id`/`tenant`/`grant_id`/`client_id`/`session`/… in the args
   (even nested) is rejected (`FORBIDDEN_TOOL_ARGUMENT_KEYS`, `mcp_query.py:37-63`).
-- **This adapter slice is partial**: `show(kind="context")` returns 501 (`:1055-1066`),
-  `list attention` returns 501 (`:1106-1117`), and `find` filters/offset are not yet implemented
-  (`:995-1015`).
+- `show` supports `chunk`, `context`, `video`, `channel`, `transcript`, and `source`
+  (`mcp_query.py:794-867`).
+- `find` passes offsets and supported filters through to lexical, semantic, and hybrid searches
+  (`mcp_query.py:314-323, 443-469`).
+- `list attention` is still outside the hosted query contract; hosted lists support `status`, `videos`,
+  and `channels` (`mcp_query.py:1238-1271`).
 
 ```mermaid
 sequenceDiagram
@@ -777,4 +780,4 @@ classDiagram
   offline. Call it "cloud replica" or "offline replica", never "always-on".
 - multi-region Postgres failover / geo-distributed workers.
 - entitlement **grace policies** (`grace_policy_jsonb` exists; enforcement deferred).
-- hosted `show(kind="context")` expansion and `list attention` (currently 501 in the adapter slice).
+- hosted `list attention` (not part of the current hosted adapter contract).

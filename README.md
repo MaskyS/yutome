@@ -118,10 +118,11 @@ The Worker is just a relay — your corpus stays on your laptop. The bridge is a
 See [`docs/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/README.md) for an index. The most useful starting points:
 
 - [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) — connecting Claude / ChatGPT / agents
+- [`docs/architecture/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/architecture/README.md) — current architecture map
 - [`docs/cli-architecture.md`](https://github.com/MaskyS/yutome/blob/main/docs/cli-architecture.md) — CLI namespace and composition rules
 - [`docs/cloud-capsule-strategy.md`](https://github.com/MaskyS/yutome/blob/main/docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
 - [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md) — the query language `find` / `q` speak
-- [`docs/plan.md`](https://github.com/MaskyS/yutome/blob/main/docs/plan.md) — internal architecture history (not a usage guide)
+- [`docs/plan.md`](https://github.com/MaskyS/yutome/blob/main/docs/plan.md) — pointer to current architecture docs and archived planning history
 
 ## Status
 
