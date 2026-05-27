@@ -158,6 +158,87 @@ The cleanup is constrained by project docs and Beads memories:
 These constraints are why the cleanup is aggressive in hosted internals but
 conservative around the published local CLI and MCP surfaces.
 
+## How to reason about the audit numbers
+
+The line counts and branch counts are triage signals, not the goal. A large file
+is not automatically bad, and a small file is not automatically good. The
+systems question is whether a module forces one reader to hold unrelated state
+machines in their head at the same time.
+
+For this cleanup, a hotspot matters when it crosses one of these boundaries:
+
+- **A public contract boundary**: CLI commands, MCP tool names, resource URI
+  templates, hosted HTTP paths, account-session tokens, CLI authorization
+  tokens, and checked-in Worker contract JSON.
+- **An authority boundary**: account/session auth, CLI grant auth, YouTube
+  source-discovery grants, provider credentials, service allocations, and Polar
+  webhook verification.
+- **A metering boundary**: every provider or search-store call that can spend
+  Yutome-owned units must be preceded by a UsageGate reservation and followed by
+  one clear reconciliation path.
+- **A tenant boundary**: workspace identity must come from verified auth/session
+  context, never from user-supplied tool arguments or dashboard request bodies.
+- **An execution boundary**: a worker claims a job, an executor runs one job
+  type, job operations hold idempotency, and retry/final failure classification
+  must be reviewable.
+
+The first implementation passes should reduce boundary mixing. They should not
+optimize for vanity metrics such as "make every file under N lines." A split is
+worth doing only when the new module has one reason to change and lets tests
+assert a load-bearing invariant more directly.
+
+## Current system shape
+
+Yutome currently has three product paths sharing code:
+
+1. **Local-first CLI/MCP path**
+
+   Local commands load `yutome.toml`, operate on SQLite and LanceDB, and expose
+   local MCP tools through `api.py` and `contract.py`. This path is already
+   published behavior, so cleanup must be conservative. The stable contract is
+   the CLI namespace in `docs/cli-architecture.md` plus MCP tools
+   `find`/`list`/`show`/`q`.
+
+2. **User-owned remote connector path**
+
+   `yutome connect --deploy` prepares and deploys the Cloudflare Worker project
+   under `cloudflare/yutome-capsule/`, then runs a local bridge so hosted
+   clients can reach the laptop corpus. This is operationally real, but the term
+   "capsule" is retired as a product concept. Until the coordinated rename
+   lands, code should treat the directory name as packaging history, not a
+   vocabulary source.
+
+3. **Hosted Yutome path**
+
+   Hosted account/session auth, hosted MCP, hosted jobs, provider broker,
+   UsageGate, usage ledger, billing export, and Postgres search store are still
+   pre-production. This is where aggressive simplification is allowed. Hosted
+   code should prefer a clean contract over compatibility with earlier generated
+   shapes.
+
+This matters because "cleanup" means different things in each path. The local
+path mostly gets extraction and test-preserving simplification. The hosted path
+can delete shims and reshape internals. The remote connector path needs careful
+terminology cleanup because packaging names, docs, and tests are currently
+entangled.
+
+## Non-negotiable invariants
+
+Every cleanup slice must preserve or improve these invariants:
+
+| Area | Invariant |
+|---|---|
+| CLI | Public commands remain `setup`, `connect`, `disconnect`, `status`, `search`, `corpus`, `serve`, `hosted`, `doctor`, and `export`; removed top-level command paths still fail. |
+| MCP | Tools remain `find`, `list`, `show`, `q`; resource URI templates stay stable; CLI nesting does not leak into MCP names. |
+| Hosted account reads | Dashboard reads are authenticated by account-session verification and are not metered through the hosted MCP list/search tools. |
+| Hosted MCP | Tool calls derive workspace identity from hosted MCP auth context and reject workspace injection in arguments. |
+| Usage | Provider/search-store calls are denied before execution when UsageGate denies; unconfigured production usage contexts fail closed. |
+| Billing | Polar mirrors usage and customer state; it does not decide authorization before provider calls. |
+| Source auth | YouTube OAuth grants authorize source discovery only; they are not Yutome login and not provider credentials. |
+| Jobs | Worker claim/lease behavior remains idempotent; retries must not double-charge or duplicate durable outputs. |
+| Secrets | Provider credentials, relay tokens, account tokens, and webhook secrets are not returned in readiness, errors, dashboard JSON, or MCP responses. |
+| Terminology | Hosted concepts use `docs/hosted-glossary.md`; new synonyms are treated as defects. |
+
 ## What is concretely wrong
 
 ### 1. The CLI has a large legacy core behind a newer public surface
@@ -179,11 +260,23 @@ Why this is risky:
 
 What to do:
 
+- First remove the stale internal Typer command tree from `_legacy.py`. Tests
+  import `yutome.cli.app`, not `_legacy.app`; the old `app`, `export_app`,
+  `list_app`, `show_app`, `quality_app`, `mcp_app`, `http_app`, `eval_app`,
+  `remote_app`, `bridge_app`, `contract_app`, and `hosted_app` definitions now
+  mostly preserve removed command paths as an internal ghost surface.
+- Convert functions that are still called by the public namespaced modules into
+  plain helpers. Remove their old `_legacy.py` decorators when the public
+  command lives in `src/yutome/cli/*.py`.
 - Extract setup flow, remote connector deployment, bridge service management,
   command streaming, and corpus sync helpers into focused private modules.
 - Keep `src/yutome/cli/__init__.py` as the public composition point.
 - Keep removed top-level command tests green.
 - Do not add old-path aliases.
+
+The intended first cut is not "split this file into smaller files." The first
+cut is to delete the unused command-registration surface, because that removes a
+real second command tree and makes the remaining helper imports honest.
 
 ### 2. Hosted HTTP routing is too concentrated
 
@@ -210,6 +303,21 @@ What to do:
 - Keep MCP tools protected by the MCP token and workspace auth context.
 - Keep Polar webhook verification isolated from usage authorization.
 
+The safe target shape is:
+
+| Module responsibility | Owns | Must not own |
+|---|---|---|
+| hosted app composition | FastAPI creation, middleware installation, state wiring, route group registration | Route bodies, SQL, token parsing details |
+| MCP route group | `/tools/call`, `/resources/read`, hosted MCP auth dependency | Dashboard account reads, billing webhook verification |
+| account route group | bootstrap, login verification, account summary/library/assistants/search/show | Provider metering, MCP workspace header auth |
+| source import route group | descriptor validation, source import actor, enqueue/import response | Account session token signing, billing |
+| billing route group | Polar signature verification, webhook processing statements | UsageGate decisions |
+
+This shape is better because reviewers can check an auth boundary without
+scrolling through unrelated routes. It is worse only in the sense that there
+will be more small modules and imports; that is an acceptable cost because the
+auth and metering boundaries are more important than file count.
+
 ### 3. Hosted indexing and hosted MCP query classes do too many jobs
 
 `HostedIndexingExecutor` and `HostedMcpQueryAdapter` are large classes that
@@ -232,6 +340,22 @@ What to do:
 - Extract result shaping from tenant and usage enforcement.
 - Preserve fail-closed tests and workspace-injection tests.
 
+The target shape is not a generic service layer. It should reflect the actual
+job/query lifecycle:
+
+1. Parse and validate the request.
+2. Derive tenant and subject from trusted context.
+3. Estimate units.
+4. Reserve through UsageGate.
+5. Execute provider/search-store call.
+6. Persist or normalize output.
+7. Reconcile reservation and append usage event.
+8. Shape response without leaking internal provider state.
+
+The critical rule is that steps 4 and 5 must not be separated by hidden callback
+or inheritance behavior. A future reviewer should be able to prove from the code
+that a paid call cannot happen before the reservation.
+
 ### 4. Retired terms and compatibility shims remain active
 
 The hosted glossary retires "capsule" as a current concept and says greenfield
@@ -251,6 +375,12 @@ What to do:
   worker, connector, relay, or replica.
 - Leave historical docs only when they explicitly label the old name.
 - Remove unnecessary hosted alias shims.
+
+This pass should be coordinated, not search-and-replace. The directory
+`cloudflare/yutome-capsule/` is currently part of packaging and tests, so the
+rename must account for `pyproject.toml` force-includes, package resource
+lookup, contract export, docs, and tests in the same slice. Until then, new code
+must not introduce more conceptual uses of "capsule."
 
 ### 5. Quality gates are too weak for this risk profile
 
@@ -272,6 +402,11 @@ What to do:
 - Use the audit output to drive cleanup.
 - Add stricter lint checks after the worst hotspot modules shrink.
 - Keep exceptions local and justified, especially in tests with fakes.
+
+The quality gates should be added last because they should enforce the simpler
+shape, not become the work itself. A useful gate prevents recurrence of a
+specific artifact class. A bad gate produces mass suppressions and teaches the
+repo to ignore warnings.
 
 ## What is being implemented first
 
@@ -340,6 +475,10 @@ Acceptance:
   exceptions, and generated artifact drift.
 - This brief exists and names actual repo risks.
 
+Status: completed. Do not keep iterating on audit metrics before making the
+first simplification cut. The audit exists to support code changes, not to
+become another analysis project.
+
 ### Slice 2: CLI legacy decomposition
 
 Beads: `yt-indexer-sk6.2`
@@ -350,12 +489,32 @@ Target modules:
 - `src/yutome/cli/__init__.py`
 - existing focused CLI modules under `src/yutome/cli/`
 
+First code edits:
+
+1. Remove the unused `_legacy.py` internal Typer app tree:
+   `app`, `export_app`, `list_app`, `show_app`, `quality_app`, `mcp_app`,
+   `http_app`, `eval_app`, `remote_app`, `bridge_app`, `contract_app`,
+   `hosted_app`, and their `add_typer` wiring.
+2. Remove decorators from helper functions whose public command is already
+   registered in focused modules such as `search.py`, `corpus.py`, `serve.py`,
+   `doctor.py`, `hosted.py`, and `export.py`.
+3. Keep plain helper functions importable through `yutome.cli.__getattr__` until
+   tests are moved to import from narrower modules.
+4. Move remote connector deployment helpers into a new private module only after
+   the ghost command tree is gone; otherwise the extraction hides the stale
+   command surface instead of removing it.
+
 Acceptance:
 
 - `_legacy.py` materially shrinks.
 - Public CLI command tree still matches `docs/cli-architecture.md`.
 - Removed old top-level paths still fail.
 - No new compatibility aliases are added.
+
+Do not start by moving `setup()` wholesale. The first-run setup flow is a real
+state machine with prompting, environment writes, config creation, hosted setup,
+source import, and first sync. Moving it before deleting the unused command tree
+creates churn without reducing the actual duplicate surface.
 
 Primary tests:
 
@@ -370,6 +529,27 @@ Beads: `yt-indexer-sk6.3`
 Target module:
 
 - `src/yutome/hosted/http_api.py`
+
+Precondition:
+
+- Do not start this slice while unrelated hosted signup/email work is dirty in
+  `src/yutome/hosted/http_api.py`, account-read tests, or web signup routes.
+  Rebase after that work lands, then split routes. This prevents mixing product
+  auth changes with mechanical route extraction.
+
+First code edits:
+
+1. Extract health/readiness registration to a helper that takes only the
+   readiness check and sanitized readiness helpers.
+2. Extract hosted MCP route registration to a helper that takes the adapter and
+   MCP auth dependency. This helper should own only `/tools/call`,
+   `/mcp/tools/call`, `/resources/read`, and `/mcp/resources/read`.
+3. Extract dashboard/account route registration separately. It must depend on
+   account-session verification and account read helpers, not the metered MCP
+   adapter.
+4. Extract Polar webhook routes separately. They should depend on webhook secret
+   verification and billing statements only.
+5. Leave `build_app()` as state wiring plus route group registration.
 
 Acceptance:
 
@@ -394,6 +574,29 @@ Target modules:
 - `src/yutome/hosted/mcp_query.py`
 - supporting hosted models/gate/search-store modules as needed
 
+First code edits for `HostedMcpQueryAdapter`:
+
+1. Move `HostedFindRequest`, `HostedShowRequest`, `HostedListRequest`, and
+   `HostedQRequest` parsing into a request module. Keep the public parsed shapes
+   identical.
+2. Move workspace-injection rejection helpers with request parsing, because they
+   protect the request boundary.
+3. Extract search-store usage reservation and event recording into a small
+   collaborator. It should expose operations such as reserve query, record
+   success, record failure, and record release.
+4. Keep `call_tool()` and `read_resource()` as thin dispatchers.
+
+First code edits for `HostedIndexingExecutor`:
+
+1. Extract job lease helpers and operation persistence helpers into explicit
+   collaborators or narrow functions.
+2. Extract provider contexts and UsageGate reservation helpers so the executor
+   reads as a job lifecycle, not as raw usage plumbing.
+3. Keep provider fetch/clean/embed call sites visibly after reservation. Do not
+   hide a provider call inside an object constructor or lazy property.
+4. Only then split source discovery from index-video execution if the shared
+   base class is still carrying too much behavior.
+
 Acceptance:
 
 - Request parsing, usage reservation, provider/search calls, and result shaping
@@ -410,6 +613,24 @@ uv run pytest tests/test_hosted_indexing_smoke.py tests/test_hosted_mcp_query.py
 ### Slice 5: Retired terminology and stale shim removal
 
 Beads: `yt-indexer-sk6.5`
+
+Precondition:
+
+- Run the audit marker report and separate references into four buckets:
+  historical docs, package path, current concept, and test fixture. Only current
+  concept usage is renamed blindly. Package-path changes require coordinated
+  packaging/test updates.
+
+First code edits:
+
+1. Rename helper/function names such as `_tracked_capsule_path` and
+   `_deploy_tracked_capsule` only in the same change that updates imports/tests.
+2. Update `contract_export.py` and package include paths if the directory is
+   renamed.
+3. Leave historical strategy docs alone unless the text claims "capsule" is the
+   current product concept.
+4. Remove hosted pre-production aliases only when tests prove no local published
+   CLI/MCP surface depends on them.
 
 Acceptance:
 
@@ -428,6 +649,21 @@ cd cloudflare/yutome-capsule && npx tsc --noEmit
 ### Slice 6: Quality gate expansion
 
 Beads: `yt-indexer-sk6.6`
+
+Precondition:
+
+- Do not expand lint rules while the largest known generated surfaces are still
+  in their current shape. The likely result would be hundreds of suppressions
+  and no architectural improvement.
+
+First code edits:
+
+1. Start with rules that catch unused imports/variables and accidental broad
+   exception patterns in production code.
+2. Exempt tests and generated boundary code explicitly, not globally.
+3. Add one rule family at a time and fix violations in the same slice.
+4. Make the audit script a documented local check, but do not fail CI on raw
+   hotspot counts until the epic has reduced the baseline.
 
 Acceptance:
 
@@ -461,6 +697,26 @@ Interpretation rules:
   current hosted code.
 - Generated artifact drift should not become a source of truth unless the file
   is deliberately checked in as a contract snapshot.
+
+## Rejected approaches
+
+The following approaches are explicitly rejected for this epic:
+
+- **Big-bang rewrite.** It would lose the green baseline and mix unrelated
+  contract changes.
+- **Line-count target as the goal.** A smaller file can still hide the same
+  state machine. The goal is clearer authority, tenant, metering, and execution
+  boundaries.
+- **Compatibility-preserving hosted cleanup.** Hosted is pre-production; keeping
+  stale aliases there preserves mistakes. The exception is local published
+  CLI/MCP behavior.
+- **Generic service/repository layering.** The splits must follow Yutome's real
+  lifecycle: request, auth, UsageGate, provider/search call, persistence,
+  reconciliation, response.
+- **Static analysis first.** Stricter linting before simplification creates
+  suppression churn. Add gates after the code shape is better.
+- **Terminology-only cleanup.** Renaming without boundary fixes makes the code
+  look cleaner while preserving the same coupling.
 
 ## Done criteria for the epic
 
