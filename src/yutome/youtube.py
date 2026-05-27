@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Literal, TypeVar
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 from requests import Session
@@ -82,6 +82,18 @@ YOUTUBE_BLOCK_MARKERS = (
     "temporarily blocked",
 )
 
+YTDLP_RETRYABLE_TRANSIENT_MARKERS = (
+    "the page needs to be reloaded",
+    "timed out after",
+    "response ended prematurely",
+    "connection broken",
+    "incompleteread",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "connection reset",
+    "connection aborted",
+)
+
 PROXY_PAYMENT_MARKERS = (
     "402 payment required",
     "connect tunnel failed, response 402",
@@ -91,6 +103,13 @@ PROXY_PAYMENT_MARKERS = (
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 YOUTUBE_VIDEO_ID_RE = r"[A-Za-z0-9_-]{11}"
+YtDlpProfile = Literal["current", "python-no-js", "player-skip-js"]
+
+
+class _YtDlpValidationError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        self.retryable = retryable
+        super().__init__(message)
 
 
 def is_youtube_block_error(error: Exception | str) -> bool:
@@ -104,6 +123,13 @@ def is_proxy_payment_error(error: Exception | str) -> bool:
 
 
 _is_ytdlp_block_error = is_youtube_block_error
+
+
+def _is_ytdlp_retryable_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    if is_proxy_payment_error(text):
+        return False
+    return is_youtube_block_error(text) or any(marker in text for marker in YTDLP_RETRYABLE_TRANSIENT_MARKERS)
 
 
 def canonical_channel_tabs(target: str) -> list[tuple[str, str]]:
@@ -149,6 +175,37 @@ def _yt_dlp_base_command() -> list[str]:
     except ImportError:
         return ["yt-dlp"]
     return [sys.executable, "-m", "yt_dlp"]
+
+
+def _effective_ytdlp_config(ytdlp_config: YtDlpConfig | None) -> YtDlpConfig:
+    return ytdlp_config or YtDlpConfig()
+
+
+def _yt_dlp_profile_args(profile: YtDlpProfile) -> list[str]:
+    if profile == "python-no-js":
+        return ["--no-js-runtimes", "--no-remote-components"]
+    if profile == "player-skip-js":
+        return ["--extractor-args", "youtube:player_skip=js"]
+    return []
+
+
+def _yt_dlp_profile_sequence(ytdlp_config: YtDlpConfig | None) -> tuple[YtDlpProfile, ...]:
+    config = _effective_ytdlp_config(ytdlp_config)
+    profiles: list[YtDlpProfile] = [config.profile]
+    if config.profile_fallback_enabled and config.fallback_profile and config.fallback_profile not in profiles:
+        profiles.append(config.fallback_profile)
+    return tuple(profiles)
+
+
+def _yt_dlp_attempts_per_profile(proxy: ProxyConfig | None, ytdlp_config: YtDlpConfig | None) -> int:
+    config = _effective_ytdlp_config(ytdlp_config)
+    if proxy and proxy.enabled:
+        return 1 + config.retries_when_blocked
+    return 1
+
+
+def _sleep_before_ytdlp_retry(attempt: int) -> None:
+    time.sleep(min(5 * attempt, 15))
 
 
 def _pick_from_pool(urls: list[str], *, key: str | None = None) -> str | None:
@@ -491,6 +548,7 @@ def _run_ytdlp(
     ytdlp_config: YtDlpConfig | None = None,
     proxy_key: str | None = None,
     hosted_context: ProviderCallContext | None = None,
+    profile: YtDlpProfile | None = None,
 ) -> subprocess.CompletedProcess[str]:
     def run() -> subprocess.CompletedProcess[str]:
         result = _run_ytdlp_unwrapped(
@@ -499,6 +557,7 @@ def _run_ytdlp(
             proxy=proxy,
             ytdlp_config=ytdlp_config,
             proxy_key=proxy_key,
+            profile=profile,
         )
         if result.returncode != 0 and _uses_hosted_webshare_proxy(proxy, hosted_context):
             status_code = _webshare_proxy_failure_status_code(result)
@@ -530,6 +589,71 @@ def _run_ytdlp(
     return run()
 
 
+def _run_ytdlp_for_operation(
+    args: Iterable[str],
+    *,
+    cwd: Path,
+    operation: str,
+    proxy: ProxyConfig | None = None,
+    ytdlp_config: YtDlpConfig | None = None,
+    proxy_key: str | None = None,
+    hosted_context: ProviderCallContext | None = None,
+    success_validator: Callable[[subprocess.CompletedProcess[str]], None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    arg_list = list(args)
+    last_result: subprocess.CompletedProcess[str] | None = None
+    last_validation_error: _YtDlpValidationError | None = None
+    terminal_failure = False
+    attempts_per_profile = _yt_dlp_attempts_per_profile(proxy, ytdlp_config)
+    for profile in _yt_dlp_profile_sequence(ytdlp_config):
+        for attempt in range(1, attempts_per_profile + 1):
+            result = _run_ytdlp(
+                arg_list,
+                cwd=cwd,
+                proxy=proxy,
+                ytdlp_config=ytdlp_config,
+                proxy_key=proxy_key,
+                hosted_context=hosted_context,
+                profile=profile,
+            )
+            if result.returncode != 0:
+                last_result = result
+                if is_proxy_payment_error((result.stderr or "") + "\n" + (result.stdout or "")):
+                    terminal_failure = True
+                    break
+                if attempt < attempts_per_profile and _is_ytdlp_retryable_error(
+                    (result.stderr or "") + "\n" + (result.stdout or "")
+                ):
+                    _sleep_before_ytdlp_retry(attempt)
+                    continue
+                break
+            if success_validator is None:
+                return result
+            try:
+                success_validator(result)
+            except _YtDlpValidationError as exc:
+                last_validation_error = exc
+                if exc.retryable and attempt < attempts_per_profile:
+                    _sleep_before_ytdlp_retry(attempt)
+                    continue
+                break
+            return result
+        if terminal_failure:
+            break
+    if last_validation_error is not None:
+        raise RuntimeError(str(last_validation_error))
+    if last_result is not None:
+        raise RuntimeError(
+            format_ytdlp_failure(
+                last_result,
+                operation=operation,
+                proxy=proxy,
+                proxy_key=proxy_key,
+            )
+        )
+    raise RuntimeError(f"yt-dlp did not run for {operation}")
+
+
 def _run_ytdlp_unwrapped(
     args: Iterable[str],
     *,
@@ -537,24 +661,23 @@ def _run_ytdlp_unwrapped(
     proxy: ProxyConfig | None = None,
     ytdlp_config: YtDlpConfig | None = None,
     proxy_key: str | None = None,
+    profile: YtDlpProfile | None = None,
 ) -> subprocess.CompletedProcess[str]:
     arg_list = list(args)
+    config = _effective_ytdlp_config(ytdlp_config)
+    selected_profile = profile or config.profile
     extra_args: list[str] = []
     proxy_url = proxy_url_for_ytdlp(proxy, key=proxy_key)
     if proxy_url:
         extra_args.extend(["--proxy", proxy_url])
-    if ytdlp_config:
-        sleep_requests = (
-            ytdlp_config.sleep_requests_seconds_with_proxy
-            if proxy_url
-            else ytdlp_config.sleep_requests_seconds
-        )
-        extra_args.extend(["--sleep-requests", str(sleep_requests)])
-        extra_args.extend(["--retry-sleep", ytdlp_config.retry_sleep])
-        if ytdlp_config.impersonate:
-            extra_args.extend(["--impersonate", ytdlp_config.impersonate])
-        if ytdlp_config.remote_components:
-            extra_args.extend(["--remote-components", "ejs:github"])
+    sleep_requests = config.sleep_requests_seconds_with_proxy if proxy_url else config.sleep_requests_seconds
+    extra_args.extend(["--sleep-requests", str(sleep_requests)])
+    extra_args.extend(["--retry-sleep", config.retry_sleep])
+    if config.impersonate:
+        extra_args.extend(["--impersonate", config.impersonate])
+    if config.remote_components:
+        extra_args.extend(["--remote-components", "ejs:github"])
+    extra_args.extend(_yt_dlp_profile_args(selected_profile))
     command = [
         *_yt_dlp_base_command(),
         "--ignore-config",
@@ -562,7 +685,7 @@ def _run_ytdlp_unwrapped(
         *extra_args,
         *arg_list,
     ]
-    timeout_seconds = ytdlp_config.subprocess_timeout_seconds if ytdlp_config else 300.0
+    timeout_seconds = config.subprocess_timeout_seconds
     try:
         result = subprocess.run(
             command,
@@ -641,25 +764,20 @@ def discover_videos(
         if limit:
             args.extend(["--playlist-end", str(limit)])
         args.append(tab_url)
-        result = _run_ytdlp(
-            args,
-            cwd=cwd,
-            proxy=proxy,
-            ytdlp_config=ytdlp_config,
-            proxy_key=tab_url,
-            hosted_context=hosted_context,
-        )
-        if result.returncode != 0:
+        try:
+            result = _run_ytdlp_for_operation(
+                args,
+                cwd=cwd,
+                operation=f"discovery for {tab_url}",
+                proxy=proxy,
+                ytdlp_config=ytdlp_config,
+                proxy_key=tab_url,
+                hosted_context=hosted_context,
+            )
+        except RuntimeError:
             if tab_name == "streams":
                 continue
-            raise RuntimeError(
-                format_ytdlp_failure(
-                    result,
-                    operation=f"discovery for {tab_url}",
-                    proxy=proxy,
-                    proxy_key=tab_url,
-                )
-            )
+            raise
         for raw in _parse_json_lines(result.stdout):
             video_id = raw.get("id")
             if not video_id or video_id in discovered:
@@ -703,6 +821,26 @@ def _validate_video_metadata_row(row: dict[str, Any], *, video_id: str) -> None:
         )
 
 
+def _metadata_has_published_date(row: dict[str, Any]) -> bool:
+    return any(row.get(field) is not None for field in ("upload_date", "release_date", "modified_date", "timestamp"))
+
+
+def _validate_video_metadata_result(result: subprocess.CompletedProcess[str], *, video_id: str) -> None:
+    rows = _parse_json_lines(result.stdout)
+    if not rows:
+        raise _YtDlpValidationError(f"yt-dlp returned no metadata for {video_id}")
+    row = rows[0]
+    try:
+        _validate_video_metadata_row(row, video_id=video_id)
+    except RuntimeError as exc:
+        raise _YtDlpValidationError(str(exc)) from exc
+    if not _metadata_has_published_date(row):
+        raise _YtDlpValidationError(
+            f"yt-dlp returned metadata without a published date for {video_id}; "
+            "retrying with the next configured attempt/profile."
+        )
+
+
 def fetch_video_metadata(
     *,
     video_id: str,
@@ -711,43 +849,22 @@ def fetch_video_metadata(
     ytdlp_config: YtDlpConfig | None = None,
     hosted_context: ProviderCallContext | None = None,
 ) -> dict[str, Any]:
-    # Tempting optimisation we tried and reverted: `--extractor-args youtube:player_skip=js`
-    # skips the player-JS download and signature decryption that yt-dlp does even
-    # for metadata. On bare IP it cut wall time ~41% (11.5s → 6.8s) with all fields
-    # intact. Through Webshare rotating residential, the same flag only bought ~8%
-    # because proxy hops dominate wall time, AND it introduced sporadic
-    # "page needs to be reloaded" failures — yt-dlp can't reconcile when JS state
-    # is needed and a rotated IP returns a player response shaped for a different
-    # session. Other player_skip values (configs / initial_data / webpage alone)
-    # gave no measurable improvement. The `js,webpage` combination breaks
-    # extraction unconditionally with the same "page needs to be reloaded" error.
-    # If we ever support a no-proxy fast path, apply `player_skip=js` only when
-    # `proxy_url is None`.
-    result = _run_ytdlp(
+    result = _run_ytdlp_for_operation(
         [
             "--skip-download",
             "--dump-json",
             f"https://www.youtube.com/watch?v={video_id}",
         ],
         cwd=cwd,
+        operation=f"metadata fetch for {video_id}",
         proxy=proxy,
         ytdlp_config=ytdlp_config,
         proxy_key=video_id,
         hosted_context=hosted_context,
+        success_validator=lambda result: _validate_video_metadata_result(result, video_id=video_id),
     )
-    if result.returncode != 0:
-        detail = format_ytdlp_failure(
-            result,
-            operation=f"metadata fetch for {video_id}",
-            proxy=proxy,
-            proxy_key=video_id,
-        )
-        raise RuntimeError(f"yt-dlp metadata fetch failed for {video_id}: {detail}")
     rows = _parse_json_lines(result.stdout)
-    if not rows:
-        raise RuntimeError(f"yt-dlp returned no metadata for {video_id}")
     row = rows[0]
-    _validate_video_metadata_row(row, video_id=video_id)
     return row
 
 
@@ -916,30 +1033,64 @@ def fetch_subtitle_transcript_with_ytdlp(
         # provider ordering and this fallback remains English-only.
         language_candidates = ["en", "en-orig"]
     last_error: str | None = None
-    for candidate in language_candidates:
-        attempts = 1
-        if ytdlp_config and proxy and proxy.enabled:
-            attempts += ytdlp_config.subtitle_retries_when_blocked
-        for attempt in range(1, attempts + 1):
-            try:
-                return _fetch_subtitle_transcript_with_ytdlp_language(
-                    video_id=video_id,
-                    cwd=cwd,
-                    language=candidate,
-                    proxy=proxy,
-                    ytdlp_config=ytdlp_config,
-                    hosted_context=hosted_context,
-                )
-            except UsageReservationDenied:
-                raise
-            except RuntimeError as exc:
-                last_error = str(exc)
-                if not is_youtube_block_error(last_error):
-                    break
-                if attempt >= attempts:
+    attempts_per_profile = _yt_dlp_attempts_per_profile(proxy, ytdlp_config)
+    for profile in _yt_dlp_profile_sequence(ytdlp_config):
+        profile_failed_from_process = False
+        for candidate in language_candidates:
+            for attempt in range(1, attempts_per_profile + 1):
+                try:
+                    return _fetch_subtitle_transcript_with_ytdlp_language(
+                        video_id=video_id,
+                        cwd=cwd,
+                        language=candidate,
+                        proxy=proxy,
+                        ytdlp_config=ytdlp_config,
+                        hosted_context=hosted_context,
+                        profile=profile,
+                    )
+                except UsageReservationDenied:
                     raise
-                time.sleep(min(5 * attempt, 15))
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    if not _is_ytdlp_retryable_error(last_error):
+                        if not _is_ytdlp_empty_subtitle_error(last_error):
+                            profile_failed_from_process = True
+                        break
+                    if attempt < attempts_per_profile:
+                        _sleep_before_ytdlp_retry(attempt)
+                        continue
+                    profile_failed_from_process = True
+                    break
+            if profile_failed_from_process:
+                break
+        if profile_failed_from_process:
+            continue
     raise RuntimeError(last_error or f"yt-dlp did not write subtitles for {video_id}")
+
+
+def _json3_text_snippets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    snippets: list[dict[str, Any]] = []
+    for event in payload.get("events", []):
+        if "segs" not in event:
+            continue
+        text = "".join(seg.get("utf8", "") for seg in event["segs"]).strip()
+        if not text:
+            continue
+        start_ms = int(event.get("tStartMs", 0) or 0)
+        duration_ms = int(event.get("dDurationMs", 0) or 0)
+        snippets.append(
+            {
+                "text": text,
+                "start": start_ms / 1000,
+                "duration": duration_ms / 1000,
+            }
+        )
+    return snippets
+
+
+def _is_ytdlp_empty_subtitle_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return "did not write json3 subtitles" in text or "json3 subtitles with no text segments" in text
 
 
 def _fetch_subtitle_transcript_with_ytdlp_language(
@@ -950,19 +1101,14 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
     proxy: ProxyConfig | None,
     ytdlp_config: YtDlpConfig | None,
     hosted_context: ProviderCallContext | None,
+    profile: YtDlpProfile | None = None,
 ) -> TranscriptFetchResult:
     with tempfile.TemporaryDirectory(prefix="yutome-subs-") as temp_dir:
         # Mirror the proxy-aware sleep policy from _run_ytdlp: per-IP rate
         # limits don't apply when a rotating proxy hands out fresh IPs.
+        config = _effective_ytdlp_config(ytdlp_config)
         using_proxy = bool(proxy_url_for_ytdlp(proxy, key=video_id))
-        if ytdlp_config:
-            sleep_subs = (
-                ytdlp_config.sleep_subtitles_seconds_with_proxy
-                if using_proxy
-                else ytdlp_config.sleep_subtitles_seconds
-            )
-        else:
-            sleep_subs = 0.0 if using_proxy else 8.0
+        sleep_subs = config.sleep_subtitles_seconds_with_proxy if using_proxy else config.sleep_subtitles_seconds
         result = _run_ytdlp(
             [
                 "--skip-download",
@@ -985,6 +1131,7 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
             ytdlp_config=ytdlp_config,
             proxy_key=video_id,
             hosted_context=hosted_context,
+            profile=profile,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -999,22 +1146,9 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
         if not files:
             raise RuntimeError(f"yt-dlp did not write json3 subtitles for {video_id}")
         payload = json.loads(files[0].read_text(encoding="utf-8"))
-    snippets: list[dict[str, Any]] = []
-    for event in payload.get("events", []):
-        if "segs" not in event:
-            continue
-        text = "".join(seg.get("utf8", "") for seg in event["segs"]).strip()
-        if not text:
-            continue
-        start_ms = int(event.get("tStartMs", 0) or 0)
-        duration_ms = int(event.get("dDurationMs", 0) or 0)
-        snippets.append(
-            {
-                "text": text,
-                "start": start_ms / 1000,
-                "duration": duration_ms / 1000,
-            }
-        )
+    snippets = _json3_text_snippets(payload)
+    if not snippets:
+        raise RuntimeError(f"yt-dlp wrote json3 subtitles with no text segments for {video_id}")
     return TranscriptFetchResult(
         raw_snippets=snippets,
         source=f"yt-dlp-json3:{language}",
@@ -1033,7 +1167,11 @@ def download_audio_for_asr(
     hosted_context: ProviderCallContext | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    result = _run_ytdlp(
+    def validate_audio_output(_: subprocess.CompletedProcess[str]) -> None:
+        if not any(path.is_file() and path.name.startswith(video_id) for path in output_dir.iterdir()):
+            raise _YtDlpValidationError(f"yt-dlp did not write audio for {video_id}")
+
+    _run_ytdlp_for_operation(
         [
             "-f",
             "bestaudio/best",
@@ -1044,14 +1182,12 @@ def download_audio_for_asr(
             f"https://www.youtube.com/watch?v={video_id}",
         ],
         cwd=cwd,
+        operation=f"audio download for {video_id}",
         proxy=proxy,
         ytdlp_config=ytdlp_config,
         proxy_key=video_id,
         hosted_context=hosted_context,
+        success_validator=validate_audio_output,
     )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     candidates = [path for path in output_dir.iterdir() if path.is_file() and path.name.startswith(video_id)]
-    if not candidates:
-        raise RuntimeError(f"yt-dlp did not write audio for {video_id}")
     return max(candidates, key=lambda path: path.stat().st_size)

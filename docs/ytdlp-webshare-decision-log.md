@@ -10,7 +10,7 @@ implementation.
 ## Decision
 
 Use Webshare for hosted YouTube indexing and make `python-no-js` the default
-hosted `yt-dlp` profile:
+`yt-dlp` profile for hosted and local runtime calls:
 
 ```text
 --no-js-runtimes --no-remote-components
@@ -30,8 +30,9 @@ Reasons:
 - The current/full profile is about 2x slower in the production Webshare matrix.
 
 Hosted is still pre-production, so no hosted backwards compatibility shim is
-required for this change. Local behavior can remain configurable, but hosted
-should optimize for a simple production contract.
+required for this change. Local behavior remains configurable, but the default
+runtime contract should match the measured production profile unless a call site
+has a concrete reason to opt out.
 
 ## Hosted JavaScript Runtime Note
 
@@ -317,46 +318,56 @@ Already implemented:
 - Production benchmark mode with bounded Webshare attempts.
 - Runtime English subtitle fallback now tries `en` before `en-orig`.
 
-Remaining implementation work:
+Implemented on 2026-05-27 after the benchmark:
 
-1. Runtime profile selection is not centralized in production code.
-   `scripts/benchmark_ytdlp_runtime.py` has profiles, but
-   `src/yutome/youtube.py` still builds the production command directly from
-   `YtDlpConfig`.
+1. Runtime profile selection is centralized in `src/yutome/youtube.py`.
+   `YtDlpConfig.profile` defaults to `python-no-js`, with `current` as the
+   fallback profile.
 
-2. Hosted Webshare runtime calls do not yet default to `python-no-js`.
-   The default command still uses current/full `yt-dlp` behavior with optional
-   impersonation and optional remote components.
+2. Hosted and local `yt-dlp` calls use the same default profile. This covers
+   discovery, exact metadata, JSON3 subtitle fallback, and audio download for
+   ASR.
 
-3. The benchmarked production retry semantics are not fully applied to
-   metadata/discovery/subtitle runtime calls.
+3. Runtime calls retry retryable process failures per profile when a proxy is
+   active, using `YtDlpConfig.retries_when_blocked`, then fall back to the
+   current/full profile.
 
-4. The old inline metadata comment about `player_skip=js` explains why it
-   should not be the Webshare default, but it should be updated after the
-   `python-no-js` runtime profile lands.
+4. Exact metadata retries and falls back when extraction succeeds but lacks a
+   published-date source.
 
-## Implementation Plan
+5. JSON3 subtitle fallback requires nonzero text segments. It retries process
+   failures with the same language/profile and only switches `en` to `en-orig`
+   after a successful empty subtitle extraction.
+
+Remaining follow-up:
+
+- Run `yt-indexer-ar9` after the runtime change to confirm the hosted-oriented
+  Webshare smoke still matches the benchmark baseline.
+
+## Runtime Implementation
 
 Beads follow-up issues:
 
-- `yt-indexer-qhb`: Runtime: default hosted yt-dlp Webshare calls to
-  `python-no-js` profile.
+- `yt-indexer-qhb`: Runtime: default hosted/local yt-dlp calls to
+  `python-no-js` profile. Closed when the runtime change lands.
 - `yt-indexer-5tu`: Runtime: add production Webshare retry policy for `yt-dlp`.
+  Closed when the runtime change lands.
 - `yt-indexer-ar9`: Hosted smoke: verify production `yt-dlp` Webshare profile
-  after runtime change.
+  after runtime change. Remains open until a real hosted-oriented smoke is run.
 
-Plan:
+Implemented shape:
 
-1. Add a centralized `yt-dlp` runtime profile abstraction.
+1. Centralize the `yt-dlp` runtime profile abstraction.
    - Profiles: `current`, `python-no-js`, `player-skip-js`.
-   - Hosted Webshare default: `python-no-js`.
+   - Hosted and local default: `python-no-js`.
    - Fallback profile: `current`.
    - Keep `player-skip-js` as benchmark/optional, not default.
 
 2. Route production command construction through that abstraction.
-   - Metadata, discovery, and subtitle paths should use the same profile code.
-   - Benchmark variants should reuse or mirror the same profile names.
-   - Tests should assert actual command args.
+   - Metadata, discovery, subtitle, and ASR audio paths use the same profile
+     code.
+   - Benchmark variants mirror the same profile names.
+   - Tests assert actual command args.
 
 3. Add bounded production retry behavior to runtime paths.
    - Retry retryable process failures with the same profile/language.

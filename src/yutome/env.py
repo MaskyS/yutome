@@ -97,6 +97,16 @@ def apply_env_to_config(config):
     if request_timeout := os.environ.get("YUTOME_TRANSCRIPTS_REQUEST_TIMEOUT_SECONDS"):
         transcript_updates["request_timeout_seconds"] = float(request_timeout)
 
+    yt_dlp_updates = {}
+    if ytdlp_profile := os.environ.get("YUTOME_YT_DLP_PROFILE"):
+        yt_dlp_updates["profile"] = ytdlp_profile
+    if ytdlp_fallback_profile := os.environ.get("YUTOME_YT_DLP_FALLBACK_PROFILE"):
+        yt_dlp_updates["fallback_profile"] = ytdlp_fallback_profile
+    if ytdlp_profile_fallback_enabled := os.environ.get("YUTOME_YT_DLP_PROFILE_FALLBACK_ENABLED"):
+        yt_dlp_updates["profile_fallback_enabled"] = _env_bool(ytdlp_profile_fallback_enabled)
+    if ytdlp_retries_when_blocked := os.environ.get("YUTOME_YT_DLP_RETRIES_WHEN_BLOCKED"):
+        yt_dlp_updates["retries_when_blocked"] = int(ytdlp_retries_when_blocked)
+
     youtube_updates = {}
     if youtube_client_secrets := os.environ.get("YUTOME_YOUTUBE_OAUTH_CLIENT_SECRETS"):
         youtube_updates["oauth_client_secrets"] = youtube_client_secrets
@@ -114,6 +124,8 @@ def apply_env_to_config(config):
         updates["gemini"] = config.gemini.model_copy(update=gemini_updates)
     if transcript_updates:
         updates["transcripts"] = config.transcripts.model_copy(update=transcript_updates)
+    if yt_dlp_updates:
+        updates["yt_dlp"] = config.yt_dlp.model_copy(update=yt_dlp_updates)
     if youtube_updates:
         updates["youtube"] = config.youtube.model_copy(update=youtube_updates)
     if updates:

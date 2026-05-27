@@ -111,7 +111,11 @@ def test_default_config_round_trip(tmp_path: Path) -> None:
     assert config.embeddings.concurrency == 4
     assert config.embeddings.max_retries == 5
     assert config.vectors.backend == "lancedb"
+    assert config.yt_dlp.retries_when_blocked == 3
     assert config.yt_dlp.subtitle_retries_when_blocked == 3
+    assert config.yt_dlp.profile == "python-no-js"
+    assert config.yt_dlp.fallback_profile == "current"
+    assert config.yt_dlp.profile_fallback_enabled is True
     assert config.yt_dlp.subprocess_timeout_seconds == 300.0
     assert config.proxy.use_for_discovery is False
     assert config.proxy.use_for_metadata is False
@@ -2514,6 +2518,22 @@ def test_webshare_metadata_auto_enable_can_be_disabled(monkeypatch, tmp_path: Pa
     assert config.proxy.enabled is True
     assert config.proxy.kind == "webshare"
     assert config.proxy.use_for_metadata is False
+
+
+def test_env_can_override_ytdlp_runtime_profile(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "yutome.toml"
+    write_default_config(config_path)
+    monkeypatch.setenv("YUTOME_YT_DLP_PROFILE", "current")
+    monkeypatch.setenv("YUTOME_YT_DLP_FALLBACK_PROFILE", "python-no-js")
+    monkeypatch.setenv("YUTOME_YT_DLP_PROFILE_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("YUTOME_YT_DLP_RETRIES_WHEN_BLOCKED", "5")
+
+    config = apply_env_to_config(load_config(config_path))
+
+    assert config.yt_dlp.profile == "current"
+    assert config.yt_dlp.fallback_profile == "python-no-js"
+    assert config.yt_dlp.profile_fallback_enabled is False
+    assert config.yt_dlp.retries_when_blocked == 5
 
 
 def test_oauth_client_secrets_loader_accepts_installed_shape(tmp_path: Path) -> None:

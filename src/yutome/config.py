@@ -118,8 +118,12 @@ media_resolution = "low"
 window_seconds = 900
 
 [yt_dlp]
+profile = "python-no-js"
+fallback_profile = "current"
+profile_fallback_enabled = true
 sleep_requests_seconds = 2.0
 sleep_subtitles_seconds = 8.0
+retries_when_blocked = 3
 subtitle_retries_when_blocked = 3
 retry_sleep = "exp=5:120"
 remote_components = false
@@ -239,6 +243,9 @@ class ProxyConfig(BaseModel):
 
 
 class YtDlpConfig(BaseModel):
+    profile: Literal["current", "python-no-js", "player-skip-js"] = "python-no-js"
+    fallback_profile: Literal["current", "python-no-js", "player-skip-js"] | None = "current"
+    profile_fallback_enabled: bool = True
     # Sleep defaults are for the no-proxy / local residential-IP case. When a
     # proxy is actually applied to a request, the *_with_proxy values are used
     # instead because per-IP rate limits no longer apply (rotating residential
@@ -247,6 +254,7 @@ class YtDlpConfig(BaseModel):
     sleep_subtitles_seconds: float = Field(default=8.0, ge=0)
     sleep_requests_seconds_with_proxy: float = Field(default=0.0, ge=0)
     sleep_subtitles_seconds_with_proxy: float = Field(default=0.0, ge=0)
+    retries_when_blocked: int = Field(default=3, ge=0)
     subtitle_retries_when_blocked: int = Field(default=3, ge=0)
     retry_sleep: str = "exp=5:120"
     remote_components: bool = False

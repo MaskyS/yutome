@@ -316,8 +316,12 @@ media_resolution = "low"
 window_seconds = 900
 
 [yt_dlp]
+profile = "python-no-js"
+fallback_profile = "current"
+profile_fallback_enabled = true
 sleep_requests_seconds = 2.0
 sleep_subtitles_seconds = 8.0
+retries_when_blocked = 3
 subtitle_retries_when_blocked = 3
 retry_sleep = "exp=5:120"
 remote_components = false

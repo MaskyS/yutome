@@ -97,7 +97,7 @@ def test_hosted_fetch_video_metadata_records_success_and_uses_proxy(
 
     def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        stdout = json.dumps({"id": "video123", "title": "Hosted test"}) + "\n"
+        stdout = json.dumps({"id": "video123", "title": "Hosted test", "upload_date": "20260527"}) + "\n"
         return subprocess.CompletedProcess(
             command,
             0,
@@ -118,13 +118,15 @@ def test_hosted_fetch_video_metadata_records_success_and_uses_proxy(
     assert commands
     proxy_flag_index = commands[0].index("--proxy")
     assert commands[0][proxy_flag_index + 1] == "http://proxy-user-rotate:proxy-pass@p.webshare.io:80/"
+    assert "--no-js-runtimes" in commands[0]
+    assert "--no-remote-components" in commands[0]
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
     succeeded = ledger.events[1]
     assert succeeded.subject == "webshare"
     assert succeeded.operation == "proxy_fetch"
     assert succeeded.actual_units["request_count"] == 1
     assert succeeded.actual_units["local_response_bytes"] == len(
-        (json.dumps({"id": "video123", "title": "Hosted test"}) + "\n").encode("utf-8")
+        (json.dumps({"id": "video123", "title": "Hosted test", "upload_date": "20260527"}) + "\n").encode("utf-8")
     )
     assert succeeded.actual_units["local_request_bytes"] > 0
     assert succeeded.actual_units["bytes"] >= succeeded.actual_units["local_response_bytes"]

@@ -72,7 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 metric = run_production_case(
                     case,
                     config=config,
-                    max_attempts=args.production_attempts or (config.yt_dlp.subtitle_retries_when_blocked + 1),
+                    max_attempts=args.production_attempts or (config.yt_dlp.retries_when_blocked + 1),
                     retry_sleep_seconds=args.production_retry_sleep_seconds,
                     timeout_seconds=args.timeout_seconds,
                 )
@@ -109,7 +109,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--production-attempts",
         type=int,
         default=None,
-        help="Maximum subprocess attempts per production case. Defaults to yt-dlp subtitle retry policy + 1.",
+        help="Maximum subprocess attempts per production case. Defaults to yt-dlp retry policy + 1.",
     )
     parser.add_argument(
         "--production-retry-sleep-seconds",
