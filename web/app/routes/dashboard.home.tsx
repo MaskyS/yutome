@@ -14,7 +14,7 @@ import {
   type WorkspaceSummary,
 } from "~/lib/hosted-api.server";
 import { isUnauthorized, requireSessionToken, signupRedirect } from "~/lib/session.server";
-import { formatClockTime, formatDate, formatGB, formatMinutes } from "~/lib/utils";
+import { formatClockTime, formatDate, formatGB, formatMinutes, formatUSD } from "~/lib/utils";
 import { Alert, AlertDescription } from "~/components/ui/alert";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
@@ -302,6 +302,22 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
                       {entitlement.unlimited ? null : <Progress value={(entitlement.percent ?? 0) * 100} />}
                     </div>
                   ))}
+                  {summary.ai_spend_usd != null ? (
+                    <div className="flex items-center justify-between gap-3 text-sm">
+                      <span className="flex items-center gap-1 font-medium">
+                        AI usage
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button type="button" className="text-muted-foreground/70 hover:text-foreground" aria-label="What is AI usage?">
+                              <Info className="size-3.5" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent>Actual cost of Gemini transcript cleanup and Voyage embeddings this period.</TooltipContent>
+                        </Tooltip>
+                      </span>
+                      <span className="text-muted-foreground tabular-nums">{formatUSD(summary.ai_spend_usd)} this period</span>
+                    </div>
+                  ) : null}
                 </TooltipProvider>
               </CardContent>
             </Card>

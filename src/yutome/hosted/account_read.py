@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -85,6 +86,9 @@ class WorkspaceSummary(BaseModel):
     # Curated, user-facing view: only the units that mean something to a workspace
     # owner, with plain labels and clamped remaining. See _ENTITLEMENT_CATALOG.
     entitlements: list[WorkspaceEntitlement] = Field(default_factory=list)
+    # Actual AI cost this period in USD (Gemini cleanup + Voyage embeddings),
+    # priced from real per-provider token usage. None when no active period.
+    ai_spend_usd: float | None = None
 
 
 class LibraryVideo(BaseModel):
@@ -190,8 +194,53 @@ _ENTITLEMENT_CATALOG: tuple[tuple[str, str, EntitlementFormat, str], ...] = (
     ("queries", "Searches", "count", "Transcript searches across your library."),
     ("media_seconds", "Transcription", "minutes", "Audio transcribed when a video has no usable captions."),
     ("bytes", "Bandwidth", "bytes", "Data fetched through reliable proxies while indexing."),
-    ("total_tokens", "AI usage", "ratio", "Transcript cleanup and embeddings that power search."),
 )
+
+
+# AI cost is the real dollar cost of Gemini cleanup + Voyage embeddings, billed at
+# 150% of published list price (fetched 2026-05-27):
+#   gemini-3.1-flash-lite: $0.25/1M input (text), $1.50/1M output
+#   voyage-4-lite:         $0.02/1M tokens
+# Stored as USD per single token (list price / 1e6 * 1.5). Audio-input tokens from
+# the rare transcribe_media fallback are priced at the text-input rate.
+_AI_MARGIN = Decimal("1.5")
+_AI_TOKEN_RATES_USD: dict[tuple[str, str], Decimal] = {
+    ("gemini", "prompt_tokens"): Decimal("0.25") / Decimal(1_000_000) * _AI_MARGIN,
+    ("gemini", "candidate_tokens"): Decimal("1.50") / Decimal(1_000_000) * _AI_MARGIN,
+    ("voyage", "total_tokens"): Decimal("0.02") / Decimal(1_000_000) * _AI_MARGIN,
+}
+
+_SUMMARY_AI_SPEND_SQL = """
+SELECT subject, actual_units_json
+FROM usage_events
+WHERE workspace_id = %(workspace_id)s
+  AND status IN ('succeeded', 'released')
+  AND subject IN ('gemini', 'voyage')
+  AND created_at >= %(period_start_at)s
+  AND created_at < %(period_end_at)s;
+""".strip()
+
+
+def _ai_token_count(units: Mapping[str, Any], key: str) -> Decimal:
+    value = units.get(key)
+    if value is None:
+        return Decimal(0)
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return Decimal(0)
+
+
+def _compute_ai_spend_usd(rows: Iterable[Mapping[str, Any]]) -> float:
+    """Sum the real dollar cost of metered Gemini + Voyage usage for the period."""
+    total = Decimal(0)
+    for row in rows:
+        subject = str(row.get("subject") or "")
+        units = _json_mapping(row.get("actual_units_json"))
+        for (rate_subject, token_key), rate in _AI_TOKEN_RATES_USD.items():
+            if rate_subject == subject:
+                total += _ai_token_count(units, token_key) * rate
+    return round(float(total), 4)
 
 
 def _coerce_unit_int(value: Any) -> int | None:
@@ -293,6 +342,16 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         )
         for unit in unit_names
     ]
+    ai_spend_rows = _rows_from_result(
+        connection.execute(
+            _SUMMARY_AI_SPEND_SQL,
+            {
+                "workspace_id": workspace_id,
+                "period_start_at": balance_row["period_start_at"],
+                "period_end_at": balance_row["period_end_at"],
+            },
+        )
+    )
     return WorkspaceSummary(
         state="active",
         plan_key=plan_key,
@@ -300,6 +359,7 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         period=BalancePeriod(start_at=balance_row["period_start_at"], end_at=balance_row["period_end_at"]),
         units=units,
         entitlements=_build_entitlements(included, used, unlimited),
+        ai_spend_usd=_compute_ai_spend_usd(ai_spend_rows),
     )
 
 

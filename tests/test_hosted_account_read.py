@@ -46,6 +46,7 @@ class RoutingConnection:
         counts: list[dict[str, Any]] | None = None,
         recent: list[dict[str, Any]] | None = None,
         grants: list[dict[str, Any]] | None = None,
+        usage_events: list[dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = workspace if workspace is not None else [{"id": "ws_pg", "name": "Demo", "status": "active"}]
         self.policy = policy or []
@@ -53,10 +54,13 @@ class RoutingConnection:
         self.counts = counts or []
         self.recent = recent or []
         self.grants = grants or []
+        self.usage_events = usage_events or []
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.calls.append((statement, dict(params or {})))
+        if "FROM usage_events" in statement:
+            return self.usage_events
         if "FROM workspaces" in statement:
             return self.workspace
         if "FROM entitlement_policies" in statement:
@@ -170,7 +174,6 @@ def test_account_summary_entitlements_are_curated_and_clamped() -> None:
                     "queries": 10000,
                     "media_seconds": 3600,
                     "bytes": 1073741824,
-                    "total_tokens": 250000,
                     "candidate_tokens": 0,
                     "latency_ms": 0,
                 },
@@ -184,13 +187,12 @@ def test_account_summary_entitlements_are_curated_and_clamped() -> None:
                     "queries": 1240,
                     "media_seconds": 1080,
                     "bytes": 214748364,
-                    "total_tokens": 300000,  # over the included 250000 → clamp to 0
                     "candidate_tokens": 5000,
                     "latency_ms": 999,
                 },
                 "reserved_units_jsonb": {},
                 # Stored negatives must be ignored; remaining is recomputed + clamped.
-                "remaining_units_jsonb": {"total_tokens": -50000, "latency_ms": -999, "candidate_tokens": -5000},
+                "remaining_units_jsonb": {"latency_ms": -999, "candidate_tokens": -5000},
                 "unlimited_units": [],
             }
         ],
@@ -202,16 +204,11 @@ def test_account_summary_entitlements_are_curated_and_clamped() -> None:
     assert response.status_code == 200, response.text
     entitlements = {item["key"]: item for item in response.json()["entitlements"]}
     # Only catalog units; internal telemetry is never surfaced.
-    assert set(entitlements) == {"queries", "media_seconds", "bytes", "total_tokens"}
+    assert set(entitlements) == {"queries", "media_seconds", "bytes"}
     assert "candidate_tokens" not in entitlements
     assert "latency_ms" not in entitlements
     # Display order follows the catalog.
-    assert [item["key"] for item in response.json()["entitlements"]] == [
-        "queries",
-        "media_seconds",
-        "bytes",
-        "total_tokens",
-    ]
+    assert [item["key"] for item in response.json()["entitlements"]] == ["queries", "media_seconds", "bytes"]
     assert entitlements["queries"]["label"] == "Searches"
     assert entitlements["queries"]["format"] == "count"
     assert entitlements["queries"]["included"] == 10000
@@ -220,10 +217,35 @@ def test_account_summary_entitlements_are_curated_and_clamped() -> None:
     assert abs(entitlements["queries"]["percent"] - 0.124) < 1e-9
     assert entitlements["media_seconds"]["format"] == "minutes"
     assert entitlements["bytes"]["format"] == "bytes"
-    # Over-budget usage clamps remaining to 0 (no negatives) and caps percent at 1.0.
-    assert entitlements["total_tokens"]["format"] == "ratio"
-    assert entitlements["total_tokens"]["remaining"] == 0
-    assert entitlements["total_tokens"]["percent"] == 1.0
+
+
+def test_account_summary_reports_real_ai_spend_in_usd() -> None:
+    connection = RoutingConnection(
+        policy=[{"id": "pol_pg", "plan_key": "starter", "included_units_jsonb": {"queries": 10000}}],
+        balance=[
+            {
+                "period_start_at": datetime.now(timezone.utc) - timedelta(days=1),
+                "period_end_at": datetime.now(timezone.utc) + timedelta(days=30),
+                "used_units_jsonb": {"queries": 10},
+                "reserved_units_jsonb": {},
+                "remaining_units_jsonb": {"queries": 9990},
+                "unlimited_units": [],
+            }
+        ],
+        usage_events=[
+            # Gemini cleanup: 100k input @ $0.25/1M*1.5 = $0.0375; 20k output @ $1.50/1M*1.5 = $0.045
+            {"subject": "gemini", "actual_units_json": {"prompt_tokens": 100000, "candidate_tokens": 20000, "total_tokens": 120000}},
+            # Voyage embeddings: 1M tokens @ $0.02/1M*1.5 = $0.03
+            {"subject": "voyage", "actual_units_json": {"total_tokens": 1000000}},
+        ],
+    )
+    client = build_account_app(connection)
+
+    response = client.get("/account/summary", headers=account_headers(mint_session()))
+
+    assert response.status_code == 200, response.text
+    # $0.0375 + $0.045 + $0.03 = $0.1125 — real dollars from real per-provider tokens.
+    assert response.json()["ai_spend_usd"] == 0.1125
 
 
 def test_account_summary_fail_soft_without_balance() -> None:

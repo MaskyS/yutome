@@ -50,3 +50,10 @@ export function formatGB(bytes: number | null | undefined): string {
   const gb = bytes / 1_073_741_824;
   return gb >= 10 ? Math.round(gb).toLocaleString() : gb.toFixed(2);
 }
+
+/** USD to cents, with a "<$0.01" floor for tiny non-zero amounts. */
+export function formatUSD(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value <= 0) return "$0.00";
+  if (value < 0.01) return "<$0.01";
+  return `$${value.toFixed(2)}`;
+}

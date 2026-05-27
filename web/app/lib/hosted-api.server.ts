@@ -221,6 +221,7 @@ export interface WorkspaceSummary {
   period: { start_at: string; end_at: string } | null;
   units: WorkspaceUnit[];
   entitlements: WorkspaceEntitlement[];
+  ai_spend_usd: number | null;
 }
 
 export interface LibraryOverview {
