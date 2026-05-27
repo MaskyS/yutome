@@ -50,9 +50,9 @@ uv run yutome --help
 
 ```bash
 yutome setup                                  # guided first-run: creates ./yutome.toml, ./data, etc.
-yutome add https://www.youtube.com/@LexClips  # add a YouTube channel or video as a source
-yutome sync                                   # discover videos, fetch transcripts, build indexes
-yutome find "first principles"                # ranked search across everything indexed
+yutome corpus add https://www.youtube.com/@LexClips  # add a YouTube channel or video as a source
+yutome corpus sync                                   # discover videos, fetch transcripts, build indexes
+yutome search find "first principles"                # ranked search across everything indexed
 ```
 
 `yutome setup` is interactive by default; pass `-y` to skip prompts and just print what would happen. It prompts for any API keys it needs. To set keys ahead of time, copy `.env.example` to `.env`. The only commonly-needed key is `VOYAGE_API_KEY` (semantic search) — get one at [voyageai.com](https://www.voyageai.com/). Without it, `find` still works but falls back to keyword search only. Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
@@ -64,15 +64,15 @@ Run `yutome --help` for the full surface. The most-used commands:
 | Goal | Command |
 |---|---|
 | First-run setup | `yutome setup` |
-| Add a channel/video | `yutome add <url>` |
-| Import a subscription list | `yutome import-youtube` or `yutome import <file>` |
-| Index everything new | `yutome sync` |
-| Search | `yutome find "<query>"` |
-| List or inspect indexed objects | `yutome list videos`, `yutome show video <id>`, … |
-| Local MCP server | `yutome mcp serve` (usually invoked via Claude config, not by hand) |
-| Deploy/manage remote connector | `yutome connect --deploy`, `yutome bridge start`, `yutome status` |
+| Add a channel/video | `yutome corpus add <url>` |
+| Import a subscription list | `yutome corpus import-youtube` or `yutome corpus import <file>` |
+| Index everything new | `yutome corpus sync` |
+| Search | `yutome search find "<query>"` |
+| List or inspect indexed objects | `yutome search list videos`, `yutome search show video <id>`, … |
+| Local MCP server | `yutome serve mcp` (usually invoked via Claude config, not by hand) |
+| Deploy/manage remote connector | `yutome connect --deploy`, `yutome serve bridge start`, `yutome status` |
 
-Commands like `list`, `show`, `remote`, `export`, `quality` are groups — append `--help` (e.g. `yutome list --help`) to see their subcommands.
+Commands like `search`, `corpus`, `serve`, `hosted`, `doctor`, and `export` are groups — append `--help` (e.g. `yutome search --help`) to see their subcommands.
 
 ## Connect to an AI assistant
 
@@ -87,7 +87,7 @@ For assistants running on the same Mac as yutome — **Claude Desktop, Cursor, C
   "mcpServers": {
     "yutome": {
       "command": "yutome",
-      "args": ["mcp", "serve", "--config", "/absolute/path/to/yutome.toml"]
+      "args": ["--config", "/absolute/path/to/yutome.toml", "serve", "mcp"]
     }
   }
 }
@@ -97,7 +97,7 @@ Where to paste it:
 
 - **Claude Desktop** — [`~/Library/Application Support/Claude/claude_desktop_config.json`](https://modelcontextprotocol.io/quickstart/user). Inside Claude Desktop: *Settings → Developer → Edit Config*. Restart Claude Desktop after saving.
 - **Cursor** — `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in your project.
-- **Claude Code** — one-liner, no JSON editing: `claude mcp add yutome -- yutome mcp serve --config /absolute/path/to/yutome.toml`
+- **Claude Code** — one-liner, no JSON editing: `claude mcp add yutome -- yutome --config /absolute/path/to/yutome.toml serve mcp`
 - **Cherry Studio / LibreChat / Goose / others** — each app has its own MCP server settings; paste the same snippet there.
 
 `yutome setup` does this interactively: shows the snippet, copies it to your clipboard, and opens the Claude Desktop config folder for you. If yutome's installed via `uv tool install`, the `yutome` binary on your PATH is what gets invoked — no `uv run` wrapper needed.
@@ -106,18 +106,19 @@ Where to paste it:
 
 ```bash
 yutome connect --deploy        # one-time: deploy the Worker, generate secrets, auto-start the bridge
-yutome bridge install          # optional: keep the bridge running across reboots (launchd / systemd)
+yutome serve bridge install    # optional: keep the bridge running across reboots (launchd / systemd)
 ```
 
 `connect --deploy` deploys a Cloudflare Worker to your own account (free plan is enough), generates an OAuth-protected `/mcp` endpoint, prints a pairing code, and auto-spawns the laptop bridge in the background. Paste the `/mcp` URL into a Claude.ai or ChatGPT custom connector and complete OAuth in the browser tab using the pairing code.
 
-The Worker is just a relay — your corpus stays on your laptop. The bridge is a WebSocket process that lets the Worker reach it; `yutome bridge status/start/stop` control it manually, and `yutome bridge install` registers it as a launchd (macOS) or systemd-user (Linux) service so it survives reboots. If the bridge isn't running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
+The Worker is just a relay — your corpus stays on your laptop. The bridge is a WebSocket process that lets the Worker reach it; `yutome serve bridge status/start/stop` control it manually, and `yutome serve bridge install` registers it as a launchd (macOS) or systemd-user (Linux) service so it survives reboots. If the bridge isn't running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
 
 ## Docs
 
 See [`docs/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/README.md) for an index. The most useful starting points:
 
 - [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) — connecting Claude / ChatGPT / agents
+- [`docs/cli-architecture.md`](https://github.com/MaskyS/yutome/blob/main/docs/cli-architecture.md) — CLI namespace and composition rules
 - [`docs/cloud-capsule-strategy.md`](https://github.com/MaskyS/yutome/blob/main/docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
 - [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md) — the query language `find` / `q` speak
 - [`docs/plan.md`](https://github.com/MaskyS/yutome/blob/main/docs/plan.md) — internal architecture history (not a usage guide)

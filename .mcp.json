@@ -2,7 +2,7 @@
   "mcpServers": {
     "yutome": {
       "command": "uv",
-      "args": ["run", "yutome", "mcp", "serve", "--config", "yutome.toml"]
+      "args": ["run", "yutome", "--config", "yutome.toml", "serve", "mcp"]
     }
   }
 }

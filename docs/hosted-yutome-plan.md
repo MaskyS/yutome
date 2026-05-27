@@ -33,7 +33,7 @@ Current storage/search shape:
 Current remote connector shape:
 
 - `yutome connect --deploy` deploys a Cloudflare Worker into the user's own Cloudflare account.
-- The Worker exposes `/mcp` with OAuth and forwards MCP tool/resource calls to a local `yutome bridge` process over a Durable Object WebSocket relay.
+- The Worker exposes `/mcp` with OAuth and forwards MCP tool/resource calls to a local `yutome serve bridge` process over a Durable Object WebSocket relay.
 - The corpus stays local in connector-only mode.
 - Replica/always-on search is planned but not implemented as a hosted default.
 
@@ -809,7 +809,7 @@ Claude / ChatGPT / MCP client
   -> user-owned Cloudflare Worker /mcp
   -> OAuthProvider + YutomeMcpAgent
   -> YutomeRelay Durable Object named "default"
-  -> /relay/connect WebSocket from local `yutome bridge`
+  -> /relay/connect WebSocket from local `yutome serve bridge`
   -> local contract.py handlers
   -> local SQLite + LanceDB + transcript artifacts
 ```
@@ -895,7 +895,7 @@ Preferred UX:
 2. Dashboard shows "Connect this computer" with a short-lived code or deep link.
 3. CLI exchanges that code for a per-install bridge token.
 4. CLI stores `endpoint_url`, `mcp_url`, `relay_url`, `workspace_id`, `install_id`, and the install token in local remote state.
-5. `yutome bridge` connects with `Authorization: Bearer <install_token>`.
+5. `yutome serve bridge` connects with `Authorization: Bearer <install_token>`.
 
 The current static `YUTOME_PAIRING_CODE` should not survive in hosted mode. It is fine for user-owned Worker/BYO mode.
 
@@ -957,7 +957,7 @@ Bridge mode is the fastest hosted MVP because it reuses the current local retrie
   -> resolve workspace_id from token
   -> choose active install/bridge for workspace
   -> Durable Object relay for workspace_id + install_id
-  -> local yutome bridge
+  -> local yutome serve bridge
   -> local SQLite + LanceDB
 ```
 

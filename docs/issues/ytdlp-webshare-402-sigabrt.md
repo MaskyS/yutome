@@ -124,7 +124,7 @@ This is distinct from:
 ## Acceptance Criteria
 
 - `yutome proxy-test` prints a clear proxy 402 diagnosis without exposing credentials.
-- `yutome sync` does not show bare `exit code -6 with no stderr/stdout` for `yt-dlp` crashes.
+- `yutome corpus sync` does not show bare `exit code -6 with no stderr/stdout` for `yt-dlp` crashes.
 - Repeated proxy 402 failures stop or pause bulk sync before burning the entire queue.
 - Existing YouTube rate-limit and missing-caption classifications continue to work.
 - Tests cover:

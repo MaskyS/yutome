@@ -922,16 +922,16 @@ def test_hosted_api_cli_command_runs_fake_app_server(monkeypatch, tmp_path: Path
             )
         )
 
-    monkeypatch.setattr("yutome.cli._hosted_api_app", fake_build_app)
-    monkeypatch.setattr("yutome.cli._run_hosted_api_app", fake_run_app)
+    monkeypatch.setattr("yutome.cli._legacy._hosted_api_app", fake_build_app)
+    monkeypatch.setattr("yutome.cli._legacy._run_hosted_api_app", fake_run_app)
 
     result = CliRunner().invoke(
         app,
         [
-            "hosted",
-            "api",
             "--config",
             str(config_path),
+            "hosted",
+            "api",
             "--host",
             "0.0.0.0",
             "--port",
@@ -959,23 +959,20 @@ def test_hosted_api_cli_command_runs_fake_app_server(monkeypatch, tmp_path: Path
 def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path: Path) -> None:
     config_path = _config_path(tmp_path)
     fake = FakeHostedRunner()
-    monkeypatch.setattr("yutome.cli._hosted_runner", lambda _config_path: fake)
+    monkeypatch.setattr("yutome.cli._legacy._hosted_runner", lambda _config_path: fake)
     runner = CliRunner()
 
-    migrate = runner.invoke(app, ["hosted", "migrate", "--config", str(config_path), "--phase", "phase4", "--json"])
-    db_check = runner.invoke(app, ["hosted", "db-check", "--config", str(config_path), "--json"])
-    search = runner.invoke(
-        app,
-        ["hosted", "search-smoke", "vitamin d", "--config", str(config_path), "--limit", "4", "--json"],
-    )
+    migrate = runner.invoke(app, ["--config", str(config_path), "hosted", "migrate", "--phase", "phase4", "--json"])
+    db_check = runner.invoke(app, ["--config", str(config_path), "doctor", "hosted-db", "--json"])
     source_add = runner.invoke(
         app,
         [
-            "hosted",
-            "source-add",
-            "leoandlongevity",
             "--config",
             str(config_path),
+            "hosted",
+            "source",
+            "add",
+            "leoandlongevity",
             "--workspace-id",
             "ws_cli",
             "--cadence-seconds",
@@ -985,63 +982,14 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
             "--json",
         ],
     )
-    enqueue_video = runner.invoke(
-        app,
-        [
-            "hosted",
-            "enqueue-index-video",
-            "https://www.youtube.com/watch?v=OEDoJyhQhXs",
-            "--config",
-            str(config_path),
-            "--workspace-id",
-            "ws_cli",
-            "--priority",
-            "5",
-            "--json",
-        ],
-    )
-    real_smoke = runner.invoke(
-        app,
-        [
-            "hosted",
-            "real-indexing-smoke",
-            "--config",
-            str(config_path),
-            "--workspace-id",
-            "ws_cli",
-            "--source-url",
-            "OEDoJyhQhXs",
-            "--migrate",
-            "--phase",
-            "hosted",
-            "--lease-owner",
-            "smoke-1",
-            "--json",
-        ],
-    )
-    billing = runner.invoke(
-        app,
-        [
-            "hosted",
-            "billing-status",
-            "--config",
-            str(config_path),
-            "--workspace-id",
-            "ws_cli",
-            "--operation",
-            "gemini.transcribe_media",
-            "--limit",
-            "5",
-            "--json",
-        ],
-    )
     billing_export = runner.invoke(
         app,
         [
-            "hosted",
-            "billing-export-worker",
             "--config",
             str(config_path),
+            "hosted",
+            "run",
+            "billing-export",
             "--once",
             "--lease-owner",
             "billing-1",
@@ -1050,50 +998,14 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
             "--json",
         ],
     )
-    reconcile = runner.invoke(
-        app,
-        [
-            "hosted",
-            "reconcile-balance",
-            "--config",
-            str(config_path),
-            "--workspace-id",
-            "ws_cli",
-            "--entitlement-policy-id",
-            "policy_cli",
-            "--period-start",
-            "2026-05-01T00:00:00Z",
-            "--period-end",
-            "2026-06-01T00:00:00Z",
-            "--json",
-        ],
-    )
-    indexing = runner.invoke(
-        app,
-        [
-            "hosted",
-            "mock-indexing-smoke",
-            "--config",
-            str(config_path),
-            "--workspace-id",
-            "ws_cli",
-            "--migrate",
-            "--phase",
-            "hosted",
-            "--query",
-            "hosted indexing",
-            "--limit",
-            "2",
-            "--json",
-        ],
-    )
     worker = runner.invoke(
         app,
         [
-            "hosted",
-            "worker",
             "--config",
             str(config_path),
+            "hosted",
+            "run",
+            "worker",
             "--once",
             "--lease-owner",
             "worker-1",
@@ -1104,42 +1016,36 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
     )
     source_tick = runner.invoke(
         app,
-        ["hosted", "source-refresh-tick", "--config", str(config_path), "--lease-owner", "source-1", "--json"],
+        [
+            "--config",
+            str(config_path),
+            "hosted",
+            "run",
+            "source-refresh",
+            "--lease-owner",
+            "source-1",
+            "--json",
+        ],
     )
-    maintenance_tick = runner.invoke(app, ["hosted", "maintenance-tick", "--config", str(config_path), "--json"])
+    maintenance_tick = runner.invoke(
+        app,
+        ["--config", str(config_path), "hosted", "run", "maintenance", "--json"],
+    )
 
     assert migrate.exit_code == 0, migrate.output
     assert json.loads(migrate.output) == {"ok": True, "phase": "phase4", "applied": 7}
     assert db_check.exit_code == 0, db_check.output
     assert json.loads(db_check.output)["database_reachable"] is True
-    assert search.exit_code == 0, search.output
-    assert json.loads(search.output)["rows"][0]["chunk_id"] == "chunk_1"
     assert source_add.exit_code == 0, source_add.output
     assert json.loads(source_add.output)["refresh_policy_id"] == "srp_cli"
-    assert enqueue_video.exit_code == 0, enqueue_video.output
-    assert json.loads(enqueue_video.output)["job_type"] == "index_video"
-    assert real_smoke.exit_code == 0, real_smoke.output
-    assert json.loads(real_smoke.output)["dev_only"] is False
-    assert billing.exit_code == 0, billing.output
-    billing_payload = json.loads(billing.output)
-    assert billing_payload["rows"][0]["entitlement_decision"]["reason"] == "usage_limit_exceeded"
-    assert billing_payload["rows"][0]["billing_exports"][0]["source_event_dedupe_key"] == "polar:evt_denied:gemini.transcribe_media"
     assert billing_export.exit_code == 0, billing_export.output
     assert json.loads(billing_export.output)["succeeded"] == 1
-    assert reconcile.exit_code == 0, reconcile.output
-    assert json.loads(reconcile.output)["remaining_units"] == {"credits": "7.0"}
-    assert indexing.exit_code == 0, indexing.output
-    indexing_payload = json.loads(indexing.output)
-    assert indexing_payload["migrated"] is True
-    assert indexing_payload["operations_executed"] == 12
-    assert indexing_payload["rows"][0]["chunk_id"] == "chunk_1"
     assert worker.exit_code == 0, worker.output
     assert json.loads(worker.output)["tick"] == "worker_once"
     assert source_tick.exit_code == 0, source_tick.output
     assert json.loads(source_tick.output)["affected_rows"] == 2
     assert maintenance_tick.exit_code == 0, maintenance_tick.output
     assert json.loads(maintenance_tick.output)["affected_rows"] == 3
-    assert ("search_smoke", {"workspace_id": "ws_default", "query": "vitamin d", "limit": 4}) in fake.calls
     assert (
         "source_add",
         {
@@ -1151,46 +1057,18 @@ def test_hosted_cli_commands_use_fake_runner_and_emit_json(monkeypatch, tmp_path
             "refresh_enabled": True,
         },
     ) in fake.calls
-    assert (
-        "enqueue_index_video",
-        {
-            "workspace_id": "ws_cli",
-            "source_url": "https://www.youtube.com/watch?v=OEDoJyhQhXs",
-            "display_name": None,
-            "priority": 5,
-        },
-    ) in fake.calls
-    assert (
-        "real_indexing_smoke",
-        {
-            "workspace_id": "ws_cli",
-            "source_url": "OEDoJyhQhXs",
-            "migrate": True,
-            "migration_phase": "hosted",
-            "lease_owner": "smoke-1",
-        },
-    ) in fake.calls
-    assert (
-        "billing_status",
-        {"workspace_id": "ws_cli", "limit": 5, "operation": "gemini.transcribe_media"},
-    ) in fake.calls
     assert ("worker_once", {"lease_owner": "worker-1", "limit": 1, "lease_seconds": 900, "workspace_id": "ws_cli"}) in fake.calls
 
 
-def test_hosted_billing_status_human_output_explains_denied_work(monkeypatch, tmp_path: Path) -> None:
+def test_hosted_billing_status_is_not_public_cli(monkeypatch, tmp_path: Path) -> None:
     config_path = _config_path(tmp_path)
     fake = FakeHostedRunner()
-    monkeypatch.setattr("yutome.cli._hosted_runner", lambda _config_path: fake)
+    monkeypatch.setattr("yutome.cli._legacy._hosted_runner", lambda _config_path: fake)
 
-    result = CliRunner().invoke(app, ["hosted", "billing-status", "--config", str(config_path)])
+    result = CliRunner().invoke(app, ["--config", str(config_path), "hosted", "billing-status"])
 
-    assert result.exit_code == 0, result.output
-    assert "Hosted billing/usage status: workspace=ws_default" in result.output
-    assert "reservation=denied decision=denied:usage_limit_exceeded" in result.output
-    assert "Fallback paused by policy." in result.output
-    assert "usage_events:" in result.output
-    assert "billing_exports:" in result.output
-    assert "dedupe=polar:evt_denied:gemini.transcribe_media" in result.output
+    assert result.exit_code != 0
+    assert "No such command" in result.output
 
 
 def test_hosted_db_check_cli_reports_missing_url_without_live_db(monkeypatch, tmp_path: Path) -> None:
@@ -1198,7 +1076,7 @@ def test_hosted_db_check_cli_reports_missing_url_without_live_db(monkeypatch, tm
     monkeypatch.delenv("YUTOME_POSTGRES_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    result = CliRunner().invoke(app, ["hosted", "db-check", "--config", str(config_path), "--json"])
+    result = CliRunner().invoke(app, ["--config", str(config_path), "doctor", "hosted-db", "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)

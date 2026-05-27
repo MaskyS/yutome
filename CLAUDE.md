@@ -27,6 +27,18 @@ push.
 `.claude/skills/yutome-retrieval/SKILL.md` is the public skill that
 governs how agents query the yutome corpus. Edit it on `main`.
 
+## CLI Architecture
+
+The CLI is a small namespaced surface over existing library primitives. New
+capabilities should be parameters or subcommands under `search`, `corpus`,
+`serve`, `hosted`, `doctor`, or `export` unless they are genuinely new
+user/operator jobs. Do not add plugin registries, entry points, compatibility
+aliases for removed command paths, or new top-level commands without updating
+[`docs/cli-architecture.md`](docs/cli-architecture.md).
+
+MCP tool names remain `find`, `list`, `show`, and `q`; CLI nesting is human
+operator ergonomics and must not reshape the agent contract.
+
 ## Vocabulary and writing
 
 Hosted-mode Yutome has a **canonical glossary** at `docs/hosted-glossary.md`. It is the

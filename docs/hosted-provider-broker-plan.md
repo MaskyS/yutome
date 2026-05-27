@@ -1524,7 +1524,7 @@ Steps:
 12. Wrap current Webshare proxy URL creation and proxy error classification.
 13. Add internal `search_store.*` usage event names.
 14. Add a narrow `SearchStore` contract and Postgres/VectorChord migrations.
-15. Add a `yutome usage` or equivalent debug command that prints recent provider and search-store usage.
+15. Add a `yutome hosted usage` or equivalent debug command that prints recent provider and search-store usage.
 16. Add tests around usage normalization, input hashing, idempotency, entitlement decisions, and provider failure classification.
 
 Acceptance criteria:
@@ -1533,7 +1533,7 @@ Acceptance criteria:
 - Search-store operations produce usage events.
 - The new Postgres-backed indexing path can deny a paid call before the provider request starts.
 - UsageGate can deny search/index work before expensive infrastructure work starts.
-- `yutome usage` can show recent provider events, search-store events, and raw provider usage references.
+- `yutome hosted usage` can show recent provider events, search-store events, and raw provider usage references.
 - No billing vendor is required.
 
 ### Phase 2: Source Registry And Hosted Account Auth Shape

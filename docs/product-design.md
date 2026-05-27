@@ -18,9 +18,9 @@ The default flow should be:
 
 ```bash
 yutome setup https://www.youtube.com/@SomeChannel
-yutome add https://youtu.be/VIDEO_ID
-yutome sync
-yutome find "topic I remember"
+yutome corpus add https://youtu.be/VIDEO_ID
+yutome corpus sync
+yutome search find "topic I remember"
 ```
 
 The broader import flow should support:
@@ -78,9 +78,9 @@ Caption quality is part of retrieval quality. Many YouTube captions are good eno
 The primary optional quality path is LLM transcript cleanup:
 
 ```bash
-yutome quality upgrade --limit 10
-yutome quality upgrade --video-id VIDEO_ID --rebuild-vectors
-yutome quality upgrade --limit 50 --video-workers 2 --concurrency 3
+yutome corpus quality --limit 10
+yutome corpus quality --video-id VIDEO_ID --rebuild-vectors
+yutome corpus quality --limit 50 --video-workers 2 --concurrency 3
 ```
 
 This path uses the existing timestamped caption segments plus bounded metadata context as input. The metadata context should include channel title/handle, video title, and truncated video/channel descriptions, because those fields often contain the spelling of names, supplements, drugs, chapters, sponsors, and technical terms that captions miss. The model is asked to return a sparse correction patch, not a rewritten transcript: only changed segment sequences and their corrected text. That keeps unchanged segments byte-for-byte stable, reduces output tokens, and makes review/diff UX natural. Patches are verified before being applied: unexpected sequence numbers, duplicate edits, empty edits, no-op edits, and oversized changes are rejected, and invalid patches are retried with the validation error before the video is marked failed. The upgrade writes a new active transcript version with provenance such as `+llm-cleanup:{model}` and preserves the original transcript version, because LLM cleanup can still be wrong. For cost control and smooth rollout, it supports limits, source filters, per-video upgrades, video-level workers, per-video request concurrency, request timeouts, and later background scheduling.
@@ -100,7 +100,7 @@ The design principle is that transcript improvement should be incremental and in
 ## Open Questions
 
 - Should OAuth onboarding remain bring-your-own Google client credentials, or should a future hosted broker exist for less technical users?
-- Should `yutome sync` with no target always mean "sync selected sources," or should it require `--all` for safety once schedules exist?
+- Should `yutome corpus sync` with no target always mean "sync selected sources," or should it require `--all` for safety once schedules exist?
 - Should LLM cleanup run automatically after ingest for selected sources, or should it remain an explicit/background upgrade?
 - ~~Should the first local agent connector be MCP, an OpenAI/ChatGPT app connector shape, a plain HTTP API, or all of these over the same service?~~ Decided: local MCP first, thin local HTTP underneath sharing the same core functions. Remote access is now a core architecture track rather than a distant integration. See the Agent And Multi-Device Connector section of `plan.md`.
 - How much should the beginner surface expose unresolved videos and transcript quality warnings before it becomes anxiety-inducing instead of helpful?

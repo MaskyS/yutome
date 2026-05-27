@@ -3,7 +3,8 @@
 The TypeScript Worker (``cloudflare/yutome-capsule``) imports the emitted
 ``contract.json`` at build time and registers tools and resource templates
 with ``McpAgent`` from the same single source of truth used by the local
-Python adapters. Run via ``yutome contract emit``.
+Python adapters. The public CLI checks drift with ``yutome doctor contract``;
+deployment flows refresh the JSON internally when needed.
 """
 from __future__ import annotations
 

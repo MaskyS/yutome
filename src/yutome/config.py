@@ -127,7 +127,7 @@ impersonate = "chrome"
 subprocess_timeout_seconds = 300.0
 
 [find]
-# Default search mode when `yutome find` is invoked without --mode.
+# Default search mode when `yutome search find` is invoked without --mode.
 # "hybrid" combines lexical (SQLite FTS) and semantic (LanceDB + Voyage)
 # recall and is the most powerful — but needs VOYAGE_API_KEY and a
 # populated vector index. "lexical" uses FTS only and works without any

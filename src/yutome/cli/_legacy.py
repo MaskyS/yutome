@@ -171,7 +171,7 @@ VOYAGE_API_KEY=
 # GEMINI_API_KEY=
 # GOOGLE_API_KEY=
 
-# Remote API/MCP access. Generate with: yutome remote prepare
+# Remote API/MCP access. Generate with: yutome serve remote prepare
 # YUTOME_HTTP_TOKEN=
 # YUTOME_HTTP_CORS_ORIGINS=
 """
@@ -949,10 +949,10 @@ def _run_hosted_setup_after_project_init(
         else:
             typer.echo("[OK] No hosted sources imported yet.")
     else:
-        typer.echo("[OK] Hosted login saved. Import sources later with `yutome import-youtube --hosted`.")
+        typer.echo("[OK] Hosted login saved. Import sources later with `yutome corpus import-youtube --hosted`.")
 
     _step_header(4, HOSTED_SETUP_TOTAL_STEPS, "Next steps")
-    typer.echo("  yutome import-youtube --hosted")
+    typer.echo("  yutome corpus import-youtube --hosted")
     typer.echo("  yutome hosted jobs")
     typer.echo("  https://app.getyutome.com/dashboard/connect")
 
@@ -979,7 +979,7 @@ def _setup_semantic_search(config_path: Path, env_path: Path, *, yes: bool) -> b
         return False
 
     typer.echo(
-        "Semantic/hybrid search lets yutome find paraphrases and concepts, not just "
+        "Semantic/hybrid search lets yutome search find paraphrases and concepts, not just "
         "exact words. It uses Voyage embeddings during sync."
     )
     _callout(
@@ -1459,7 +1459,7 @@ def _setup_import_youtube_subscriptions(
     method_choices = [
         "Browser cookies (recommended)",
         "Google OAuth (pick a specific account)",
-        "Skip - I'll add channels manually with `yutome add`",
+        "Skip - I'll add channels manually with `yutome corpus add`",
     ]
     while True:
         method = setup_prompts.select(
@@ -1570,7 +1570,7 @@ def _setup_import_youtube_subscriptions(
             break
         method = setup_prompts.select(
             "How do you want to import your subscriptions?",
-            choices=["Google OAuth (pick a specific account)", "Skip - I'll add channels manually with `yutome add`"],
+            choices=["Google OAuth (pick a specific account)", "Skip - I'll add channels manually with `yutome corpus add`"],
             default="Google OAuth (pick a specific account)",
         )
         if method.startswith("Skip"):
@@ -1631,7 +1631,7 @@ def _run_sync_targets(
     typer.echo(f"  discovery: {'catalog cache' if use_catalog else 'source-specific'}")
     typer.echo(f"  max-process: {effective_max_process if effective_max_process is not None else 'unlimited'}")
     typer.echo(f"  workers: {effective_workers}")
-    typer.echo(f"  staged fallback: transcript API first, yt-dlp retry second, metadata backfill third")
+    typer.echo("  staged fallback: transcript API first, yt-dlp retry second, metadata backfill third")
     typer.echo(f"  embeddings: {'enabled' if effective_embed else 'disabled'}")
     typer.echo(f"  retry failed/deferred: {retry_failed}")
     typer.echo("")
@@ -1991,7 +1991,7 @@ def _prompt_first_run_video_cap(default_cap: int) -> int | None:
         choices = [
             (f"Quick try · {quick_value} videos per channel", quick_value),
             (f"Default · {default_cap} videos per channel", default_cap),
-            (f"All available · slow, large library", all_value),
+            ("All available · slow, large library", all_value),
             ("Custom number…", custom_value),
         ]
         chosen = setup_prompts.select(
@@ -2017,7 +2017,7 @@ def _prompt_first_run_video_cap(default_cap: int) -> int | None:
                 return value
         return chosen  # int
     # Non-TTY: legacy free-text prompt — kept verbatim so existing tests pass.
-    typer.echo(f"  10    quick try")
+    typer.echo("  10    quick try")
     typer.echo(f"  {default_cap}    default")
     typer.echo("  all   everything available (slow, large)")
     typer.echo("  N     type any custom number")
@@ -2079,10 +2079,10 @@ def _print_connector_next_steps(
         typer.echo("reach the local corpus. `yutome connect --deploy` auto-starts it in the background.")
         typer.echo("")
         typer.echo("Bridge controls:")
-        typer.echo("  yutome bridge status     # see if it's running")
-        typer.echo("  yutome bridge start      # start manually (e.g. if you stopped it)")
-        typer.echo("  yutome bridge stop       # stop it")
-        typer.echo("  yutome bridge install    # run it via launchd/systemd so it survives reboots")
+        typer.echo("  yutome serve bridge status     # see if it's running")
+        typer.echo("  yutome serve bridge start      # start manually (e.g. if you stopped it)")
+        typer.echo("  yutome serve bridge stop       # stop it")
+        typer.echo("  yutome serve bridge install    # run it via launchd/systemd so it survives reboots")
         typer.echo("  (Behind a corporate proxy that blocks WebSockets, requests fall back to the offline response.)")
     else:
         typer.echo("This endpoint is saved, but the local bridge token is not. This computer")
@@ -2197,7 +2197,7 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("")
     typer.echo("Use Yutome from your AI assistant:")
     typer.echo("")
-    typer.echo("  Right now, to search your library you run `yutome find \"topic\"`. After")
+    typer.echo("  Right now, to search your library you run `yutome search find \"topic\"`. After")
     typer.echo("  this step, you can ask an AI assistant the same question and it searches")
     typer.echo("  yutome for you, citing the videos. Works with any assistant that speaks")
     typer.echo("  MCP — Claude (Desktop, Code, web, mobile), ChatGPT, Cursor, Cherry")
@@ -2219,7 +2219,7 @@ def _print_setup_mcp_section(*, yes: bool) -> None:
     typer.echo("      sign in to Cloudflare during setup; no card needed for the free tier)")
     typer.echo("    - Add one URL to your assistant once; it works from every device after")
     typer.echo("    - Catch: this computer has to be on (the laptop bridge runs in the")
-    typer.echo("      background; `yutome bridge install` makes it survive reboots). When")
+    typer.echo("      background; `yutome serve bridge install` makes it survive reboots). When")
     typer.echo("      it's off, the assistant just says 'Yutome Desktop offline' and the")
     typer.echo("      rest of the chat keeps working.")
     typer.echo("")
@@ -2303,7 +2303,7 @@ def _yutome_mcpb_manifest(yutome_cmd: str, abs_config: Path) -> dict[str, Any]:
             "entry_point": yutome_cmd,
             "mcp_config": {
                 "command": yutome_cmd,
-                "args": ["mcp", "serve", "--config", str(abs_config)],
+                "args": ["--config", str(abs_config), "serve", "mcp"],
             },
         },
     }
@@ -2392,7 +2392,7 @@ def _setup_local_mcp(config_path: Path) -> None:
             "mcpServers": {
                 "yutome": {
                     "command": yutome_cmd,
-                    "args": ["mcp", "serve", "--config", str(abs_config)],
+                    "args": ["--config", str(abs_config), "serve", "mcp"],
                 }
             }
         },
@@ -2419,7 +2419,7 @@ def _setup_local_mcp(config_path: Path) -> None:
     typer.echo("      Paste into ~/.cursor/mcp.json (global) or .cursor/mcp.json (per-project).")
     typer.echo("")
     typer.echo("    Claude Code  (one-liner, no JSON editing)")
-    typer.echo(f"      claude mcp add yutome -- {yutome_cmd} mcp serve --config {abs_config}")
+    typer.echo(f"      claude mcp add yutome -- {yutome_cmd} --config {abs_config} serve mcp")
     typer.echo("")
     typer.echo("    Cherry Studio, LibreChat, Goose, others")
     typer.echo("      Find each app's MCP server settings and paste the same snippet.")
@@ -3401,18 +3401,18 @@ def setup(
     typer.echo("")
     typer.echo("Next steps:" if not ran_sync else "After this run:")
     if setup_library_channels:
-        typer.echo("  yutome sync")
+        typer.echo("  yutome corpus sync")
     else:
-        typer.echo("  yutome add https://www.youtube.com/@SomeChannel")
-        typer.echo("  yutome sync")
+        typer.echo("  yutome corpus add https://www.youtube.com/@SomeChannel")
+        typer.echo("  yutome corpus sync")
     if semantic_enabled:
-        typer.echo("  yutome find \"topic I remember\" --mode hybrid")
+        typer.echo("  yutome search find \"topic I remember\" --mode hybrid")
     else:
         typer.echo("  # Optional semantic search:")
         typer.echo("  #   add VOYAGE_API_KEY to .env")
         typer.echo("  #   yutome setup")
     typer.echo("  yutome status")
-    typer.echo('  yutome find "topic I remember"')
+    typer.echo('  yutome search find "topic I remember"')
     if _env_has_webshare_credentials(env_path):
         typer.echo("  yutome proxy-info")
     if not yes:
@@ -4872,7 +4872,7 @@ def quality_upgrade(
         if vector_stats.message:
             typer.echo(vector_stats.message)
     elif stats.upgraded:
-        typer.echo("Vector index note: run `yutome rebuild-vectors` to refresh semantic/hybrid retrieval.")
+        typer.echo("Vector index note: run `yutome corpus rebuild vectors` to refresh semantic/hybrid retrieval.")
 
 
 @app.command()
@@ -5042,7 +5042,7 @@ def sync(
         with connect_catalog(paths.catalog_db) as connection:
             selected_sources = list_library_sources(connection, selected_only=True)
         if not selected_sources:
-            typer.echo("No selected sources. Add one with `yutome add URL` or import subscriptions.", err=True)
+            typer.echo("No selected sources. Add one with `yutome corpus add URL` or import subscriptions.", err=True)
             raise typer.Exit(code=1)
         sync_targets = [
             (
@@ -5774,11 +5774,11 @@ def remote_prepare(
         typer.echo("Token not printed. Re-run with --show-token if you need to copy it to a client.")
     typer.echo("")
     typer.echo("Serve locally for a reverse proxy:")
-    typer.echo("  yutome remote serve --host 127.0.0.1 --port 8765")
+    typer.echo("  yutome serve remote http --host 127.0.0.1 --port 8765")
     typer.echo("Serve on a private network/VPN interface:")
-    typer.echo("  yutome remote serve --host 0.0.0.0 --port 8765")
+    typer.echo("  yutome serve remote http --host 0.0.0.0 --port 8765")
     typer.echo("Serve remote MCP for agent clients:")
-    typer.echo("  yutome remote mcp --host 0.0.0.0 --port 8766")
+    typer.echo("  yutome serve remote mcp --host 0.0.0.0 --port 8766")
 
 
 def _remote_bridge_headers(token: str) -> dict[str, str]:
@@ -6229,10 +6229,11 @@ def _bridge_binary_args() -> list[str]:
 def _bridge_foreground_command(binary_args: list[str], config_path: Path) -> list[str]:
     return [
         *binary_args,
-        "bridge",
-        "start",
         "--config",
         str(config_path),
+        "serve",
+        "bridge",
+        "start",
         "--foreground",
     ]
 
@@ -6555,7 +6556,7 @@ def _restart_bridge_after_deploy(config_path: Path, paths: ProjectPaths) -> None
         typer.echo("Bridge: starting a project-local background bridge instead.")
     pid, log_path = _bridge_start_detached(config_path, paths)
     typer.echo(f"Bridge: started in background (PID {pid}, logs at {log_path}).")
-    typer.echo("Survives this terminal session but not reboots. For persistence: yutome bridge install")
+    typer.echo("Survives this terminal session but not reboots. For persistence: yutome serve bridge install")
 
 
 def _finalize_remote_bridge_setup(
@@ -6613,7 +6614,7 @@ def bridge_start_command(
                 typer.echo(
                     f"     Restart it: launchctl kickstart -k gui/{os.getuid()}/{LAUNCHD_BRIDGE_LABEL}"
                 )
-                typer.echo("     Remove auto-start: yutome bridge uninstall")
+                typer.echo("     Remove auto-start: yutome serve bridge uninstall")
                 return
             typer.echo("Bridge auto-start is installed but the service isn't running. Starting via launchd…")
             result = _start_launchd_bridge_service()
@@ -6623,7 +6624,7 @@ def bridge_start_command(
             else:
                 detail = (result.stderr or result.stdout or "").strip()
                 typer.echo(
-                    "[WARN] launchctl returned but no PID was reported. Check `yutome bridge status`."
+                    "[WARN] launchctl returned but no PID was reported. Check `yutome serve bridge status`."
                     + (f" Details: {detail}" if detail else "")
                 )
             return
@@ -6639,7 +6640,7 @@ def bridge_start_command(
                     fg="green",
                 )
                 typer.echo(f"     Restart it: systemctl --user restart {SYSTEMD_BRIDGE_UNIT}")
-                typer.echo("     Remove auto-start: yutome bridge uninstall")
+                typer.echo("     Remove auto-start: yutome serve bridge uninstall")
                 return
             typer.echo("Bridge auto-start is installed but the service isn't running. Starting via systemd…")
             subprocess.run(
@@ -6650,14 +6651,14 @@ def bridge_start_command(
             if new_pid:
                 typer.secho(f"[OK] Bridge running under systemd (PID {new_pid}).", fg="green")
             else:
-                typer.echo("[WARN] systemctl start returned but no MainPID was reported. Check `yutome bridge status`.")
+                typer.echo("[WARN] systemctl start returned but no MainPID was reported. Check `yutome serve bridge status`.")
             return
     _, paths = _load_runtime(config)
     pid, log_path = _bridge_start_detached(config, paths)
     typer.echo(f"[OK] Bridge started (PID {pid}).")
     typer.echo(f"     Logs: {log_path}")
-    typer.echo("     Stop with: yutome bridge stop")
-    typer.echo("     Want it to survive reboots? Run: yutome bridge install")
+    typer.echo("     Stop with: yutome serve bridge stop")
+    typer.echo("     Want it to survive reboots? Run: yutome serve bridge install")
 
 
 @bridge_app.command("stop")
@@ -6674,7 +6675,7 @@ def bridge_stop_command(
             result = _stop_launchd_bridge_service()
             service_handled = True
             if result.returncode == 0 or _launchd_bridge_pid() is None:
-                typer.echo("[OK] Stopped launchd bridge service. Start it again with: yutome bridge start")
+                typer.echo("[OK] Stopped launchd bridge service. Start it again with: yutome serve bridge start")
             else:
                 detail = (result.stderr or result.stdout or "").strip()
                 typer.echo(
@@ -6694,7 +6695,7 @@ def bridge_stop_command(
             )
             service_handled = True
             if result.returncode == 0 or _systemd_bridge_pid() is None:
-                typer.echo("[OK] Stopped systemd bridge service. Start it again with: yutome bridge start")
+                typer.echo("[OK] Stopped systemd bridge service. Start it again with: yutome serve bridge start")
             else:
                 detail = (result.stderr or result.stdout or "").strip()
                 typer.echo(
@@ -6758,7 +6759,7 @@ def bridge_status_command(
                 typer.echo(f"Bridge process: PID {manual_pid} recorded but process is not alive.")
             return
     else:
-        typer.echo("Bridge auto-start: not installed (run `yutome bridge install` to persist across reboots)")
+        typer.echo("Bridge auto-start: not installed (run `yutome serve bridge install` to persist across reboots)")
     # When auto-start is installed, the *service manager's* PID is the
     # source of truth — not the local PID file, which only the manual
     # detached-start path writes to.
@@ -6771,13 +6772,13 @@ def bridge_status_command(
         if manual_pid is not None and manual_pid != service_pid and _pid_is_alive(manual_pid):
             typer.secho(
                 f"[WARN] A second bridge process is also running (manual PID {manual_pid}). "
-                "Stop it with `yutome bridge stop` to avoid two bridges fighting for the worker.",
+                "Stop it with `yutome serve bridge stop` to avoid two bridges fighting for the worker.",
                 fg="yellow",
             )
         return
     if _launchd_installed() or _systemd_installed():
         typer.echo("Bridge process: auto-start is configured but the service isn't running.")
-        typer.echo("  Start it with: yutome bridge start")
+        typer.echo("  Start it with: yutome serve bridge start")
         return
     manual_pid = _read_bridge_pid(paths)
     if manual_pid is None:
@@ -6788,14 +6789,14 @@ def bridge_status_command(
         typer.echo(f"  logs: {_bridge_log_path(paths)}")
     else:
         typer.echo(f"Bridge process: PID {manual_pid} recorded but process is not alive.")
-        typer.echo("  Run `yutome bridge start` to restart it.")
+        typer.echo("  Run `yutome serve bridge start` to restart it.")
 
 
 def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str | None]:
     """Install the bridge as a launchd / systemd user service.
 
     Returns ``(installed, service_path, error_message)``. Used by both
-    ``yutome bridge install`` and the post-deploy setup step that offers
+    ``yutome serve bridge install`` and the post-deploy setup step that offers
     persistence after a successful Cloudflare deploy. Splitting it out
     lets the setup wizard call this without raising ``typer.Exit`` on
     failure — the wizard prefers to warn and continue.
@@ -6806,8 +6807,8 @@ def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str |
         return (
             False,
             None,
-            f"`yutome bridge install` is not supported on platform {sys.platform!r} yet. "
-            "Use `yutome bridge start` to run the bridge manually.",
+            f"`yutome serve bridge install` is not supported on platform {sys.platform!r} yet. "
+            "Use `yutome serve bridge start` to run the bridge manually.",
         )
     _, paths = _load_runtime(config_path)
     config_abs = config_path.resolve()
@@ -6860,7 +6861,7 @@ def _install_bridge_service(config_path: Path) -> tuple[bool, Path | None, str |
     return (
         False,
         None,
-        f"`yutome bridge install` is not supported on platform {sys.platform!r}.",
+        f"`yutome serve bridge install` is not supported on platform {sys.platform!r}.",
     )
 
 
@@ -6869,7 +6870,7 @@ def _bridge_persistence_supported() -> bool:
 
 
 def _bridge_install_command(config_path: Path) -> str:
-    return f"yutome bridge install --config {shlex.quote(str(config_path.resolve()))}"
+    return f"yutome --config {shlex.quote(str(config_path.resolve()))} serve bridge install"
 
 
 def _offer_bridge_persistence(config_path: Path) -> None:
@@ -6928,13 +6929,13 @@ def _offer_bridge_persistence(config_path: Path) -> None:
     installed, service_path, error_message = _install_bridge_service(config_path)
     if installed and service_path is not None:
         typer.secho(f"[OK] Installed bridge auto-start service: {service_path}", fg="green")
-        typer.echo("     Uninstall any time with: yutome bridge uninstall")
+        typer.echo("     Uninstall any time with: yutome serve bridge uninstall")
     else:
         typer.secho(
             f"[WARN] Bridge auto-start didn't install: {error_message or 'unknown error'}",
             fg="yellow",
         )
-        typer.echo("       You can retry later with: yutome bridge install")
+        typer.echo("       You can retry later with: yutome serve bridge install")
 
 
 @bridge_app.command("install")
@@ -6953,7 +6954,7 @@ def bridge_install_command(
     log_path = _bridge_log_path(paths)
     typer.echo(f"[OK] Installed bridge auto-start service: {service_path}")
     typer.echo(f"     Logs: {log_path}")
-    typer.echo("     Uninstall with: yutome bridge uninstall")
+    typer.echo("     Uninstall with: yutome serve bridge uninstall")
 
 
 @bridge_app.command("uninstall")

@@ -69,7 +69,7 @@ def test_phrase_helper_wraps_and_escapes_embedded_quotes() -> None:
 
 
 def test_find_with_hyphens_no_longer_crashes(fixture_corpus: tuple[object, ProjectPaths]) -> None:
-    """v0.1.1: `yutome find term-with-hyphens` raised
+    """v0.1.1: `yutome search find term-with-hyphens` raised
     `OperationalError: no such column: nonexistent` because FTS5
     interpreted the hyphen as a negative column-filter prefix."""
     config, paths = fixture_corpus

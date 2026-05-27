@@ -701,7 +701,7 @@ def test_jsonl_usage_ledger_and_cli_usage_command(tmp_path: Path) -> None:
     assert events[0].workspace_id == "ws_alice"
     assert events[0].actual_units["result_count"] == 12
 
-    result = CliRunner().invoke(app, ["usage", "--ledger", str(ledger_path), "--json"])
+    result = CliRunner().invoke(app, ["hosted", "usage", "--ledger", str(ledger_path), "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -710,7 +710,7 @@ def test_jsonl_usage_ledger_and_cli_usage_command(tmp_path: Path) -> None:
 
 
 def test_usage_command_reports_empty_ledger(tmp_path: Path) -> None:
-    result = CliRunner().invoke(app, ["usage", "--ledger", str(tmp_path / "missing.jsonl")])
+    result = CliRunner().invoke(app, ["hosted", "usage", "--ledger", str(tmp_path / "missing.jsonl")])
 
     assert result.exit_code == 0
     assert "No hosted usage events recorded" in result.output

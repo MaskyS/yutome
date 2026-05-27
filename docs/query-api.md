@@ -2,21 +2,21 @@
 
 `yutome` exposes one retrieval model through three surfaces:
 
-- CLI: `yutome find`, `yutome list`, `yutome show`, `yutome q`
+- CLI: `yutome search find`, `yutome search list`, `yutome search show`, `yutome search q`
 - MCP: tools named `find`, `list`, `show`, `q`
 - HTTP: `POST /find`, `POST /list`, `POST /show`, `POST /q`
 
 The raw primitive is `QueryRequest` in `src/yutome/query.py`. The transport-neutral convenience verbs live in `src/yutome/api.py`.
 
-For multi-device use, run the authenticated HTTP API with `yutome remote prepare` and `yutome remote serve`. See `docs/remote-access.md`.
+For multi-device use, run the authenticated HTTP API with `yutome serve remote prepare` and `yutome serve remote http`. See `docs/remote-access.md`.
 
 ## HTTP Examples
 
 Start a local authenticated server:
 
 ```bash
-uv run yutome remote prepare --show-token
-uv run yutome remote serve --host 127.0.0.1 --port 8765
+uv run yutome serve remote prepare --show-token
+uv run yutome serve remote http --host 127.0.0.1 --port 8765
 ```
 
 Check readiness:
@@ -61,35 +61,35 @@ FastAPI also exposes interactive OpenAPI docs at `/docs` when you are serving th
 `find` ranks results by relevance. It searches transcript chunks by default and can search video titles or descriptions lexically.
 
 ```bash
-uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run yutome find "cerebrolysin" --in titles --mode lexical --json
+uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome search find "cerebrolysin" --in titles --mode lexical --json
 ```
 
 `list` enumerates corpus objects by filter.
 
 ```bash
-uv run yutome list videos --status 'indexed' --limit 20
-uv run yutome list channels --selected
-uv run yutome list attention
-uv run yutome list status
+uv run yutome search list videos --status 'indexed' --limit 20
+uv run yutome search list channels --selected
+uv run yutome search list attention
+uv run yutome search list status
 ```
 
 `show` fetches resources or resolves citations.
 
 ```bash
-uv run yutome show chunk CHUNK_ID
-uv run yutome show video VIDEO_ID
-uv run yutome show transcript TRANSCRIPT_VERSION_ID
-uv run yutome show transcript VIDEO_ID --offset 0 --limit 300
-uv run yutome show source CHUNK_ID
-uv run yutome show context CHUNK_ID --token-budget 3000
-uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s"
+uv run yutome search show chunk CHUNK_ID
+uv run yutome search show video VIDEO_ID
+uv run yutome search show transcript TRANSCRIPT_VERSION_ID
+uv run yutome search show transcript VIDEO_ID --offset 0 --limit 300
+uv run yutome search show source CHUNK_ID
+uv run yutome search show context CHUNK_ID --token-budget 3000
+uv run yutome search show context "https://youtube.com/watch?v=VIDEO_ID&t=123s"
 ```
 
 `q` accepts a raw `QueryRequest` JSON object.
 
 ```bash
-uv run yutome q '{"entity":"video","filter":{"ingest_status":{"eq":"indexed"}},"project":"video_card","limit":5}'
+uv run yutome search q '{"entity":"video","filter":{"ingest_status":{"eq":"indexed"}},"project":"video_card","limit":5}'
 ```
 
 ## Projections

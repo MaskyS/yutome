@@ -144,44 +144,43 @@ Implemented commands:
 | Command | Purpose |
 | --- | --- |
 | `yutome setup [SOURCE]` | Guided first-run setup: config, `.env`, Webshare proxy secrets, semantic search, YouTube subscription import, source picker, and optional first sync. |
-| `yutome init` | Create `yutome.toml`, base directories, and SQLite catalog. |
-| `yutome doctor` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
-| `yutome add SOURCE` | Add a YouTube channel or video source to the local library. |
-| `yutome import FILE` | Import source entries from CSV, OPML/XML, or a plain URL list. |
-| `yutome import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
-| `yutome select/unselect SOURCE` | Include or exclude source entries from default library syncs. |
-| `yutome sync [SOURCE]` | Discover and index a channel source, exact video source, or selected sources when omitted. |
-| `yutome sync --all` | Sync every selected source in the local library. |
-| `yutome find QUERY` | Ranked retrieval over chunks, titles, or descriptions with lexical/semantic/hybrid modes. |
-| `yutome list videos` | Enumerate videos by status, channel, source, language, and date filters. |
-| `yutome list channels` | Show channel entries from the local source library and catalog. |
-| `yutome list attention` | Show failed/deferred videos with latest provider-attempt details. |
-| `yutome list status` | Show catalog counts, index percentages, statuses, and job breakdowns. |
-| `yutome show chunk/video/channel/transcript` | Fetch one resource by id or selector; transcripts can be addressed by transcript id or active video id. |
-| `yutome show source` | Resolve a citation anchor to a YouTube timestamp and provenance. |
-| `yutome show context` | Expand a selected hit into bounded neighboring transcript context. |
-| `yutome q` | Execute a raw QueryRequest JSON object. |
-| `yutome eval run FILE` | Run corpus-relative retrieval evals from a JSON fixture. |
-| `yutome remote prepare` | Generate and store the authenticated HTTP API token for remote clients. |
-| `yutome remote serve` | Serve the authenticated HTTP API for private-network or reverse-proxy remote access. |
-| `yutome remote mcp` | Serve the authenticated MCP streamable HTTP endpoint for remote agent clients. |
-| `yutome remote check URL` | Verify remote liveness and authenticated readiness from a client machine. |
-| `yutome rebuild-chunks` | Rebuild chunk rows/artifacts from active normalized transcripts. |
-| `yutome rebuild-vectors` | Rebuild or resume embeddings and LanceDB rows from canonical chunks. |
-| `yutome proxy-info` | Show proxy policy and supported env config. |
-| `yutome proxy-test` | Test transcript API and yt-dlp subtitle paths through configured proxy. |
-| `yutome gemini-test` | Test Gemini video-understanding fallback on one video. |
-| `yutome export portable-md` | Export indexed videos as portable Markdown. |
+| `yutome doctor local` | Check runtime, config, SQLite FTS5, and optional dependency availability. |
+| `yutome corpus add SOURCE` | Add a YouTube channel or video source to the local library. |
+| `yutome corpus import FILE` | Import source entries from CSV, OPML/XML, or a plain URL list. |
+| `yutome corpus import-youtube [CHANNEL]` | Import the signed-in user's YouTube subscriptions, or a channel's public subscriptions when `CHANNEL` is passed. |
+| `yutome corpus select SOURCE [--off]` | Include or exclude source entries from default library syncs. |
+| `yutome corpus sync [SOURCE]` | Discover and index a channel source, exact video source, or selected sources when omitted. |
+| `yutome corpus sync --all` | Sync every selected source in the local library. |
+| `yutome search find QUERY` | Ranked retrieval over chunks, titles, or descriptions with lexical/semantic/hybrid modes. |
+| `yutome search list videos` | Enumerate videos by status, channel, source, language, and date filters. |
+| `yutome search list channels` | Show channel entries from the local source library and catalog. |
+| `yutome search list attention` | Show failed/deferred videos with latest provider-attempt details. |
+| `yutome search list status` | Show catalog counts, index percentages, statuses, and job breakdowns. |
+| `yutome search show chunk/video/channel/transcript` | Fetch one resource by id or selector; transcripts can be addressed by transcript id or active video id. |
+| `yutome search show source` | Resolve a citation anchor to a YouTube timestamp and provenance. |
+| `yutome search show context` | Expand a selected hit into bounded neighboring transcript context. |
+| `yutome search q` | Execute a raw QueryRequest JSON object. |
+| `yutome doctor eval FILE` | Run corpus-relative retrieval evals from a JSON fixture. |
+| `yutome serve remote prepare` | Generate and store the authenticated HTTP API token for remote clients. |
+| `yutome serve remote http` | Serve the authenticated HTTP API for private-network or reverse-proxy remote access. |
+| `yutome serve remote mcp` | Serve the authenticated MCP streamable HTTP endpoint for remote agent clients. |
+| `yutome doctor remote URL` | Verify remote liveness and authenticated readiness from a client machine. |
+| `yutome corpus rebuild chunks` | Rebuild chunk rows/artifacts from active normalized transcripts. |
+| `yutome corpus rebuild vectors` | Rebuild or resume embeddings and LanceDB rows from canonical chunks. |
+| `yutome doctor proxy --info-only` | Show proxy policy and supported env config. |
+| `yutome doctor proxy` | Test transcript API and yt-dlp subtitle paths through configured proxy. |
+| `yutome doctor gemini` | Test Gemini video-understanding fallback on one video. |
+| `yutome export markdown` | Export indexed videos as portable Markdown. |
 | `yutome export obsidian` | Export indexed videos as Obsidian-friendly Markdown. |
-| `yutome quality upgrade` | Create LLM-cleaned transcript versions from already-indexed active transcripts. |
+| `yutome corpus quality` | Create LLM-cleaned transcript versions from already-indexed active transcripts. |
 
 Target command surface not yet implemented:
 
 | Target command | Intended purpose |
 | --- | --- |
-| `yutome sync --channel ID` | Sync one registered channel by local/channel id. |
+| `yutome corpus sync --channel ID` | Sync one registered channel by local/channel id. |
 | `yutome backfill --channel ID --limit N --workers N` | Controlled historical ingest for an existing channel. Current `sync --use-catalog --max-process --workers` covers part of this need. |
-| `yutome index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `rebuild-chunks` and `rebuild-vectors`. |
+| `yutome index --lexical --vectors` | Rebuild SQLite FTS and/or LanceDB from artifacts. Current implementation has `yutome corpus rebuild chunks` and `yutome corpus rebuild vectors`. |
 | `yutome scheduler install` | Install a cron/launchd schedule for bounded recurring syncs. |
 | `yutome inspect video VIDEO_ID` | Inspect one video, active transcript version, artifacts, chunks, and status. |
 | `yutome inspect chunk CHUNK_ID` | Inspect one chunk, text, timestamps, source, and neighboring chunks. |
@@ -542,8 +541,8 @@ Why LanceDB is rebuildable:
 
 - SQLite and artifacts are the source of truth.
 - Embeddings are deterministic enough for a selected provider/model/dimension.
-- If LanceDB table shape is missing required columns, `find --mode hybrid` and semantic retrieval fail with a clear message to run `yutome rebuild-vectors`.
-- If hybrid search fails because the LanceDB FTS index is not ready, the error tells the user to run `yutome rebuild-vectors`.
+- If LanceDB table shape is missing required columns, `find --mode hybrid` and semantic retrieval fail with a clear message to run `yutome corpus rebuild vectors`.
+- If hybrid search fails because the LanceDB FTS index is not ready, the error tells the user to run `yutome corpus rebuild vectors`.
 
 Why SQLite is still needed when LanceDB exists:
 
@@ -688,7 +687,7 @@ Resumability rules:
 - `--use-catalog` avoids rediscovery when resuming known videos.
 - `--max-process` lets users index a channel a little at a time.
 - `--retry-failed` is required to revisit failed or deferred videos.
-- Embedding failures leave chunks pending so `rebuild-vectors --resume` can continue.
+- Embedding failures leave chunks pending so `yutome corpus rebuild vectors --resume` can continue.
 
 Reliability requirements:
 
@@ -771,7 +770,7 @@ Embedding behavior:
 - Query only chunks that do not already have an indexed embedding record for the selected provider/model/dimension.
 - Fetch embeddings in bounded concurrent batches.
 - Retry transient and rate-limit provider errors with exponential backoff.
-- Leave failed batches pending so `yutome rebuild-vectors --resume` can continue.
+- Leave failed batches pending so `yutome corpus rebuild vectors --resume` can continue.
 - Write LanceDB rows and SQLite embedding status after successful batches.
 - Create or refresh the LanceDB FTS index on `text` when vectors are ingested.
 
@@ -779,8 +778,8 @@ Important implementation detail:
 
 - Embedding API calls are parallelized.
 - LanceDB/SQLite writes are kept controlled so one failed batch does not corrupt the whole rebuild.
-- Full `yutome rebuild-vectors` drops the existing LanceDB table and clears matching embedding records.
-- `yutome rebuild-vectors --resume` preserves existing indexed rows and embeds only pending chunks.
+- Full `yutome corpus rebuild vectors` drops the existing LanceDB table and clears matching embedding records.
+- `yutome corpus rebuild vectors --resume` preserves existing indexed rows and embeds only pending chunks.
 
 Future embedding work:
 
@@ -834,7 +833,7 @@ Retrieval is intentionally two-stage.
 Stage 1 returns compact hits:
 
 ```bash
-uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
 ```
 
 Defaults:
@@ -915,9 +914,9 @@ Important retrieval rule:
 Stage 2 expands a selected hit:
 
 ```bash
-uv run yutome show context CHUNK_ID --token-budget 3000
-uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
-uv run yutome show context --video-id VIDEO_ID --time 123
+uv run yutome search show context CHUNK_ID --token-budget 3000
+uv run yutome search show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
+uv run yutome search show context --video-id VIDEO_ID --time 123
 ```
 
 Output shape:
@@ -1019,7 +1018,7 @@ Recommended next ranking improvements:
 Portable Markdown:
 
 ```bash
-uv run yutome export portable-md
+uv run yutome export markdown
 ```
 
 Output:
@@ -1200,7 +1199,7 @@ Resource bytes for transcripts come from the existing artifact files on disk; th
 | Authenticated HTTP API | HTTP/HTTPS behind private network or reverse proxy | bearer token | Current multi-device slice. |
 | Remote MCP | MCP streamable HTTP behind private network or reverse proxy | same bearer token | Current multi-device slice for agent clients. |
 
-The local HTTP surface is bound to loopback by default. `yutome remote serve` and `yutome remote mcp` are the current authenticated remote-read shapes; both refuse non-loopback binding without `YUTOME_HTTP_TOKEN`. Public hosted remote access still needs per-user data isolation, rate limits, audit logging, and a decision about whether remote writes can start sync jobs or remote is read-only over already-indexed corpus data.
+The local HTTP surface is bound to loopback by default. `yutome serve remote http` and `yutome serve remote mcp` are the current authenticated remote-read shapes; both refuse non-loopback binding without `YUTOME_HTTP_TOKEN`. Public hosted remote access still needs per-user data isolation, rate limits, audit logging, and a decision about whether remote writes can start sync jobs or remote is read-only over already-indexed corpus data.
 
 ### Beginner Vs Expert Shape
 
@@ -1218,15 +1217,15 @@ Shipped (query/API slice):
 3. `src/yutome/api.py` exposes transport-neutral `find`, `list`, `show`, and `q` verbs plus resources.
 4. `src/yutome/mcp_server.py` implements four tools and four resources wired through `api.py`.
 5. `src/yutome/http_server.py` exposes the same verbs/resources as REST endpoints: `POST /find`, `POST /list`, `POST /show`, `POST /q`, `GET /chunks/{id}`, `GET /videos/{id}`, `GET /channels/{id}`, `GET /transcripts/{id}`, plus unauthenticated `GET /healthz` and authenticated `GET /readyz`.
-6. `yutome mcp serve` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, LanceDB, and Voyage credentials are inherited.
-7. `yutome http serve --config yutome.toml --port 8765` CLI entrypoint runs uvicorn on `127.0.0.1`.
+6. `yutome serve mcp` CLI entrypoint runs FastMCP over stdio in the project venv so `yt-dlp`, LanceDB, and Voyage credentials are inherited.
+7. `yutome --config yutome.toml serve http --port 8765` CLI entrypoint runs uvicorn on `127.0.0.1`.
 8. Optional bearer auth via the `YUTOME_HTTP_TOKEN` env var for loopback HTTP; required for non-loopback remote serving.
 9. Tests: `tests/test_mcp_server.py`, `tests/test_http_server.py`, `tests/test_retrieval_exports.py`, plus subprocess smoke helpers.
-10. `yutome remote prepare|serve|mcp|check` for authenticated remote HTTP and MCP access from other devices/private agents.
+10. `yutome serve remote prepare|sync|http|mcp` plus `yutome doctor remote` for authenticated remote HTTP and MCP access from other devices/private agents.
 
 Still to do:
 
-11. Optional Claude skill bundling few-shot examples of good yutome queries (Scry-style).
+11. Optional Claude skill bundling few-shot examples of good yutome search queries (Scry-style).
 12. Long-running tools (`sync`, `quality_upgrade`) once the `jobs` table is writable.
 13. Remote MCP / ChatGPT connector shape with OAuth or app-issued tokens.
 
@@ -1236,8 +1235,8 @@ For Claude Code, the project-scoped `.mcp.json` at the repo root is read automat
 
 ```bash
 claude mcp add --scope user yutome -- \
-  uv run --directory /absolute/path/to/yutome yutome mcp serve \
-  --config /absolute/path/to/yutome/yutome.toml
+  uv run --directory /absolute/path/to/yutome yutome \
+  --config /absolute/path/to/yutome/yutome.toml serve mcp
 ```
 
 For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -1248,8 +1247,8 @@ For Claude Desktop, add to `~/Library/Application Support/Claude/claude_desktop_
     "yutome": {
       "command": "uv",
       "args": ["run", "--directory", "/absolute/path/to/yutome",
-               "yutome", "mcp", "serve",
-               "--config", "/absolute/path/to/yutome/yutome.toml"]
+               "yutome", "--config", "/absolute/path/to/yutome/yutome.toml",
+               "serve", "mcp"]
     }
   }
 }
@@ -1273,13 +1272,13 @@ uv run yutome doctor
 Index or resume Leo and Longevity from catalog:
 
 ```bash
-uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25
+uv run yutome corpus sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25
 ```
 
 Run with embeddings:
 
 ```bash
-uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25 --embed
+uv run yutome corpus sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --max-process 25 --embed
 ```
 
 Test provider/proxy paths:
@@ -1291,52 +1290,52 @@ uv run yutome proxy-test --video-id VIDEO_ID
 Retry deferred rows:
 
 ```bash
-uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --status-filter "deferred: rate_limited" --max-process 10
+uv run yutome corpus sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --status-filter "deferred: rate_limited" --max-process 10
 ```
 
 Use Gemini fallback for known fallback rows:
 
 ```bash
-uv run yutome sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --gemini-fallback --max-process 5
+uv run yutome corpus sync "https://www.youtube.com/@LeoandLongevity" --use-catalog --retry-failed --gemini-fallback --max-process 5
 ```
 
 Check status:
 
 ```bash
-uv run yutome list status
+uv run yutome search list status
 ```
 
 Rebuild chunks from active normalized transcripts:
 
 ```bash
-uv run yutome rebuild-chunks
+uv run yutome corpus rebuild chunks
 ```
 
 Resume vector indexing for pending chunks:
 
 ```bash
-uv run yutome rebuild-vectors --resume --batch-size 128 --concurrency 4
+uv run yutome corpus rebuild vectors --resume --batch-size 128 --concurrency 4
 ```
 
 Full vector rebuild:
 
 ```bash
-uv run yutome rebuild-vectors
+uv run yutome corpus rebuild vectors
 ```
 
 Run retrieval checks:
 
 ```bash
-uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run yutome find "donepezil AChEI" --mode hybrid --limit 5 --json
-uv run yutome find "neuroautoimmune disease" --mode hybrid --limit 5 --json
-uv run yutome show context CHUNK_ID --token-budget 3000
+uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome search find "donepezil AChEI" --mode hybrid --limit 5 --json
+uv run yutome search find "neuroautoimmune disease" --mode hybrid --limit 5 --json
+uv run yutome search show context CHUNK_ID --token-budget 3000
 ```
 
 Export:
 
 ```bash
-uv run yutome export portable-md
+uv run yutome export markdown
 uv run yutome export obsidian
 ```
 
@@ -1352,7 +1351,7 @@ Expected current checks:
 
 ```bash
 uv run yutome doctor
-uv run yutome list status
+uv run yutome search list status
 uv run pytest -q
 ```
 
@@ -1646,11 +1645,11 @@ Suggested retrieval eval queries:
 - `small fiber neuropathy`
 - `probiotics Crohn diet`
 
-Shipped: local MCP server (`yutome mcp serve`) and local HTTP API (`yutome http serve`) sharing the same in-process handlers. See the Agent And Multi-Device Connector section.
+Shipped: local MCP server (`yutome serve mcp`) and local HTTP API (`yutome serve http`) sharing the same in-process handlers. See the Agent And Multi-Device Connector section.
 
 Next slice:
 
-- Optional Claude skill with few-shot yutome query examples.
+- Optional Claude skill with few-shot yutome search query examples.
 
 Later slices:
 
@@ -1658,7 +1657,7 @@ Later slices:
 - Built-in `yutome answer`.
 - Hosted API / remote MCP for multi-device access.
 - Web UI or local browser transcript navigator.
-- `yutome add`, `yutome sync --all`, and scheduler install/run commands.
+- `yutome corpus add`, `yutome corpus sync --all`, and scheduler install/run commands.
 - `yutome index --lexical --vectors` as a unified rebuild command.
 - Incremental scheduler for new channel videos.
 - Topic/entity extraction.

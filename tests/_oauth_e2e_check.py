@@ -17,7 +17,7 @@ The script simulates a Claude-style custom connector:
 6. POST /mcp with the access_token: initialize, tools/list,
    resources/templates/list, resources/read.
 
-Pass-through requires the laptop bridge (``yutome bridge start``) to be
+Pass-through requires the laptop bridge (``yutome serve bridge start``) to be
 running so resources/read can reach a chunk.
 """
 from __future__ import annotations
@@ -207,7 +207,7 @@ def main() -> int:
     if not code:
         print(f"pair redirect missing code: {location}", file=sys.stderr)
         return 1
-    print(f"[OK] /pair issued auth code")
+    print("[OK] /pair issued auth code")
 
     # ---- 5. POST /token ----
     status, _, body = _http(
@@ -320,7 +320,7 @@ def main() -> int:
         else:
             print(f"[WARN] resources/read returned no contents: {read}")
     else:
-        print(f"[WARN] no videos in corpus to resource-read against")
+        print("[WARN] no videos in corpus to resource-read against")
 
     return 0
 

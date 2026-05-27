@@ -9,10 +9,8 @@ from yutome.db import catalog_is_initialized, connect_catalog
 from yutome.paths import ProjectPaths, resolve_under
 from yutome.query import (
     BoolPredicate,
-    CompiledQuery,
     DateRange,
     Filter,
-    IntPredicate,
     OrderBy,
     QueryRequest,
     QueryResult,
@@ -427,12 +425,12 @@ def _context_request(
 
 
 _EMPTY_CORPUS_NOTE = (
-    "No videos indexed yet — run `yutome sync <channel-url>` to index a channel before searching."
+    "No videos indexed yet — run `yutome corpus sync <channel-url>` to index a channel before searching."
 )
 
 _NO_MATCH_NOTE = (
     "No matches for this query. Try different phrasing, `--mode lexical` for exact terms, "
-    "or `yutome list videos --limit 5` to see what's indexed."
+    "or `yutome search list videos --limit 5` to see what's indexed."
 )
 
 

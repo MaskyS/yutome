@@ -54,9 +54,9 @@ def test_hosted_login_fake_browser_callback_stores_auth(monkeypatch, tmp_path: P
         }
 
     monkeypatch.setattr("webbrowser.open", fake_open)
-    monkeypatch.setattr("yutome.cli._hosted_api_request_json", fake_api)
+    monkeypatch.setattr("yutome.cli._legacy._hosted_api_request_json", fake_api)
 
-    result = runner.invoke(app, ["hosted", "login", "--config", str(config_path)])
+    result = runner.invoke(app, ["--config", str(config_path), "hosted", "login"])
 
     assert result.exit_code == 0, result.output
     assert "Hosted CLI connected to workspace ws_cli_test" in result.output
@@ -91,10 +91,10 @@ def test_import_youtube_hosted_uploads_public_channel_rows(monkeypatch, tmp_path
         captured.update(kwargs)
         return {"ok": True, "imported": [{"source_id": "src_1"}], "jobs": [], "refresh_policies": [{"id": "srp_1"}]}
 
-    monkeypatch.setattr("yutome.cli.fetch_user_subscription_channels_from_browser", fake_fetch)
-    monkeypatch.setattr("yutome.cli._hosted_import_sources", fake_import)
+    monkeypatch.setattr("yutome.cli._legacy.fetch_user_subscription_channels_from_browser", fake_fetch)
+    monkeypatch.setattr("yutome.cli._legacy._hosted_import_sources", fake_import)
 
-    result = runner.invoke(app, ["import-youtube", "--hosted", "--config", str(config_path)])
+    result = runner.invoke(app, ["--config", str(config_path), "corpus", "import-youtube", "--hosted"])
 
     assert result.exit_code == 0, result.output
     assert "Uploaded 1 YouTube subscription channel" in result.output
@@ -104,4 +104,3 @@ def test_import_youtube_hosted_uploads_public_channel_rows(monkeypatch, tmp_path
     assert descriptor["import_source"] == "youtube_oauth"
     with connect_catalog(tmp_path / "data/indexes/catalog.sqlite") as connection:
         assert list_library_channels(connection) == []
-

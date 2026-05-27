@@ -86,38 +86,38 @@ Health and status:
 
 ```bash
 uv run yutome doctor
-uv run yutome list status
+uv run yutome search list status
 uv run pytest -q
 ```
 
 Retrieval smoke tests:
 
 ```bash
-uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run yutome find "donepezil AChEI" --mode hybrid --limit 5 --json
-uv run yutome find "neuroautoimmune disease" --mode hybrid --limit 5 --json
-uv run yutome find "complex disease diagnosis" --mode hybrid --limit 5 --json
+uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome search find "donepezil AChEI" --mode hybrid --limit 5 --json
+uv run yutome search find "neuroautoimmune disease" --mode hybrid --limit 5 --json
+uv run yutome search find "complex disease diagnosis" --mode hybrid --limit 5 --json
 ```
 
 Compare retrieval modes:
 
 ```bash
-uv run yutome find "Crohn probiotics" --mode lexical --limit 5 --json
-uv run yutome find "Crohn probiotics" --mode semantic --limit 5 --json
-uv run yutome find "Crohn probiotics" --mode hybrid --limit 5 --json
+uv run yutome search find "Crohn probiotics" --mode lexical --limit 5 --json
+uv run yutome search find "Crohn probiotics" --mode semantic --limit 5 --json
+uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
 ```
 
 Context expansion:
 
 ```bash
-uv run yutome show context CHUNK_ID --token-budget 3000
-uv run yutome show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
+uv run yutome search show context CHUNK_ID --token-budget 3000
+uv run yutome search show context "https://youtube.com/watch?v=VIDEO_ID&t=123s" --token-budget 1800
 ```
 
 Export checks:
 
 ```bash
-uv run yutome export portable-md
+uv run yutome export markdown
 uv run yutome export obsidian
 ```
 
@@ -147,7 +147,7 @@ PY
 
 ## Expected Current State
 
-Expected `yutome list status`:
+Expected `yutome search list status`:
 
 ```text
 {
@@ -235,9 +235,9 @@ Check:
 
 Check:
 
-- `rebuild-chunks` can regenerate chunks from active normalized transcripts.
-- `rebuild-vectors --resume` only embeds pending chunks.
-- Full `rebuild-vectors` can recreate LanceDB from SQLite chunks.
+- `yutome corpus rebuild chunks` can regenerate chunks from active normalized transcripts.
+- `yutome corpus rebuild vectors --resume` only embeds pending chunks.
+- Full `yutome corpus rebuild vectors` can recreate LanceDB from SQLite chunks.
 - Stale LanceDB schema produces a clear error.
 - Failed embedding batches stay pending.
 

@@ -174,7 +174,7 @@ Laptop off:
 
 This mode solves the "best app is no app" problem without making Yutome a hosted transcript provider.
 
-Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome bridge`; the bridge runs the local `find/list/show/q` or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
+Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome serve bridge`; the bridge runs the local `find/list/show/q` or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
 
 ### Mode 2: Always-On Search Replica
 
@@ -432,7 +432,7 @@ Noob-facing copy should avoid implementation words like Worker, Durable Object, 
 
 The user-facing verb should be **connect**, not **capsule**. "Cloud Capsule" is the architecture/product name for the user-owned remote environment, but a normal user should not need to understand or type it. Remote setup should appear as a guided step inside `yutome setup`, plus a direct `yutome connect` command for users who already have a local corpus.
 
-`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after the local corpus steps. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, the user chooses which assistant they want help with (Claude, ChatGPT, both, or another MCP client), ChatGPT also requires selecting the Yutome app in each chat from `+` > `More` / composer tools, the laptop-backed V1 needs this computer and `yutome bridge` online, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Voyage, Webshare, Gemini, or proxy credentials.
+`yutome setup` should introduce this in noob language as **Use Yutome from Claude/ChatGPT** after the local corpus steps. The copy should explain the value first: the user can ask their normal assistant about their YouTube library instead of opening Yutome. Then it should explain the rough shape: one remote MCP connector URL, add it once per assistant account, the user chooses which assistant they want help with (Claude, ChatGPT, both, or another MCP client), ChatGPT also requires selecting the Yutome app in each chat from `+` > `More` / composer tools, the laptop-backed V1 needs this computer and `yutome serve bridge` online, and setup needs a small public connector endpoint. Do not assume the noob user has a Cloudflare account; if Yutome or a team provides the endpoint they can paste it, otherwise Yutome can prepare Cloudflare deploy files for the user or a helper to deploy. The copy should also say that this step does not require Voyage, Webshare, Gemini, or proxy credentials.
 
 Primary choice:
 
@@ -460,7 +460,7 @@ Advanced detail can map this to:
 5. If Node/npm/npx are missing or Node is older than 22, Yutome explains the runtime problem in plain language and asks the user to install Node.js 22 LTS or newer, then rerun `yutome connect --deploy`. (The dashboard-paste fallback is no longer offered because the Worker is a multi-file TypeScript project, not a single JS file.)
 6. Future no-node best path should be a public Deploy-to-Cloudflare template. Cloudflare documents Deploy buttons as a way to let users deploy a Workers app into their own account, with resource provisioning from the app configuration. Source: [Cloudflare Deploy Buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 7. CLI stores the deployed endpoint and normalized `/mcp` URL in local remote state.
-8. User starts `yutome bridge` when they want the assistant to reach the laptop-backed corpus.
+8. User starts `yutome serve bridge` when they want the assistant to reach the laptop-backed corpus.
 9. User adds the MCP URL to Claude/ChatGPT.
    - Claude: add one custom connector for the Claude account from Customize > Connectors, leaving advanced OAuth fields blank.
    - ChatGPT: turn on Developer mode where available, create the app with the MCP Server URL from Settings > Apps, choose OAuth/authenticated, then select Yutome from `+` > `More` / composer tools in each chat.
@@ -505,7 +505,7 @@ This keeps the beginner path honest. If local assisted deploy is possible, it is
 
 Remote status should be exposed through the normal status surface, not a brand-new noob namespace:
 
-- `yutome status` includes the corpus summary plus a remote connector section when configured. There is no separate `yutome remote status`; pass `--json` for the full machine-readable view.
+- `yutome status` includes the corpus summary plus a remote connector section when configured. There is no separate `yutome serve remote status`; pass `--json` for the full machine-readable view.
 
 Status should show:
 
@@ -562,8 +562,8 @@ The local implementation should keep beginner verbs aligned with the existing CL
 - `yutome setup` should offer remote connection as an optional guided step after basic local setup.
 - `yutome connect` should be the direct user-facing command for connecting Claude/ChatGPT; without an endpoint it should generate a deployable Cloudflare Worker project, explain whether assisted deploy is available on this machine, and with `--deploy` it should use `npx`/Wrangler for the user.
 - `yutome status` shows remote connector health when configured (use `--json` for the detailed/operational view).
-- `yutome bridge` is the top-level group for the laptop bridge process (start, stop, status, install for launchd/systemd, uninstall). `connect --deploy` auto-spawns it; install registers it as a service so it survives reboots.
-- `yutome remote sync` should handle replica export/upload when always-on search is enabled.
+- `yutome serve bridge` is the top-level group for the laptop bridge process (start, stop, status, install for launchd/systemd, uninstall). `connect --deploy` auto-spawns it; install registers it as a service so it survives reboots.
+- `yutome serve remote sync` should handle replica export/upload when always-on search is enabled.
 - `yutome disconnect` is the cleanup command. It removes local remote connector state and, when Yutome knows the deployed Worker name and Wrangler can run, removes that Worker from the user's Cloudflare account. Destructive nouns like `delete` are not part of the user-facing remote CLI.
 - An internal or advanced `capsule` module/package can still hold implementation code and state helpers.
 
@@ -631,7 +631,7 @@ Cloud should never treat a half-uploaded snapshot as active.
 
 ### Milestone 3: Replica export
 
-- Add `yutome remote sync --dry-run`.
+- Add `yutome serve remote sync --dry-run`.
 - Export corpus manifest and batches locally.
 - Verify secret exclusion.
 - Add deletion/tombstone tracking.

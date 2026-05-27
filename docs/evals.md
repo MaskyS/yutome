@@ -1,6 +1,6 @@
 # Retrieval Evals
 
-`yutome eval run` executes small local retrieval benchmarks against the current SQLite/LanceDB corpus. Evals are intentionally corpus-relative: they assert that known queries surface known videos, chunks, or terms.
+`yutome doctor eval` executes small local retrieval benchmarks against the current SQLite/LanceDB corpus. Evals are intentionally corpus-relative: they assert that known queries surface known videos, chunks, or terms.
 
 ## Format
 
@@ -29,8 +29,8 @@ Supported expectations:
 Run:
 
 ```bash
-uv run yutome eval run evals/leo-smoke.json
-uv run yutome eval run evals/leo-smoke.json --json
+uv run yutome doctor eval evals/leo-smoke.json
+uv run yutome doctor eval evals/leo-smoke.json --json
 ```
 
 ## Use

@@ -35,7 +35,7 @@ def test_append_demo_usage_event_writes_real_jsonl_visible_to_usage_command(tmp_
     assert event.raw_usage["synthetic"] is True
     assert JsonlUsageLedger(ledger_path).recent(limit=1)[0].id == event.id
 
-    result = CliRunner().invoke(app, ["usage", "--ledger", str(ledger_path), "--json"])
+    result = CliRunner().invoke(app, ["hosted", "usage", "--ledger", str(ledger_path), "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -51,7 +51,7 @@ def test_usage_command_can_append_demo_events_and_print_summary(tmp_path: Path) 
 
     result = CliRunner().invoke(
         app,
-        ["usage", "--ledger", str(ledger_path), "--append-demo", "--summary", "--json"],
+        ["hosted", "usage", "--ledger", str(ledger_path), "--append-demo", "--summary", "--json"],
     )
 
     assert result.exit_code == 0

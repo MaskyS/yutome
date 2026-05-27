@@ -3,7 +3,7 @@
 These fail when:
 
 - The TypeScript Worker's ``contract.json`` drifts from what
-  ``yutome contract emit`` would produce now.
+  the Python contract registry would produce now.
 - ``SKILL.md`` stops mentioning a tool name or resource URI template.
 - The OAuth scope diverges between the Python and TS sides.
 
@@ -26,14 +26,12 @@ SKILL_MD = REPO_ROOT / ".claude" / "skills" / "yutome-retrieval" / "SKILL.md"
 
 
 def test_emitted_contract_json_matches_registry() -> None:
-    """The committed contract.json must equal what `yutome contract emit` would
-    write right now. If this fails, run `uv run yutome contract emit` and
-    commit the result."""
+    """The committed contract.json must equal the Python registry output."""
     expected = build_contract_payload()
     on_disk = json.loads(CONTRACT_JSON.read_text(encoding="utf-8"))
     assert on_disk == expected, (
         "cloudflare/yutome-capsule/src/contract.json is stale. "
-        "Run `uv run yutome contract emit` and commit the change."
+        "Refresh it through the internal contract export path and commit the change."
     )
 
 

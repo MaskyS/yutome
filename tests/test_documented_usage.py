@@ -10,7 +10,7 @@ Each test here picks an instruction that appears in `contract.py` or
 SKILL.md and turns it into an actual function call. They run against the
 ``_order`` helper directly (no DB needed), so they're fast and don't depend
 on a populated catalog. Heavier end-to-end usage is covered by the eval
-suite (`yutome eval`).
+suite (`yutome doctor eval`).
 """
 from __future__ import annotations
 

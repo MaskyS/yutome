@@ -11,15 +11,15 @@ description: Use whenever the user asks a question that should be answered from 
 
 If the user gives a YouTube channel/video URL and asks to add it, index it, or answer from it in a local Claude Code repo session, use the CLI. The MCP server is read-only and exposes retrieval tools only.
 
-1. Register the source: `uv run yutome add SOURCE`.
-2. Ingest/index it: `uv run yutome sync SOURCE`.
-3. Query with `uv run yutome find "question terms" --limit 10 --json`.
-4. Expand only the promising hits with `uv run yutome show context CHUNK_ID --token-budget 2000`.
+1. Register the source: `uv run yutome corpus add SOURCE`.
+2. Ingest/index it: `uv run yutome corpus sync SOURCE`.
+3. Query with `uv run yutome search find "question terms" --limit 10 --json`.
+4. Expand only the promising hits with `uv run yutome search show context CHUNK_ID --token-budget 2000`.
 5. Answer with timestamped `youtube_url` citations.
 
 Use exact-video sync for old or specific episodes. `SOURCE` may be a YouTube channel URL, handle, channel id, video URL, Shorts URL, or raw video id. Playlist URLs are detected but may not be supported yet; report that clearly instead of guessing.
 
-If `sync` fails because a global `yt-dlp` executable is broken, stay inside the uv environment. Prefer `uv run yutome sync SOURCE`; if diagnosing, check `uv run python -m yt_dlp --version` before relying on `yt-dlp` from the shell `PATH`.
+If `sync` fails because a global `yt-dlp` executable is broken, stay inside the uv environment. Prefer `uv run yutome corpus sync SOURCE`; if diagnosing, check `uv run python -m yt_dlp --version` before relying on `yt-dlp` from the shell `PATH`.
 
 ## Two-stage retrieval is mandatory
 
@@ -112,8 +112,8 @@ The remote MCP transport returns JSON-RPC errors with structured `data`. Recogni
 For other failures:
 
 - **Pairing / auth (HTTP 401 from the relay)** — the connector token has been rejected. Tell the user to run `yutome connect --deploy` and re-pair the connector in their assistant client. Do not retry with the same token.
-- **Local HTTP unreachable** (`http://127.0.0.1:8765` connection refused, when not using MCP) — `yutome http` isn't running. Tell the user to start it or to fall back to the CLI.
-- **Empty corpus** — if `find` returns rows=[] and the result includes a note about no videos indexed, surface that note verbatim. Don't run more searches; suggest `yutome sync <channel>` instead.
+- **Local HTTP unreachable** (`http://127.0.0.1:8765` connection refused, when not using MCP) — `yutome serve http` isn't running. Tell the user to start it or to fall back to the CLI.
+- **Empty corpus** — if `find` returns rows=[] and the result includes a note about no videos indexed, surface that note verbatim. Don't run more searches; suggest `yutome corpus sync <channel>` instead.
 
 In every case, prefer one clear sentence ("Your laptop's Yutome bridge is offline — open Yutome Desktop and try again") over a generic apology. The user can't see the structured error; you're their translator.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import sqlite3
 import time
+from importlib.util import find_spec
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -263,7 +264,7 @@ def ensure_lancedb_chunk_indexes(table) -> None:
     try:
         table.create_fts_index("text", replace=True)
     except Exception as exc:  # noqa: BLE001 - surface index issues during hybrid queries.
-        raise RuntimeError(f"failed to create LanceDB text index; run `yutome rebuild-vectors`: {exc}") from exc
+        raise RuntimeError(f"failed to create LanceDB text index; run `yutome corpus rebuild vectors`: {exc}") from exc
     try:
         table.optimize()
     except Exception:
@@ -287,9 +288,10 @@ def embed_pending_chunks(
 
     try:
         import lancedb
-        import voyageai
     except ImportError as exc:
         return EmbeddingStats(embedded_chunks=0, skipped=True, message=f"missing optional dependency: {exc.name}")
+    if find_spec("voyageai") is None:
+        return EmbeddingStats(embedded_chunks=0, skipped=True, message="missing optional dependency: voyageai")
 
     provider = config.embeddings.provider
     model = config.embeddings.model

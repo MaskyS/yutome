@@ -5,9 +5,10 @@ For usage and install, see the [top-level README](../README.md). The files in th
 ## User-facing
 
 - [`remote-access.md`](remote-access.md) — connecting Claude, ChatGPT, and other agents to Yutome (both local stdio MCP and the remote Cloudflare path).
-- [`query-api.md`](query-api.md) — the query schema that `yutome find` and `yutome q` speak; useful when you want richer filtering than the CLI flags expose.
+- [`cli-architecture.md`](cli-architecture.md) — CLI namespace rules and shared command architecture.
+- [`query-api.md`](query-api.md) — the query schema that `yutome search find` and `yutome search q` speak; useful when you want richer filtering than the CLI flags expose.
 - [`oauth-testing.md`](oauth-testing.md) — how to validate the OAuth + pairing flow against a deployed Cloudflare capsule.
-- [`evals.md`](evals.md) — running retrieval-quality evaluations with `yutome eval`.
+- [`evals.md`](evals.md) — running retrieval-quality evaluations with `yutome doctor eval`.
 - [`proxy-strategy.md`](proxy-strategy.md) — when transcript fetches get rate-limited, how to wire up a proxy.
 
 ## Internal / design history

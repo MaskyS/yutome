@@ -1,6 +1,6 @@
 """End-to-end MCP smoke test.
 
-Launches `uv run yutome mcp serve --config yutome.toml` as a subprocess and drives
+Launches `uv run yutome --config yutome.toml serve mcp` as a subprocess and drives
 it through the MCP Python client over stdio. Not part of the pytest run by
 default (subprocess + live LanceDB makes it slow and environment-dependent).
 """
@@ -60,7 +60,7 @@ async def main() -> int:
     print("SMOKE QUERY:", smoke_query)
     params = StdioServerParameters(
         command="uv",
-        args=["run", "yutome", "mcp", "serve", "--config", "yutome.toml"],
+        args=["run", "yutome", "--config", "yutome.toml", "serve", "mcp"],
         cwd=str(repo_root),
         env=os.environ.copy(),
     )

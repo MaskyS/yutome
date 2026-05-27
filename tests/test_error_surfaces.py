@@ -3,7 +3,7 @@
 Cover the user-facing failure paths that previously surfaced silently:
 
 * Empty-corpus searches must include a note telling the user to run
-  ``yutome sync`` rather than returning rows=[] with no explanation.
+  ``yutome corpus sync`` rather than returning rows=[] with no explanation.
 * Missing yutome.toml at the CLI boundary must exit cleanly with an
   init hint, not a Python traceback.
 * Corrupt remote connector state must surface a clean ValueError

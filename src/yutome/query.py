@@ -16,7 +16,7 @@ from yutome.embeddings import (
     _lancedb_missing_chunk_columns,
 )
 from yutome.paths import ProjectPaths
-from yutome.retrieval import _format_hit, _snippet, _youtube_url
+from yutome.retrieval import _format_hit, _snippet
 
 EntityName = Literal["chunk", "video", "channel"]
 SearchOver = Literal["chunk_text", "video_title", "video_description"]
@@ -245,7 +245,7 @@ def execute_query(compiled: CompiledQuery, config: AppConfig, paths: ProjectPath
             if not _vectors_available_for_chunks(config, paths):
                 vector_message = (
                     "Vector search unavailable. Configure VOYAGE_API_KEY and run "
-                    "`yutome rebuild-vectors` to enable hybrid/semantic recall."
+                    "`yutome corpus rebuild vectors` to enable hybrid/semantic recall."
                 )
                 if request.search is not None and request.search.mode == "semantic":
                     raise RuntimeError(vector_message)
@@ -500,12 +500,12 @@ def _execute_lance_chunk(
     assert request.search is not None
     db = lancedb.connect(paths.lancedb_dir)
     if not _lancedb_has_table(db, LANCEDB_CHUNKS_TABLE):
-        raise RuntimeError("LanceDB chunks table is missing; run `yutome rebuild-vectors`")
+        raise RuntimeError("LanceDB chunks table is missing; run `yutome corpus rebuild vectors`")
     table = db.open_table(LANCEDB_CHUNKS_TABLE)
     missing = _lancedb_missing_chunk_columns(table)
     if missing:
         missing_text = ", ".join(sorted(missing))
-        raise RuntimeError(f"LanceDB chunks table is stale; missing {missing_text}. Run `yutome rebuild-vectors`")
+        raise RuntimeError(f"LanceDB chunks table is stale; missing {missing_text}. Run `yutome corpus rebuild vectors`")
 
     vector = _embed_voyage_query(
         query=request.search.text,
@@ -566,7 +566,7 @@ def _lance_search(table: Any, vector: list[float], text: str, mode: SearchMode, 
         return table.search(vector).where(where, prefilter=True).limit(limit).to_list()
     except Exception as exc:  # noqa: BLE001 - LanceDB exposes mixed exception types.
         if mode == "hybrid":
-            raise RuntimeError(f"LanceDB hybrid search is not ready; run `yutome rebuild-vectors`: {exc}") from exc
+            raise RuntimeError(f"LanceDB hybrid search is not ready; run `yutome corpus rebuild vectors`: {exc}") from exc
         raise
 
 
