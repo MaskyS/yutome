@@ -161,39 +161,75 @@ def _authorize_token(*, client: OAuthClient, port: int, open_browser: bool) -> d
     )
 
 
-def _authorization_url(*, client: OAuthClient, redirect_uri: str, state: str, challenge: str) -> str:
+def _authorization_url(
+    *,
+    client: OAuthClient,
+    redirect_uri: str,
+    state: str,
+    challenge: str | None,
+    scopes: str | list[str] | tuple[str, ...] = YOUTUBE_READONLY_SCOPE,
+    access_type: str | None = "offline",
+    prompt: str | None = "consent",
+    include_granted_scopes: bool | None = None,
+) -> str:
+    scope = " ".join(scopes) if isinstance(scopes, (list, tuple)) else scopes
     params = {
         "client_id": client.client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": YOUTUBE_READONLY_SCOPE,
-        "access_type": "offline",
-        "prompt": "consent",
+        "scope": scope,
         "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
     }
+    if access_type:
+        params["access_type"] = access_type
+    if prompt:
+        params["prompt"] = prompt
+    if challenge:
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
+    if include_granted_scopes is not None:
+        params["include_granted_scopes"] = "true" if include_granted_scopes else "false"
     return f"{client.auth_uri}?{urllib.parse.urlencode(params)}"
 
 
-def authorization_url(*, client: OAuthClient, redirect_uri: str, state: str, challenge: str) -> str:
-    return _authorization_url(client=client, redirect_uri=redirect_uri, state=state, challenge=challenge)
+def authorization_url(
+    *,
+    client: OAuthClient,
+    redirect_uri: str,
+    state: str,
+    challenge: str | None = None,
+    scopes: str | list[str] | tuple[str, ...] = YOUTUBE_READONLY_SCOPE,
+    access_type: str | None = "offline",
+    prompt: str | None = "consent",
+    include_granted_scopes: bool | None = None,
+) -> str:
+    return _authorization_url(
+        client=client,
+        redirect_uri=redirect_uri,
+        state=state,
+        challenge=challenge,
+        scopes=scopes,
+        access_type=access_type,
+        prompt=prompt,
+        include_granted_scopes=include_granted_scopes,
+    )
 
 
-def _exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
+def _exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str | None) -> dict[str, Any]:
     fields = {
         "client_id": client.client_id,
         "code": code,
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
-        "code_verifier": verifier,
     }
+    if verifier:
+        fields["code_verifier"] = verifier
     if client.client_secret:
         fields["client_secret"] = client.client_secret
     return _token_request(client.token_uri, fields)
 
 
-def exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
+def exchange_code(*, client: OAuthClient, code: str, redirect_uri: str, verifier: str | None = None) -> dict[str, Any]:
     return _exchange_code(client=client, code=code, redirect_uri=redirect_uri, verifier=verifier)
 
 

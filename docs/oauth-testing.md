@@ -57,20 +57,26 @@ Open the printed URL manually in a browser.
 Use a Google Cloud OAuth client configured as a Web application. Add the hosted dashboard callback as an authorized redirect URI:
 
 ```text
+https://app.getyutome.com/auth/google/callback
 https://app.getyutome.com/dashboard/youtube/callback
 ```
 
 For local development, add the matching localhost callback for the dev server you use. Configure the hosted Python API with:
 
 ```bash
+YUTOME_GOOGLE_OAUTH_CLIENT_ID=...
+YUTOME_GOOGLE_OAUTH_CLIENT_SECRET=...
 YUTOME_YOUTUBE_OAUTH_CLIENT_ID=...
 YUTOME_YOUTUBE_OAUTH_CLIENT_SECRET=...
 ```
 
+`YUTOME_GOOGLE_OAUTH_*` is for account sign-in and requests only `openid email profile`. `YUTOME_YOUTUBE_OAUTH_*` is for the explicit dashboard YouTube connection and requests `https://www.googleapis.com/auth/youtube.readonly`. The sign-in settings fall back to the YouTube OAuth client env vars for local/dev convenience, but production should set the Google identity env vars explicitly so account auth and source-discovery auth stay conceptually separate.
+
 Expected result:
 
+- Signup shows Sign in with Google and returns to `/auth/google/callback` with a normal account session.
 - Dashboard shows the YouTube subscriptions card as connectable.
-- Google consent requests only `https://www.googleapis.com/auth/youtube.readonly`.
+- Account sign-in consent requests only `openid email profile`; YouTube connection consent requests only `https://www.googleapis.com/auth/youtube.readonly`.
 - Returning to `/dashboard/youtube/callback` stores a YouTube grant.
 - Selecting subscribed channels imports them as public channel sources and queues `discover_source` jobs.
 

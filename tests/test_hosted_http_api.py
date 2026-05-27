@@ -6,6 +6,7 @@ import hmac
 import json
 import time
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,9 +30,11 @@ from yutome.hosted.http_api import (
     build_postgres_app,
     error_body,
 )
+from yutome.hosted.google_signin_service import GoogleSignInSettings
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpQueryAdapter, HostedMcpUsageContext
 from yutome.hosted.models import EntitlementPolicy, UsageEvent, WorkspaceBalance
 from yutome.hosted.search_store import SearchStoreUsage
+from yutome.youtube_oauth import OAuthClient
 
 
 TEST_API_TOKEN = "hosted-test-token"
@@ -997,7 +1000,13 @@ class _LoginVerifyConnection:
         return []
 
 
-def _login_app(connection: Any, sender: RecordingEmailSender, *, dev_link: bool = True) -> TestClient:
+def _login_app(
+    connection: Any,
+    sender: RecordingEmailSender,
+    *,
+    dev_link: bool = True,
+    google_signin_settings: GoogleSignInSettings | None = None,
+) -> TestClient:
     store = RecordingSearchStore()
     adapter = HostedMcpQueryAdapter(search_store=store, usage_context_provider=_allow_search_usage_context)
     app = build_app(
@@ -1008,6 +1017,7 @@ def _login_app(connection: Any, sender: RecordingEmailSender, *, dev_link: bool 
         email_sender=sender,
         app_base_url="https://app.example.test",
         dev_return_login_link=dev_link,
+        google_signin_settings=google_signin_settings,
     )
     return TestClient(app)
 
@@ -1104,6 +1114,104 @@ def test_account_login_start_requires_bearer_token() -> None:
     assert error_body(response.json())["code"] == "api_token_required"
     assert sender.messages == []
     assert connection.calls == []
+
+
+def test_account_google_authorize_requests_identity_scopes_only() -> None:
+    connection = RecordingConnection()
+    client = _login_app(
+        connection,
+        RecordingEmailSender(),
+        google_signin_settings=GoogleSignInSettings(
+            client=OAuthClient(client_id="google-client", client_secret="google-secret")
+        ),
+    )
+
+    response = client.post(
+        "/account/google/authorize",
+        json={"redirect_uri": "https://app.example.test/auth/google/callback", "redirect_path": "/dashboard"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    params = parse_qs(urlsplit(body["authorization_url"]).query)
+    assert params["client_id"] == ["google-client"]
+    assert params["scope"] == ["openid email profile"]
+    assert "youtube" not in params["scope"][0]
+    assert "include_granted_scopes" not in params
+    assert "access_type" not in params
+    assert connection.calls == []
+
+
+def test_account_google_callback_mints_session_without_youtube_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = RecordingConnection()
+    client = _login_app(
+        connection,
+        RecordingEmailSender(),
+        google_signin_settings=GoogleSignInSettings(
+            client=OAuthClient(client_id="google-client", client_secret="google-secret")
+        ),
+    )
+
+    monkeypatch.setattr(
+        "yutome.hosted.google_signin_service.exchange_code",
+        lambda **_: {"access_token": "google-access-token", "expires_at": time.time() + 3600},
+    )
+    monkeypatch.setattr(
+        "yutome.hosted.google_signin_service.fetch_google_userinfo",
+        lambda access_token: {
+            "sub": "google-subject",
+            "email": "Alice@Example.com",
+            "email_verified": True,
+            "name": "Alice",
+        },
+    )
+
+    redirect_uri = "https://app.example.test/auth/google/callback"
+    authorize = client.post(
+        "/account/google/authorize",
+        json={"redirect_uri": redirect_uri, "redirect_path": "/dashboard/search?q=crohn"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+    state = parse_qs(urlsplit(authorize.json()["authorization_url"]).query)["state"][0]
+
+    response = client.post(
+        "/account/google/callback",
+        json={"code": "google-code", "state": state, "redirect_uri": redirect_uri},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["session"]["token"]
+    assert body["principal"]["normalized_email"] == "alice@example.com"
+    assert body["redirect_path"] == "/dashboard/search?q=crohn"
+    assert any("INSERT INTO account_sessions" in sql for sql, _ in connection.calls)
+    assert not any("youtube_grants" in sql for sql, _ in connection.calls)
+
+
+def test_account_google_callback_rejects_invalid_state() -> None:
+    client = _login_app(
+        RecordingConnection(),
+        RecordingEmailSender(),
+        google_signin_settings=GoogleSignInSettings(
+            client=OAuthClient(client_id="google-client", client_secret="google-secret")
+        ),
+    )
+
+    response = client.post(
+        "/account/google/callback",
+        json={
+            "code": "google-code",
+            "state": "not-a-state",
+            "redirect_uri": "https://app.example.test/auth/google/callback",
+        },
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "google_signin_state_invalid"
 
 
 def test_account_login_verify_consumes_token_and_mints_session() -> None:

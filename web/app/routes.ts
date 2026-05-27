@@ -5,6 +5,8 @@ export default [
   route("cli/authorize", "routes/cli.authorize.tsx"),
   route("signup", "routes/signup.tsx"),
   route("auth/verify", "routes/auth.verify.tsx"),
+  route("auth/google/start", "routes/auth.google.start.tsx"),
+  route("auth/google/callback", "routes/auth.google.callback.tsx"),
   route("signout", "routes/signout.tsx"),
   route("dashboard", "routes/dashboard.tsx", [
     index("routes/dashboard.home.tsx"),

@@ -31,6 +31,13 @@ from yutome.hosted.auth_login import (
     new_login_token_id,
 )
 from yutome.hosted.email import EmailMessage, EmailSender, EmailSendError, build_email_sender_from_env
+from yutome.hosted.google_signin_service import (
+    GoogleSignInSettings,
+    HostedGoogleSignInError,
+    complete_google_signin,
+    google_signin_settings_from_env,
+    start_google_signin,
+)
 from yutome.hosted.account_cli import (
     CLI_ACCOUNT_READ_SCOPE,
     CLI_AUTH_CODE_TTL_SECONDS,
@@ -141,6 +148,21 @@ class AccountLoginVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: str
+
+
+class AccountGoogleAuthorizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    redirect_uri: str
+    redirect_path: str | None = None
+
+
+class AccountGoogleCallbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    state: str
+    redirect_uri: str
 
 
 class AccountCliAuthorizeRequest(BaseModel):
@@ -284,6 +306,7 @@ def build_postgres_app(
     login_token_ttl_seconds: int | None = None,
     dev_return_login_link: bool | None = None,
     youtube_oauth_settings: YouTubeOAuthSettings | None = None,
+    google_signin_settings: GoogleSignInSettings | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -315,6 +338,7 @@ def build_postgres_app(
         if dev_return_login_link is not None
         else _auth_dev_return_link_from_env(),
         youtube_oauth_settings=youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ),
+        google_signin_settings=google_signin_settings or google_signin_settings_from_env(os.environ),
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -339,6 +363,7 @@ def build_app(
     login_token_ttl_seconds: int | None = None,
     dev_return_login_link: bool | None = None,
     youtube_oauth_settings: YouTubeOAuthSettings | None = None,
+    google_signin_settings: GoogleSignInSettings | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
@@ -369,12 +394,14 @@ def build_app(
     login_token_ttl = _positive_int(login_token_ttl_seconds, DEFAULT_LOGIN_TOKEN_TTL_SECONDS)
     resolved_dev_return_login_link = bool(dev_return_login_link)
     resolved_youtube_oauth_settings = youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ)
+    resolved_google_signin_settings = google_signin_settings or google_signin_settings_from_env(os.environ)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
     app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
     app.state.account_session_signing_configured = bool(normalized_account_session_secret)
     app.state.hosted_account_api_configured = bool(normalized_account_api_token)
     app.state.youtube_oauth_configured = resolved_youtube_oauth_settings.configured
+    app.state.google_signin_configured = resolved_google_signin_settings.configured
 
     async def default_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -552,6 +579,122 @@ def build_app(
                 "cookie_name": ACCOUNT_SESSION_COOKIE_NAME,
                 "max_age_seconds": account_session_ttl,
             },
+        }
+
+    @app.post("/account/google/authorize")
+    def account_google_authorize(
+        request: AccountGoogleAuthorizeRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _verify_bearer_token_any(
+            authorization=authorization,
+            expected_tokens=(normalized_api_token, normalized_account_api_token),
+        )
+        if not normalized_account_session_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_signing_unconfigured",
+                    message=f"Set {ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR} before creating hosted account sessions.",
+                    status_code=503,
+                )
+            )
+        try:
+            return start_google_signin(
+                settings=resolved_google_signin_settings,
+                redirect_uri=request.redirect_uri,
+                redirect_path=_safe_redirect_path(request.redirect_path),
+                state_secret=normalized_account_session_secret,
+            )
+        except HostedGoogleSignInError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code=exc.code,
+                    message=exc.message,
+                    status_code=exc.status_code,
+                    data=exc.data,
+                )
+            ) from exc
+
+    @app.post("/account/google/callback")
+    def account_google_callback(
+        request: AccountGoogleCallbackRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _verify_bearer_token_any(
+            authorization=authorization,
+            expected_tokens=(normalized_api_token, normalized_account_api_token),
+        )
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_login_connection_unconfigured",
+                    message="Hosted login requires a database connection.",
+                    status_code=503,
+                )
+            )
+        if not normalized_account_session_secret:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_signing_unconfigured",
+                    message=f"Set {ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR} before creating hosted account sessions.",
+                    status_code=503,
+                )
+            )
+        now = datetime.now(timezone.utc)
+        try:
+            identity = complete_google_signin(
+                settings=resolved_google_signin_settings,
+                code=request.code,
+                state=request.state,
+                redirect_uri=request.redirect_uri,
+                state_secret=normalized_account_session_secret,
+                now=now,
+            )
+            expires_at = now + timedelta(seconds=account_session_ttl)
+            bootstrap_input = AccountBootstrapInput(
+                email=identity.email,
+                name=_optional_text(identity.name),
+            )
+            session_token = sign_account_session_token(
+                user_id=bootstrap_input.user_id,
+                workspace_id=bootstrap_input.workspace_id,
+                secret=normalized_account_session_secret,
+                expires_at=expires_at,
+                issued_at=now,
+                audience=normalized_account_session_audience,
+            )
+            session_input = AccountBootstrapInput(
+                email=bootstrap_input.email,
+                name=bootstrap_input.name,
+                workspace_name=bootstrap_input.workspace_name,
+                session_token=session_token,
+                session_scopes=(contract.AUTH_SCOPE,),
+                session_audience=normalized_account_session_audience,
+                session_expires_at=expires_at,
+            )
+            result = _bootstrap_account_in_transaction(billing_connection, session_input)
+        except HostedGoogleSignInError as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code=exc.code,
+                    message=exc.message,
+                    status_code=exc.status_code,
+                    data=exc.data,
+                )
+            ) from exc
+        except ValueError as exc:
+            raise _http_error(HostedMcpError(code="account_login_invalid", message=str(exc), status_code=400)) from exc
+        return {
+            "ok": True,
+            "principal": result.principal.model_dump(mode="json"),
+            "session": {
+                "token": session_token,
+                "expires_at": expires_at.isoformat(),
+                "audience": normalized_account_session_audience,
+                "cookie_name": ACCOUNT_SESSION_COOKIE_NAME,
+                "max_age_seconds": account_session_ttl,
+            },
+            "redirect_path": _safe_redirect_path(identity.redirect_path),
         }
 
     @app.post("/account/login/start")

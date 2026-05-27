@@ -116,6 +116,66 @@ export async function verifyLogin(env: YutomeWebEnv, token: string): Promise<Ver
   return { session, redirect_path: typeof json.redirect_path === "string" ? json.redirect_path : null };
 }
 
+export interface StartGoogleSignInResult {
+  ok: true;
+  authorization_url: string;
+  scopes: string[];
+  expires_at: string;
+}
+
+export async function startGoogleSignIn(
+  env: YutomeWebEnv,
+  body: { redirect_uri: string; redirect_path?: string | null },
+): Promise<StartGoogleSignInResult> {
+  const response = await fetch(apiUrl(env, "/account/google/authorize"), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await parseJson(response);
+  if (!response.ok || json.ok === false) throw toError(response.status, json);
+  if (typeof json.authorization_url !== "string") {
+    throw new HostedApiError(502, "invalid_hosted_api_response", "Google authorization response was missing a URL.");
+  }
+  return {
+    ok: true,
+    authorization_url: json.authorization_url,
+    scopes: Array.isArray(json.scopes) ? json.scopes.filter((scope): scope is string => typeof scope === "string") : [],
+    expires_at: typeof json.expires_at === "string" ? json.expires_at : "",
+  };
+}
+
+export interface CompleteGoogleSignInResult {
+  session: LoginSession;
+  redirect_path: string | null;
+}
+
+export async function completeGoogleSignIn(
+  env: YutomeWebEnv,
+  body: { code: string; state: string; redirect_uri: string },
+): Promise<CompleteGoogleSignInResult> {
+  const response = await fetch(apiUrl(env, "/account/google/callback"), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.YUTOME_DASHBOARD_API_TOKEN}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await parseJson(response);
+  if (!response.ok || json.ok === false) throw toError(response.status, json);
+  const session = json.session as LoginSession | undefined;
+  if (!session || typeof session.token !== "string" || typeof session.max_age_seconds !== "number") {
+    throw new HostedApiError(502, "invalid_hosted_api_response", "Google sign-in response was missing a session token.");
+  }
+  return { session, redirect_path: typeof json.redirect_path === "string" ? json.redirect_path : null };
+}
+
 export interface CliAuthorizeResult {
   code: string;
   state?: string | null;
