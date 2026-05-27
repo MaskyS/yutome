@@ -37,3 +37,16 @@ export function formatClockTime(value: string | null | undefined): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : `${CLOCK_FORMAT.format(date)} UTC`;
 }
+
+/** Whole minutes from a seconds count, locale-grouped (e.g. `1,080s` → `18`). */
+export function formatMinutes(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "0";
+  return Math.round(seconds / 60).toLocaleString();
+}
+
+/** Gigabytes from a byte count: 2 decimals under 10 GB, whole numbers above. */
+export function formatGB(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes)) return "0";
+  const gb = bytes / 1_073_741_824;
+  return gb >= 10 ? Math.round(gb).toLocaleString() : gb.toFixed(2);
+}

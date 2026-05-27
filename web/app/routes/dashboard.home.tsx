@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Plus, RefreshCcw } from "lucide-react";
+import { Info, Plus, RefreshCcw } from "lucide-react";
 import { useFetcher, useRevalidator, useRouteLoaderData } from "react-router";
 
 import type { Route } from "./+types/dashboard.home";
@@ -10,17 +10,20 @@ import {
   getSourceJobs,
   HostedApiError,
   type SourceJob,
+  type WorkspaceEntitlement,
   type WorkspaceSummary,
 } from "~/lib/hosted-api.server";
 import { isUnauthorized, requireSessionToken, signupRedirect } from "~/lib/session.server";
-import { formatClockTime, formatDate } from "~/lib/utils";
+import { formatClockTime, formatDate, formatGB, formatMinutes } from "~/lib/utils";
 import { Alert, AlertDescription } from "~/components/ui/alert";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
+import { Progress } from "~/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/components/ui/table";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "~/components/ui/tooltip";
 
 export function meta(_: Route.MetaArgs) {
   return [{ title: "Dashboard · Yutome" }];
@@ -76,10 +79,21 @@ export async function action({ request, context }: Route.ActionArgs) {
   }
 }
 
-function formatUnit(value: number | string | null): string {
-  if (value === null) return "-";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  return Number.isFinite(numeric) ? numeric.toLocaleString() : String(value);
+function entitlementValue(entitlement: WorkspaceEntitlement): string {
+  if (entitlement.unlimited) return "Unlimited";
+  const included = entitlement.included;
+  switch (entitlement.format) {
+    case "minutes":
+      return `${formatMinutes(entitlement.used)} / ${included != null ? formatMinutes(included) : "—"} min`;
+    case "bytes":
+      return `${formatGB(entitlement.used)} / ${included != null ? formatGB(included) : "—"} GB`;
+    case "ratio":
+      // Per the glossary, never show the raw token count — only a proportion.
+      return `${Math.round((entitlement.percent ?? 0) * 100)}% used`;
+    case "count":
+    default:
+      return `${entitlement.used.toLocaleString()} / ${included != null ? included.toLocaleString() : "—"}`;
+  }
 }
 
 const ACTIVE_JOB_STATUSES = new Set([
@@ -254,41 +268,41 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
 
       {summary ? (
         <section className="grid gap-3">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <h2 className="text-lg font-semibold">Plan &amp; usage</h2>
             {summary.plan_key ? (
               <Badge variant="secondary">{summary.plan_key}</Badge>
             ) : (
               <Badge variant="outline">no active plan</Badge>
             )}
+            {summary.period ? (
+              <span className="text-muted-foreground text-sm">renews {formatDate(summary.period.end_at)}</span>
+            ) : null}
           </div>
-          {summary.units.length ? (
+          {summary.entitlements.length ? (
             <Card>
-              <CardContent className="pt-6">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Unit</TableHead>
-                      <TableHead className="text-right">Included</TableHead>
-                      <TableHead className="text-right">Used</TableHead>
-                      <TableHead className="text-right">Remaining</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {summary.units.map((unit) => (
-                      <TableRow key={unit.unit}>
-                        <TableCell className="font-medium">{unit.unit}</TableCell>
-                        <TableCell className="text-right">
-                          {unit.unlimited ? "Unlimited" : formatUnit(unit.included)}
-                        </TableCell>
-                        <TableCell className="text-right">{formatUnit(unit.used)}</TableCell>
-                        <TableCell className="text-right">
-                          {unit.unlimited ? "Unlimited" : formatUnit(unit.remaining)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+              <CardContent className="grid gap-5 pt-6">
+                <TooltipProvider>
+                  {summary.entitlements.map((entitlement) => (
+                    <div key={entitlement.key} className="grid gap-1.5">
+                      <div className="flex items-center justify-between gap-3 text-sm">
+                        <span className="flex items-center gap-1 font-medium">
+                          {entitlement.label}
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button type="button" className="text-muted-foreground/70 hover:text-foreground" aria-label={`What is ${entitlement.label}?`}>
+                                <Info className="size-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent>{entitlement.description}</TooltipContent>
+                          </Tooltip>
+                        </span>
+                        <span className="text-muted-foreground tabular-nums">{entitlementValue(entitlement)}</span>
+                      </div>
+                      {entitlement.unlimited ? null : <Progress value={(entitlement.percent ?? 0) * 100} />}
+                    </div>
+                  ))}
+                </TooltipProvider>
               </CardContent>
             </Card>
           ) : (

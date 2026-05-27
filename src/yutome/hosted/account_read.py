@@ -56,12 +56,35 @@ class WorkspaceUnit(BaseModel):
     unlimited: bool = False
 
 
+EntitlementFormat = Literal["count", "minutes", "bytes", "ratio"]
+
+
+class WorkspaceEntitlement(BaseModel):
+    """A single user-facing usage line: a metered unit translated to a plain label
+    the workspace owner understands, with `remaining` clamped to never go below 0."""
+
+    key: str
+    label: str
+    description: str
+    format: EntitlementFormat
+    included: int | None = None
+    used: int = 0
+    remaining: int | None = None
+    unlimited: bool = False
+    percent: float | None = None
+
+
 class WorkspaceSummary(BaseModel):
     state: WorkspaceState
     plan_key: str | None = None
     workspace: WorkspaceRef
     period: BalancePeriod | None = None
+    # Raw per-unit balances (every metered key, including internal telemetry).
+    # Kept for debugging/back-compat; the dashboard renders `entitlements` instead.
     units: list[WorkspaceUnit] = Field(default_factory=list)
+    # Curated, user-facing view: only the units that mean something to a workspace
+    # owner, with plain labels and clamped remaining. See _ENTITLEMENT_CATALOG.
+    entitlements: list[WorkspaceEntitlement] = Field(default_factory=list)
 
 
 class LibraryVideo(BaseModel):
@@ -157,6 +180,68 @@ def load_active_workspace(connection: SqlConnection, *, workspace_id: str) -> di
     return row
 
 
+# User-facing usage catalog: the few metered units that mean something to a
+# workspace owner, in display order. Everything else (token breakdowns, vector
+# dimensions, latency, request byte sizes, …) is intentionally omitted so the
+# dashboard never surfaces internal cost/telemetry. `total_tokens` is shown as a
+# `ratio` (meter + percent only) because the glossary says not to expose raw
+# tokens. See docs/hosted-glossary.md "User-Facing Entitlements".
+_ENTITLEMENT_CATALOG: tuple[tuple[str, str, EntitlementFormat, str], ...] = (
+    ("queries", "Searches", "count", "Transcript searches across your library."),
+    ("media_seconds", "Transcription", "minutes", "Audio transcribed when a video has no usable captions."),
+    ("bytes", "Bandwidth", "bytes", "Data fetched through reliable proxies while indexing."),
+    ("total_tokens", "AI usage", "ratio", "Transcript cleanup and embeddings that power search."),
+)
+
+
+def _coerce_unit_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
+def _build_entitlements(
+    included: Mapping[str, Any],
+    used: Mapping[str, Any],
+    unlimited: set[str],
+) -> list[WorkspaceEntitlement]:
+    """Project the raw unit maps onto the curated catalog. `remaining` is computed
+    as max(0, included - used) — never trusting a stored negative — and a unit is
+    skipped when the plan neither includes nor has used it."""
+
+    entitlements: list[WorkspaceEntitlement] = []
+    for key, label, fmt, description in _ENTITLEMENT_CATALOG:
+        is_unlimited = key in unlimited
+        included_value = _coerce_unit_int(included.get(key))
+        used_value = _coerce_unit_int(used.get(key)) or 0
+        if included_value is None and used_value == 0 and not is_unlimited:
+            continue  # not part of this plan and unused → nothing to show
+        remaining = None if included_value is None else max(0, included_value - used_value)
+        percent: float | None = None
+        if not is_unlimited and included_value and included_value > 0:
+            percent = min(1.0, max(0.0, used_value / included_value))
+        entitlements.append(
+            WorkspaceEntitlement(
+                key=key,
+                label=label,
+                description=description,
+                format=fmt,
+                included=included_value,
+                used=used_value,
+                remaining=remaining,
+                unlimited=is_unlimited,
+                percent=percent,
+            )
+        )
+    return entitlements
+
+
 def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> WorkspaceSummary:
     workspace_row = _one(connection.execute(_ACTIVE_WORKSPACE_SQL, {"workspace_id": workspace_id}))
     workspace = WorkspaceRef(
@@ -184,7 +269,13 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
             WorkspaceUnit(unit=unit, included=jsonable_exact(value))
             for unit, value in sorted(included.items())
         ]
-        return WorkspaceSummary(state="no_active_plan", plan_key=plan_key, workspace=workspace, units=units)
+        return WorkspaceSummary(
+            state="no_active_plan",
+            plan_key=plan_key,
+            workspace=workspace,
+            units=units,
+            entitlements=_build_entitlements(included, {}, set()),
+        )
 
     used = _json_mapping(balance_row.get("used_units_jsonb"))
     reserved = _json_mapping(balance_row.get("reserved_units_jsonb"))
@@ -208,6 +299,7 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         workspace=workspace,
         period=BalancePeriod(start_at=balance_row["period_start_at"], end_at=balance_row["period_end_at"]),
         units=units,
+        entitlements=_build_entitlements(included, used, unlimited),
     )
 
 

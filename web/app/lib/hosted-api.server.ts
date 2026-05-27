@@ -201,6 +201,18 @@ export interface WorkspaceUnit {
   unlimited: boolean;
 }
 
+export interface WorkspaceEntitlement {
+  key: string;
+  label: string;
+  description: string;
+  format: "count" | "minutes" | "bytes" | "ratio";
+  included: number | null;
+  used: number;
+  remaining: number | null;
+  unlimited: boolean;
+  percent: number | null;
+}
+
 export interface WorkspaceSummary {
   ok: true;
   state: "active" | "no_active_plan";
@@ -208,6 +220,7 @@ export interface WorkspaceSummary {
   workspace: { id: string; name: string | null };
   period: { start_at: string; end_at: string } | null;
   units: WorkspaceUnit[];
+  entitlements: WorkspaceEntitlement[];
 }
 
 export interface LibraryOverview {

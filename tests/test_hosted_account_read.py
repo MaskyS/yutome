@@ -159,6 +159,73 @@ def test_account_summary_returns_plan_and_units() -> None:
     assert all(params.get("workspace_id") == "ws_pg" for _, params in connection.calls)
 
 
+def test_account_summary_entitlements_are_curated_and_clamped() -> None:
+    connection = RoutingConnection(
+        policy=[
+            {
+                "id": "pol_pg",
+                "plan_key": "starter",
+                # Catalog units + internal telemetry units (which must not surface).
+                "included_units_jsonb": {
+                    "queries": 10000,
+                    "media_seconds": 3600,
+                    "bytes": 1073741824,
+                    "total_tokens": 250000,
+                    "candidate_tokens": 0,
+                    "latency_ms": 0,
+                },
+            }
+        ],
+        balance=[
+            {
+                "period_start_at": datetime.now(timezone.utc) - timedelta(days=1),
+                "period_end_at": datetime.now(timezone.utc) + timedelta(days=30),
+                "used_units_jsonb": {
+                    "queries": 1240,
+                    "media_seconds": 1080,
+                    "bytes": 214748364,
+                    "total_tokens": 300000,  # over the included 250000 → clamp to 0
+                    "candidate_tokens": 5000,
+                    "latency_ms": 999,
+                },
+                "reserved_units_jsonb": {},
+                # Stored negatives must be ignored; remaining is recomputed + clamped.
+                "remaining_units_jsonb": {"total_tokens": -50000, "latency_ms": -999, "candidate_tokens": -5000},
+                "unlimited_units": [],
+            }
+        ],
+    )
+    client = build_account_app(connection)
+
+    response = client.get("/account/summary", headers=account_headers(mint_session()))
+
+    assert response.status_code == 200, response.text
+    entitlements = {item["key"]: item for item in response.json()["entitlements"]}
+    # Only catalog units; internal telemetry is never surfaced.
+    assert set(entitlements) == {"queries", "media_seconds", "bytes", "total_tokens"}
+    assert "candidate_tokens" not in entitlements
+    assert "latency_ms" not in entitlements
+    # Display order follows the catalog.
+    assert [item["key"] for item in response.json()["entitlements"]] == [
+        "queries",
+        "media_seconds",
+        "bytes",
+        "total_tokens",
+    ]
+    assert entitlements["queries"]["label"] == "Searches"
+    assert entitlements["queries"]["format"] == "count"
+    assert entitlements["queries"]["included"] == 10000
+    assert entitlements["queries"]["used"] == 1240
+    assert entitlements["queries"]["remaining"] == 8760
+    assert abs(entitlements["queries"]["percent"] - 0.124) < 1e-9
+    assert entitlements["media_seconds"]["format"] == "minutes"
+    assert entitlements["bytes"]["format"] == "bytes"
+    # Over-budget usage clamps remaining to 0 (no negatives) and caps percent at 1.0.
+    assert entitlements["total_tokens"]["format"] == "ratio"
+    assert entitlements["total_tokens"]["remaining"] == 0
+    assert entitlements["total_tokens"]["percent"] == 1.0
+
+
 def test_account_summary_fail_soft_without_balance() -> None:
     connection = RoutingConnection(
         policy=[{"id": "pol_pg", "plan_key": "starter", "included_units_jsonb": {"queries": 10000}}],
