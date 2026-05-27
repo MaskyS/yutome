@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from yutome.config import AppConfig
+from yutome.config import AppConfig, ProxyConfig
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_ytdlp_runtime.py"
@@ -118,3 +118,56 @@ def test_error_classifier_marks_proxy_payment_required() -> None:
     result = subprocess.CompletedProcess(["yt-dlp"], 1, stdout="", stderr="CONNECT tunnel failed, response 402")
 
     assert bench.classify_error(result) == "proxy_payment_required"
+
+
+def test_failed_case_records_redacted_diagnostic_tails_without_live_youtube() -> None:
+    bench = _load_script_module()
+    config = AppConfig(
+        proxy=ProxyConfig(
+            enabled=True,
+            kind="webshare",
+            webshare_username="proxy-user",
+            webshare_password="proxy-pass",
+            webshare_domain="p.webshare.io",
+            webshare_port=80,
+        )
+    )
+
+    def fake_runner(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        proxy_url = command[command.index("--proxy") + 1]
+        stderr = (
+            f"ERROR: [youtube] OEDoJyhQhXs: {proxy_url} "
+            "CONNECT tunnel failed, response 402; Sign in to confirm you're not a bot"
+        )
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+
+    metric = bench.run_case(
+        bench.BenchmarkCase(
+            operation="metadata",
+            variant="current",
+            proxy_mode="webshare",
+            video_id="OEDoJyhQhXs",
+            run_order=3,
+            warmup=False,
+        ),
+        config=config,
+        runner=fake_runner,
+    )
+
+    assert metric["error_class"] == "proxy_payment_required"
+    assert "stderr_tail" in metric
+    assert "proxy-user" not in metric["stderr_tail"]
+    assert "proxy-pass" not in metric["stderr_tail"]
+    assert "http://***:***@p.webshare.io:80/" in metric["stderr_tail"]
+    assert "proxy_payment_required" in metric["diagnostic_markers"]
+    assert "youtube_block" in metric["diagnostic_markers"]
+
+
+def test_signal_failure_records_signal_name_and_empty_output_marker() -> None:
+    bench = _load_script_module()
+    result = subprocess.CompletedProcess(["yt-dlp"], -6, stdout="", stderr="")
+
+    diagnostics = bench.failure_diagnostics(result, proxy=None, key=None)
+
+    assert diagnostics["signal_name"] == "SIGABRT"
+    assert diagnostics["diagnostic_markers"] == ["process_signal", "signal_without_output"]

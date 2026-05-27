@@ -7,6 +7,7 @@ import json
 import platform
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,11 +19,12 @@ from typing import Any
 
 from yutome.config import AppConfig, DEFAULT_CONFIG_FILENAME, ProxyConfig, load_config
 from yutome.env import apply_env_to_config, load_dotenv
-from yutome.youtube import proxy_url_for_ytdlp, redact_proxy_url
+from yutome.youtube import proxy_url_for_ytdlp, redact_proxy_secrets, redact_proxy_url
 
 
 WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 CORE_METADATA_FIELDS = ("id", "title", "duration", "upload_date", "timestamp", "channel_id", "live_status")
+FAILURE_TAIL_CHARS = 2_000
 VARIANT_ARGS = {
     "current": (),
     "python-no-js": ("--no-js-runtimes", "--no-remote-components"),
@@ -186,6 +188,13 @@ def run_case(
             "command": redact_command(command),
             "proxy_applied": proxy_url is not None,
         }
+        metric.update(
+            failure_diagnostics(
+                result,
+                proxy=_proxy_for_mode(case.proxy_mode, config),
+                key=case.video_id,
+            )
+        )
         if case.operation == "metadata":
             metric.update(metadata_metrics(result.stdout))
         elif case.operation == "subtitles":
@@ -321,6 +330,67 @@ def classify_error(result: subprocess.CompletedProcess[str]) -> str | None:
     return "yt_dlp_failed"
 
 
+def failure_diagnostics(
+    result: subprocess.CompletedProcess[str],
+    *,
+    proxy: ProxyConfig | None,
+    key: str | None,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    name = signal_name(result.returncode)
+    if name:
+        diagnostics["signal_name"] = name
+    if result.returncode == 0:
+        return diagnostics
+
+    stdout = redact_proxy_secrets(proxy, result.stdout, key=key)
+    stderr = redact_proxy_secrets(proxy, result.stderr, key=key)
+    if stdout:
+        diagnostics["stdout_tail"] = _tail_text(stdout, FAILURE_TAIL_CHARS)
+    if stderr:
+        diagnostics["stderr_tail"] = _tail_text(stderr, FAILURE_TAIL_CHARS)
+    diagnostics["diagnostic_markers"] = diagnostic_markers(result)
+    return diagnostics
+
+
+def diagnostic_markers(result: subprocess.CompletedProcess[str]) -> list[str]:
+    markers: list[str] = []
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    if result.returncode == 124:
+        markers.append("timeout")
+    if result.returncode < 0:
+        markers.append("process_signal")
+        if not result.stdout and not result.stderr:
+            markers.append("signal_without_output")
+    if "402" in text or "payment required" in text:
+        markers.append("proxy_payment_required")
+    if "407" in text or "proxy authentication" in text or "proxy auth" in text:
+        markers.append("proxy_auth_failed")
+    if "403" in text or "forbidden" in text:
+        markers.append("http_403_or_forbidden")
+    if "429" in text or "too many requests" in text or "rate limit" in text:
+        markers.append("youtube_rate_limited")
+    if "captcha" in text or "not a bot" in text or "sign in" in text or "/sorry/" in text:
+        markers.append("youtube_block")
+    if "unable to download webpage" in text or "unable to download api page" in text:
+        markers.append("youtube_download_failed")
+    if "timed out" in text or "timeout" in text:
+        markers.append("network_timeout")
+    if "curl_cffi" in text or "curl" in text:
+        markers.append("curl_transport")
+    return markers
+
+
+def signal_name(returncode: int) -> str | None:
+    if returncode >= 0:
+        return None
+    signal_number = abs(returncode)
+    try:
+        return signal.Signals(signal_number).name
+    except ValueError:
+        return f"signal_{signal_number}"
+
+
 def environment_metrics() -> dict[str, Any]:
     return {
         "python": sys.version.split()[0],
@@ -337,6 +407,12 @@ def redact_command(command: Sequence[str]) -> list[str]:
         if index > 0 and redacted[index - 1] == "--proxy":
             redacted[index] = redact_proxy_url(value)
     return redacted
+
+
+def _tail_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"...{text[-max_chars:]}"
 
 
 def _load_app_config(path: Path) -> AppConfig:
