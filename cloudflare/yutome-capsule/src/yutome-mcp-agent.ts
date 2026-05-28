@@ -211,6 +211,7 @@ export class YutomeMcpAgent extends McpAgent<Env, unknown, YutomeAuthProps> {
     try {
       return { result: await operation() };
     } catch (err) {
+      console.error("hosted_mcp_dispatch_failed", hostedDispatchLogPayload(err));
       return { error: dispatchErrorFromHostedError(err) };
     }
   }
@@ -362,6 +363,27 @@ function dispatchErrorFromHostedError(err: unknown): DispatchError {
     code: ErrorCode.InternalError,
     message: "Hosted Yutome API request failed.",
     data: { error: String(err) },
+  };
+}
+
+function hostedDispatchLogPayload(err: unknown): Record<string, unknown> {
+  if (err instanceof HostedMcpApiError) {
+    return {
+      error_type: err.name,
+      hosted_api_error: err.code,
+      hosted_api_status: err.status,
+      message: err.message,
+    };
+  }
+  if (err instanceof Error) {
+    return {
+      error_type: err.name,
+      message: err.message,
+    };
+  }
+  return {
+    error_type: typeof err,
+    message: String(err),
   };
 }
 

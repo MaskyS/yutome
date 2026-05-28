@@ -6,11 +6,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import bindparam, select
 
 from yutome.hosted.control_plane import Source, SourceRefreshPolicy
 from yutome.hosted.ids import input_hash
 from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import jobs, sources, videos
 from yutome.hosted.source_registry import hosted_source_id, provider_credentials_in_source
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 class HostedSourceImportError(RuntimeError):
@@ -374,27 +377,45 @@ def _contains_credential_shape(value: Any) -> bool:
 
 
 def account_jobs_sql(*, workspace_id: str, limit: int, source_id: str | None = None) -> SqlStatement:
-    # Enrich each job with human context the dashboard Activity feed needs.
-    return SqlStatement(
-        sql="""
-SELECT j.id, j.workspace_id, j.source_id, j.job_type, j.status, j.priority, j.created_at,
-       j.started_at, j.finished_at, j.cancelled_at, j.error_code, j.error_message, j.metadata_json,
-       s.display_name AS source_display_name,
-       s.source_type AS source_type,
-       s.source_url AS source_url,
-       v.title AS video_title
-FROM jobs AS j
-LEFT JOIN sources AS s ON s.id = j.source_id
-LEFT JOIN videos AS v
-       ON v.workspace_id = j.workspace_id
-      AND v.youtube_video_id = j.metadata_json->>'youtube_video_id'
-WHERE j.workspace_id = %(workspace_id)s
-  AND (%(source_id)s::text IS NULL OR j.source_id = %(source_id)s)
-ORDER BY j.created_at DESC
-LIMIT %(limit)s;
-""".strip(),
-        params={"workspace_id": workspace_id, "source_id": source_id, "limit": limit},
+    # Enrich each job with the human context the dashboard Activity feed needs:
+    # the source's display name/type, and (for index_video jobs) the video title,
+    # joined on the youtube_video_id carried in metadata_json.
+    join = jobs.outerjoin(sources, sources.c.id == jobs.c.source_id).outerjoin(
+        videos,
+        (videos.c.workspace_id == jobs.c.workspace_id)
+        & (videos.c.youtube_video_id == jobs.c.metadata_json[bindparam("video_id_key", value="youtube_video_id")].astext),
     )
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    statement = (
+        select(
+            jobs.c.id,
+            jobs.c.workspace_id,
+            jobs.c.source_id,
+            jobs.c.job_type,
+            jobs.c.status,
+            jobs.c.priority,
+            jobs.c.created_at,
+            jobs.c.started_at,
+            jobs.c.finished_at,
+            jobs.c.cancelled_at,
+            jobs.c.error_code,
+            jobs.c.error_message,
+            jobs.c.metadata_json,
+            sources.c.display_name.label("source_display_name"),
+            sources.c.source_type.label("source_type"),
+            sources.c.source_url.label("source_url"),
+            videos.c.title.label("video_title"),
+        )
+        .select_from(join)
+        .where(jobs.c.workspace_id == workspace_param)
+        .order_by(jobs.c.created_at.desc())
+        .limit(bindparam("limit", value=limit))
+    )
+    if source_id is not None:
+        statement = statement.where(jobs.c.source_id == bindparam("source_id", value=source_id))
+    sql, params = compile_postgres_statement(statement)
+    params.setdefault("source_id", source_id)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def job_row_json(row: Mapping[str, Any]) -> dict[str, Any]:

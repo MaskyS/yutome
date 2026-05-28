@@ -6,7 +6,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import TIMESTAMP, Integer, and_, bindparam, case, cast, distinct, func, literal, literal_column, or_, select, text, true
+from sqlalchemy.dialects.postgresql import JSONB
+
 from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import chunks, sources, transcript_versions, videos
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 TRANSCRIPT_TEXT_CAP = 200_000
@@ -157,34 +162,53 @@ class HostedResourceQueries:
         return [format_channel_list_row(row) for row in _rows(self.connection.execute(statement.sql, statement.params))]
 
 
-def chunk_resource_sql(*, workspace_id: str, chunk_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    c.id AS chunk_id,
-    c.video_id,
-    v.youtube_video_id,
-    c.transcript_version_id,
-    c.chunk_index,
-    c.start_seconds,
-    c.end_seconds,
-    c.text,
-    c.metadata_json AS chunk_metadata,
-    v.title,
-    v.channel_id,
-    v.source_id,
-    tv.source AS transcript_source,
-    tv.language_code AS language,
-    tv.metadata_json AS transcript_metadata
-FROM chunks c
-JOIN videos v ON v.id = c.video_id AND v.workspace_id = c.workspace_id
-JOIN transcript_versions tv ON tv.id = c.transcript_version_id AND tv.workspace_id = c.workspace_id
-WHERE c.workspace_id = %(workspace_id)s
-  AND c.id = %(chunk_id)s
-LIMIT 1;
-""".strip(),
-        params={"workspace_id": workspace_id, "chunk_id": chunk_id},
+def _chunk_resource_columns() -> list[Any]:
+    return [
+        chunks.c.id.label("chunk_id"),
+        chunks.c.video_id,
+        videos.c.youtube_video_id,
+        chunks.c.transcript_version_id,
+        chunks.c.chunk_index,
+        chunks.c.start_seconds,
+        chunks.c.end_seconds,
+        chunks.c.text,
+        chunks.c.metadata_json.label("chunk_metadata"),
+        videos.c.title,
+        videos.c.channel_id,
+        videos.c.source_id,
+        transcript_versions.c.source.label("transcript_source"),
+        transcript_versions.c.language_code.label("language"),
+        transcript_versions.c.metadata_json.label("transcript_metadata"),
+    ]
+
+
+def _chunk_resource_join() -> Any:
+    return chunks.join(
+        videos,
+        and_(videos.c.id == chunks.c.video_id, videos.c.workspace_id == chunks.c.workspace_id),
+    ).join(
+        transcript_versions,
+        and_(
+            transcript_versions.c.id == chunks.c.transcript_version_id,
+            transcript_versions.c.workspace_id == chunks.c.workspace_id,
+        ),
     )
+
+
+def chunk_resource_sql(*, workspace_id: str, chunk_id: str) -> SqlStatement:
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    chunk_param = bindparam("chunk_id", value=chunk_id)
+    statement = (
+        select(*_chunk_resource_columns())
+        .select_from(_chunk_resource_join())
+        .where(
+            chunks.c.workspace_id == workspace_param,
+            chunks.c.id == chunk_param,
+        )
+        .limit(literal_column("1"))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def context_anchor_sql(
@@ -196,141 +220,138 @@ def context_anchor_sql(
 ) -> SqlStatement:
     if not chunk_id and not video_id:
         raise ValueError("context requires a chunk id, video id, or timestamped YouTube URL")
-    return SqlStatement(
-        sql="""
-SELECT
-    c.id AS chunk_id,
-    c.video_id,
-    v.youtube_video_id,
-    c.transcript_version_id,
-    c.chunk_index,
-    c.start_seconds,
-    c.end_seconds,
-    c.text,
-    c.metadata_json AS chunk_metadata,
-    v.title,
-    v.channel_id,
-    v.source_id,
-    tv.source AS transcript_source,
-    tv.language_code AS language,
-    tv.metadata_json AS transcript_metadata
-FROM chunks c
-JOIN videos v ON v.id = c.video_id AND v.workspace_id = c.workspace_id
-JOIN transcript_versions tv ON tv.id = c.transcript_version_id AND tv.workspace_id = c.workspace_id
-WHERE c.workspace_id = %(workspace_id)s
-  AND (
-    (%(chunk_id)s::text IS NOT NULL AND c.id = %(chunk_id)s::text)
-    OR (
-      %(chunk_id)s::text IS NULL
-      AND %(video_id)s::text IS NOT NULL
-      AND (v.id = %(video_id)s::text OR v.youtube_video_id = %(video_id)s::text)
-      AND v.active_transcript_version_id = c.transcript_version_id
+    anchor_chunk_id = _blank_to_none(chunk_id)
+    anchor_video_id = _blank_to_none(video_id)
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+
+    # The raw query branched on whether each id param was NULL; building the
+    # match conditions in Python reproduces that without per-row SQL NULL checks.
+    if anchor_chunk_id is not None:
+        match_condition: Any = chunks.c.id == bindparam("chunk_id", value=anchor_chunk_id)
+    else:
+        video_param = bindparam("video_id", value=anchor_video_id)
+        match_condition = and_(
+            anchor_video_id is not None,
+            or_(videos.c.id == video_param, videos.c.youtube_video_id == video_param),
+            videos.c.active_transcript_version_id == chunks.c.transcript_version_id,
+        )
+
+    time_bound = None if time_seconds is None else cast(literal(time_seconds), Integer)
+    rank_cases: list[Any] = []
+    if time_bound is not None:
+        rank_cases.append(
+            (
+                and_(chunks.c.start_seconds <= time_bound, chunks.c.end_seconds >= time_bound),
+                0,
+            )
+        )
+    if anchor_chunk_id is not None:
+        rank_cases.append((chunks.c.id == anchor_chunk_id, 0))
+    rank = case(*rank_cases, else_=1) if rank_cases else literal(1)
+    distance = func.abs(
+        func.coalesce(chunks.c.start_seconds, 0) - func.coalesce(time_bound, 0)
     )
-  )
-ORDER BY
-    CASE
-      WHEN %(time_seconds)s::integer IS NOT NULL
-       AND c.start_seconds <= %(time_seconds)s::integer
-       AND c.end_seconds >= %(time_seconds)s::integer THEN 0
-      WHEN %(chunk_id)s::text IS NOT NULL AND c.id = %(chunk_id)s::text THEN 0
-      ELSE 1
-    END,
-    abs(coalesce(c.start_seconds, 0) - coalesce(%(time_seconds)s::integer, 0)),
-    c.chunk_index
-LIMIT 1;
-""".strip(),
-        params={
-            "workspace_id": workspace_id,
-            "chunk_id": _blank_to_none(chunk_id),
-            "video_id": _blank_to_none(video_id),
-            "time_seconds": time_seconds,
-        },
+
+    statement = (
+        select(*_chunk_resource_columns())
+        .select_from(_chunk_resource_join())
+        .where(chunks.c.workspace_id == workspace_param, match_condition)
+        .order_by(rank, distance, chunks.c.chunk_index)
+        .limit(literal_column("1"))
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def context_chunks_sql(*, workspace_id: str, transcript_version_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    c.id AS chunk_id,
-    c.video_id,
-    v.youtube_video_id,
-    c.transcript_version_id,
-    c.chunk_index,
-    c.start_seconds,
-    c.end_seconds,
-    c.text,
-    c.metadata_json AS chunk_metadata,
-    v.title,
-    v.channel_id,
-    v.source_id,
-    tv.source AS transcript_source,
-    tv.language_code AS language,
-    tv.metadata_json AS transcript_metadata
-FROM chunks c
-JOIN videos v ON v.id = c.video_id AND v.workspace_id = c.workspace_id
-JOIN transcript_versions tv ON tv.id = c.transcript_version_id AND tv.workspace_id = c.workspace_id
-WHERE c.workspace_id = %(workspace_id)s
-  AND c.transcript_version_id = %(transcript_version_id)s
-ORDER BY c.chunk_index;
-""".strip(),
-        params={"workspace_id": workspace_id, "transcript_version_id": transcript_version_id},
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    statement = (
+        select(*_chunk_resource_columns())
+        .select_from(_chunk_resource_join())
+        .where(
+            chunks.c.workspace_id == workspace_param,
+            chunks.c.transcript_version_id == bindparam("transcript_version_id", value=transcript_version_id),
+        )
+        .order_by(chunks.c.chunk_index)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def video_resource_sql(*, workspace_id: str, video_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    v.id AS video_id,
-    v.youtube_video_id,
-    v.source_id,
-    v.active_transcript_version_id,
-    v.channel_id,
-    v.title,
-    v.description,
-    v.published_at,
-    v.duration_seconds,
-    v.metadata_json,
-    s.display_name AS source_display_name,
-    s.source_url,
-    s.source_type,
-    COUNT(c.id) FILTER (WHERE c.transcript_version_id = v.active_transcript_version_id) AS active_chunk_count
-FROM videos v
-LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
-LEFT JOIN chunks c ON c.video_id = v.id AND c.workspace_id = v.workspace_id
-WHERE v.workspace_id = %(workspace_id)s
-  AND (v.id = %(video_id)s OR v.youtube_video_id = %(video_id)s)
-GROUP BY v.id, s.id
-LIMIT 1;
-""".strip(),
-        params={"workspace_id": workspace_id, "video_id": video_id},
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    video_param = bindparam("video_id", value=video_id)
+    join = videos.outerjoin(
+        sources,
+        and_(sources.c.id == videos.c.source_id, sources.c.workspace_id == videos.c.workspace_id),
+    ).outerjoin(
+        chunks,
+        and_(chunks.c.video_id == videos.c.id, chunks.c.workspace_id == videos.c.workspace_id),
     )
+    statement = (
+        select(
+            videos.c.id.label("video_id"),
+            videos.c.youtube_video_id,
+            videos.c.source_id,
+            videos.c.active_transcript_version_id,
+            videos.c.channel_id,
+            videos.c.title,
+            videos.c.description,
+            videos.c.published_at,
+            videos.c.duration_seconds,
+            videos.c.metadata_json,
+            sources.c.display_name.label("source_display_name"),
+            sources.c.source_url,
+            sources.c.source_type,
+            func.count(chunks.c.id)
+            .filter(chunks.c.transcript_version_id == videos.c.active_transcript_version_id)
+            .label("active_chunk_count"),
+        )
+        .select_from(join)
+        .where(
+            videos.c.workspace_id == workspace_param,
+            or_(videos.c.id == video_param, videos.c.youtube_video_id == video_param),
+        )
+        .group_by(videos.c.id, sources.c.id)
+        .limit(literal_column("1"))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def channel_resource_sql(*, workspace_id: str, channel_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    COALESCE(v.channel_id, s.canonical_channel_id, %(channel_id)s) AS channel_id,
-    max(COALESCE(v.metadata_json->>'channel_title', s.display_name)) AS title,
-    max(v.metadata_json->>'channel_handle') AS channel_handle,
-    count(DISTINCT v.id) AS video_count,
-    max(v.published_at) AS latest_published_at,
-    array_remove(array_agg(DISTINCT s.id), NULL) AS source_ids
-FROM videos v
-LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
-WHERE v.workspace_id = %(workspace_id)s
-  AND (
-    v.channel_id = %(channel_id)s
-    OR v.metadata_json->>'channel_handle' = %(channel_id)s
-    OR s.canonical_channel_id = %(channel_id)s
-  )
-GROUP BY COALESCE(v.channel_id, s.canonical_channel_id, %(channel_id)s)
-LIMIT 1;
-""".strip(),
-        params={"workspace_id": workspace_id, "channel_id": channel_id},
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    channel_param = bindparam("channel_id", value=channel_id)
+    join = videos.outerjoin(
+        sources,
+        and_(sources.c.id == videos.c.source_id, sources.c.workspace_id == videos.c.workspace_id),
     )
+    channel_id_expr = func.coalesce(videos.c.channel_id, sources.c.canonical_channel_id, channel_param)
+    statement = (
+        select(
+            channel_id_expr.label("channel_id"),
+            func.max(
+                func.coalesce(videos.c.metadata_json["channel_title"].astext, sources.c.display_name)
+            ).label("title"),
+            func.max(videos.c.metadata_json["channel_handle"].astext).label("channel_handle"),
+            func.count(distinct(videos.c.id)).label("video_count"),
+            func.max(videos.c.published_at).label("latest_published_at"),
+            func.array_remove(func.array_agg(distinct(sources.c.id)), None).label("source_ids"),
+        )
+        .select_from(join)
+        .where(
+            videos.c.workspace_id == workspace_param,
+            or_(
+                videos.c.channel_id == channel_param,
+                videos.c.metadata_json["channel_handle"].astext == channel_param,
+                sources.c.canonical_channel_id == channel_param,
+            ),
+        )
+        .group_by(channel_id_expr)
+        .limit(literal_column("1"))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def transcript_resource_sql(
@@ -342,125 +363,227 @@ def transcript_resource_sql(
 ) -> SqlStatement:
     bounded_offset = max(0, offset)
     bounded_limit = None if limit is None else max(1, min(limit, 5000))
-    return SqlStatement(
-        sql="""
-WITH selected_transcript AS (
-    SELECT
-        tv.id AS transcript_version_id,
-        tv.video_id,
-        v.youtube_video_id,
-        tv.source,
-        tv.language_code,
-        tv.content_hash,
-        tv.metadata_json,
-        tv.created_at,
-        (v.active_transcript_version_id = tv.id) AS active,
-        count(c.id) AS segment_count
-    FROM transcript_versions tv
-    JOIN videos v ON v.id = tv.video_id AND v.workspace_id = tv.workspace_id
-    LEFT JOIN chunks c ON c.transcript_version_id = tv.id AND c.workspace_id = tv.workspace_id
-    WHERE tv.workspace_id = %(workspace_id)s
-      AND (
-        tv.id = %(transcript_version_id)s
-        OR v.id = %(transcript_version_id)s
-        OR v.youtube_video_id = %(transcript_version_id)s
-      )
-    GROUP BY tv.id, v.id
-    ORDER BY (tv.id = %(transcript_version_id)s) DESC, active DESC, tv.created_at DESC
-    LIMIT 1
-),
-selected_chunks AS (
-    SELECT c.*
-    FROM chunks c
-    JOIN selected_transcript st ON st.transcript_version_id = c.transcript_version_id
-    WHERE c.workspace_id = %(workspace_id)s
-    ORDER BY c.chunk_index
-    OFFSET %(offset)s
-    LIMIT COALESCE(%(limit)s::integer, 2147483647)
-)
-SELECT
-    st.transcript_version_id,
-    st.video_id,
-    st.youtube_video_id,
-    st.source,
-    st.language_code,
-    st.content_hash,
-    st.metadata_json,
-    st.created_at,
-    st.active,
-    st.segment_count,
-    c.id AS chunk_id,
-    c.chunk_index,
-    c.start_seconds,
-    c.end_seconds,
-    c.text
-FROM selected_transcript st
-LEFT JOIN selected_chunks c ON true
-ORDER BY c.chunk_index NULLS LAST;
-""".strip(),
-        params={
-            "workspace_id": workspace_id,
-            "transcript_version_id": transcript_version_id,
-            "offset": bounded_offset,
-            "limit": bounded_limit,
-        },
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    transcript_param = bindparam("transcript_version_id", value=transcript_version_id)
+
+    selected_transcript = (
+        select(
+            transcript_versions.c.id.label("transcript_version_id"),
+            transcript_versions.c.video_id,
+            videos.c.youtube_video_id,
+            transcript_versions.c.source,
+            transcript_versions.c.language_code,
+            transcript_versions.c.content_hash,
+            transcript_versions.c.metadata_json,
+            transcript_versions.c.created_at,
+            (videos.c.active_transcript_version_id == transcript_versions.c.id).label("active"),
+            func.count(chunks.c.id).label("segment_count"),
+        )
+        .select_from(
+            transcript_versions.join(
+                videos,
+                and_(
+                    videos.c.id == transcript_versions.c.video_id,
+                    videos.c.workspace_id == transcript_versions.c.workspace_id,
+                ),
+            ).outerjoin(
+                chunks,
+                and_(
+                    chunks.c.transcript_version_id == transcript_versions.c.id,
+                    chunks.c.workspace_id == transcript_versions.c.workspace_id,
+                ),
+            )
+        )
+        .where(
+            transcript_versions.c.workspace_id == workspace_param,
+            or_(
+                transcript_versions.c.id == transcript_param,
+                videos.c.id == transcript_param,
+                videos.c.youtube_video_id == transcript_param,
+            ),
+        )
+        .group_by(transcript_versions.c.id, videos.c.id)
+        .order_by(
+            (transcript_versions.c.id == transcript_param).desc(),
+            literal_column("active").desc(),
+            transcript_versions.c.created_at.desc(),
+        )
+        .limit(literal_column("1"))
+        .cte("selected_transcript")
     )
+
+    selected_chunks = (
+        select(chunks)
+        .select_from(
+            chunks.join(
+                selected_transcript,
+                selected_transcript.c.transcript_version_id == chunks.c.transcript_version_id,
+            )
+        )
+        .where(chunks.c.workspace_id == workspace_param)
+        .order_by(chunks.c.chunk_index)
+        .offset(bindparam("offset", value=bounded_offset))
+        .limit(func.coalesce(cast(bindparam("limit", value=bounded_limit), Integer), 2147483647))
+        .cte("selected_chunks")
+    )
+
+    final_join = selected_transcript.outerjoin(selected_chunks, true())
+    statement = (
+        select(
+            selected_transcript.c.transcript_version_id,
+            selected_transcript.c.video_id,
+            selected_transcript.c.youtube_video_id,
+            selected_transcript.c.source,
+            selected_transcript.c.language_code,
+            selected_transcript.c.content_hash,
+            selected_transcript.c.metadata_json,
+            selected_transcript.c.created_at,
+            selected_transcript.c.active,
+            selected_transcript.c.segment_count,
+            selected_chunks.c.id.label("chunk_id"),
+            selected_chunks.c.chunk_index,
+            selected_chunks.c.start_seconds,
+            selected_chunks.c.end_seconds,
+            selected_chunks.c.text,
+        )
+        .select_from(final_join)
+        .order_by(selected_chunks.c.chunk_index.nullslast())
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def source_resource_sql(*, workspace_id: str, source_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    id AS source_id,
-    source_type,
-    source_url,
-    canonical_channel_id,
-    canonical_playlist_id,
-    canonical_video_id,
-    display_name,
-    selected,
-    auto_index_allowed,
-    import_source,
-    auth_grant_id,
-    metadata_json,
-    status,
-    last_discovered_at,
-    last_indexed_at,
-    created_at,
-    updated_at
-FROM sources
-WHERE workspace_id = %(workspace_id)s
-  AND id = %(source_id)s
-LIMIT 1;
-""".strip(),
-        params={"workspace_id": workspace_id, "source_id": source_id},
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    source_param = bindparam("source_id", value=source_id)
+    statement = (
+        select(
+            sources.c.id.label("source_id"),
+            sources.c.source_type,
+            sources.c.source_url,
+            sources.c.canonical_channel_id,
+            sources.c.canonical_playlist_id,
+            sources.c.canonical_video_id,
+            sources.c.display_name,
+            sources.c.selected,
+            sources.c.auto_index_allowed,
+            sources.c.import_source,
+            sources.c.auth_grant_id,
+            sources.c.metadata_json,
+            sources.c.status,
+            sources.c.last_discovered_at,
+            sources.c.last_indexed_at,
+            sources.c.created_at,
+            sources.c.updated_at,
+        )
+        .where(
+            sources.c.workspace_id == workspace_param,
+            sources.c.id == source_param,
+        )
+        .limit(literal_column("1"))
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def list_status_sql(*, workspace_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT
-    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s) AS videos,
-    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s AND v.active_transcript_version_id IS NOT NULL) AS searchable_now,
-    (SELECT count(*) FROM videos v WHERE v.workspace_id = %(workspace_id)s AND v.active_transcript_version_id IS NULL) AS still_indexing,
-    0::integer AS needs_attention,
-    (SELECT count(*) FROM chunks c WHERE c.workspace_id = %(workspace_id)s) AS chunks,
-    (SELECT count(*) FROM transcript_versions tv WHERE tv.workspace_id = %(workspace_id)s) AS transcript_versions,
-    (SELECT count(*) FROM sources s WHERE s.workspace_id = %(workspace_id)s AND s.source_type = 'channel') AS channels,
-    (
-        SELECT COALESCE(jsonb_object_agg(status, count), '{}'::jsonb)
-        FROM (
-            SELECT
-                CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END AS status,
-                count(*) AS count
-            FROM videos v
-            WHERE v.workspace_id = %(workspace_id)s
-            GROUP BY 1
-        ) status_counts
-    ) AS statuses;
-""".strip(),
-        params={"workspace_id": workspace_id},
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    videos_count = (
+        select(func.count()).select_from(videos).where(videos.c.workspace_id == workspace_param).scalar_subquery().label("videos")
+    )
+    searchable_now = (
+        select(func.count())
+        .select_from(videos)
+        .where(videos.c.workspace_id == workspace_param, videos.c.active_transcript_version_id.is_not(None))
+        .scalar_subquery()
+        .label("searchable_now")
+    )
+    still_indexing = (
+        select(func.count())
+        .select_from(videos)
+        .where(videos.c.workspace_id == workspace_param, videos.c.active_transcript_version_id.is_(None))
+        .scalar_subquery()
+        .label("still_indexing")
+    )
+    chunks_count = (
+        select(func.count()).select_from(chunks).where(chunks.c.workspace_id == workspace_param).scalar_subquery().label("chunks")
+    )
+    transcript_versions_count = (
+        select(func.count())
+        .select_from(transcript_versions)
+        .where(transcript_versions.c.workspace_id == workspace_param)
+        .scalar_subquery()
+        .label("transcript_versions")
+    )
+    channels_count = (
+        select(func.count())
+        .select_from(sources)
+        .where(sources.c.workspace_id == workspace_param, sources.c.source_type == bindparam("source_type", value="channel"))
+        .scalar_subquery()
+        .label("channels")
+    )
+    status_label = case(
+        (videos.c.active_transcript_version_id.is_(None), bindparam("pending_status", value="pending")),
+        else_=bindparam("indexed_status", value="indexed"),
+    ).label("status")
+    status_counts = (
+        select(status_label, func.count().label("count"))
+        .where(videos.c.workspace_id == workspace_param)
+        .group_by(literal_column("1"))
+        .subquery("status_counts")
+    )
+    statuses = (
+        select(
+            func.coalesce(
+                func.jsonb_object_agg(status_counts.c.status, status_counts.c.count),
+                cast(text("'{}'"), JSONB),
+            )
+        )
+        .select_from(status_counts)
+        .scalar_subquery()
+        .label("statuses")
+    )
+    statement = select(
+        videos_count,
+        searchable_now,
+        still_indexing,
+        cast(literal(0), Integer).label("needs_attention"),
+        chunks_count,
+        transcript_versions_count,
+        channels_count,
+        statuses,
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
+def _video_ingest_status_expr() -> Any:
+    return func.coalesce(
+        videos.c.metadata_json["ingest_status"].astext,
+        case((videos.c.active_transcript_version_id.is_(None), "pending"), else_="indexed"),
+    )
+
+
+def _list_videos_order_by(order_by: str | None) -> list[Any]:
+    orderings: dict[str | None, list[Any]] = {
+        None: [videos.c.published_at.desc().nullslast(), videos.c.created_at.desc(), videos.c.id],
+        "newest": [videos.c.published_at.desc().nullslast(), videos.c.created_at.desc(), videos.c.id],
+        "oldest": [videos.c.published_at.asc().nullslast(), videos.c.created_at.asc(), videos.c.id],
+        "longest": [
+            videos.c.duration_seconds.desc().nullslast(),
+            videos.c.published_at.desc().nullslast(),
+            videos.c.id,
+        ],
+        "shortest": [
+            videos.c.duration_seconds.asc().nullslast(),
+            videos.c.published_at.desc().nullslast(),
+            videos.c.id,
+        ],
+        "title": [videos.c.title.asc(), videos.c.published_at.desc().nullslast(), videos.c.id],
+    }
+    return orderings.get(
+        order_by,
+        [videos.c.published_at.desc().nullslast(), videos.c.created_at.desc(), videos.c.id],
     )
 
 
@@ -478,86 +601,104 @@ def list_videos_sql(
     language: str | None = None,
     order_by: str | None = None,
 ) -> SqlStatement:
-    order_clause = {
-        None: "v.published_at DESC NULLS LAST, v.created_at DESC, v.id",
-        "newest": "v.published_at DESC NULLS LAST, v.created_at DESC, v.id",
-        "oldest": "v.published_at ASC NULLS LAST, v.created_at ASC, v.id",
-        "longest": "v.duration_seconds DESC NULLS LAST, v.published_at DESC NULLS LAST, v.id",
-        "shortest": "v.duration_seconds ASC NULLS LAST, v.published_at DESC NULLS LAST, v.id",
-        "title": "v.title ASC, v.published_at DESC NULLS LAST, v.id",
-    }.get(order_by)
-    if order_clause is None:
-        order_clause = "v.published_at DESC NULLS LAST, v.created_at DESC, v.id"
-    return SqlStatement(
-        sql=f"""
-SELECT
-    v.id AS video_id,
-    v.youtube_video_id,
-    v.source_id,
-    v.active_transcript_version_id,
-    v.channel_id,
-    v.title,
-    v.description,
-    v.published_at,
-    v.duration_seconds,
-    v.metadata_json,
-    s.display_name AS source_display_name,
-    s.source_url,
-    s.source_type,
-    count(c.id) FILTER (WHERE c.transcript_version_id = v.active_transcript_version_id) AS active_chunk_count
-FROM videos v
-LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
-LEFT JOIN transcript_versions tv ON tv.id = v.active_transcript_version_id AND tv.workspace_id = v.workspace_id
-LEFT JOIN chunks c ON c.video_id = v.id AND c.workspace_id = v.workspace_id
-WHERE v.workspace_id = %(workspace_id)s
-  AND (%(video_id)s::text IS NULL OR v.id = %(video_id)s::text OR v.youtube_video_id = %(video_id)s::text)
-  AND (
-    %(channel)s::text IS NULL
-    OR v.channel_id = %(channel)s::text
-    OR v.metadata_json->>'channel_handle' = %(channel)s::text
-    OR v.metadata_json->>'channel_title' = %(channel)s::text
-    OR s.canonical_channel_id = %(channel)s::text
-    OR s.display_name = %(channel)s::text
-  )
-  AND (%(since)s::timestamptz IS NULL OR v.published_at >= %(since)s::timestamptz)
-  AND (%(until)s::timestamptz IS NULL OR v.published_at <= %(until)s::timestamptz)
-  AND (
-    %(status)s::text IS NULL
-    OR COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) = %(status)s::text
-    OR (
-      %(status_prefix)s::text IS NOT NULL
-      AND COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) LIKE %(status_prefix)s::text
+    since_value = _blank_to_none(since)
+    until_value = _blank_to_none(until)
+    status_exact = _status_exact(status)
+    status_prefix = _status_prefix(status)
+    source_value = _blank_to_none(source)
+    source_prefix = _prefix(source)
+    language_value = _blank_to_none(language)
+    ingest_status = _video_ingest_status_expr()
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+
+    join = (
+        videos.outerjoin(
+            sources,
+            and_(sources.c.id == videos.c.source_id, sources.c.workspace_id == videos.c.workspace_id),
+        )
+        .outerjoin(
+            transcript_versions,
+            and_(
+                transcript_versions.c.id == videos.c.active_transcript_version_id,
+                transcript_versions.c.workspace_id == videos.c.workspace_id,
+            ),
+        )
+        .outerjoin(
+            chunks,
+            and_(chunks.c.video_id == videos.c.id, chunks.c.workspace_id == videos.c.workspace_id),
+        )
     )
-  )
-  AND (
-    %(source)s::text IS NULL
-    OR tv.source = %(source)s::text
-    OR tv.source LIKE %(source_prefix)s::text
-    OR s.id = %(source)s::text
-    OR s.source_url = %(source)s::text
-    OR s.import_source = %(source)s::text
-  )
-  AND (%(language)s::text IS NULL OR tv.language_code = %(language)s::text)
-GROUP BY v.id, s.id
-ORDER BY {order_clause}
-LIMIT %(limit)s
-OFFSET %(offset)s;
-""".strip(),
-        params={
-            "workspace_id": workspace_id,
-            "video_id": video_id,
-            "channel": channel,
-            "since": _blank_to_none(since),
-            "until": _blank_to_none(until),
-            "status": _status_exact(status),
-            "status_prefix": _status_prefix(status),
-            "source": _blank_to_none(source),
-            "source_prefix": _prefix(source),
-            "language": _blank_to_none(language),
-            "limit": max(1, min(limit, 200)),
-            "offset": max(0, offset),
-        },
+
+    conditions: list[Any] = [videos.c.workspace_id == workspace_param]
+    if video_id is not None:
+        video_param = bindparam("video_id", value=video_id)
+        conditions.append(or_(videos.c.id == video_param, videos.c.youtube_video_id == video_param))
+    if channel is not None:
+        channel_param = bindparam("channel", value=channel)
+        conditions.append(
+            or_(
+                videos.c.channel_id == channel_param,
+                videos.c.metadata_json["channel_handle"].astext == channel_param,
+                videos.c.metadata_json["channel_title"].astext == channel_param,
+                sources.c.canonical_channel_id == channel_param,
+                sources.c.display_name == channel_param,
+            )
+        )
+    if since_value is not None:
+        conditions.append(videos.c.published_at >= cast(bindparam("since", value=since_value), TIMESTAMP(timezone=True)))
+    if until_value is not None:
+        conditions.append(videos.c.published_at <= cast(bindparam("until", value=until_value), TIMESTAMP(timezone=True)))
+    if status_exact is not None:
+        conditions.append(ingest_status == bindparam("status", value=status_exact))
+    elif status_prefix is not None:
+        conditions.append(ingest_status.like(bindparam("status_prefix", value=status_prefix)))
+    if source_value is not None:
+        source_param = bindparam("source", value=source_value)
+        source_prefix_param = bindparam("source_prefix", value=source_prefix)
+        conditions.append(
+            or_(
+                transcript_versions.c.source == source_param,
+                transcript_versions.c.source.like(source_prefix_param),
+                sources.c.id == source_param,
+                sources.c.source_url == source_param,
+                sources.c.import_source == source_param,
+            )
+        )
+    if language_value is not None:
+        conditions.append(transcript_versions.c.language_code == bindparam("language", value=language_value))
+
+    statement = (
+        select(
+            videos.c.id.label("video_id"),
+            videos.c.youtube_video_id,
+            videos.c.source_id,
+            videos.c.active_transcript_version_id,
+            videos.c.channel_id,
+            videos.c.title,
+            videos.c.description,
+            videos.c.published_at,
+            videos.c.duration_seconds,
+            videos.c.metadata_json,
+            sources.c.display_name.label("source_display_name"),
+            sources.c.source_url,
+            sources.c.source_type,
+            func.count(chunks.c.id)
+            .filter(chunks.c.transcript_version_id == videos.c.active_transcript_version_id)
+            .label("active_chunk_count"),
+        )
+        .select_from(join)
+        .where(*conditions)
+        .group_by(videos.c.id, sources.c.id)
+        .order_by(*_list_videos_order_by(order_by))
+        .limit(bindparam("limit", value=max(1, min(limit, 200))))
+        .offset(bindparam("offset", value=max(0, offset)))
     )
+    sql, params = compile_postgres_statement(statement)
+    params.setdefault("video_id", video_id)
+    params.setdefault("channel", channel)
+    params.setdefault("source_prefix", source_prefix)
+    params.setdefault("language", language_value)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def list_channels_sql(
@@ -573,94 +714,135 @@ def list_channels_sql(
     language: str | None = None,
     selected: bool | None = None,
 ) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-WITH channel_sources AS (
-    SELECT
-        COALESCE(s.canonical_channel_id, s.id) AS channel_id,
-        max(s.display_name) AS title,
-        bool_or(s.selected) AS selected,
-        count(DISTINCT s.id) AS source_count,
-        array_remove(array_agg(DISTINCT s.id), NULL) AS source_ids,
-        max(s.last_discovered_at) AS last_discovered_at,
-        max(s.last_indexed_at) AS last_indexed_at
-    FROM sources s
-    WHERE s.workspace_id = %(workspace_id)s
-      AND s.source_type = 'channel'
-      AND (%(selected)s::boolean IS NULL OR s.selected = %(selected)s::boolean)
-    GROUP BY COALESCE(s.canonical_channel_id, s.id)
-),
-channel_videos AS (
-    SELECT
-        COALESCE(v.channel_id, s.canonical_channel_id) AS channel_id,
-        max(COALESCE(v.metadata_json->>'channel_title', s.display_name)) AS title,
-        max(v.metadata_json->>'channel_handle') AS channel_handle,
-        count(DISTINCT v.id) AS video_count,
-        max(v.published_at) AS latest_published_at
-    FROM videos v
-    LEFT JOIN sources s ON s.id = v.source_id AND s.workspace_id = v.workspace_id
-    LEFT JOIN transcript_versions tv ON tv.id = v.active_transcript_version_id AND tv.workspace_id = v.workspace_id
-    WHERE v.workspace_id = %(workspace_id)s
-      AND (%(since)s::timestamptz IS NULL OR v.published_at >= %(since)s::timestamptz)
-      AND (%(until)s::timestamptz IS NULL OR v.published_at <= %(until)s::timestamptz)
-      AND (
-        %(status)s::text IS NULL
-        OR COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) = %(status)s::text
-        OR (
-          %(status_prefix)s::text IS NOT NULL
-          AND COALESCE(v.metadata_json->>'ingest_status', CASE WHEN v.active_transcript_version_id IS NULL THEN 'pending' ELSE 'indexed' END) LIKE %(status_prefix)s::text
+    since_value = _blank_to_none(since)
+    until_value = _blank_to_none(until)
+    status_exact = _status_exact(status)
+    status_prefix = _status_prefix(status)
+    source_value = _blank_to_none(source)
+    source_prefix = _prefix(source)
+    language_value = _blank_to_none(language)
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+
+    cs_channel_id = func.coalesce(sources.c.canonical_channel_id, sources.c.id)
+    cs_conditions: list[Any] = [
+        sources.c.workspace_id == workspace_param,
+        sources.c.source_type == bindparam("source_type", value="channel"),
+    ]
+    if selected is not None:
+        cs_conditions.append(sources.c.selected == bindparam("selected", value=selected))
+    channel_sources = (
+        select(
+            cs_channel_id.label("channel_id"),
+            func.max(sources.c.display_name).label("title"),
+            func.bool_or(sources.c.selected).label("selected"),
+            func.count(distinct(sources.c.id)).label("source_count"),
+            func.array_remove(func.array_agg(distinct(sources.c.id)), None).label("source_ids"),
+            func.max(sources.c.last_discovered_at).label("last_discovered_at"),
+            func.max(sources.c.last_indexed_at).label("last_indexed_at"),
         )
-      )
-      AND (
-        %(source)s::text IS NULL
-        OR tv.source = %(source)s::text
-        OR tv.source LIKE %(source_prefix)s::text
-        OR s.id = %(source)s::text
-        OR s.source_url = %(source)s::text
-        OR s.import_source = %(source)s::text
-      )
-      AND (%(language)s::text IS NULL OR tv.language_code = %(language)s::text)
-    GROUP BY COALESCE(v.channel_id, s.canonical_channel_id)
-)
-SELECT
-    COALESCE(cs.channel_id, cv.channel_id) AS channel_id,
-    COALESCE(cv.title, cs.title) AS title,
-    cv.channel_handle,
-    COALESCE(cv.video_count, 0) AS video_count,
-    cv.latest_published_at,
-    COALESCE(cs.selected, true) AS selected,
-    COALESCE(cs.source_count, 0) AS source_count,
-    COALESCE(cs.source_ids, ARRAY[]::text[]) AS source_ids,
-    cs.last_discovered_at,
-    cs.last_indexed_at
-FROM channel_sources cs
-FULL OUTER JOIN channel_videos cv USING (channel_id)
-WHERE COALESCE(cs.channel_id, cv.channel_id) IS NOT NULL
-  AND (
-    %(channel)s::text IS NULL
-    OR COALESCE(cs.channel_id, cv.channel_id) = %(channel)s::text
-    OR cv.channel_handle = %(channel)s::text
-    OR COALESCE(cv.title, cs.title) = %(channel)s::text
-  )
-ORDER BY cv.latest_published_at DESC NULLS LAST, COALESCE(cv.title, cs.title) ASC, COALESCE(cs.channel_id, cv.channel_id)
-LIMIT %(limit)s
-OFFSET %(offset)s;
-""".strip(),
-        params={
-            "workspace_id": workspace_id,
-            "channel": channel,
-            "since": _blank_to_none(since),
-            "until": _blank_to_none(until),
-            "status": _status_exact(status),
-            "status_prefix": _status_prefix(status),
-            "source": _blank_to_none(source),
-            "source_prefix": _prefix(source),
-            "language": _blank_to_none(language),
-            "selected": selected,
-            "limit": max(1, min(limit, 200)),
-            "offset": max(0, offset),
-        },
+        .where(*cs_conditions)
+        .group_by(cs_channel_id)
+        .cte("channel_sources")
     )
+
+    cv_channel_id = func.coalesce(videos.c.channel_id, sources.c.canonical_channel_id)
+    ingest_status = _video_ingest_status_expr()
+    cv_conditions: list[Any] = [videos.c.workspace_id == workspace_param]
+    if since_value is not None:
+        cv_conditions.append(videos.c.published_at >= cast(bindparam("since", value=since_value), TIMESTAMP(timezone=True)))
+    if until_value is not None:
+        cv_conditions.append(videos.c.published_at <= cast(bindparam("until", value=until_value), TIMESTAMP(timezone=True)))
+    if status_exact is not None:
+        cv_conditions.append(ingest_status == bindparam("status", value=status_exact))
+    elif status_prefix is not None:
+        cv_conditions.append(ingest_status.like(bindparam("status_prefix", value=status_prefix)))
+    if source_value is not None:
+        source_param = bindparam("source", value=source_value)
+        source_prefix_param = bindparam("source_prefix", value=source_prefix)
+        cv_conditions.append(
+            or_(
+                transcript_versions.c.source == source_param,
+                transcript_versions.c.source.like(source_prefix_param),
+                sources.c.id == source_param,
+                sources.c.source_url == source_param,
+                sources.c.import_source == source_param,
+            )
+        )
+    if language_value is not None:
+        cv_conditions.append(transcript_versions.c.language_code == bindparam("language", value=language_value))
+    channel_videos = (
+        select(
+            cv_channel_id.label("channel_id"),
+            func.max(
+                func.coalesce(videos.c.metadata_json["channel_title"].astext, sources.c.display_name)
+            ).label("title"),
+            func.max(videos.c.metadata_json["channel_handle"].astext).label("channel_handle"),
+            func.count(distinct(videos.c.id)).label("video_count"),
+            func.max(videos.c.published_at).label("latest_published_at"),
+        )
+        .select_from(
+            videos.outerjoin(
+                sources,
+                and_(sources.c.id == videos.c.source_id, sources.c.workspace_id == videos.c.workspace_id),
+            ).outerjoin(
+                transcript_versions,
+                and_(
+                    transcript_versions.c.id == videos.c.active_transcript_version_id,
+                    transcript_versions.c.workspace_id == videos.c.workspace_id,
+                ),
+            )
+        )
+        .where(*cv_conditions)
+        .group_by(cv_channel_id)
+        .cte("channel_videos")
+    )
+
+    coalesced_channel_id = func.coalesce(channel_sources.c.channel_id, channel_videos.c.channel_id)
+    coalesced_title = func.coalesce(channel_videos.c.title, channel_sources.c.title)
+    join = channel_sources.outerjoin(
+        channel_videos,
+        channel_sources.c.channel_id == channel_videos.c.channel_id,
+        full=True,
+    )
+    final_conditions: list[Any] = [coalesced_channel_id.is_not(None)]
+    if channel is not None:
+        channel_param = bindparam("channel", value=channel)
+        final_conditions.append(
+            or_(
+                coalesced_channel_id == channel_param,
+                channel_videos.c.channel_handle == channel_param,
+                coalesced_title == channel_param,
+            )
+        )
+    statement = (
+        select(
+            coalesced_channel_id.label("channel_id"),
+            coalesced_title.label("title"),
+            channel_videos.c.channel_handle,
+            func.coalesce(channel_videos.c.video_count, 0).label("video_count"),
+            channel_videos.c.latest_published_at,
+            func.coalesce(channel_sources.c.selected, true()).label("selected"),
+            func.coalesce(channel_sources.c.source_count, 0).label("source_count"),
+            func.coalesce(channel_sources.c.source_ids, literal_column("ARRAY[]::text[]")).label("source_ids"),
+            channel_sources.c.last_discovered_at,
+            channel_sources.c.last_indexed_at,
+        )
+        .select_from(join)
+        .where(*final_conditions)
+        .order_by(
+            channel_videos.c.latest_published_at.desc().nullslast(),
+            coalesced_title.asc(),
+            coalesced_channel_id,
+        )
+        .limit(bindparam("limit", value=max(1, min(limit, 200))))
+        .offset(bindparam("offset", value=max(0, offset)))
+    )
+    sql, params = compile_postgres_statement(statement)
+    params.setdefault("channel", channel)
+    params.setdefault("source_prefix", source_prefix)
+    params.setdefault("language", language_value)
+    params.setdefault("selected", selected)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def format_chunk_resource(row: Mapping[str, Any]) -> dict[str, Any]:

@@ -195,7 +195,7 @@ export class HostedMcpApiClient {
 
   constructor(env: HostedMcpApiEnv, fetcher: typeof fetch = fetch) {
     this.env = env;
-    this.fetcher = fetcher;
+    this.fetcher = ((input, init) => fetcher.call(globalThis, input, init)) as typeof fetch;
   }
 
   async callTool(auth: HostedMcpAuthContext, name: string, args: Record<string, unknown>): Promise<unknown> {

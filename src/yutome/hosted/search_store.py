@@ -927,7 +927,7 @@ AND (
     %(filter_channel)s::text IS NULL
     OR v.channel_id = %(filter_channel)s::text
     OR v.metadata_json->>'channel_handle' = %(filter_channel)s::text
-    OR ('@' || v.metadata_json->>'channel_handle') = %(filter_channel)s::text
+    OR ('@' || (v.metadata_json->>'channel_handle')) = %(filter_channel)s::text
     OR v.metadata_json->>'channel_title' = %(filter_channel)s::text
     OR s.canonical_channel_id = %(filter_channel)s::text
     OR s.display_name = %(filter_channel)s::text

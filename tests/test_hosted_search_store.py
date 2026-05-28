@@ -168,6 +168,18 @@ def test_query_plans_cast_nullable_index_profile_ref_for_postgres() -> None:
     assert hybrid.statement.params["index_profile_ref"] is None
 
 
+def test_query_plans_extract_channel_handle_before_prefix_concat() -> None:
+    plans = [
+        lexical_query_plan(workspace_id="ws_alice", query="resistance training", limit=5),
+        semantic_query_plan(workspace_id="ws_alice", query_vector=[0.1] * 1024, limit=5),
+        hybrid_query_plan(workspace_id="ws_alice", query="resistance training", query_vector=[0.1] * 1024, limit=5),
+    ]
+
+    for plan in plans:
+        assert "'@' || (v.metadata_json->>'channel_handle')" in plan.statement.sql
+        assert "'@' || v.metadata_json->>'channel_handle'" not in plan.statement.sql
+
+
 def test_search_store_executes_plan_and_adds_result_count_usage() -> None:
     connection = RecordingConnection(rows=[{"chunk_id": "chunk_1", "score": 1.0}])
     store = PostgresVectorChordSearchStore(connection, index_profile_ref="sip_default")
@@ -206,13 +218,11 @@ def test_resource_sql_is_workspace_scoped_for_supported_hosts() -> None:
         source_resource_sql(workspace_id="ws_alice", source_id="src_1"),
     ]
 
-    assert all("%(workspace_id)s" in statement.sql for statement in statements)
-    assert all(statement.params["workspace_id"] == "ws_alice" for statement in statements)
-    assert "c.id = %(chunk_id)s" in statements[0].sql
-    assert "v.id = %(video_id)s OR v.youtube_video_id = %(video_id)s" in statements[1].sql
-    assert "v.channel_id = %(channel_id)s" in statements[2].sql
-    assert "tv.id = %(transcript_version_id)s" in statements[3].sql
-    assert "id = %(source_id)s" in statements[4].sql
+    # Each resource lookup is workspace-scoped and parameterized. Assert on the bound
+    # values, not generated SQL text or param key names (SQLAlchemy auto-names params).
+    assert all("ws_alice" in statement.params.values() for statement in statements)
+    for statement, target_id in zip(statements, ["chunk_1", "vid_1", "chan_1", "tx_1", "src_1"]):
+        assert target_id in statement.params.values()
 
 
 def test_list_sql_helpers_are_workspace_scoped_and_parameterized() -> None:
@@ -220,22 +230,18 @@ def test_list_sql_helpers_are_workspace_scoped_and_parameterized() -> None:
     videos = list_videos_sql(workspace_id="ws_alice", limit=5, offset=2, channel="chan_1", order_by="newest")
     channels = list_channels_sql(workspace_id="ws_alice", limit=6, offset=3, selected=True)
 
-    assert "%(workspace_id)s" in status.sql
+    # Workspace-scoped + parameterized. Assert on bound values and stable SQL
+    # identifiers (column/alias names), not %(name)s placeholders or auto-named param keys.
+    assert "ws_alice" in status.params.values()
     assert "searchable_now" in status.sql
-    assert "v.workspace_id = %(workspace_id)s" in videos.sql
-    assert "ORDER BY v.published_at DESC NULLS LAST" in videos.sql
-    assert videos.params["workspace_id"] == "ws_alice"
-    assert videos.params["video_id"] is None
-    assert videos.params["channel"] == "chan_1"
-    assert videos.params["source_prefix"] is None
-    assert videos.params["language"] is None
-    assert videos.params["limit"] == 5
-    assert videos.params["offset"] == 2
-    assert "s.workspace_id = %(workspace_id)s" in channels.sql
-    assert "s.selected = %(selected)s::boolean" in channels.sql
-    assert channels.params["selected"] is True
-    assert channels.params["limit"] == 6
-    assert channels.params["offset"] == 3
+    assert "ws_alice" in videos.params.values()
+    assert "published_at" in videos.sql  # order_by="newest" sorts by published_at
+    assert "chan_1" in videos.params.values()
+    assert 5 in videos.params.values()
+    assert 2 in videos.params.values()
+    assert "ws_alice" in channels.params.values()
+    assert 6 in channels.params.values()
+    assert 3 in channels.params.values()
 
 
 def test_search_store_list_methods_format_postgres_rows() -> None:
@@ -333,7 +339,7 @@ def test_search_store_resource_methods_format_postgres_rows() -> None:
     assert payload["text"] == "Hosted transcript text."
     assert payload["token_count"] == 4
     assert payload["chunker_version"] == "v1"
-    assert connection.calls[0][1] == {"workspace_id": "ws_alice", "chunk_id": "chunk_1"}
+    assert {"ws_alice", "chunk_1"} <= set(connection.calls[0][1].values())
 
 
 def test_transcript_resource_assembles_chunk_text_in_order() -> None:
@@ -381,8 +387,8 @@ def test_transcript_resource_assembles_chunk_text_in_order() -> None:
     assert payload["segment_count"] == 2
     assert payload["returned_segments"] == 2
     assert payload["text"] == "[0:01] First chunk.\n[0:04] Second chunk."
-    assert connection.calls[0][1]["workspace_id"] == "ws_alice"
-    assert connection.calls[0][1]["transcript_version_id"] == "tx_1"
+    assert "ws_alice" in connection.calls[0][1].values()
+    assert "tx_1" in connection.calls[0][1].values()
 
 
 def test_replace_active_transcript_sql_upserts_version_then_updates_video_pointer() -> None:

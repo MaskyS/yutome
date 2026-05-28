@@ -22,6 +22,7 @@ logger = logging.getLogger("yutome.hosted.email")
 RESEND_API_KEY_ENV_VAR = "RESEND_API_KEY"
 EMAIL_FROM_ENV_VAR = "YUTOME_EMAIL_FROM"
 RESEND_ENDPOINT = "https://api.resend.com/emails"
+RESEND_USER_AGENT = "Yutome/1.0 (+https://getyutome.com)"
 
 
 class EmailSendError(RuntimeError):
@@ -71,7 +72,12 @@ class ResendEmailSender:
         request = urllib.request.Request(
             RESEND_ENDPOINT,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": RESEND_USER_AGENT,
+            },
             method="POST",
         )
         try:

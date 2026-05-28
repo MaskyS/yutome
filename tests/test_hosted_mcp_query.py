@@ -388,9 +388,13 @@ class RecordingSourceImportConnection:
                 row["metadata_json"] = {**row["metadata_json"], **metadata}
             return [dict(row)]
         if "FROM jobs" in statement:
-            source_id = params.get("source_id")
-            rows = [dict(row) for row in self.jobs.values() if source_id is None or row["source_id"] == source_id]
-            return sorted(rows, key=lambda row: row["created_at"], reverse=True)[: params.get("limit", 100)]
+            # account_jobs_sql binds params via SQLAlchemy Core (auto-named keys), so
+            # match the requested source_id by value rather than a fixed param key.
+            known_source_ids = {row["source_id"] for row in self.jobs.values()}
+            requested = next((value for value in params.values() if value in known_source_ids), None)
+            rows = [dict(row) for row in self.jobs.values() if requested is None or row["source_id"] == requested]
+            limit = next((value for value in params.values() if isinstance(value, int)), 100)
+            return sorted(rows, key=lambda row: row["created_at"], reverse=True)[:limit]
         return []
 
 

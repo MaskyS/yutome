@@ -278,7 +278,9 @@ test("hosted auth context comes from OAuth props and requires search scope", () 
 
 test("hosted API client dispatches tool calls with Yutome auth headers", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
-  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  let fetchThis: unknown;
+  const fetcher = (async function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+    fetchThis = this;
     calls.push({ url: String(input), init: init ?? {} });
     return Response.json({
       ok: true,
@@ -311,6 +313,7 @@ test("hosted API client dispatches tool calls with Yutome auth headers", async (
     notes: [],
     total: null,
   });
+  assert.equal(fetchThis, globalThis);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://hosted.example/mcp/tools/call");
   assert.equal(calls[0].init.method, "POST");

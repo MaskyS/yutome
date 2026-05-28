@@ -79,6 +79,13 @@ The optional live test hook is `YUTOME_TEST_POSTGRES_DSN`; with a local disposab
 Postgres running, `tests/test_hosted_postgres.py` exercises representative generated SQL
 against a real parser instead of only fake connections.
 
+Hosted SQL is built with **SQLAlchemy Core** (not hand-written strings), compiled to
+`SqlStatement` via `compile_postgres_statement`. The conventions — JSONB handling,
+parameter naming (auto-named; never read by key or asserted on in tests), and which queries
+stay raw (VectorChord/bm25, DDL, `FOR UPDATE`/`SKIP LOCKED` locks, heavy `jsonb_agg`) — live
+in [`docs/architecture/hosted-sql.md`](docs/architecture/hosted-sql.md) and the
+`hosted-sqlalchemy-core` bd memory.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker

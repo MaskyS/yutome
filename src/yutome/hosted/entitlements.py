@@ -5,6 +5,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from sqlalchemy import Text, any_, bindparam, case, func, select
+from sqlalchemy.dialects.postgresql import ARRAY
+
 from yutome.hosted.allocations import resolve_allocation
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpUsageContext
 from yutome.hosted.models import (
@@ -15,6 +18,14 @@ from yutome.hosted.models import (
     UsageSubject,
     WorkspaceBalance,
 )
+from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import (
+    entitlement_policies,
+    provider_allocations,
+    service_allocations,
+    workspace_balances,
+)
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 class SqlConnection(Protocol):
@@ -71,40 +82,18 @@ class PostgresUsageContextProvider:
 
     def _allocation(self, *, workspace_id: str, subject: UsageSubject, operation: str) -> ProviderAllocation | ServiceAllocation | None:
         if subject == "search_store":
-            rows = _rows_from_result(
-                self.connection.execute(
-                    _SERVICE_ALLOCATION_SQL,
-                    {
-                        "workspace_id": workspace_id,
-                        "service": "search_store",
-                        "operations": [operation, "*"],
-                        "operation": operation,
-                    },
-                )
-            )
+            statement = service_allocation_sql(workspace_id=workspace_id, service="search_store", operation=operation)
+            rows = _rows_from_result(self.connection.execute(statement.sql, statement.params))
             allocations = [_service_allocation_from_row(row) for row in rows]
         else:
-            rows = _rows_from_result(
-                self.connection.execute(
-                    _PROVIDER_ALLOCATION_SQL,
-                    {
-                        "workspace_id": workspace_id,
-                        "provider": subject,
-                        "operations": [operation, "*"],
-                        "operation": operation,
-                    },
-                )
-            )
+            statement = provider_allocation_sql(workspace_id=workspace_id, provider=subject, operation=operation)
+            rows = _rows_from_result(self.connection.execute(statement.sql, statement.params))
             allocations = [_provider_allocation_from_row(row) for row in rows]
         return resolve_allocation(allocations, workspace_id=workspace_id, subject=subject, operation=operation).allocation
 
     def _active_policy(self, *, workspace_id: str) -> EntitlementPolicy | None:
-        row = _one(
-            self.connection.execute(
-                _ACTIVE_POLICY_SQL,
-                {"workspace_id": workspace_id},
-            )
-        )
+        statement = active_policy_sql(workspace_id=workspace_id)
+        row = _one(self.connection.execute(statement.sql, statement.params))
         if row is None:
             return None
         return EntitlementPolicy(
@@ -118,12 +107,8 @@ class PostgresUsageContextProvider:
     def _active_balance(self, *, workspace_id: str, entitlement_policy_id: str | None) -> WorkspaceBalance | None:
         if entitlement_policy_id is None:
             return None
-        row = _one(
-            self.connection.execute(
-                _ACTIVE_BALANCE_SQL,
-                {"workspace_id": workspace_id, "entitlement_policy_id": entitlement_policy_id},
-            )
-        )
+        statement = active_balance_sql(workspace_id=workspace_id, entitlement_policy_id=entitlement_policy_id)
+        row = _one(self.connection.execute(statement.sql, statement.params))
         if row is None:
             return None
         return WorkspaceBalance(
@@ -133,72 +118,115 @@ class PostgresUsageContextProvider:
         )
 
 
-_PROVIDER_ALLOCATION_SQL = """
-SELECT
-    id,
-    workspace_id,
-    provider,
-    operation,
-    credential_mode,
-    status,
-    model_or_plan,
-    external_allocation_id,
-    metadata_json
-FROM provider_allocations
-WHERE workspace_id = %(workspace_id)s
-  AND provider = %(provider)s
-  AND operation = ANY(%(operations)s::text[])
-ORDER BY CASE WHEN operation = %(operation)s THEN 0 ELSE 1 END, id;
-""".strip()
+def provider_allocation_sql(*, workspace_id: str, provider: str, operation: str) -> SqlStatement:
+    operations = [operation, "*"]
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    provider_param = bindparam("provider", value=provider)
+    operation_param = bindparam("operation", value=operation)
+    statement = (
+        select(
+            provider_allocations.c.id,
+            provider_allocations.c.workspace_id,
+            provider_allocations.c.provider,
+            provider_allocations.c.operation,
+            provider_allocations.c.credential_mode,
+            provider_allocations.c.status,
+            provider_allocations.c.model_or_plan,
+            provider_allocations.c.external_allocation_id,
+            provider_allocations.c.metadata_json,
+        )
+        .where(
+            provider_allocations.c.workspace_id == workspace_param,
+            provider_allocations.c.provider == provider_param,
+            provider_allocations.c.operation == any_(bindparam("operations", value=operations, type_=ARRAY(Text))),
+        )
+        .order_by(
+            case((provider_allocations.c.operation == operation_param, 0), else_=1),
+            provider_allocations.c.id,
+        )
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
-_SERVICE_ALLOCATION_SQL = """
-SELECT
-    id,
-    workspace_id,
-    service,
-    operation,
-    credential_mode,
-    status,
-    backend,
-    index_profile_ref,
-    metadata_json
-FROM service_allocations
-WHERE workspace_id = %(workspace_id)s
-  AND service = %(service)s
-  AND operation = ANY(%(operations)s::text[])
-ORDER BY CASE WHEN operation = %(operation)s THEN 0 ELSE 1 END, id;
-""".strip()
+def service_allocation_sql(*, workspace_id: str, service: str, operation: str) -> SqlStatement:
+    operations = [operation, "*"]
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    service_param = bindparam("service", value=service)
+    operation_param = bindparam("operation", value=operation)
+    statement = (
+        select(
+            service_allocations.c.id,
+            service_allocations.c.workspace_id,
+            service_allocations.c.service,
+            service_allocations.c.operation,
+            service_allocations.c.credential_mode,
+            service_allocations.c.status,
+            service_allocations.c.backend,
+            service_allocations.c.index_profile_ref,
+            service_allocations.c.metadata_json,
+        )
+        .where(
+            service_allocations.c.workspace_id == workspace_param,
+            service_allocations.c.service == service_param,
+            service_allocations.c.operation == any_(bindparam("operations", value=operations, type_=ARRAY(Text))),
+        )
+        .order_by(
+            case((service_allocations.c.operation == operation_param, 0), else_=1),
+            service_allocations.c.id,
+        )
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
-_ACTIVE_POLICY_SQL = """
-SELECT
-    id,
-    workspace_id,
-    allowed_operations,
-    hard_limits_jsonb,
-    soft_limits_jsonb
-FROM entitlement_policies
-WHERE workspace_id = %(workspace_id)s
-  AND status = 'active'
-ORDER BY updated_at DESC, created_at DESC, id
-LIMIT 1;
-""".strip()
+def active_policy_sql(*, workspace_id: str) -> SqlStatement:
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    statement = (
+        select(
+            entitlement_policies.c.id,
+            entitlement_policies.c.workspace_id,
+            entitlement_policies.c.allowed_operations,
+            entitlement_policies.c.hard_limits_jsonb,
+            entitlement_policies.c.soft_limits_jsonb,
+        )
+        .where(
+            entitlement_policies.c.workspace_id == workspace_param,
+            entitlement_policies.c.status == bindparam("status", value="active"),
+        )
+        .order_by(
+            entitlement_policies.c.updated_at.desc(),
+            entitlement_policies.c.created_at.desc(),
+            entitlement_policies.c.id,
+        )
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
-_ACTIVE_BALANCE_SQL = """
-SELECT
-    workspace_id,
-    entitlement_policy_id,
-    remaining_units_jsonb,
-    unlimited_units
-FROM workspace_balances
-WHERE workspace_id = %(workspace_id)s
-  AND entitlement_policy_id = %(entitlement_policy_id)s
-  AND period_start_at <= now()
-  AND period_end_at > now()
-LIMIT 1;
-""".strip()
+def active_balance_sql(*, workspace_id: str, entitlement_policy_id: str) -> SqlStatement:
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    statement = (
+        select(
+            workspace_balances.c.workspace_id,
+            workspace_balances.c.entitlement_policy_id,
+            workspace_balances.c.remaining_units_jsonb,
+            workspace_balances.c.unlimited_units,
+        )
+        .where(
+            workspace_balances.c.workspace_id == workspace_param,
+            workspace_balances.c.entitlement_policy_id == bindparam(
+                "entitlement_policy_id",
+                value=entitlement_policy_id,
+            ),
+            workspace_balances.c.period_start_at <= func.now(),
+            workspace_balances.c.period_end_at > func.now(),
+        )
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def _deny_policy(*, workspace_id: str) -> EntitlementPolicy:
@@ -280,4 +308,10 @@ def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
-__all__ = ["PostgresUsageContextProvider"]
+__all__ = [
+    "PostgresUsageContextProvider",
+    "active_balance_sql",
+    "active_policy_sql",
+    "provider_allocation_sql",
+    "service_allocation_sql",
+]

@@ -10,9 +10,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import bindparam, cast, func, literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
+
 from yutome import contract
 from yutome.hosted.account import AccountSessionError
 from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import account_grants
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 DEFAULT_CLI_AUDIENCE = "yutome:hosted-cli"
@@ -98,44 +103,46 @@ def create_pending_cli_grant_sql(
         "redirect_uri": redirect_uri,
         "state": state,
     }
-    return SqlStatement(
-        sql="""
-INSERT INTO account_grants (
-    id, user_id, workspace_id, kind, scopes, status, audience, client_id,
-    install_id, token_version, metadata_json, expires_at, created_at
-)
-VALUES (
-    %(id)s, %(user_id)s, %(workspace_id)s, 'cli_install', %(scopes)s,
-    'pending', %(audience)s, %(client_id)s, %(install_id)s, 1,
-    %(metadata_json)s::jsonb, %(expires_at)s, now()
-)
-RETURNING *;
-""".strip(),
-        params={
-            "id": grant_id,
-            "user_id": user_id,
-            "workspace_id": workspace_id,
-            "scopes": list(dict.fromkeys(scopes)),
-            "audience": audience,
-            "client_id": client_id,
-            "install_id": code_hash_value,
-            "metadata_json": _json_param({key: value for key, value in metadata.items() if value is not None}),
-            "expires_at": expires_at,
-        },
+    statement = (
+        insert(account_grants)
+        .values(
+            id=bindparam("id", value=grant_id),
+            user_id=bindparam("user_id", value=user_id),
+            workspace_id=bindparam("workspace_id", value=workspace_id),
+            kind=literal("cli_install"),
+            scopes=bindparam("scopes", value=list(dict.fromkeys(scopes))),
+            status=literal("pending"),
+            audience=bindparam("audience", value=audience),
+            client_id=bindparam("client_id", value=client_id),
+            install_id=bindparam("install_id", value=code_hash_value),
+            token_version=literal(1),
+            metadata_json=cast(
+                bindparam(
+                    "metadata_json",
+                    value=_json_param({key: value for key, value in metadata.items() if value is not None}),
+                ),
+                JSONB,
+            ),
+            expires_at=bindparam("expires_at", value=expires_at),
+            created_at=func.now(),
+        )
+        .returning(account_grants)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def load_cli_grant_by_code_hash_sql(*, code_hash_value: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT *
-FROM account_grants
-WHERE kind = 'cli_install'
-  AND install_id = %(code_hash)s
-LIMIT 1;
-""".strip(),
-        params={"code_hash": code_hash_value},
+    statement = (
+        select(account_grants)
+        .where(
+            account_grants.c.kind == literal("cli_install"),
+            account_grants.c.install_id == bindparam("code_hash", value=code_hash_value),
+        )
+        .limit(1)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def activate_pending_cli_grant_sql(
@@ -148,54 +155,54 @@ def activate_pending_cli_grant_sql(
 ) -> SqlStatement:
     merged_metadata = {"purpose": "cli_install", "authorized_at": datetime.now(timezone.utc).isoformat()}
     merged_metadata.update(dict(metadata or {}))
-    return SqlStatement(
-        sql="""
-UPDATE account_grants
-SET status = 'active',
-    install_id = %(install_id)s,
-    token_version = 1,
-    expires_at = %(token_expires_at)s,
-    last_used_at = now(),
-    metadata_json = metadata_json || %(metadata_json)s::jsonb
-WHERE id = %(grant_id)s
-  AND kind = 'cli_install'
-  AND status = 'pending'
-  AND install_id = %(code_hash)s
-RETURNING *;
-""".strip(),
-        params={
-            "grant_id": grant_id,
-            "code_hash": code_hash_value,
-            "install_id": install_id,
-            "token_expires_at": token_expires_at,
-            "metadata_json": _json_param(merged_metadata),
-        },
+    statement = (
+        update(account_grants)
+        .where(
+            account_grants.c.id == bindparam("grant_id", value=grant_id),
+            account_grants.c.kind == literal("cli_install"),
+            account_grants.c.status == literal("pending"),
+            account_grants.c.install_id == bindparam("code_hash", value=code_hash_value),
+        )
+        .values(
+            status=literal("active"),
+            install_id=bindparam("install_id", value=install_id),
+            token_version=literal(1),
+            expires_at=bindparam("token_expires_at", value=token_expires_at),
+            last_used_at=func.now(),
+            metadata_json=account_grants.c.metadata_json.op("||")(
+                cast(bindparam("metadata_json", value=_json_param(merged_metadata)), JSONB)
+            ),
+        )
+        .returning(account_grants)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def load_cli_grant_by_id_sql(*, grant_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-SELECT *
-FROM account_grants
-WHERE id = %(grant_id)s
-  AND kind = 'cli_install'
-LIMIT 1;
-""".strip(),
-        params={"grant_id": grant_id},
+    statement = (
+        select(account_grants)
+        .where(
+            account_grants.c.id == bindparam("grant_id", value=grant_id),
+            account_grants.c.kind == literal("cli_install"),
+        )
+        .limit(1)
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def mark_cli_grant_used_sql(*, grant_id: str) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-UPDATE account_grants
-SET last_used_at = now()
-WHERE id = %(grant_id)s
-  AND kind = 'cli_install';
-""".strip(),
-        params={"grant_id": grant_id},
+    statement = (
+        update(account_grants)
+        .where(
+            account_grants.c.id == bindparam("grant_id", value=grant_id),
+            account_grants.c.kind == literal("cli_install"),
+        )
+        .values(last_used_at=func.now())
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def sign_cli_token(

@@ -7,11 +7,10 @@ minimal `UsageGate` inputs and **fails closed** (missing policy/balance → deny
 whereas a dashboard read of an unprovisioned or out-of-period workspace should
 **fail soft** — return a clear "no active plan" projection, never a denial.
 
-SQL is raw, parameterized psycopg (`%(name)s`) to match the existing read paths
-(`entitlements.py`); these are SELECTs, not the ordinary upserts being moved to a
-SQLAlchemy Core metadata module. None of these reads is metered — they never go
-through `UsageGate`, so rendering the dashboard cannot spend a workspace's
-`queries` budget.
+SQL is built with SQLAlchemy Core (compiled to the psycopg `%(name)s` shape) to
+match the repository layer; these are SELECTs, not the upserts in the repository
+module. None of these reads is metered — they never go through `UsageGate`, so
+rendering the dashboard cannot spend a workspace's `queries` budget.
 """
 
 from __future__ import annotations
@@ -22,8 +21,20 @@ from decimal import Decimal
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
+from sqlalchemy import bindparam, distinct, func, select
 
 from yutome.hosted.models import jsonable_exact
+from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import (
+    account_grants,
+    entitlement_policies,
+    sources,
+    usage_events,
+    videos,
+    workspace_balances,
+    workspaces,
+)
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 class SqlConnection(Protocol):
@@ -116,59 +127,134 @@ class ConnectedAssistant(BaseModel):
     expires_at: datetime | None = None
 
 
-_ACTIVE_WORKSPACE_SQL = """
-SELECT id, name, status
-FROM workspaces
-WHERE id = %(workspace_id)s
-LIMIT 1;
-""".strip()
+def _active_workspace_sql(*, workspace_id: str) -> SqlStatement:
+    statement = (
+        select(workspaces.c.id, workspaces.c.name, workspaces.c.status)
+        .where(workspaces.c.id == bindparam("workspace_id", value=workspace_id))
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
-_SUMMARY_POLICY_SQL = """
-SELECT id, plan_key, included_units_jsonb
-FROM entitlement_policies
-WHERE workspace_id = %(workspace_id)s
-  AND status = 'active'
-ORDER BY updated_at DESC, created_at DESC, id
-LIMIT 1;
-""".strip()
 
-_SUMMARY_BALANCE_SQL = """
-SELECT period_start_at, period_end_at, used_units_jsonb, reserved_units_jsonb,
-       remaining_units_jsonb, unlimited_units
-FROM workspace_balances
-WHERE workspace_id = %(workspace_id)s
-  AND entitlement_policy_id = %(entitlement_policy_id)s
-  AND period_start_at <= now()
-  AND period_end_at > now()
-LIMIT 1;
-""".strip()
+def _summary_policy_sql(*, workspace_id: str) -> SqlStatement:
+    statement = (
+        select(
+            entitlement_policies.c.id,
+            entitlement_policies.c.plan_key,
+            entitlement_policies.c.included_units_jsonb,
+        )
+        .where(
+            entitlement_policies.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+            entitlement_policies.c.status == bindparam("status", value="active"),
+        )
+        .order_by(
+            entitlement_policies.c.updated_at.desc(),
+            entitlement_policies.c.created_at.desc(),
+            entitlement_policies.c.id,
+        )
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
-_LIBRARY_COUNTS_SQL = """
-SELECT
-    (SELECT count(*) FROM videos WHERE workspace_id = %(workspace_id)s) AS videos,
-    (SELECT count(DISTINCT channel_id) FROM videos
-        WHERE workspace_id = %(workspace_id)s AND channel_id IS NOT NULL) AS channels,
-    (SELECT count(*) FROM sources
-        WHERE workspace_id = %(workspace_id)s AND status = 'active') AS sources;
-""".strip()
 
-_LIBRARY_RECENT_SQL = """
-SELECT youtube_video_id, title, channel_id, published_at, duration_seconds
-FROM videos
-WHERE workspace_id = %(workspace_id)s
-ORDER BY published_at DESC NULLS LAST, created_at DESC
-LIMIT %(limit)s;
-""".strip()
+def _summary_balance_sql(*, workspace_id: str, entitlement_policy_id: str) -> SqlStatement:
+    statement = (
+        select(
+            workspace_balances.c.period_start_at,
+            workspace_balances.c.period_end_at,
+            workspace_balances.c.used_units_jsonb,
+            workspace_balances.c.reserved_units_jsonb,
+            workspace_balances.c.remaining_units_jsonb,
+            workspace_balances.c.unlimited_units,
+        )
+        .where(
+            workspace_balances.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+            workspace_balances.c.entitlement_policy_id == bindparam(
+                "entitlement_policy_id",
+                value=entitlement_policy_id,
+            ),
+            workspace_balances.c.period_start_at <= func.now(),
+            workspace_balances.c.period_end_at > func.now(),
+        )
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
-_ASSISTANTS_SQL = """
-SELECT id, client_id, scopes, audience, status, token_version,
-       created_at, last_used_at, expires_at
-FROM account_grants
-WHERE workspace_id = %(workspace_id)s
-  AND status = 'active'
-  AND kind = 'mcp_client'
-ORDER BY created_at DESC;
-""".strip()
+
+def _library_counts_sql(*, workspace_id: str) -> SqlStatement:
+    videos_count = (
+        select(func.count())
+        .select_from(videos)
+        .where(videos.c.workspace_id == bindparam("workspace_id", value=workspace_id))
+        .scalar_subquery()
+        .label("videos")
+    )
+    channels_count = (
+        select(func.count(distinct(videos.c.channel_id)))
+        .where(
+            videos.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+            videos.c.channel_id.is_not(None),
+        )
+        .scalar_subquery()
+        .label("channels")
+    )
+    sources_count = (
+        select(func.count())
+        .select_from(sources)
+        .where(
+            sources.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+            sources.c.status == bindparam("source_status", value="active"),
+        )
+        .scalar_subquery()
+        .label("sources")
+    )
+    statement = select(videos_count, channels_count, sources_count)
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
+def _library_recent_sql(*, workspace_id: str, limit: int) -> SqlStatement:
+    statement = (
+        select(
+            videos.c.youtube_video_id,
+            videos.c.title,
+            videos.c.channel_id,
+            videos.c.published_at,
+            videos.c.duration_seconds,
+        )
+        .where(videos.c.workspace_id == bindparam("workspace_id", value=workspace_id))
+        .order_by(videos.c.published_at.desc().nullslast(), videos.c.created_at.desc())
+        .limit(bindparam("limit", value=limit))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
+def _assistants_sql(*, workspace_id: str) -> SqlStatement:
+    statement = (
+        select(
+            account_grants.c.id,
+            account_grants.c.client_id,
+            account_grants.c.scopes,
+            account_grants.c.audience,
+            account_grants.c.status,
+            account_grants.c.token_version,
+            account_grants.c.created_at,
+            account_grants.c.last_used_at,
+            account_grants.c.expires_at,
+        )
+        .where(
+            account_grants.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+            account_grants.c.status == bindparam("status", value="active"),
+            account_grants.c.kind == bindparam("kind", value="mcp_client"),
+        )
+        .order_by(account_grants.c.created_at.desc())
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def load_active_workspace(connection: SqlConnection, *, workspace_id: str) -> dict[str, Any] | None:
@@ -178,7 +264,8 @@ def load_active_workspace(connection: SqlConnection, *, workspace_id: str) -> di
     been removed or disabled, rather than serving an empty dashboard.
     """
 
-    row = _one(connection.execute(_ACTIVE_WORKSPACE_SQL, {"workspace_id": workspace_id}))
+    statement = _active_workspace_sql(workspace_id=workspace_id)
+    row = _one(connection.execute(statement.sql, statement.params))
     if row is None or str(row.get("status")) != "active":
         return None
     return row
@@ -210,15 +297,16 @@ _AI_TOKEN_RATES_USD: dict[tuple[str, str], Decimal] = {
     ("voyage", "total_tokens"): Decimal("0.02") / Decimal(1_000_000) * _AI_MARGIN,
 }
 
-_SUMMARY_AI_SPEND_SQL = """
-SELECT subject, actual_units_json
-FROM usage_events
-WHERE workspace_id = %(workspace_id)s
-  AND status IN ('succeeded', 'released')
-  AND subject IN ('gemini', 'voyage')
-  AND created_at >= %(period_start_at)s
-  AND created_at < %(period_end_at)s;
-""".strip()
+def _summary_ai_spend_sql(*, workspace_id: str, period_start_at: Any, period_end_at: Any) -> SqlStatement:
+    statement = select(usage_events.c.subject, usage_events.c.actual_units_json).where(
+        usage_events.c.workspace_id == bindparam("workspace_id", value=workspace_id),
+        usage_events.c.status.in_(["succeeded", "released"]),
+        usage_events.c.subject.in_(["gemini", "voyage"]),
+        usage_events.c.created_at >= bindparam("period_start_at", value=period_start_at),
+        usage_events.c.created_at < bindparam("period_end_at", value=period_end_at),
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def _ai_token_count(units: Mapping[str, Any], key: str) -> Decimal:
@@ -292,25 +380,26 @@ def _build_entitlements(
 
 
 def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> WorkspaceSummary:
-    workspace_row = _one(connection.execute(_ACTIVE_WORKSPACE_SQL, {"workspace_id": workspace_id}))
+    workspace_statement = _active_workspace_sql(workspace_id=workspace_id)
+    workspace_row = _one(connection.execute(workspace_statement.sql, workspace_statement.params))
     workspace = WorkspaceRef(
         id=workspace_id,
         name=_optional_str(workspace_row.get("name")) if workspace_row else None,
     )
 
-    policy_row = _one(connection.execute(_SUMMARY_POLICY_SQL, {"workspace_id": workspace_id}))
+    policy_statement = _summary_policy_sql(workspace_id=workspace_id)
+    policy_row = _one(connection.execute(policy_statement.sql, policy_statement.params))
     if policy_row is None:
         return WorkspaceSummary(state="no_active_plan", workspace=workspace)
 
     plan_key = _optional_str(policy_row.get("plan_key"))
     included = _json_mapping(policy_row.get("included_units_jsonb"))
 
-    balance_row = _one(
-        connection.execute(
-            _SUMMARY_BALANCE_SQL,
-            {"workspace_id": workspace_id, "entitlement_policy_id": str(policy_row["id"])},
-        )
+    balance_statement = _summary_balance_sql(
+        workspace_id=workspace_id,
+        entitlement_policy_id=str(policy_row["id"]),
     )
+    balance_row = _one(connection.execute(balance_statement.sql, balance_statement.params))
     if balance_row is None:
         # Policy exists but no balance for the current period: show the plan and
         # its included allowances, but mark the period inactive.
@@ -342,16 +431,12 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         )
         for unit in unit_names
     ]
-    ai_spend_rows = _rows_from_result(
-        connection.execute(
-            _SUMMARY_AI_SPEND_SQL,
-            {
-                "workspace_id": workspace_id,
-                "period_start_at": balance_row["period_start_at"],
-                "period_end_at": balance_row["period_end_at"],
-            },
-        )
+    ai_spend_statement = _summary_ai_spend_sql(
+        workspace_id=workspace_id,
+        period_start_at=balance_row["period_start_at"],
+        period_end_at=balance_row["period_end_at"],
     )
+    ai_spend_rows = _rows_from_result(connection.execute(ai_spend_statement.sql, ai_spend_statement.params))
     return WorkspaceSummary(
         state="active",
         plan_key=plan_key,
@@ -364,15 +449,15 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
 
 
 def read_library_overview(connection: SqlConnection, *, workspace_id: str, recent_limit: int = 10) -> LibraryOverview:
-    counts_row = _one(connection.execute(_LIBRARY_COUNTS_SQL, {"workspace_id": workspace_id})) or {}
+    counts_statement = _library_counts_sql(workspace_id=workspace_id)
+    counts_row = _one(connection.execute(counts_statement.sql, counts_statement.params)) or {}
     counts = {
         "videos": _int(counts_row.get("videos")),
         "channels": _int(counts_row.get("channels")),
         "sources": _int(counts_row.get("sources")),
     }
-    recent_rows = _rows_from_result(
-        connection.execute(_LIBRARY_RECENT_SQL, {"workspace_id": workspace_id, "limit": max(0, recent_limit)})
-    )
+    recent_statement = _library_recent_sql(workspace_id=workspace_id, limit=max(0, recent_limit))
+    recent_rows = _rows_from_result(connection.execute(recent_statement.sql, recent_statement.params))
     recent = [
         LibraryVideo(
             video_id=str(row.get("youtube_video_id")),
@@ -387,7 +472,8 @@ def read_library_overview(connection: SqlConnection, *, workspace_id: str, recen
 
 
 def read_active_account_grants(connection: SqlConnection, *, workspace_id: str) -> list[ConnectedAssistant]:
-    rows = _rows_from_result(connection.execute(_ASSISTANTS_SQL, {"workspace_id": workspace_id}))
+    statement = _assistants_sql(workspace_id=workspace_id)
+    rows = _rows_from_result(connection.execute(statement.sql, statement.params))
     return [
         ConnectedAssistant(
             grant_id=str(row.get("id")),

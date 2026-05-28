@@ -14,7 +14,12 @@ import hashlib
 import secrets
 from datetime import datetime
 
+from sqlalchemy import bindparam, update
+from sqlalchemy.dialects.postgresql import insert
+
 from yutome.hosted.repositories import SqlStatement
+from yutome.hosted.schema import email_login_tokens
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 LOGIN_TOKEN_BYTES = 32
 DEFAULT_LOGIN_TOKEN_TTL_SECONDS = 15 * 60
@@ -46,27 +51,18 @@ def insert_login_token_sql(
     expires_at: datetime,
     user_agent: str | None,
 ) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO email_login_tokens (
-    id, token_hash, normalized_email, name, workspace_name, redirect_path, user_agent, expires_at
-)
-VALUES (
-    %(id)s, %(token_hash)s, %(normalized_email)s, %(name)s, %(workspace_name)s,
-    %(redirect_path)s, %(user_agent)s, %(expires_at)s
-);
-""".strip(),
-        params={
-            "id": token_id,
-            "token_hash": token_hash,
-            "normalized_email": normalized_email,
-            "name": name,
-            "workspace_name": workspace_name,
-            "redirect_path": redirect_path,
-            "user_agent": user_agent,
-            "expires_at": expires_at,
-        },
+    statement = insert(email_login_tokens).values(
+        id=token_id,
+        token_hash=token_hash,
+        normalized_email=normalized_email,
+        name=name,
+        workspace_name=workspace_name,
+        redirect_path=redirect_path,
+        user_agent=user_agent,
+        expires_at=expires_at,
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 def consume_login_token_sql(*, token_hash: str, now: datetime) -> SqlStatement:
@@ -75,17 +71,24 @@ def consume_login_token_sql(*, token_hash: str, now: datetime) -> SqlStatement:
     Returns the stored sign-up details for the matched row, or no rows when the
     token is unknown, already used, or expired.
     """
-    return SqlStatement(
-        sql="""
-UPDATE email_login_tokens
-SET consumed_at = %(now)s
-WHERE token_hash = %(token_hash)s
-  AND consumed_at IS NULL
-  AND expires_at > %(now)s
-RETURNING normalized_email, name, workspace_name, redirect_path;
-""".strip(),
-        params={"token_hash": token_hash, "now": now},
+    now_param = bindparam("now", value=now)
+    statement = (
+        update(email_login_tokens)
+        .where(
+            email_login_tokens.c.token_hash == bindparam("token_hash", value=token_hash),
+            email_login_tokens.c.consumed_at.is_(None),
+            email_login_tokens.c.expires_at > now_param,
+        )
+        .values(consumed_at=now_param)
+        .returning(
+            email_login_tokens.c.normalized_email,
+            email_login_tokens.c.name,
+            email_login_tokens.c.workspace_name,
+            email_login_tokens.c.redirect_path,
+        )
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
 
 
 __all__ = [

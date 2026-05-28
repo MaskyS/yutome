@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert
 
 from yutome.config import AppConfig
 from yutome.hosted.control_plane import Job, Source, SourceRefreshPolicy, TERMINAL_JOB_STATUSES
@@ -38,7 +40,9 @@ from yutome.hosted.jobs import claim_jobs_sql
 from yutome.hosted.ledger import PostgresUsageGate, PostgresUsageLedger, release_stale_unknown_usage_reservations
 from yutome.hosted.postgres import apply_hosted_schema, apply_phase1_schema, apply_phase4_schema, apply_schema
 from yutome.hosted.repositories import SqlStatement, usage_repository_constraint_statements
+from yutome.hosted.schema import source_refresh_policies, sources, workspaces
 from yutome.hosted.search_store import PostgresVectorChordSearchStore
+from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
 MigrationPhase = Literal["phase1", "phase4", "hosted"]
@@ -647,102 +651,85 @@ SELECT 'source_refresh_policy' AS target, id FROM released_source_locks;
     )
 
 
+def _sql_statement(statement: Any) -> SqlStatement:
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
 def ensure_workspace_sql(*, workspace_id: str, name: str | None = None) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO workspaces (id, name, status)
-VALUES (%(workspace_id)s, %(name)s, 'active')
-ON CONFLICT (id) DO NOTHING
-RETURNING *;
-""".strip(),
-        params={"workspace_id": workspace_id, "name": name or workspace_id},
+    statement = (
+        insert(workspaces)
+        .values(id=workspace_id, name=name or workspace_id, status="active")
+        .on_conflict_do_nothing(index_elements=[workspaces.c.id])
+        .returning(workspaces)
     )
+    return _sql_statement(statement)
 
 
 def upsert_hosted_source_sql(source: Source) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO sources (
-    id, workspace_id, source_type, source_url, canonical_channel_id,
-    canonical_playlist_id, canonical_video_id, display_name, selected,
-    auto_index_allowed, import_source, auth_grant_id, metadata_json, status
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_type)s, %(source_url)s,
-    %(canonical_channel_id)s, %(canonical_playlist_id)s, %(canonical_video_id)s,
-    %(display_name)s, %(selected)s, %(auto_index_allowed)s, %(import_source)s,
-    %(auth_grant_id)s, %(metadata_json)s::jsonb, %(status)s
-)
-ON CONFLICT (workspace_id, source_url) DO UPDATE
-SET source_type = EXCLUDED.source_type,
-    canonical_channel_id = COALESCE(EXCLUDED.canonical_channel_id, sources.canonical_channel_id),
-    canonical_playlist_id = COALESCE(EXCLUDED.canonical_playlist_id, sources.canonical_playlist_id),
-    canonical_video_id = COALESCE(EXCLUDED.canonical_video_id, sources.canonical_video_id),
-    display_name = COALESCE(EXCLUDED.display_name, sources.display_name),
-    selected = EXCLUDED.selected,
-    auto_index_allowed = EXCLUDED.auto_index_allowed,
-    import_source = EXCLUDED.import_source,
-    auth_grant_id = EXCLUDED.auth_grant_id,
-    metadata_json = sources.metadata_json || EXCLUDED.metadata_json,
-    status = EXCLUDED.status,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
-            "id": source.id,
-            "workspace_id": source.workspace_id,
-            "source_type": source.source_type,
-            "source_url": source.source_url,
-            "canonical_channel_id": source.canonical_channel_id,
-            "canonical_playlist_id": source.canonical_playlist_id,
-            "canonical_video_id": source.canonical_video_id,
-            "display_name": source.display_name,
-            "selected": source.selected,
-            "auto_index_allowed": source.auto_index_allowed,
-            "import_source": source.import_source,
-            "auth_grant_id": source.auth_grant_id,
-            "metadata_json": _json_param(source.metadata_jsonb),
-            "status": source.status,
-        },
+    statement = insert(sources).values(
+        id=source.id,
+        workspace_id=source.workspace_id,
+        source_type=source.source_type,
+        source_url=source.source_url,
+        canonical_channel_id=source.canonical_channel_id,
+        canonical_playlist_id=source.canonical_playlist_id,
+        canonical_video_id=source.canonical_video_id,
+        display_name=source.display_name,
+        selected=source.selected,
+        auto_index_allowed=source.auto_index_allowed,
+        import_source=source.import_source,
+        auth_grant_id=source.auth_grant_id,
+        metadata_json=_json_param(source.metadata_jsonb),
+        status=source.status,
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[sources.c.workspace_id, sources.c.source_url],
+        set_={
+            "source_type": statement.excluded.source_type,
+            "canonical_channel_id": func.coalesce(statement.excluded.canonical_channel_id, sources.c.canonical_channel_id),
+            "canonical_playlist_id": func.coalesce(statement.excluded.canonical_playlist_id, sources.c.canonical_playlist_id),
+            "canonical_video_id": func.coalesce(statement.excluded.canonical_video_id, sources.c.canonical_video_id),
+            "display_name": func.coalesce(statement.excluded.display_name, sources.c.display_name),
+            "selected": statement.excluded.selected,
+            "auto_index_allowed": statement.excluded.auto_index_allowed,
+            "import_source": statement.excluded.import_source,
+            "auth_grant_id": statement.excluded.auth_grant_id,
+            # EXCLUDED.metadata_json is the jsonb column value, so `jsonb || jsonb` needs no cast.
+            "metadata_json": sources.c.metadata_json.op("||")(statement.excluded.metadata_json),
+            "status": statement.excluded.status,
+            "updated_at": func.now(),
+        },
+    ).returning(sources)
+    return _sql_statement(statement)
 
 
 def upsert_source_refresh_policy_sql(policy: SourceRefreshPolicy) -> SqlStatement:
-    return SqlStatement(
-        sql="""
-INSERT INTO source_refresh_policies (
-    id, workspace_id, source_id, enabled, cadence_seconds, jitter_seconds,
-    next_run_at, max_new_videos_per_run, max_index_jobs_per_day, policy_snapshot_json
-)
-VALUES (
-    %(id)s, %(workspace_id)s, %(source_id)s, %(enabled)s,
-    %(cadence_seconds)s, %(jitter_seconds)s, %(next_run_at)s,
-    %(max_new_videos_per_run)s, %(max_index_jobs_per_day)s,
-    %(policy_snapshot_json)s::jsonb
-)
-ON CONFLICT (workspace_id, source_id) DO UPDATE
-SET enabled = EXCLUDED.enabled,
-    cadence_seconds = EXCLUDED.cadence_seconds,
-    jitter_seconds = EXCLUDED.jitter_seconds,
-    max_new_videos_per_run = EXCLUDED.max_new_videos_per_run,
-    max_index_jobs_per_day = EXCLUDED.max_index_jobs_per_day,
-    policy_snapshot_json = EXCLUDED.policy_snapshot_json,
-    updated_at = now()
-RETURNING *;
-""".strip(),
-        params={
-            "id": policy.id,
-            "workspace_id": policy.workspace_id,
-            "source_id": policy.source_id,
-            "enabled": policy.enabled,
-            "cadence_seconds": policy.cadence_seconds,
-            "jitter_seconds": policy.jitter_seconds,
-            "next_run_at": policy.next_run_at,
-            "max_new_videos_per_run": policy.max_new_videos_per_run,
-            "max_index_jobs_per_day": policy.max_index_jobs_per_day,
-            "policy_snapshot_json": _json_param(policy.policy_snapshot_jsonb),
-        },
+    statement = insert(source_refresh_policies).values(
+        id=policy.id,
+        workspace_id=policy.workspace_id,
+        source_id=policy.source_id,
+        enabled=policy.enabled,
+        cadence_seconds=policy.cadence_seconds,
+        jitter_seconds=policy.jitter_seconds,
+        next_run_at=policy.next_run_at,
+        max_new_videos_per_run=policy.max_new_videos_per_run,
+        max_index_jobs_per_day=policy.max_index_jobs_per_day,
+        policy_snapshot_json=_json_param(policy.policy_snapshot_jsonb),
     )
+    statement = statement.on_conflict_do_update(
+        index_elements=[source_refresh_policies.c.workspace_id, source_refresh_policies.c.source_id],
+        set_={
+            "enabled": statement.excluded.enabled,
+            "cadence_seconds": statement.excluded.cadence_seconds,
+            "jitter_seconds": statement.excluded.jitter_seconds,
+            "max_new_videos_per_run": statement.excluded.max_new_videos_per_run,
+            "max_index_jobs_per_day": statement.excluded.max_index_jobs_per_day,
+            "policy_snapshot_json": statement.excluded.policy_snapshot_json,
+            "updated_at": func.now(),
+        },
+    ).returning(source_refresh_policies)
+    return _sql_statement(statement)
 
 
 def postgres_url_from_env(
