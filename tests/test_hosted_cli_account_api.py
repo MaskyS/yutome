@@ -364,7 +364,8 @@ def test_dashboard_youtube_oauth_lists_and_imports_selected_subscriptions(monkey
     client = build_client(
         connection,
         youtube_oauth_settings=YouTubeOAuthSettings(
-            client=OAuthClient(client_id="youtube-client", client_secret="youtube-secret")
+            client=OAuthClient(client_id="youtube-client", client_secret="youtube-secret"),
+            token_encryption_key="youtube-token-encryption-key",
         ),
     )
 
@@ -394,6 +395,9 @@ def test_dashboard_youtube_oauth_lists_and_imports_selected_subscriptions(monkey
     )
     assert authorize.status_code == 200, authorize.text
     state = parse_qs(urlsplit(authorize.json()["authorization_url"]).query)["state"][0]
+    pending_grant = next(iter(connection.youtube_grants.values()))
+    assert "code_verifier" not in pending_grant["metadata_json"]
+    assert pending_grant["metadata_json"]["code_verifier_ciphertext"].startswith("v1:")
 
     callback = client.post(
         "/account/youtube/callback",
@@ -402,6 +406,11 @@ def test_dashboard_youtube_oauth_lists_and_imports_selected_subscriptions(monkey
     )
     assert callback.status_code == 200, callback.text
     assert callback.json()["connected"] is True
+    active_grant = next(iter(connection.youtube_grants.values()))
+    assert "access_token" not in active_grant["metadata_json"]
+    assert "refresh_token" not in active_grant["metadata_json"]
+    assert active_grant["metadata_json"]["access_token_ciphertext"].startswith("v1:")
+    assert active_grant["metadata_json"]["refresh_token_ciphertext"].startswith("v1:")
 
     subscriptions = client.get("/account/youtube/subscriptions", headers=account_headers())
     assert subscriptions.status_code == 200, subscriptions.text
@@ -440,6 +449,24 @@ def test_dashboard_youtube_oauth_authorize_requires_configuration() -> None:
 
     assert response.status_code == 503
     assert error_body(response.json())["code"] == "youtube_oauth_unconfigured"
+
+
+def test_dashboard_youtube_oauth_authorize_requires_token_encryption_key() -> None:
+    client = build_client(
+        StatefulAccountConnection(),
+        youtube_oauth_settings=YouTubeOAuthSettings(
+            client=OAuthClient(client_id="youtube-client", client_secret="youtube-secret"),
+        ),
+    )
+
+    response = client.post(
+        "/account/youtube/authorize",
+        json={"redirect_uri": "http://localhost:3000/dashboard/youtube/callback"},
+        headers=account_headers(),
+    )
+
+    assert response.status_code == 503
+    assert error_body(response.json())["code"] == "youtube_oauth_token_encryption_unconfigured"
 
 
 def test_dashboard_source_import_requires_account_session_and_dashboard_token() -> None:

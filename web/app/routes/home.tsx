@@ -26,6 +26,14 @@ export default function Home() {
           <Link to="/signup">Get started</Link>
         </Button>
       </div>
+      <footer className="text-muted-foreground flex gap-4 text-xs">
+        <Link to="/privacy" className="hover:text-foreground">
+          Privacy
+        </Link>
+        <Link to="/terms" className="hover:text-foreground">
+          Terms
+        </Link>
+      </footer>
     </main>
   );
 }

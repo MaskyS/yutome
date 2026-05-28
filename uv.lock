@@ -3275,6 +3275,7 @@ version = "0.1.14"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "cryptography" },
     { name = "curl-cffi" },
     { name = "fastapi" },
     { name = "faster-whisper" },
@@ -3304,6 +3305,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.13,<2" },
+    { name = "cryptography", specifier = ">=48,<49" },
     { name = "curl-cffi", specifier = ">=0.11,<0.15" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "faster-whisper", specifier = ">=1.1" },

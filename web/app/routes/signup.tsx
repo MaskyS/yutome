@@ -1,4 +1,4 @@
-import { Form, useActionData, useNavigation, useSearchParams } from "react-router";
+import { Form, Link, useActionData, useNavigation, useSearchParams } from "react-router";
 import { CircleUserRound } from "lucide-react";
 
 import type { Route } from "./+types/signup";
@@ -155,6 +155,14 @@ export default function Signup() {
           </Form>
         </CardContent>
       </Card>
+      <footer className="text-muted-foreground mt-6 flex justify-center gap-4 text-xs">
+        <Link to="/privacy" className="hover:text-foreground">
+          Privacy
+        </Link>
+        <Link to="/terms" className="hover:text-foreground">
+          Terms
+        </Link>
+      </footer>
     </main>
   );
 }

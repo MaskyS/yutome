@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 import urllib.error
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import bindparam, cast, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
@@ -39,6 +41,8 @@ from yutome.youtube_oauth import (
 
 YOUTUBE_OAUTH_STATE_TTL_SECONDS = 10 * 60
 YOUTUBE_SUBSCRIPTION_IMPORT_SOURCE = "youtube_oauth_subscriptions"
+YOUTUBE_TOKEN_ENCRYPTION_ENV_VAR = "YUTOME_YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY"
+YOUTUBE_TOKEN_ENCRYPTION_ALGORITHM = "aesgcm-sha256-v1"
 
 
 class HostedYouTubeOAuthError(RuntimeError):
@@ -60,6 +64,7 @@ class HostedYouTubeOAuthError(RuntimeError):
 @dataclass(frozen=True)
 class YouTubeOAuthSettings:
     client: OAuthClient | None
+    token_encryption_key: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -74,7 +79,8 @@ def youtube_oauth_settings_from_env(environ: Mapping[str, str]) -> YouTubeOAuthS
         client=OAuthClient(
             client_id=client_id,
             client_secret=_optional_text(environ.get("YUTOME_YOUTUBE_OAUTH_CLIENT_SECRET")),
-        )
+        ),
+        token_encryption_key=_optional_text(environ.get(YOUTUBE_TOKEN_ENCRYPTION_ENV_VAR)),
     )
 
 
@@ -106,6 +112,7 @@ def start_youtube_authorization(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     client = _require_client(settings)
+    token_encryption_key = _require_token_encryption_key(settings)
     redirect_uri = _validate_dashboard_redirect_uri(redirect_uri)
     issued_at = now or datetime.now(timezone.utc)
     expires_at = issued_at + timedelta(seconds=YOUTUBE_OAUTH_STATE_TTL_SECONDS)
@@ -128,6 +135,7 @@ def start_youtube_authorization(
         workspace_id=workspace_id,
         state_hash=oauth_state_hash(state),
         code_verifier=verifier,
+        token_encryption_key=token_encryption_key,
         redirect_uri=redirect_uri,
         expires_at=expires_at,
         now=issued_at,
@@ -160,6 +168,7 @@ def complete_youtube_authorization(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     client = _require_client(settings)
+    token_encryption_key = _require_token_encryption_key(settings)
     redirect_uri = _validate_dashboard_redirect_uri(redirect_uri)
     clock = now or datetime.now(timezone.utc)
     state_claims = verify_youtube_oauth_state(
@@ -191,7 +200,12 @@ def complete_youtube_authorization(
             message="This YouTube connection attempt has expired. Start again.",
             status_code=401,
         )
-    verifier = _optional_text(metadata.get("code_verifier"))
+    verifier = _metadata_secret(
+        metadata,
+        "code_verifier",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(str(grant["id"]), "code_verifier"),
+    )
     if verifier is None:
         raise HostedYouTubeOAuthError(
             code="youtube_oauth_state_invalid",
@@ -211,6 +225,8 @@ def complete_youtube_authorization(
         connected_at=clock,
         redirect_uri=redirect_uri,
         previous_metadata={},
+        grant_id=str(grant["id"]),
+        token_encryption_key=token_encryption_key,
     )
     activate_statement = activate_youtube_grant_sql(
         grant_id=str(grant["id"]),
@@ -245,9 +261,9 @@ def list_youtube_subscription_channels(
     user_id: str,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    client = _require_client(settings)
+    _require_client(settings)
     grant = _require_active_grant(connection, workspace_id=workspace_id, user_id=user_id)
-    access_token = access_token_for_grant(connection, client=client, grant=grant)
+    access_token = access_token_for_grant(connection, settings=settings, grant=grant)
     channels = _fetch_channels_or_mark_invalid(connection, grant=grant, access_token=access_token)
     if limit is not None:
         channels = channels[: max(1, min(limit, 250))]
@@ -282,9 +298,9 @@ def import_youtube_subscription_channels(
             code="youtube_subscription_selection_too_large",
             message="Import at most 250 subscriptions at a time.",
         )
-    client = _require_client(settings)
+    _require_client(settings)
     grant = _require_active_grant(connection, workspace_id=workspace_id, user_id=user_id)
-    access_token = access_token_for_grant(connection, client=client, grant=grant)
+    access_token = access_token_for_grant(connection, settings=settings, grant=grant)
     channels = _fetch_channels_or_mark_invalid(connection, grant=grant, access_token=access_token)
     by_id = {channel.channel_id: channel for channel in channels if channel.channel_id}
     missing = [channel_id for channel_id in normalized_ids if channel_id not in by_id]
@@ -345,15 +361,28 @@ def revoke_youtube_connection(
     return {"ok": True, "revoked": True, "grant_id": str(grant["id"])}
 
 
-def access_token_for_grant(connection: Any, *, client: OAuthClient, grant: Mapping[str, Any]) -> str:
+def access_token_for_grant(connection: Any, *, settings: YouTubeOAuthSettings, grant: Mapping[str, Any]) -> str:
+    client = _require_client(settings)
+    token_encryption_key = _require_token_encryption_key(settings)
+    grant_id = str(grant["id"])
     metadata = _json_object(grant.get("metadata_json"))
-    token = _optional_text(metadata.get("access_token"))
+    token = _metadata_secret(
+        metadata,
+        "access_token",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(grant_id, "access_token"),
+    )
     access_expires_at = _metadata_datetime(metadata, "access_token_expires_at")
     if token and (access_expires_at is None or access_expires_at > datetime.now(timezone.utc) + timedelta(seconds=60)):
         statement = mark_youtube_grant_used_sql(grant_id=str(grant["id"]))
         connection.execute(statement.sql, statement.params)
         return token
-    refresh = _optional_text(metadata.get("refresh_token"))
+    refresh = _metadata_secret(
+        metadata,
+        "refresh_token",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(grant_id, "refresh_token"),
+    )
     if refresh is None:
         _expire_grant(connection, grant=grant)
         raise HostedYouTubeOAuthError(
@@ -375,6 +404,8 @@ def access_token_for_grant(connection: Any, *, client: OAuthClient, grant: Mappi
         connected_at=_metadata_datetime(metadata, "connected_at") or datetime.now(timezone.utc),
         redirect_uri=str(metadata.get("redirect_uri") or ""),
         previous_metadata=metadata,
+        grant_id=grant_id,
+        token_encryption_key=token_encryption_key,
     )
     statement = update_youtube_grant_token_sql(
         grant_id=str(grant["id"]),
@@ -384,7 +415,12 @@ def access_token_for_grant(connection: Any, *, client: OAuthClient, grant: Mappi
     rows = _rows_from_result(connection.execute(statement.sql, statement.params))
     row = rows[0] if rows else {"metadata_json": refreshed_metadata}
     refreshed_row_metadata = _json_object(row.get("metadata_json"))
-    access_token = _optional_text(refreshed_row_metadata.get("access_token"))
+    access_token = _metadata_secret(
+        refreshed_row_metadata,
+        "access_token",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(grant_id, "access_token"),
+    )
     if access_token is None:
         raise HostedYouTubeOAuthError(
             code="youtube_oauth_reconnect_required",
@@ -429,6 +465,17 @@ def _require_client(settings: YouTubeOAuthSettings) -> OAuthClient:
             status_code=503,
         )
     return settings.client
+
+
+def _require_token_encryption_key(settings: YouTubeOAuthSettings) -> str:
+    key = _optional_text(settings.token_encryption_key)
+    if key is None:
+        raise HostedYouTubeOAuthError(
+            code="youtube_oauth_token_encryption_unconfigured",
+            message=f"Set {YOUTUBE_TOKEN_ENCRYPTION_ENV_VAR} before using YouTube OAuth.",
+            status_code=503,
+        )
+    return key
 
 
 def _require_active_grant(connection: Any, *, workspace_id: str, user_id: str) -> Mapping[str, Any]:
@@ -559,6 +606,7 @@ def create_pending_youtube_grant_sql(
     workspace_id: str,
     state_hash: str,
     code_verifier: str,
+    token_encryption_key: str,
     redirect_uri: str,
     expires_at: datetime,
     now: datetime,
@@ -566,7 +614,12 @@ def create_pending_youtube_grant_sql(
     metadata = {
         "purpose": "youtube_oauth_authorization_code",
         "state_hash": state_hash,
-        "code_verifier": code_verifier,
+        "token_encryption": YOUTUBE_TOKEN_ENCRYPTION_ALGORITHM,
+        "code_verifier_ciphertext": _encrypt_metadata_secret(
+            code_verifier,
+            token_encryption_key=token_encryption_key,
+            aad=_secret_aad(grant_id, "code_verifier"),
+        ),
         "code_challenge_method": "S256",
         "redirect_uri": redirect_uri,
         "state_expires_at": expires_at.isoformat(),
@@ -713,8 +766,16 @@ def _token_metadata(
     connected_at: datetime,
     redirect_uri: str,
     previous_metadata: Mapping[str, Any],
+    grant_id: str,
+    token_encryption_key: str,
 ) -> dict[str, Any]:
-    access_token = _optional_text(token.get("access_token")) or _optional_text(previous_metadata.get("access_token"))
+    previous_access_token = _metadata_secret(
+        previous_metadata,
+        "access_token",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(grant_id, "access_token"),
+    )
+    access_token = _optional_text(token.get("access_token")) or previous_access_token
     if access_token is None:
         raise HostedYouTubeOAuthError(
             code="youtube_oauth_exchange_failed",
@@ -722,14 +783,33 @@ def _token_metadata(
             status_code=502,
         )
     expires_at = _token_expires_at(token) or _metadata_datetime(previous_metadata, "access_token_expires_at")
-    refresh = _optional_text(token.get("refresh_token")) or _optional_text(previous_metadata.get("refresh_token"))
+    previous_refresh_token = _metadata_secret(
+        previous_metadata,
+        "refresh_token",
+        token_encryption_key=token_encryption_key,
+        aad=_secret_aad(grant_id, "refresh_token"),
+    )
+    refresh = _optional_text(token.get("refresh_token")) or previous_refresh_token
     metadata = {
         "purpose": "youtube_subscription_discovery",
         "oauth_provider": "google",
+        "token_encryption": YOUTUBE_TOKEN_ENCRYPTION_ALGORITHM,
         "scope": _optional_text(token.get("scope")) or YOUTUBE_READONLY_SCOPE,
         "token_type": _optional_text(token.get("token_type")) or "Bearer",
-        "access_token": access_token,
-        "refresh_token": refresh,
+        "access_token_ciphertext": _encrypt_metadata_secret(
+            access_token,
+            token_encryption_key=token_encryption_key,
+            aad=_secret_aad(grant_id, "access_token"),
+        ),
+        "refresh_token_ciphertext": (
+            _encrypt_metadata_secret(
+                refresh,
+                token_encryption_key=token_encryption_key,
+                aad=_secret_aad(grant_id, "refresh_token"),
+            )
+            if refresh
+            else None
+        ),
         "access_token_expires_at": expires_at.isoformat() if expires_at is not None else None,
         "connected_at": connected_at.isoformat(),
         "redirect_uri": redirect_uri or _optional_text(previous_metadata.get("redirect_uri")),
@@ -738,7 +818,7 @@ def _token_metadata(
 
 
 def _grant_expires_at(metadata: Mapping[str, Any]) -> datetime | None:
-    if _optional_text(metadata.get("refresh_token")):
+    if _optional_text(metadata.get("refresh_token_ciphertext")) or _optional_text(metadata.get("refresh_token")):
         return None
     return _metadata_datetime(metadata, "access_token_expires_at")
 
@@ -827,6 +907,55 @@ def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def _encrypt_metadata_secret(value: str, *, token_encryption_key: str, aad: bytes) -> str:
+    secret = _optional_text(value)
+    if secret is None:
+        raise HostedYouTubeOAuthError(
+            code="youtube_oauth_token_secret_invalid",
+            message="OAuth token material was empty.",
+            status_code=500,
+        )
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(_aesgcm_key(token_encryption_key)).encrypt(nonce, secret.encode("utf-8"), aad)
+    return "v1:" + _base64url(nonce + ciphertext)
+
+
+def _metadata_secret(
+    metadata: Mapping[str, Any],
+    key: str,
+    *,
+    token_encryption_key: str,
+    aad: bytes,
+) -> str | None:
+    ciphertext = _optional_text(metadata.get(f"{key}_ciphertext"))
+    if ciphertext:
+        return _decrypt_metadata_secret(ciphertext, token_encryption_key=token_encryption_key, aad=aad)
+    return _optional_text(metadata.get(key))
+
+
+def _decrypt_metadata_secret(ciphertext: str, *, token_encryption_key: str, aad: bytes) -> str:
+    payload = ciphertext.removeprefix("v1:")
+    try:
+        raw = _base64url_decode(payload)
+        nonce, encrypted = raw[:12], raw[12:]
+        decrypted = AESGCM(_aesgcm_key(token_encryption_key)).decrypt(nonce, encrypted, aad)
+    except Exception as exc:
+        raise HostedYouTubeOAuthError(
+            code="youtube_oauth_token_secret_invalid",
+            message="OAuth token material could not be decrypted.",
+            status_code=500,
+        ) from exc
+    return decrypted.decode("utf-8")
+
+
+def _aesgcm_key(value: str) -> bytes:
+    return hashlib.sha256(value.strip().encode("utf-8")).digest()
+
+
+def _secret_aad(grant_id: str, key: str) -> bytes:
+    return f"youtube_grants:{grant_id}:{key}".encode("utf-8")
 
 
 def _rows_from_result(result: Any) -> list[dict[str, Any]]:

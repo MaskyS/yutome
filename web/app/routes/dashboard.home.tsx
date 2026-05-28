@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { AlertTriangle, Check, CirclePlay, Info, Loader2, Plus, RefreshCcw } from "lucide-react";
+import { AlertTriangle, Check, CirclePlay, Info, Loader2, Plus, RefreshCcw, Unplug } from "lucide-react";
 import { Link, useFetcher, useRevalidator, useRouteLoaderData } from "react-router";
 
 import type { Route } from "./+types/dashboard.home";
@@ -13,6 +13,7 @@ import {
   getYoutubeSubscriptions,
   HostedApiError,
   importYoutubeSubscriptions,
+  revokeYoutubeConnection,
   type WorkspaceEntitlement,
   type WorkspaceSummary,
   type YoutubeSubscriptionChannel,
@@ -84,6 +85,18 @@ export async function action({ request, context }: Route.ActionArgs) {
   const token = requireSessionToken(request);
   const form = await request.formData();
   const intent = String(form.get("_intent") ?? "add_source");
+  if (intent === "disconnect_youtube") {
+    try {
+      const result = await revokeYoutubeConnection(env, token);
+      return { ok: true, intent, revoked: result.revoked, imported: 0, jobs: 0 };
+    } catch (error) {
+      if (isAccountSessionError(error)) {
+        signupRedirect(env);
+      }
+      const message = error instanceof HostedApiError ? error.message : "Could not disconnect YouTube.";
+      return { ok: false, intent, error: message };
+    }
+  }
   if (intent === "import_youtube_subscriptions") {
     const channelIds = form
       .getAll("channel_id")
@@ -341,9 +354,9 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
               {youtubeActionData?.ok ? (
                 <Alert>
                   <AlertDescription>
-                    Imported {youtubeActionData.imported} channel
-                    {youtubeActionData.imported === 1 ? "" : "s"} and queued {youtubeActionData.jobs} job
-                    {youtubeActionData.jobs === 1 ? "" : "s"}.
+                    {youtubeActionData.intent === "disconnect_youtube"
+                      ? "YouTube disconnected."
+                      : `Imported ${youtubeActionData.imported} channel${youtubeActionData.imported === 1 ? "" : "s"} and queued ${youtubeActionData.jobs} job${youtubeActionData.jobs === 1 ? "" : "s"}.`}
                   </AlertDescription>
                 </Alert>
               ) : null}
@@ -357,12 +370,21 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
                     <span className="text-muted-foreground text-sm">
                       {youtube.grant?.connected_at ? `Connected ${formatDate(youtube.grant.connected_at)}` : "Connected"}
                     </span>
-                    <Button asChild variant="outline" size="sm">
-                      <Link to="/dashboard/youtube/start">
-                        <CirclePlay />
-                        Reconnect
-                      </Link>
-                    </Button>
+                    <div className="flex gap-2">
+                      <Button asChild variant="outline" size="sm">
+                        <Link to="/dashboard/youtube/start">
+                          <CirclePlay />
+                          Reconnect
+                        </Link>
+                      </Button>
+                      <youtubeFetcher.Form method="post">
+                        <input type="hidden" name="_intent" value="disconnect_youtube" />
+                        <Button type="submit" variant="outline" size="sm" disabled={youtubeBusy}>
+                          <Unplug />
+                          Disconnect
+                        </Button>
+                      </youtubeFetcher.Form>
+                    </div>
                   </div>
                   {youtubeSubscriptions.length ? (
                     <youtubeFetcher.Form method="post" className="grid gap-3">

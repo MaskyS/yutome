@@ -493,6 +493,17 @@ export function importYoutubeSubscriptions(
   return authedPost(env, sessionToken, "/account/youtube/subscriptions/import", body) as unknown as Promise<SourceImportResult>;
 }
 
+export function revokeYoutubeConnection(
+  env: YutomeWebEnv,
+  sessionToken: string,
+): Promise<{ ok: true; revoked: boolean; grant_id?: string }> {
+  return authedPost(env, sessionToken, "/account/youtube/revoke", {}) as unknown as Promise<{
+    ok: true;
+    revoked: boolean;
+    grant_id?: string;
+  }>;
+}
+
 // --- Retrieval & browse (session-authenticated dashboard search/read) -------
 // These call /account/{search,show,list}, served from the same query adapter as
 // the MCP endpoint, scoped to the session's workspace. Responses are parsed with
