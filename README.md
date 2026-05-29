@@ -122,6 +122,22 @@ yutome serve bridge install    # optional: keep the bridge running across reboot
 
 The Worker is just a relay — your corpus stays on your laptop. The bridge is a WebSocket process that lets the Worker reach it; `yutome serve bridge status/start/stop` control it manually, and `yutome serve bridge install` registers it as a launchd (macOS) or systemd-user (Linux) service so it survives reboots. If the bridge isn't running, the connector reports "Yutome Desktop offline" and the assistant chat keeps working otherwise. Full setup walkthrough: [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md) and [`cloudflare/yutome-capsule/README.md`](https://github.com/MaskyS/yutome/blob/main/cloudflare/yutome-capsule/README.md).
 
+### From a script or agent (HTTP API)
+
+The MCP connector is one front door; the bearer-token HTTP API is the other. Yutome exposes **one retrieval model through three surfaces** — CLI, MCP, and HTTP — so a script, cron job, or agent can hit the same library directly:
+
+```bash
+yutome serve remote prepare --show-token              # writes/prints the YUTOME_HTTP_TOKEN
+yutome serve remote http --host 127.0.0.1 --port 8765 # serve the authenticated HTTP API
+
+curl -s http://127.0.0.1:8765/find \
+  -H "Authorization: Bearer $YUTOME_HTTP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"first principles","mode":"hybrid","limit":5}'
+```
+
+The HTTP API speaks the same `find` / `list` / `show` / `q` verbs as MCP. It's available today when you self-host or run the CLI server; for multi-device or behind-a-proxy deployments see [`docs/remote-access.md`](https://github.com/MaskyS/yutome/blob/main/docs/remote-access.md). The full endpoint reference and query language live in [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md).
+
 ## Docs
 
 See [`docs/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/README.md) for an index. The most useful starting points:
@@ -130,7 +146,7 @@ See [`docs/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/README.md
 - [`docs/architecture/README.md`](https://github.com/MaskyS/yutome/blob/main/docs/architecture/README.md) — current architecture map
 - [`docs/cli-architecture.md`](https://github.com/MaskyS/yutome/blob/main/docs/cli-architecture.md) — CLI namespace and composition rules
 - [`docs/cloud-capsule-strategy.md`](https://github.com/MaskyS/yutome/blob/main/docs/cloud-capsule-strategy.md) — how the Cloudflare Worker is designed
-- [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md) — the query language `find` / `q` speak
+- [`docs/query-api.md`](https://github.com/MaskyS/yutome/blob/main/docs/query-api.md) — **Developer API**: the HTTP/MCP/CLI surfaces and the query language `find` / `list` / `show` / `q` speak
 - [`docs/plan.md`](https://github.com/MaskyS/yutome/blob/main/docs/plan.md) — pointer to current architecture docs and archived planning history
 
 ## Status

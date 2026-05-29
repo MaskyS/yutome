@@ -504,6 +504,39 @@ export function revokeYoutubeConnection(
   }>;
 }
 
+// --- Billing (Stripe Checkout + Customer Portal) ----------------------------
+// Both endpoints take no body, are scoped to the session's workspace by the
+// hosted API, and return a Stripe-hosted URL the browser is then redirected to.
+
+export interface BillingRedirect {
+  ok: true;
+  url: string;
+}
+
+async function billingUrl(
+  env: YutomeWebEnv,
+  sessionToken: string,
+  path: "/billing/checkout" | "/billing/portal",
+): Promise<BillingRedirect> {
+  const json = await authedPost(env, sessionToken, path, {});
+  if (typeof json.url !== "string") {
+    throw new HostedApiError(502, "invalid_hosted_api_response", "Billing response was missing a Stripe url.");
+  }
+  return { ok: true, url: json.url };
+}
+
+// Creates a Stripe Checkout session for the $4/mo Personal plan (14-day trial).
+export function startBillingCheckout(env: YutomeWebEnv, sessionToken: string): Promise<BillingRedirect> {
+  return billingUrl(env, sessionToken, "/billing/checkout");
+}
+
+// Opens the Stripe Customer Portal so an already-subscribed workspace can manage
+// billing. The hosted API returns 409 (stripe_customer_not_found) if the
+// workspace has never subscribed.
+export function openBillingPortal(env: YutomeWebEnv, sessionToken: string): Promise<BillingRedirect> {
+  return billingUrl(env, sessionToken, "/billing/portal");
+}
+
 // --- Retrieval & browse (session-authenticated dashboard search/read) -------
 // These call /account/{search,show,list}, served from the same query adapter as
 // the MCP endpoint, scoped to the session's workspace. Responses are parsed with

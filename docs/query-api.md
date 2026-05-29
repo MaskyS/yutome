@@ -1,10 +1,14 @@
 # Query API
 
+This is Yutome's **developer API** — the programmatic way into the same library your assistant reads over MCP.
+
 `yutome` exposes one retrieval model through three surfaces:
 
 - CLI: `yutome search find`, `yutome search list`, `yutome search show`, `yutome search q`
 - MCP: tools named `find`, `list`, `show`, `q`
 - HTTP: `POST /find`, `POST /list`, `POST /show`, `POST /q`
+
+The HTTP surface is the script/agent front door; the MCP surface is the assistant front door. Both run the same in-process API, so results match across surfaces. For how to stand the HTTP API up (single-device, multi-device, or behind a reverse proxy), see [`remote-access.md`](remote-access.md).
 
 The raw primitive is `QueryRequest` in `src/yutome/query.py`. The transport-neutral convenience verbs live in `src/yutome/api.py`.
 

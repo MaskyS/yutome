@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import { AlertTriangle, Check, CirclePlay, Info, Loader2, Plus, RefreshCcw, Unplug } from "lucide-react";
-import { Link, useFetcher, useRevalidator, useRouteLoaderData } from "react-router";
+import { AlertTriangle, Check, CirclePlay, CreditCard, Info, Loader2, Plus, RefreshCcw, Sparkles, Unplug } from "lucide-react";
+import { Link, redirect, useFetcher, useRevalidator, useRouteLoaderData } from "react-router";
+import { toast } from "sonner";
 
 import type { Route } from "./+types/dashboard.home";
 import { getEnv } from "~/lib/env.server";
@@ -13,7 +14,9 @@ import {
   getYoutubeSubscriptions,
   HostedApiError,
   importYoutubeSubscriptions,
+  openBillingPortal,
   revokeYoutubeConnection,
+  startBillingCheckout,
   type WorkspaceEntitlement,
   type WorkspaceSummary,
   type YoutubeSubscriptionChannel,
@@ -30,6 +33,7 @@ import { Label } from "~/components/ui/label";
 import { Progress } from "~/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/components/ui/table";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "~/components/ui/tooltip";
+import { Toaster } from "~/components/ui/sonner";
 import { ConnectGuides } from "~/components/connect-guides";
 import { CopyField } from "~/components/copy-field";
 
@@ -70,6 +74,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
       youtubeSubscriptions,
       youtubeError,
       youtubeNotice: url.searchParams.get("youtube"),
+      billingNotice: url.searchParams.get("billing"),
       mcpUrl: env.YUTOME_MCP_URL,
     };
   } catch (error) {
@@ -85,6 +90,27 @@ export async function action({ request, context }: Route.ActionArgs) {
   const token = requireSessionToken(request);
   const form = await request.formData();
   const intent = String(form.get("_intent") ?? "add_source");
+  if (intent === "start_checkout" || intent === "open_portal") {
+    try {
+      const { url } =
+        intent === "start_checkout"
+          ? await startBillingCheckout(env, token)
+          : await openBillingPortal(env, token);
+      // Send the browser to the Stripe-hosted Checkout / Customer Portal page.
+      return redirect(url);
+    } catch (error) {
+      if (isAccountSessionError(error)) {
+        signupRedirect(env);
+      }
+      const message =
+        error instanceof HostedApiError
+          ? error.message
+          : intent === "start_checkout"
+            ? "Could not start checkout."
+            : "Could not open the billing portal.";
+      return { ok: false, intent, error: message };
+    }
+  }
   if (intent === "disconnect_youtube") {
     try {
       const result = await revokeYoutubeConnection(env, token);
@@ -194,16 +220,28 @@ function youtubeNoticeMessage(code: string | null): string | null {
 }
 
 export default function DashboardHome({ loaderData }: Route.ComponentProps) {
-  const { library, jobs, assistants, youtube, youtubeSubscriptions, youtubeError, youtubeNotice, mcpUrl } = loaderData;
+  const { library, jobs, assistants, youtube, youtubeSubscriptions, youtubeError, youtubeNotice, billingNotice, mcpUrl } =
+    loaderData;
   const fetcher = useFetcher<typeof action>();
   const youtubeFetcher = useFetcher<typeof action>();
+  const billingFetcher = useFetcher<typeof action>();
   const revalidator = useRevalidator();
   const parent = useRouteLoaderData("routes/dashboard") as { summary: WorkspaceSummary } | undefined;
   const summary = parent?.summary;
   const actionData = fetcher.data;
   const youtubeActionData = youtubeFetcher.data;
+  // start_checkout / open_portal redirect to Stripe on success, so a settled
+  // billing fetcher with data is always an error to surface.
+  const billingError = billingFetcher.data?.ok === false ? billingFetcher.data.error : null;
   const busy = fetcher.state !== "idle";
   const youtubeBusy = youtubeFetcher.state !== "idle";
+  const billingBusy = billingFetcher.state !== "idle";
+  // A workspace with an active plan period has subscribed (Stripe Checkout
+  // provisions the EntitlementPolicy on the checkout.session.completed webhook),
+  // so "Manage billing" is the right primary action. The backend summary does
+  // not yet expose subscription_status / trial_ends_at (see report), so we
+  // cannot distinguish "trialing" from "active" or show days-remaining here.
+  const hasPlan = summary?.state === "active" || Boolean(summary?.plan_key);
   const activity = toActivity(jobs);
   const activityRunning = hasActiveActivity(activity);
 
@@ -224,6 +262,14 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
     const interval = window.setInterval(() => revalidator.revalidate(), 5000);
     return () => window.clearInterval(interval);
   }, [activityRunning, revalidator]);
+
+  useEffect(() => {
+    if (billingNotice === "success") {
+      toast.success("Subscribed — your 14-day free trial has started.");
+    } else if (billingNotice === "cancelled") {
+      toast.info("Checkout cancelled — you can subscribe anytime.");
+    }
+  }, [billingNotice]);
 
   return (
     <div className="grid gap-8">
@@ -474,6 +520,52 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
         </Card>
       </section>
 
+      <section className="grid gap-3">
+        <h2 className="text-lg font-semibold">Plan &amp; billing</h2>
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="grid gap-1">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <CreditCard className="text-muted-foreground size-4" />
+                  Personal plan
+                </CardTitle>
+                <CardDescription>
+                  {hasPlan
+                    ? "Your plan is active. Update payment details, cancel, or view invoices in the Stripe portal."
+                    : "$4 / month after a 14-day free trial. Cancel anytime."}
+                </CardDescription>
+              </div>
+              {hasPlan ? <Badge variant="secondary">Active</Badge> : null}
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            {billingError ? (
+              <Alert variant="destructive">
+                <AlertDescription>{billingError}</AlertDescription>
+              </Alert>
+            ) : null}
+            {hasPlan ? (
+              <billingFetcher.Form method="post">
+                <input type="hidden" name="_intent" value="open_portal" />
+                <Button type="submit" variant="outline" disabled={billingBusy}>
+                  {billingBusy ? <RefreshCcw className="animate-spin" /> : <CreditCard />}
+                  {billingBusy ? "Opening" : "Manage billing"}
+                </Button>
+              </billingFetcher.Form>
+            ) : (
+              <billingFetcher.Form method="post">
+                <input type="hidden" name="_intent" value="start_checkout" />
+                <Button type="submit" disabled={billingBusy}>
+                  {billingBusy ? <RefreshCcw className="animate-spin" /> : <Sparkles />}
+                  {billingBusy ? "Starting checkout" : "Subscribe — $4/mo · 14-day free trial"}
+                </Button>
+              </billingFetcher.Form>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
       {summary ? (
         <section className="grid gap-3">
           <div className="flex flex-wrap items-center gap-3">
@@ -571,6 +663,8 @@ export default function DashboardHome({ loaderData }: Route.ComponentProps) {
           <p className="text-muted-foreground text-sm">Nothing indexed yet.</p>
         )}
       </section>
+
+      <Toaster />
     </div>
   );
 }
