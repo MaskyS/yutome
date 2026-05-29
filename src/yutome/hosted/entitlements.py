@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import Text, any_, bindparam, case, func, select
@@ -24,8 +25,15 @@ from yutome.hosted.schema import (
     provider_allocations,
     service_allocations,
     workspace_balances,
+    workspaces,
 )
 from yutome.hosted.sqlalchemy_core import compile_postgres_statement
+
+
+# Stripe subscription statuses that keep a workspace entitled to ingest + tool calls. The seat
+# treats `trialing` exactly like `active`; everything else (past_due/canceled/none) combined
+# with an elapsed trial window is trial-expiry read-only.
+_ENTITLED_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing"})
 
 
 class SqlConnection(Protocol):
@@ -68,6 +76,17 @@ class PostgresUsageContextProvider:
         operation: str,
         estimated_units: Mapping[str, UnitQuantity],
     ) -> HostedMcpUsageContext:
+        # Trial-expiry read-only: when the seat's trial has ended with no active/trialing
+        # subscription, ingest and agent-facing MCP/API tool calls hard-deny (a deny policy
+        # makes every operation_not_allowed). Dashboard BFF reads (auth.dashboard_read) are
+        # exempt so the existing corpus stays readable. Fail closed: an unreadable/missing
+        # workspace row is treated as expired rather than entitled.
+        if not auth.dashboard_read and self._trial_expired(workspace_id=auth.workspace_id):
+            return HostedMcpUsageContext(
+                allocation=None,
+                policy=_deny_policy(workspace_id=auth.workspace_id),
+                balance=WorkspaceBalance(workspace_id=auth.workspace_id),
+            )
         policy = self._active_policy(workspace_id=auth.workspace_id)
         allocation = self._allocation(workspace_id=auth.workspace_id, subject=subject, operation=operation)
         balance = self._active_balance(
@@ -79,6 +98,27 @@ class PostgresUsageContextProvider:
             policy=policy or _deny_policy(workspace_id=auth.workspace_id),
             balance=balance or WorkspaceBalance(workspace_id=auth.workspace_id),
         )
+
+    def _trial_expired(self, *, workspace_id: str) -> bool:
+        """True when the workspace's trial has ended and it has no active/trialing subscription.
+
+        Reads workspaces.subscription_status / trial_ends_at. A still-running trial
+        (`trialing`) and an `active` subscription are entitled regardless of trial_ends_at. A
+        missing row reads as expired (fail closed).
+        """
+
+        statement = workspace_subscription_state_sql(workspace_id=workspace_id)
+        row = _one(self.connection.execute(statement.sql, statement.params))
+        if row is None:
+            return True
+        subscription_status = str(row.get("subscription_status") or "none").strip().lower()
+        if subscription_status in _ENTITLED_SUBSCRIPTION_STATUSES:
+            return False
+        trial_ends_at = row.get("trial_ends_at")
+        if trial_ends_at is None:
+            # No subscription and no trial window recorded: treat as expired (fail closed).
+            return True
+        return _coerce_datetime(trial_ends_at) <= _now_utc()
 
     def _allocation(self, *, workspace_id: str, subject: UsageSubject, operation: str) -> ProviderAllocation | ServiceAllocation | None:
         if subject == "search_store":
@@ -176,6 +216,16 @@ def service_allocation_sql(*, workspace_id: str, service: str, operation: str) -
             service_allocations.c.id,
         )
     )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
+def workspace_subscription_state_sql(*, workspace_id: str) -> SqlStatement:
+    workspace_param = bindparam("workspace_id", value=workspace_id)
+    statement = select(
+        workspaces.c.subscription_status,
+        workspaces.c.trial_ends_at,
+    ).where(workspaces.c.id == workspace_param)
     sql, params = compile_postgres_statement(statement)
     return SqlStatement(sql=sql + ";", params=params)
 
@@ -308,10 +358,25 @@ def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _coerce_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        text_value = value.strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text_value)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    raise TypeError(f"Cannot interpret trial_ends_at value of type {type(value).__name__}.")
+
+
 __all__ = [
     "PostgresUsageContextProvider",
     "active_balance_sql",
     "active_policy_sql",
     "provider_allocation_sql",
     "service_allocation_sql",
+    "workspace_subscription_state_sql",
 ]

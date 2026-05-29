@@ -85,6 +85,14 @@ def test_account_bootstrap_sql_creates_owner_membership_starter_entitlements_and
     assert "ON CONFLICT (workspace_id, user_id) DO UPDATE" in statements["workspace_member"].sql
     assert "role = 'owner'" in statements["workspace_member"].sql
 
+    # A new workspace bootstraps a 14-day card-gated trial (no perpetual free tier). Re-bootstrap
+    # must preserve the existing trial window / paid status rather than restart it.
+    workspace_sql = statements["workspace"].sql
+    assert "subscription_status" in workspace_sql
+    assert "now() + interval '14 days'" in workspace_sql
+    assert "trial_ends_at = workspaces.trial_ends_at" in workspace_sql
+    assert "subscription_status = workspaces.subscription_status" in workspace_sql
+
     policy_params = statements["entitlement_policy"].params
     balance_params = statements["workspace_balance"].params
     assert policy_params["allowed_operations"] == list(STARTER_ALLOWED_OPERATIONS)

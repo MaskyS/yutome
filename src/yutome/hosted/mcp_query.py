@@ -103,6 +103,10 @@ class HostedMcpAuthContext:
     grant_id: str | None = None
     client_id: str | None = None
     session_id: str | None = None
+    # True for the dashboard BFF read path (/account/search|show|list): the existing corpus
+    # stays readable even when the workspace is trial-expiry read-only. The agent-facing
+    # /mcp/tools/call path leaves this False, so those tool calls hard-deny once the trial ends.
+    dashboard_read: bool = False
 
     def validated(self) -> HostedMcpAuthContext:
         workspace_id = self.workspace_id.strip()
@@ -133,6 +137,7 @@ class HostedMcpAuthContext:
             grant_id=self.grant_id,
             client_id=self.client_id,
             session_id=self.session_id,
+            dashboard_read=self.dashboard_read,
         )
 
 

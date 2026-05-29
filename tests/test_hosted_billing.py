@@ -26,7 +26,9 @@ from yutome.hosted.billing import (
     credits_from_billable_units,
     derive_workspace_balance_snapshot,
     finish_stripe_meter_export_sql,
+    included_allowance_credits,
     mark_stripe_meter_export_replay,
+    overage_credits_for_event,
     process_stripe_webhook_event,
     stripe_meter_event_payload,
     stripe_meter_export_event_from_row,
@@ -87,10 +89,63 @@ def test_price_book_models_product_limits_without_authorizing_usage() -> None:
 
 
 def test_credits_meter_collapses_billable_units_and_drops_internal_units() -> None:
-    # total_tokens=1_000_000 * 1e-7 = 0.1; vectors=2 * 1e-5 = 0.00002; candidate_limit is not billable.
+    # total_tokens=1_000_000 * 5e-5 = 50; vectors=2 * 7e-3 = 0.014; candidate_limit is not billable.
     credits = credits_from_billable_units({"total_tokens": 1_000_000, "vectors": 2, "candidate_limit": 50})
 
-    assert credits == Decimal("0.10002")
+    assert credits == Decimal("50.01400")
+
+
+def test_retuned_weights_make_one_credit_about_one_indexed_video_hour() -> None:
+    # ~20-min video on the common index path: ~5_700 total_tokens + ~8 vectors.
+    per_video = credits_from_billable_units({"total_tokens": 5_700, "vectors": 8})
+    assert per_video == Decimal("0.34100")  # 5_700*5e-5 + 8*7e-3
+    # ~3 such videos make one video-hour -> ~1 credit per video-hour.
+    assert per_video * 3 == Decimal("1.02300")
+
+
+def test_included_allowance_credits_ignores_non_billable_and_overdrawn_units() -> None:
+    # Only billable units contribute; candidate_limit (quota) is dropped; a negative
+    # (overdrawn) billable unit contributes 0, never a negative credit.
+    credits = included_allowance_credits(
+        {"total_tokens": 100_000, "vectors": 5, "candidate_limit": 9_999, "queries": Decimal("-3")}
+    )
+    assert credits == Decimal("5.03500")  # 100_000*5e-5 + 5*7e-3 + 0 (queries clamped)
+
+
+def test_overage_credits_meters_only_the_portion_beyond_the_included_allowance() -> None:
+    # Allowance fully covers the event -> nothing metered.
+    assert overage_credits_for_event(Decimal("4"), included_remaining_credits=Decimal("10")) == Decimal("0")
+    # Allowance partially covers it -> meter exactly the uncovered remainder.
+    assert overage_credits_for_event(Decimal("8"), included_remaining_credits=Decimal("6")) == Decimal("2")
+    # Allowance already exhausted (0 or overdrawn) -> meter the whole event.
+    assert overage_credits_for_event(Decimal("5"), included_remaining_credits=Decimal("0")) == Decimal("5")
+    assert overage_credits_for_event(Decimal("5"), included_remaining_credits=Decimal("-3")) == Decimal("5")
+
+
+def test_meter_export_within_included_allowance_enqueues_nothing() -> None:
+    event = _usage_event(actual_units={"total_tokens": 1_000, "vectors": 1})
+    event_credits = credits_from_billable_units(event.actual_units)  # 0.057
+    # Allowance still free comfortably exceeds the event credits.
+    override = overage_credits_for_event(event_credits, included_remaining_credits=Decimal("10"))
+
+    assert override == Decimal("0")
+    assert stripe_meter_exports_from_usage_event(event, stripe_customer_id="cus_1", credits_override=override) == ()
+
+
+def test_meter_export_beyond_included_allowance_meters_only_the_excess() -> None:
+    event = _usage_event(actual_units={"total_tokens": 1_000_000, "vectors": 2})  # 50.014 credits
+    event_credits = credits_from_billable_units(event.actual_units)
+    override = overage_credits_for_event(event_credits, included_remaining_credits=Decimal("0.014"))
+
+    exports = stripe_meter_exports_from_usage_event(event, stripe_customer_id="cus_1", credits_override=override)
+    assert len(exports) == 1
+    export = exports[0]
+    # 50.014 event credits - 0.014 free allowance = 50 metered overage.
+    assert override == Decimal("50.00000")
+    # value sent to Stripe is the canonicalized decimal.
+    assert export.value_decimal == Decimal("50")
+    assert export.metadata["event_credits"] == "50.01400"
+    assert export.metadata["metered_credits"] == "50.00000"
 
 
 def test_meter_export_is_one_row_with_stable_deterministic_identifier() -> None:
@@ -107,8 +162,8 @@ def test_meter_export_is_one_row_with_stable_deterministic_identifier() -> None:
     assert export.replay_status == "pending"
     assert export.meter_unit == "credits"
     assert export.event_name == CREDITS_METER_EVENT_NAME
-    # total_tokens=1_000_000*1e-7 + vectors=2*1e-5 = 0.10002
-    assert export.value_decimal == Decimal("0.10002")
+    # total_tokens=1_000_000*5e-5 + vectors=2*7e-3 = 50.014
+    assert export.value_decimal == Decimal("50.01400")
 
 
 def test_meter_event_payload_shape_uses_exact_decimal_string() -> None:
@@ -119,8 +174,8 @@ def test_meter_event_payload_shape_uses_exact_decimal_string() -> None:
 
     assert payload["event_name"] == CREDITS_METER_EVENT_NAME
     assert payload["payload"]["stripe_customer_id"] == "cus_99"
-    # media_seconds 123.5 * 0.001 = 0.1235 — exact, no float truncation.
-    assert payload["payload"]["value"] == "0.1235"
+    # media_seconds 123.5 * 3e-4 = 0.03705 — exact, no float truncation.
+    assert payload["payload"]["value"] == "0.03705"
     # identifier is the compact hash of the dedupe key (Stripe caps identifier at 100 chars).
     assert payload["identifier"] == export.stripe_identifier
     assert payload["identifier"].startswith("me_") and len(payload["identifier"]) <= 100
@@ -301,8 +356,13 @@ def test_stripe_webhook_processing_upserts_customer_and_finalizes_exactly_once()
     assert result.stripe_customer is not None
     assert result.stripe_customer.subscription_status == "past_due"
     assert result.stripe_customer.status == "paused"
-    # snapshot insert (exactly-once via PK), customer upsert, finalize snapshot.
-    assert len(statements) == 3
+    # snapshot insert (exactly-once via PK), customer upsert, workspace status mirror, finalize.
+    assert len(statements) == 4
+    # The subscription lifecycle is mirrored onto the workspace so the entitlement layer can
+    # compute trial-expiry read-only.
+    workspace_stmt = next(stmt for stmt in statements if "UPDATE workspaces" in stmt.sql)
+    assert workspace_stmt.params["workspace_id"] == "ws_http"
+    assert workspace_stmt.params["subscription_status"] == "past_due"
     # The webhook snapshot is keyed by the Stripe event id, so a replay is a PK conflict
     # that does nothing destructive.
     snapshot_stmt = upsert_stripe_webhook_event_sql(result.event)

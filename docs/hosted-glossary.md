@@ -108,7 +108,33 @@ all of them.
   (`media_seconds`, `total_tokens`, `vectors`, `queries`) are collapsed into one `credits`
   value via fixed per-unit weights. All other units (`candidate_limit`,
   `query_vector_dimensions`, `request_count`, `bytes`, …) are cost-visibility/quota units
-  and are never reported to Stripe. [code: `billing.STRIPE_CREDIT_UNIT_WEIGHTS`]
+  and are never reported to Stripe. The weights are calibrated so **1 credit ≈ 1 indexed
+  video-hour ≈ ~$0.10 retail**: `media_seconds` 3e-4, `total_tokens` 5e-5, `vectors` 7e-3,
+  `queries` 1e-3. [code: `billing.STRIPE_CREDIT_UNIT_WEIGHTS`]
+- **Personal plan / seat** — the single paid plan: a **$4/mo flat recurring seat** plus a
+  metered overage price. Stripe Checkout (`mode=subscription`) subscribes the customer to
+  **both** line items — the flat seat Price (`STRIPE_SEAT_PRICE_ID`, quantity 1) and the
+  metered `credits` Price (`STRIPE_PRICE_ID`, no quantity). The `starter` entitlement plan is
+  reused as this seat's included allowance, not a free tier. [code: `STRIPE_SEAT_PRICE_ID`]
+- **included allowance** — the monthly usage the seat covers before any overage is metered:
+  ~25 indexed video-hours, tracked as billable units in `WorkspaceBalance.remaining_units`
+  (`account.STARTER_INCLUDED_UNITS`). The reserve/settle accounting that already debits this
+  balance is the single source of truth for "remaining included units".
+- **metered overage** — usage **beyond** the included allowance, reported to the Stripe
+  `credits` meter. Each settled event meters only `max(0, event_credits −
+  included_remaining_credits)` (the allowance still free, in credits, read under the balance
+  lock before the event). While the allowance covers the event nothing is enqueued; once
+  exhausted only the excess is. [code: `billing.overage_credits_for_event`,
+  `ledger._enqueue_stripe_meter_exports`]
+- **trial** — a **14-day, card-gated** evaluation set at Checkout via
+  `subscription_data[trial_period_days]=14`. There is **no perpetual free tier**: a new
+  workspace bootstraps a trial (`workspaces.subscription_status = 'trialing'`, a
+  `workspaces.trial_ends_at` set 14 days out). The entitlement layer treats Stripe status
+  `trialing` exactly like `active`.
+- **trial-expiry read-only** — the entitlement state of a workspace whose trial has ended
+  with no active/trialing subscription: ingest (`source.write` / `index`) and MCP/API tool
+  calls **hard-deny** (fail closed), while the existing corpus stays readable from the
+  dashboard `/account/*` read endpoints. [code: `entitlements.PostgresUsageContextProvider`]
 - **Stripe meter export** — a queued usage→meter-event row: one settled usage event maps to
   one pending `stripe_meter_exports` row, claimed by the `stripe-meter-export` worker and
   POSTed to Stripe `/v1/billing/meter_events`. [code: `stripe_meter_exports` table,
@@ -119,10 +145,12 @@ all of them.
   so re-enqueues and retries are no-ops.
 - **billing mirror (Stripe)** — the external billing provider. A **mirror only**: it never
   authorizes a call and its availability never changes a `UsageGate` decision. Subscriptions
-  are created via Stripe Checkout (`mode=subscription`, metered price); usage is charged in
-  arrears by reporting the `credits` meter. A free/unsubscribed workspace has no Stripe
-  Customer until its first `/billing/checkout` (lazy creation); pre-subscription usage is
-  enqueued as `skipped`, not billed.
+  are created via Stripe Checkout (`mode=subscription`) on **two** line items — the flat seat
+  Price and the metered `credits` Price (see **Personal plan / seat**) — with a 14-day
+  card-gated trial. Overage usage is charged in arrears by reporting the `credits` meter (see
+  **metered overage**). A workspace has no Stripe Customer until its first `/billing/checkout`
+  (lazy creation); usage with no active/trialing subscription is enqueued as `skipped`, not
+  billed.
 - **provider broker** — the component that holds provider credentials and meters and
   authorizes provider/service calls on a workspace's behalf. (Kept; it is the name of the
   plan and the `yt-indexer-pvq` epic. Defined here so it stops being used vaguely.)

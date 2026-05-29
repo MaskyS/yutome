@@ -15,6 +15,7 @@ from starlette.requests import Request
 from yutome import contract
 from yutome.hosted.account import (
     DEFAULT_ACCOUNT_SESSION_AUDIENCE,
+    TRIAL_PERIOD_DAYS,
     AccountBootstrapInput,
     AccountSessionError,
     bootstrap_hosted_account,
@@ -101,7 +102,9 @@ TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
 DASHBOARD_TOKEN_ENV_VAR = "YUTOME_DASHBOARD_API_TOKEN"
 STRIPE_WEBHOOK_SECRET_ENV_VAR = "STRIPE_WEBHOOK_SECRET"
 STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+# The metered overage credits Price (no quantity); the flat $4 recurring seat Price (quantity 1).
 STRIPE_PRICE_ID_ENV_VAR = "STRIPE_PRICE_ID"
+STRIPE_SEAT_PRICE_ID_ENV_VAR = "STRIPE_SEAT_PRICE_ID"
 STRIPE_CHECKOUT_SUCCESS_URL_ENV_VAR = "STRIPE_CHECKOUT_SUCCESS_URL"
 STRIPE_CHECKOUT_CANCEL_URL_ENV_VAR = "STRIPE_CHECKOUT_CANCEL_URL"
 STRIPE_PORTAL_RETURN_URL_ENV_VAR = "STRIPE_PORTAL_RETURN_URL"
@@ -1008,19 +1011,25 @@ def build_app(
 
     @app.post("/billing/checkout")
     def billing_checkout(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
-        price_id = _stripe_env(STRIPE_PRICE_ID_ENV_VAR)
+        seat_price_id = _stripe_env(STRIPE_SEAT_PRICE_ID_ENV_VAR)
+        overage_price_id = _stripe_env(STRIPE_PRICE_ID_ENV_VAR)
         success_url = _stripe_env(STRIPE_CHECKOUT_SUCCESS_URL_ENV_VAR)
         cancel_url = _stripe_env(STRIPE_CHECKOUT_CANCEL_URL_ENV_VAR)
         customer_external_id = _get_or_create_stripe_customer(
             workspace_id=context.workspace_id, user_id=context.user_id
         )
-        # Metered prices must OMIT line_items[0][quantity]; Stripe errors if it is sent.
+        # Personal plan = flat $4 seat (licensed Price, quantity 1) + metered overage credits
+        # (metered Price, quantity OMITTED — Stripe errors if it is sent). 14-day card-gated
+        # trial via subscription_data[trial_period_days].
         session = _stripe_post(
             "/v1/checkout/sessions",
             {
                 "mode": "subscription",
                 "customer": customer_external_id,
-                "line_items[0][price]": price_id,
+                "line_items[0][price]": seat_price_id,
+                "line_items[0][quantity]": "1",
+                "line_items[1][price]": overage_price_id,
+                "subscription_data[trial_period_days]": str(int(TRIAL_PERIOD_DAYS)),
                 "success_url": success_url,
                 "cancel_url": cancel_url,
                 "client_reference_id": context.workspace_id,
@@ -1529,12 +1538,17 @@ def _parse_scopes(scopes_header: str | None) -> set[str]:
 def _account_query_auth(context: AccountApiContext) -> HostedMcpAuthContext:
     """Build a query auth context from a verified dashboard session. The workspace
     and user come from the session claims; the adapter's `.validated()` enforces
-    workspace identity and the required scope."""
+    workspace identity and the required scope.
+
+    `dashboard_read=True` exempts these BFF reads from the trial-expiry read-only deny so the
+    existing corpus stays readable after a trial ends; the agent-facing /mcp/tools/call path
+    builds its auth context without this flag and is denied."""
 
     return HostedMcpAuthContext(
         workspace_id=context.workspace_id,
         scopes=frozenset({contract.AUTH_SCOPE}),
         user_id=context.user_id,
+        dashboard_read=True,
     ).validated()
 
 

@@ -35,6 +35,12 @@ STARTER_PRICE_BOOK_VERSION = "starter-v1"
 STARTER_PLAN_KEY = "starter"
 DEFAULT_ACCOUNT_SESSION_AUDIENCE = "yutome:hosted-oauth"
 
+# The Personal plan ships a 14-day card-gated trial; there is no perpetual free tier. A new
+# workspace bootstraps with subscription_status='trialing' and trial_ends_at 14 days out. The
+# entitlement layer treats `trialing` exactly like `active`; once trial_ends_at passes with no
+# active/trialing subscription the workspace becomes trial-expiry read-only.
+TRIAL_PERIOD_DAYS = 14
+
 STARTER_ALLOWED_OPERATIONS: tuple[str, ...] = (
     "youtube.metadata_fetch",
     "youtube.transcript_fetch",
@@ -50,16 +56,34 @@ STARTER_ALLOWED_OPERATIONS: tuple[str, ...] = (
     "search_store.list_read",
     "search_store.resource_read",
 )
+# Personal-plan seat included allowance: ~25 indexed video-hours / month, the usage the $4
+# flat seat covers before any metered overage. Easily tunable — change the video-hours target
+# and re-derive the four billable units below; the non-billable quota units are generous
+# operational ceilings (cost-visibility only) scaled to match.
+#
+# Derivation (grounded in the common index path: existing transcript -> Gemini cleanup ->
+# Voyage embed; see indexing.py _token_estimate + chunking.py DEFAULT_TARGET_TOKENS=700):
+#   25 video-hours ≈ 75 videos (~20 min each, ~3 videos/video-hour)
+#   per video ≈ 5_700 total_tokens (cleanup read + embed) and ≈ 8 vectors (chunks)
+#     total_tokens: 75 × 5_700 ≈ 427_500   -> 430_000
+#     vectors:      75 × 8     = 600        -> 600
+#   media_seconds covers the Gemini transcribe fallback (no caption track):
+#     25 video-hours × 3_600 s/h = 90_000   -> 90_000
+#   queries: a generous monthly read budget for the seat (not the dominant cost) -> 25_000
+# Credit check via STRIPE_CREDIT_UNIT_WEIGHTS (1 credit ≈ 1 video-hour):
+#   430_000×5e-5 + 600×7e-3 = 21.5 + 4.2 = 25.7 credits ≈ 25 indexed video-hours.
 STARTER_INCLUDED_UNITS: dict[str, Any] = {
-    "total_tokens": 250_000,
-    "media_seconds": 3_600,
-    "vectors": 10_000,
-    "queries": 10_000,
+    # Billable units (collapse into the composite `credits` meter): the seat's real allowance.
+    "total_tokens": 430_000,
+    "vectors": 600,
+    "media_seconds": 90_000,
+    "queries": 25_000,
+    # Non-billable quota / cost-visibility ceilings (never metered to Stripe).
     "candidate_limit": 100_000,
     "query_vector_dimensions": 10_240_000,
-    "resource_reads": 10_000,
+    "resource_reads": 25_000,
     "result_count": 100_000,
-    "request_count": 1_000,
+    "request_count": 2_000,
     "bytes": 1_073_741_824,
     "transcript_versions": 10_000,
     "chunks": 100_000,
@@ -485,6 +509,10 @@ def upsert_personal_workspace_sql(account: AccountBootstrapInput) -> SqlStatemen
         owner_user_id=account.user_id,
         name=account.workspace_name or _default_workspace_name(account.normalized_email),
         status="active",
+        # A brand-new workspace starts a 14-day card-gated trial. The Stripe webhook mirror
+        # later moves subscription_status to active/past_due/canceled.
+        subscription_status="trialing",
+        trial_ends_at=text(f"now() + interval '{int(TRIAL_PERIOD_DAYS)} days'"),
         created_at=func.now(),
     )
     statement = statement.on_conflict_do_update(
@@ -493,6 +521,10 @@ def upsert_personal_workspace_sql(account: AccountBootstrapInput) -> SqlStatemen
             "owner_user_id": workspaces.c.owner_user_id,
             "name": workspaces.c.name,
             "status": case((workspaces.c.status == "disabled", workspaces.c.status), else_="active"),
+            # Re-bootstrap (e.g. a returning sign-in) must NOT restart the trial or overwrite a
+            # paid subscription_status — preserve the existing trial window and status.
+            "subscription_status": workspaces.c.subscription_status,
+            "trial_ends_at": workspaces.c.trial_ends_at,
         },
     ).returning(workspaces)
     return _sql_statement(statement)
@@ -794,6 +826,7 @@ __all__ = [
     "STARTER_PRICE_BOOK_VERSION",
     "STARTER_PROVIDER_OPERATIONS",
     "STARTER_SERVICE_OPERATIONS",
+    "TRIAL_PERIOD_DAYS",
     "account_bootstrap_sql",
     "bootstrap_hosted_account",
     "deterministic_account_session_id",

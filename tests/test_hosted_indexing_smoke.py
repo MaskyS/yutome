@@ -90,6 +90,8 @@ class HostedExecutorConnection:
                     "status": "active",
                 }
             ]
+        if "FROM workspaces" in statement:
+            return [{"subscription_status": "trialing", "trial_ends_at": "2999-01-01T00:00:00+00:00"}]
         if "FROM provider_allocations" in statement:
             return [
                 {

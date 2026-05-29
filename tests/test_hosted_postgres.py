@@ -26,6 +26,7 @@ from yutome.hosted.billing import (
     upsert_price_book_sql,
     upsert_stripe_customer_sql,
     upsert_stripe_meter_export_sql,
+    update_workspace_subscription_status_sql,
     upsert_stripe_webhook_event_sql,
     upsert_workspace_balance_sql,
 )
@@ -393,7 +394,16 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
     now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
     with psycopg.connect(live_postgres_dsn, autocommit=False, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("CREATE TEMP TABLE workspaces (id text PRIMARY KEY, name text NOT NULL) ON COMMIT DROP;")
+            cursor.execute(
+                """
+                CREATE TEMP TABLE workspaces (
+                    id text PRIMARY KEY,
+                    name text NOT NULL,
+                    subscription_status text NOT NULL DEFAULT 'trialing',
+                    trial_ends_at timestamptz
+                ) ON COMMIT DROP;
+                """
+            )
             cursor.execute("CREATE TEMP TABLE usage_reservations (id text PRIMARY KEY) ON COMMIT DROP;")
             cursor.execute("CREATE TEMP TABLE usage_events (id text PRIMARY KEY) ON COMMIT DROP;")
             cursor.execute(
@@ -607,6 +617,16 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
             cursor.execute(webhook_statement.sql, webhook_statement.params)
             webhook_count = cursor.execute("SELECT count(*) AS n FROM stripe_webhook_events;").fetchone()
             assert webhook_count["n"] == 1
+
+            # The subscription-status mirror onto the workspace row (drives trial-expiry).
+            workspace_status_statement = update_workspace_subscription_status_sql(
+                workspace_id="ws_1", subscription_status="active"
+            )
+            cursor.execute(workspace_status_statement.sql, workspace_status_statement.params)
+            workspace_row = cursor.execute(
+                "SELECT subscription_status FROM workspaces WHERE id = 'ws_1';"
+            ).fetchone()
+            assert workspace_row["subscription_status"] == "active"
 
         connection.rollback()
 

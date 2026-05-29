@@ -454,6 +454,114 @@ def test_postgres_usage_ledger_persists_overage_as_negative_balance() -> None:
     assert connection.balance["reserved_units_jsonb"] == {}
 
 
+class SubscribedReservationConnection(AtomicReservationConnection):
+    """AtomicReservationConnection that also models an active Stripe subscriber and captures
+    the meter exports enqueued by the usage->meter loop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.meter_export_params: list[dict[str, object]] = []
+
+    def execute(self, statement: str, params: dict[str, object] | None = None) -> list[dict[str, object]]:
+        params = dict(params or {})
+        if "FROM stripe_customers" in statement and "subscription_status = 'active'" in statement:
+            self.calls.append((statement, params))
+            return [{"stripe_customer_id": "cus_sub_1"}]
+        if "INSERT INTO stripe_meter_exports" in statement:
+            self.calls.append((statement, params))
+            self.meter_export_params.append(params)
+            return []
+        return super().execute(statement, params)
+
+
+def _reserve_and_settle(
+    connection: SubscribedReservationConnection,
+    *,
+    estimate_vectors,
+    actual_vectors,
+    key: str,
+):
+    # The gate authorizes on the ESTIMATE (which must fit the remaining included allowance);
+    # the metered overage is computed from the settled ACTUAL units (which may exceed it).
+    gate = PostgresUsageGate(connection)
+    ledger = PostgresUsageLedger(connection)
+    remaining = connection.balance["remaining_units_jsonb"]
+    allocation = ProviderAllocation(
+        id="alloc_voyage", workspace_id="ws_alice", provider="voyage", operation="embed_documents"
+    )
+    policy = EntitlementPolicy(id="policy", workspace_id="ws_alice", allowed_operations={"voyage.embed_documents"})
+    reservation = gate.reserve(
+        workspace_id="ws_alice",
+        subject="voyage",
+        operation="embed_documents",
+        estimated_units={"vectors": estimate_vectors},
+        allocation=allocation,
+        policy=policy,
+        balance=WorkspaceBalance(workspace_id="ws_alice", remaining_units=dict(remaining)),
+        idempotency_key=key,
+    )
+    assert reservation.status == "reserved"
+    ledger.append(
+        UsageEvent(
+            reservation_id=reservation.id,
+            workspace_id="ws_alice",
+            subject="voyage",
+            operation="embed_documents",
+            event_type="provider_attempt_succeeded",
+            status="succeeded",
+            actual_units={"vectors": actual_vectors},
+            provider_request_id=f"req_{key}",
+            metadata={"idempotency_key": key},
+        )
+    )
+    return reservation
+
+
+def test_usage_within_included_allowance_enqueues_no_meter_export(monkeypatch) -> None:
+    # vectors weight 7e-3. Balance 10 vectors = 0.07 credits; settled actual 2 vectors = 0.014
+    # credits, comfortably within the included allowance -> nothing metered (even with overage on).
+    monkeypatch.setenv("STRIPE_OVERAGE_ENABLED", "1")
+    connection = SubscribedReservationConnection()
+    connection.balance["remaining_units_jsonb"] = {"vectors": 10}
+
+    _reserve_and_settle(connection, estimate_vectors=2, actual_vectors=2, key="idem_within")
+
+    assert connection.meter_export_params == []
+
+
+def test_usage_beyond_included_allowance_meters_only_the_overage(monkeypatch) -> None:
+    # With overage metering enabled (yt-indexer-6a0): balance 2 vectors = 0.014 included credits.
+    # The estimate (2) fits and is authorized, but the settled actual is 10 vectors = 0.07
+    # credits. Only the excess 0.07 - 0.014 = 0.056 credits is metered; the included 0.014 is
+    # never billed.
+    monkeypatch.setenv("STRIPE_OVERAGE_ENABLED", "1")
+    connection = SubscribedReservationConnection()
+    connection.balance["remaining_units_jsonb"] = {"vectors": 2}
+
+    _reserve_and_settle(connection, estimate_vectors=2, actual_vectors=10, key="idem_overage_meter")
+
+    assert len(connection.meter_export_params) == 1
+    assert connection.meter_export_params[0]["value_text"] == "0.056"
+    # Remaining included allowance is now overdrawn (2 - 10 = -8 vectors).
+    assert connection.balance["remaining_units_jsonb"] == {"vectors": -8}
+    # event_credits records the full event; metered_credits is just the overage.
+    metadata = json.loads(str(connection.meter_export_params[0]["metadata_json"]))
+    assert metadata["event_credits"] == "0.070"
+    assert metadata["metered_credits"] == "0.056"
+
+
+def test_overage_metering_disabled_by_default_enqueues_nothing(monkeypatch) -> None:
+    # Launch hard-cap default (STRIPE_OVERAGE_ENABLED unset): even usage beyond the included
+    # allowance enqueues no meter export -- the flat seat is the only charge.
+    monkeypatch.delenv("STRIPE_OVERAGE_ENABLED", raising=False)
+    connection = SubscribedReservationConnection()
+    connection.balance["remaining_units_jsonb"] = {"vectors": 2}
+
+    _reserve_and_settle(connection, estimate_vectors=2, actual_vectors=10, key="idem_overage_off")
+
+    assert connection.meter_export_params == []
+
+
 def test_postgres_usage_gate_allows_new_reservations_with_existing_negative_balance_units() -> None:
     connection = AtomicReservationConnection()
     connection.balance["remaining_units_jsonb"] = {"total_tokens": 500, "request_duration": -1.2}

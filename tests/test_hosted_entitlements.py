@@ -16,16 +16,31 @@ class EntitlementConnection:
         balance: bool = True,
         service_allocation: bool = True,
         provider_allocation: bool = True,
+        subscription_status: str = "trialing",
+        trial_ends_at: Any = "2999-01-01T00:00:00+00:00",
+        workspace_row: bool = True,
     ) -> None:
         self.policy = policy
         self.balance = balance
         self.service_allocation = service_allocation
         self.provider_allocation = provider_allocation
+        self.subscription_status = subscription_status
+        self.trial_ends_at = trial_ends_at
+        self.workspace_row = workspace_row
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         params = dict(params or {})
         self.calls.append((statement, params))
+        if "FROM workspaces" in statement:
+            if not self.workspace_row:
+                return []
+            return [
+                {
+                    "subscription_status": self.subscription_status,
+                    "trial_ends_at": self.trial_ends_at,
+                }
+            ]
         if "FROM service_allocations" in statement:
             if not self.service_allocation:
                 return []
@@ -84,8 +99,12 @@ class EntitlementConnection:
         return []
 
 
-def _auth(workspace_id: str = "ws_prod") -> HostedMcpAuthContext:
-    return HostedMcpAuthContext(workspace_id=workspace_id, scopes=frozenset({contract.AUTH_SCOPE}))
+def _auth(workspace_id: str = "ws_prod", *, dashboard_read: bool = False) -> HostedMcpAuthContext:
+    return HostedMcpAuthContext(
+        workspace_id=workspace_id,
+        scopes=frozenset({contract.AUTH_SCOPE}),
+        dashboard_read=dashboard_read,
+    )
 
 
 def test_postgres_usage_context_provider_loads_search_store_entitlement_inputs() -> None:
@@ -174,3 +193,104 @@ def test_postgres_usage_context_provider_missing_balance_is_hard_denial() -> Non
     assert reservation.decision.reason == "insufficient_balance"
     assert reservation.decision.denial_effect == "hard"
     assert context.balance.unlimited_units == set()
+
+
+def _reserve(provider: PostgresUsageContextProvider, subject: str, operation: str):
+    method = provider.voyage if subject == "voyage" else provider
+    context = (
+        method(_auth(), operation, {"queries": 1})
+        if subject == "search_store"
+        else method(_auth(), operation, {"total_tokens": 10, "vectors": 1})
+    )
+    return UsageGate().reserve(
+        workspace_id="ws_prod",
+        subject=subject,  # type: ignore[arg-type]
+        operation=operation,
+        estimated_units={"queries": 1} if subject == "search_store" else {"total_tokens": 10, "vectors": 1},
+        allocation=context.allocation,
+        policy=context.policy,
+        balance=context.balance,
+        idempotency_key=f"idem_{subject}_{operation}",
+    )
+
+
+def test_trialing_subscription_is_entitled_like_active() -> None:
+    # A still-running trial grants ingest/tool calls exactly like an active subscription.
+    connection = EntitlementConnection(subscription_status="trialing")
+    provider = PostgresUsageContextProvider(connection)
+
+    reservation = _reserve(provider, "search_store", "lexical_query")
+
+    assert reservation.status == "reserved"
+    assert any("FROM workspaces" in statement for statement, _params in connection.calls)
+
+
+def test_active_subscription_is_entitled_regardless_of_trial_window() -> None:
+    # An active paid subscription stays entitled even after the original trial window passed.
+    connection = EntitlementConnection(
+        subscription_status="active", trial_ends_at="2000-01-01T00:00:00+00:00"
+    )
+    provider = PostgresUsageContextProvider(connection)
+
+    reservation = _reserve(provider, "voyage", "embed_query")
+
+    assert reservation.status == "reserved"
+
+
+def test_expired_trial_without_subscription_hard_denies_ingest_tool_calls() -> None:
+    # Trial ended (past trial_ends_at) and no active/trialing subscription -> read-only:
+    # ingest/tool calls hard-deny, and the gate short-circuits before loading policy/balance.
+    connection = EntitlementConnection(
+        subscription_status="canceled", trial_ends_at="2000-01-01T00:00:00+00:00"
+    )
+    provider = PostgresUsageContextProvider(connection)
+
+    reservation = _reserve(provider, "search_store", "lexical_query")
+
+    assert reservation.status == "denied"
+    # The trial gate returns no allocation + a deny policy, so the gate fails closed before any
+    # operation/limit/balance check (allocation_missing is a hard deny).
+    assert reservation.decision.reason == "allocation_missing"
+    assert reservation.decision.denial_effect == "hard"
+    # Read-only deny is decided at the trial gate; policy/balance are not even consulted.
+    assert all("FROM entitlement_policies" not in statement for statement, _params in connection.calls)
+
+
+def test_missing_workspace_row_fails_closed_as_expired() -> None:
+    connection = EntitlementConnection(workspace_row=False)
+    provider = PostgresUsageContextProvider(connection)
+
+    reservation = _reserve(provider, "search_store", "lexical_query")
+
+    assert reservation.status == "denied"
+    assert reservation.decision.reason == "allocation_missing"
+
+
+def test_expired_trial_dashboard_read_stays_allowed() -> None:
+    # The dashboard BFF read path (dashboard_read=True) is exempt from the trial-expiry deny,
+    # so the existing corpus remains searchable from the dashboard after a trial ends.
+    connection = EntitlementConnection(
+        subscription_status="canceled", trial_ends_at="2000-01-01T00:00:00+00:00"
+    )
+    provider = PostgresUsageContextProvider(connection)
+
+    context = provider.for_subject(
+        auth=_auth(dashboard_read=True),
+        subject="search_store",
+        operation="lexical_query",
+        estimated_units={"queries": 1},
+    )
+    reservation = UsageGate().reserve(
+        workspace_id="ws_prod",
+        subject="search_store",
+        operation="lexical_query",
+        estimated_units={"queries": 1},
+        allocation=context.allocation,
+        policy=context.policy,
+        balance=context.balance,
+        idempotency_key="idem_dashboard_read",
+    )
+
+    assert reservation.status == "reserved"
+    # The real policy/balance are loaded (not the deny policy) because the read is exempt.
+    assert context.policy.operation_allowed("search_store.lexical_query")

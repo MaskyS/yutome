@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,16 +54,36 @@ CREDITS_METER_EVENT_NAME = "yutome.credits"
 CREDITS_METER_ID_ENV_VAR = "STRIPE_METER_CREDITS_ID"
 CREDITS_UNIT = "credits"
 
+# Metered overage is OFF for launch (hard-cap model): the flat seat is the only charge and the
+# included allowance is a pure cap enforced by UsageGate, so no meter events are sent. Flip
+# STRIPE_OVERAGE_ENABLED on — together with request rate limiting and a per-period overage
+# ceiling (yt-indexer-434 / yt-indexer-6a0) — to bill usage beyond the included allowance. The
+# overage machinery below stays built and tested, just dormant.
+STRIPE_OVERAGE_ENABLED_ENV_VAR = "STRIPE_OVERAGE_ENABLED"
+
+
+def overage_metering_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    return (env.get(STRIPE_OVERAGE_ENABLED_ENV_VAR) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Internal usage units that contribute to one composite `credits` value. The weight is
 # credits charged per unit of usage. Units absent from this table (candidate_limit,
 # query_vector_dimensions, request_count, bytes, latency_ms, …) are cost-visibility /
 # quota units and are NEVER reported to Stripe — mirroring the workspace-balance
 # "untracked_units" discipline.
+#
+# Calibration: 1 credit ~= 1 indexed video-hour ~= ~$0.10 retail. A ~20-min video on the
+# common index path (existing transcript -> Gemini cleanup -> Voyage embed) costs about
+# 5_700 total_tokens + ~8 vectors ~= 0.34 credits, so ~3 videos/hour ~= ~1.02 credits per
+# video-hour. media_seconds covers the Gemini transcribe fallback path (no caption track);
+# queries price read traffic. See STARTER_INCLUDED_UNITS in account.py for the seat
+# allowance derived from these weights.
 STRIPE_CREDIT_UNIT_WEIGHTS: dict[str, Decimal] = {
-    "media_seconds": Decimal("0.001"),
-    "total_tokens": Decimal("0.0000001"),
-    "vectors": Decimal("0.00001"),
-    "queries": Decimal("0.0001"),
+    "media_seconds": Decimal("0.0003"),
+    "total_tokens": Decimal("0.00005"),
+    "vectors": Decimal("0.007"),
+    "queries": Decimal("0.001"),
 }
 
 
@@ -445,6 +466,51 @@ def credits_from_billable_units(units: Mapping[str, Any]) -> Decimal:
     return total
 
 
+def included_allowance_credits(remaining_units: Mapping[str, Any]) -> Decimal:
+    """Credits-equivalent of the billable portion of a workspace balance.
+
+    The seat ships a monthly included allowance tracked as billable units in
+    WorkspaceBalance.remaining_units (total_tokens/vectors/queries/media_seconds). Collapsing
+    that remaining allowance through the same composite weights yields how many credits of
+    included usage are still free. Non-billable quota units (candidate_limit, request_count,
+    …) do not contribute. A unit that is overdrawn (negative remaining) contributes 0 rather
+    than a negative credit, so an overdrawn balance reads as "no allowance left" not "owed".
+    """
+
+    total = Decimal(0)
+    for unit, quantity in normalize_usage_units(remaining_units).items():
+        weight = STRIPE_CREDIT_UNIT_WEIGHTS.get(unit)
+        if weight is None or isinstance(quantity, (bool, str)) or quantity is None:
+            continue
+        exact = unit_quantity_decimal(quantity)
+        if exact <= 0:
+            continue
+        total += exact * weight
+    return total
+
+
+def overage_credits_for_event(
+    event_credits: Decimal,
+    *,
+    included_remaining_credits: Decimal,
+) -> Decimal:
+    """Portion of an event's composite credits that falls BEYOND the included allowance.
+
+    ``included_remaining_credits`` is the credits-equivalent of the seat allowance still
+    available BEFORE this event consumed any of it. Only the excess is metered to Stripe:
+
+      - allowance fully covers the event  -> 0 overage (nothing metered, never over-bills)
+      - allowance partially covers it     -> meter exactly the uncovered remainder
+      - allowance already exhausted (<=0)  -> meter the whole event (never under-bills)
+
+    Clamped to >= 0 so a negative/overdrawn allowance figure still meters the full event.
+    """
+
+    available = included_remaining_credits if included_remaining_credits > 0 else Decimal(0)
+    overage = event_credits - available
+    return overage if overage > 0 else Decimal(0)
+
+
 def stripe_meter_export_idempotency_key(event: UsageEvent, *, meter_unit: str = CREDITS_UNIT) -> str:
     return f"stripe:{event.workspace_id}:{event.id}:{meter_unit}"
 
@@ -454,16 +520,25 @@ def stripe_meter_exports_from_usage_event(
     *,
     stripe_customer_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    credits_override: Decimal | None = None,
 ) -> tuple[StripeMeterExportEvent, ...]:
     """Build the composite credits meter export for a usage event.
 
     One usage event maps to one credits meter export. The row is `pending` only when the
     event settled (succeeded/released); otherwise `skipped`. A zero/empty credits value
     is skipped (nothing to bill).
+
+    ``credits_override`` meters only the OVERAGE portion (credits beyond the seat's monthly
+    included allowance). When supplied and <= 0 the whole event sits within the allowance and
+    nothing is enqueued. When omitted the full event credits are metered (e.g. a workspace
+    with no remaining included allowance, or a caller that has already netted out allowance).
     """
 
     credits = credits_from_billable_units(event.actual_units)
     if credits <= 0:
+        return ()
+    metered_credits = credits if credits_override is None else credits_override
+    if metered_credits <= 0:
         return ()
     settled = event.status in {"succeeded", "released"}
     replay_status: BillingReplayStatus = "pending" if settled else "skipped"
@@ -482,6 +557,10 @@ def stripe_meter_exports_from_usage_event(
             for unit, quantity in _billable_units(event.actual_units).items()
             if unit in STRIPE_CREDIT_UNIT_WEIGHTS
         },
+        # event_credits = the event's full composite credits; metered_credits = the overage
+        # portion actually reported to Stripe (== event_credits when no allowance is netted).
+        "event_credits": str(credits),
+        "metered_credits": str(metered_credits),
     }
     export_metadata.update(_redacted_metadata(metadata or {}))
     export = StripeMeterExportEvent(
@@ -493,7 +572,7 @@ def stripe_meter_exports_from_usage_event(
         operation_key=event.operation_key,
         meter_unit=CREDITS_UNIT,
         event_name=CREDITS_METER_EVENT_NAME,
-        value=credits,
+        value=metered_credits,
         replay_status=replay_status,
         timestamp=event.created_at,
         metadata={key: value for key, value in export_metadata.items() if value is not None},
@@ -738,10 +817,39 @@ def process_stripe_webhook_event(
     return StripeWebhookProcessingResult(event=event, stripe_customer=stripe_customer, ignored=ignored)
 
 
+def update_workspace_subscription_status_sql(
+    *,
+    workspace_id: str,
+    subscription_status: str,
+) -> BillingSqlStatement:
+    """Mirror a subscription lifecycle change onto the workspace row.
+
+    The entitlement layer reads workspaces.subscription_status to decide trial-expiry
+    read-only. The StripeCustomer model already normalizes Stripe's `trialing` to the entitled
+    `active`, so mirroring its status keeps the workspace entitled while subscribed and lets it
+    fall back to the trial window once `canceled`/`past_due`/`none`.
+    """
+
+    return BillingSqlStatement(
+        sql="""
+UPDATE workspaces
+SET subscription_status = %(subscription_status)s
+WHERE id = %(workspace_id)s;
+""".strip(),
+        params={"workspace_id": workspace_id, "subscription_status": subscription_status},
+    )
+
+
 def stripe_webhook_processing_statements(result: StripeWebhookProcessingResult) -> tuple[BillingSqlStatement, ...]:
     statements: list[BillingSqlStatement] = [upsert_stripe_webhook_event_sql(result.event)]
     if result.stripe_customer is not None:
         statements.append(upsert_stripe_customer_sql(result.stripe_customer))
+        statements.append(
+            update_workspace_subscription_status_sql(
+                workspace_id=result.stripe_customer.workspace_id,
+                subscription_status=result.stripe_customer.subscription_status,
+            )
+        )
     final_event = result.event.model_copy(
         update={
             "status": "skipped" if result.ignored else "succeeded",
@@ -1605,8 +1713,11 @@ __all__ = [
     "enqueue_stripe_meter_export_sql",
     "entitlement_policy_params",
     "finish_stripe_meter_export_sql",
+    "included_allowance_credits",
     "load_stripe_customer_sql",
     "mark_stripe_meter_export_replay",
+    "overage_credits_for_event",
+    "overage_metering_enabled",
     "price_book_params",
     "process_stripe_webhook_event",
     "stripe_customer_id",
@@ -1619,6 +1730,7 @@ __all__ = [
     "stripe_webhook_event_from_payload",
     "stripe_webhook_event_params",
     "stripe_webhook_processing_statements",
+    "update_workspace_subscription_status_sql",
     "upsert_entitlement_policy_sql",
     "upsert_price_book_sql",
     "upsert_stripe_customer_sql",

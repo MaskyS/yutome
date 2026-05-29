@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     owner_user_id text REFERENCES users(id),
     name text NOT NULL,
     status text NOT NULL DEFAULT 'active',
+    subscription_status text NOT NULL DEFAULT 'trialing',
+    trial_ends_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 

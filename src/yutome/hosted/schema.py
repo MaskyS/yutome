@@ -45,6 +45,11 @@ workspaces = Table(
     Column("owner_user_id", Text, ForeignKey("users.id")),
     Column("name", Text, nullable=False),
     Column("status", Text, nullable=False, server_default=text("'active'")),
+    # Personal plan (flat seat + metered overage) lifecycle. `trialing` and `active` both grant
+    # ingest; a workspace whose trial_ends_at has passed with no active/trialing subscription is
+    # trial-expiry read-only. The Stripe webhook mirror keeps subscription_status in sync.
+    Column("subscription_status", Text, nullable=False, server_default=text("'trialing'")),
+    Column("trial_ends_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
 )
 

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from yutome.hosted.gate import Allocation, UsageGate
@@ -120,8 +121,16 @@ class PostgresUsageLedger:
         with _transaction(self.connection):
             row = _execute_one(self.connection, insert_usage_event_sql(durable, idempotency=idempotency))
             persisted = usage_event_from_row(row) if row else durable
-            _reconcile_balance_for_usage_event(self.connection, persisted)
-            _enqueue_stripe_meter_exports(self.connection, persisted)
+            # included_remaining_credits is the seat's monthly included allowance still free
+            # (in composite credits) BEFORE this event consumed any of it; reconciliation then
+            # deducts the event's actual units. The meter export uses the pre-event figure to
+            # bill only the overage, so the deduction order cannot double-charge the boundary.
+            included_remaining_credits = _reconcile_balance_for_usage_event(self.connection, persisted)
+            _enqueue_stripe_meter_exports(
+                self.connection,
+                persisted,
+                included_remaining_credits=included_remaining_credits,
+            )
             return persisted
 
     def recent(self, *, workspace_id: str, limit: int = 20) -> list[UsageEvent]:
@@ -234,15 +243,24 @@ def _numeric_actual_units(event: UsageEvent) -> UnitMap:
     return numeric
 
 
-def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> None:
+def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> Decimal | None:
+    """Apply a settled event to the locked workspace balance.
+
+    Returns the seat's included allowance still free (composite credits) as read from the
+    locked balance row BEFORE this event's deduction, or ``None`` when there is no
+    reservation/balance row to net against (caller then meters the full event credits).
+    """
+
     if event.reservation_id is None or event.status not in {"succeeded", "failed", "released"}:
-        return
+        return None
     row = _lock_reservation_by_id(connection, workspace_id=event.workspace_id, reservation_id=event.reservation_id)
     if row is None or str(row.get("status")) != "reserved":
-        return
+        return None
     reservation = usage_reservation_from_row(row)
     balance_row = _lock_current_workspace_balance_row(connection, workspace_id=event.workspace_id)
+    included_remaining_credits: Decimal | None = None
     if balance_row is not None:
+        included_remaining_credits = _included_allowance_credits_before_event(balance_row, reservation)
         remaining_units, reserved_units = _balance_after_usage_event(balance_row, reservation, event)
         _execute_one(
             connection,
@@ -264,22 +282,65 @@ def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> No
             status=next_status,
         ),
     )
+    return included_remaining_credits
 
 
-def _enqueue_stripe_meter_exports(connection: Any, event: UsageEvent) -> None:
-    """Close the usage -> Stripe meter loop at write time.
+def _included_allowance_credits_before_event(row: Mapping[str, Any], reservation: UsageReservation) -> Decimal:
+    """Composite-credits value of the seat's included allowance free BEFORE this operation.
+
+    The locked balance row already reflects this reservation's hold (reserve subtracted the
+    ESTIMATE from remaining). To recover the allowance free before the operation, add the held
+    estimate back, then collapse through the meter weights. Settle then deducts the true ACTUAL,
+    so the overage is exactly ``credits(actual) - credits(allowance_before)``: the included
+    portion is never metered (no double-charge) and any excess is (no under-bill).
+    """
+
+    from yutome.hosted.billing import included_allowance_credits
+
+    unlimited_units = set(_text_array(row.get("unlimited_units")))
+    remaining = normalize_unit_map(_json_mapping(row.get("remaining_units_jsonb")), allow_negative=True)
+    held_estimate = {
+        unit: quantity
+        for unit, quantity in normalize_unit_map(reservation.estimated_units).items()
+        if unit not in unlimited_units
+    }
+    allowance_before = add_unit_maps(remaining, held_estimate)
+    return included_allowance_credits(allowance_before)
+
+
+def _enqueue_stripe_meter_exports(
+    connection: Any,
+    event: UsageEvent,
+    *,
+    included_remaining_credits: Decimal | None = None,
+) -> None:
+    """Close the usage -> Stripe meter loop at write time, metering only OVERAGE.
 
     Enqueue a pending Stripe meter export only when the event settled
     (succeeded/released) AND the workspace has an active stripe_customers row.
     Best-effort: a missing/inactive customer (free/unsubscribed workspace) enqueues
     nothing and never blocks the usage write. The billing mirror never authorizes a call.
+
+    The seat carries a monthly included allowance (WorkspaceBalance.remaining_units). Only the
+    portion of this event's composite credits BEYOND the still-free allowance is metered:
+    ``included_remaining_credits`` is the allowance (in credits) read under the balance lock
+    BEFORE this event's deduction. While the allowance covers the event, nothing is enqueued;
+    once exhausted, only the excess is enqueued. ``None`` means there was no balance row to net
+    against, so the full event credits are metered (fail toward billing, never under-bill).
     """
 
     from yutome.hosted.billing import (
+        credits_from_billable_units,
         enqueue_stripe_meter_export_sql,
+        overage_credits_for_event,
+        overage_metering_enabled,
         stripe_meter_exports_from_usage_event,
     )
 
+    # Launch hard-cap: overage metering is dormant by default (the flat seat is the only
+    # charge; the included allowance is a pure cap via UsageGate). yt-indexer-6a0 flips it on.
+    if not overage_metering_enabled():
+        return
     if event.status not in {"succeeded", "released"}:
         return
     customer_row = _execute_one(
@@ -294,9 +355,16 @@ def _enqueue_stripe_meter_exports(connection: Any, event: UsageEvent) -> None:
     stripe_customer_external_id = customer_row.get("stripe_customer_id")
     if not stripe_customer_external_id:
         return
+    credits_override: Decimal | None = None
+    if included_remaining_credits is not None:
+        credits_override = overage_credits_for_event(
+            credits_from_billable_units(event.actual_units),
+            included_remaining_credits=included_remaining_credits,
+        )
     for export in stripe_meter_exports_from_usage_event(
         event,
         stripe_customer_id=str(stripe_customer_external_id),
+        credits_override=credits_override,
     ):
         statement = enqueue_stripe_meter_export_sql(export)
         connection.execute(statement.sql, statement.params)

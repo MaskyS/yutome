@@ -182,7 +182,7 @@ The four roles here are distinct and easy to confuse — keep them straight:
 |---|---|---|
 | **allocation** | `provider_allocations` / `service_allocations` | *Is this operation authorized, and where do its credentials come from?* (`credential_mode`) |
 | **EntitlementPolicy** | `entitlement_policies` | *Which operations are allowed, and what are the hard/soft per-operation ceilings?* |
-| **WorkspaceBalance** | `workspace_balances` | *How many free-tier quota units remain this period (and which units are unlimited)?* |
+| **WorkspaceBalance** | `workspace_balances` | *How many of the seat's monthly included-allowance units remain this period (and which units are unlimited)? The source of truth for the included→overage boundary.* |
 | **price_book** | `price_books` | *What does a unit cost / how do product units map?* |
 
 ### 2.4 Usage / Metering (append-only)
@@ -238,8 +238,11 @@ erDiagram
 The **usage ledger** (`usage_reservations` + `usage_events`) is the source of truth for pre-call
 authorization. `stripe_meter_exports` is a *mirror* of settled events: one settled usage event maps
 to one pending row carrying the composite `credits` value, which the `stripe-meter-export` worker
-POSTs to Stripe `/v1/billing/meter_events`. Stripe is pure metered (billed in arrears); the prepaid
-credit-purchase path was removed. Billing is decoupled from authorization. Idempotency is enforced
+POSTs to Stripe `/v1/billing/meter_events`. The Personal plan is a **flat $4/mo seat + metered
+overage**: only credits *beyond* the seat's monthly included allowance are metered (billed in
+arrears); usage within the allowance enqueues nothing. The included allowance is tracked in
+`workspace_balances`, so the same reserve/settle accounting decides the boundary. Billing is
+decoupled from authorization. Idempotency is enforced
 by unique constraints: `(workspace_id, idempotency_key)` on reservations, `(source_event_dedupe_key)`
 on meter exports (the row id == the Stripe meter_event `identifier`), and the Stripe event id as the
 `stripe_webhook_events` PK for exactly-once webhook processing.
@@ -638,7 +641,7 @@ Grouped by auth dependency. Method/path anchored to `http_api.py`.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/account/cli/token` (`:921`) | PKCE token exchange (no auth) |
-| POST | `/billing/checkout` | Create a Stripe Checkout session (subscription, metered price); session-authenticated |
+| POST | `/billing/checkout` | Create a Stripe Checkout session (subscription on flat seat Price + metered overage Price, 14-day trial); session-authenticated |
 | POST | `/billing/portal` | Create a Stripe Customer Portal session; session-authenticated |
 | POST | `/webhooks/stripe` | Stripe webhook (signature-verified, exactly-once by event id) |
 

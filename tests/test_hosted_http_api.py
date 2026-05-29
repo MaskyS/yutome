@@ -213,12 +213,30 @@ class RecordingSearchStore:
 
 
 class RecordingConnection:
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        workspace_subscription_status: str = "trialing",
+        workspace_trial_ends_at: Any = "2999-01-01T00:00:00+00:00",
+    ) -> None:
         self.rows = rows or []
+        self.workspace_subscription_status = workspace_subscription_status
+        self.workspace_trial_ends_at = workspace_trial_ends_at
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.calls.append((statement, dict(params or {})))
+        # The entitlement provider checks trial-expiry before loading policy/balance; model an
+        # entitled (trialing) workspace by default so denials fall through to the path under
+        # test rather than short-circuiting at the trial gate.
+        if "FROM workspaces" in statement and "subscription_status" in statement:
+            return [
+                {
+                    "subscription_status": self.workspace_subscription_status,
+                    "trial_ends_at": self.workspace_trial_ends_at,
+                }
+            ]
         return self.rows
 
 
@@ -449,6 +467,7 @@ def _billing_client_with_customer(
 ) -> tuple[TestClient, list[tuple[str, dict[str, str]]]]:
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_123")
     monkeypatch.setenv("STRIPE_PRICE_ID", "price_metered_123")
+    monkeypatch.setenv("STRIPE_SEAT_PRICE_ID", "price_seat_4usd")
     monkeypatch.setenv("STRIPE_CHECKOUT_SUCCESS_URL", "https://app.example.test/billing/success")
     monkeypatch.setenv("STRIPE_CHECKOUT_CANCEL_URL", "https://app.example.test/billing/cancel")
     monkeypatch.setenv("STRIPE_PORTAL_RETURN_URL", "https://app.example.test/billing")
@@ -516,9 +535,14 @@ def test_billing_checkout_creates_customer_and_returns_url(monkeypatch: pytest.M
     checkout_form = posted[1][1]
     assert checkout_form["mode"] == "subscription"
     assert checkout_form["customer"] == "cus_created_1"
-    assert checkout_form["line_items[0][price]"] == "price_metered_123"
-    # Metered prices must omit quantity.
-    assert not any("quantity" in key for key in checkout_form)
+    # Personal plan subscribes to BOTH line items: flat $4 seat (quantity 1) + metered overage.
+    assert checkout_form["line_items[0][price]"] == "price_seat_4usd"
+    assert checkout_form["line_items[0][quantity]"] == "1"
+    assert checkout_form["line_items[1][price]"] == "price_metered_123"
+    # The metered overage price must omit quantity (only the seat carries a quantity).
+    assert "line_items[1][quantity]" not in checkout_form
+    # 14-day card-gated trial.
+    assert checkout_form["subscription_data[trial_period_days]"] == "14"
     assert checkout_form["client_reference_id"] == "ws_http"
     assert checkout_form["subscription_data[metadata][workspace_id]"] == "ws_http"
 
