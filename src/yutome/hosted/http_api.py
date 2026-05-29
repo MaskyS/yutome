@@ -99,7 +99,13 @@ SESSION_HEADER = "X-Yutome-Session-Id"
 ACCOUNT_SESSION_TOKEN_HEADER = "X-Yutome-Account-Session"
 TOKEN_ENV_VAR = "YUTOME_HOSTED_API_TOKEN"
 DASHBOARD_TOKEN_ENV_VAR = "YUTOME_DASHBOARD_API_TOKEN"
-POLAR_WEBHOOK_SECRET_ENV_VAR = "POLAR_WEBHOOK_SECRET"
+STRIPE_WEBHOOK_SECRET_ENV_VAR = "STRIPE_WEBHOOK_SECRET"
+STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+STRIPE_PRICE_ID_ENV_VAR = "STRIPE_PRICE_ID"
+STRIPE_CHECKOUT_SUCCESS_URL_ENV_VAR = "STRIPE_CHECKOUT_SUCCESS_URL"
+STRIPE_CHECKOUT_CANCEL_URL_ENV_VAR = "STRIPE_CHECKOUT_CANCEL_URL"
+STRIPE_PORTAL_RETURN_URL_ENV_VAR = "STRIPE_PORTAL_RETURN_URL"
+STRIPE_API_BASE_ENV_VAR = "STRIPE_API_BASE"
 ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR = "YUTOME_ACCOUNT_SESSION_HMAC_SECRET"
 ACCOUNT_SESSION_AUDIENCE_ENV_VAR = "YUTOME_ACCOUNT_SESSION_AUDIENCE"
 ACCOUNT_SESSION_MAX_AGE_SECONDS_ENV_VAR = "YUTOME_ACCOUNT_SESSION_MAX_AGE_SECONDS"
@@ -297,7 +303,7 @@ def build_postgres_app(
     index_profile_ref: str | None = None,
     expected_api_token: str | None = None,
     expected_account_api_token: str | None = None,
-    polar_webhook_secret: str | None = None,
+    stripe_webhook_secret: str | None = None,
     account_session_secret: str | None = None,
     account_session_audience: str | None = None,
     account_session_ttl_seconds: int | None = None,
@@ -327,7 +333,7 @@ def build_postgres_app(
         expected_api_token=_normalize_api_token(expected_api_token) or _api_token_from_env(),
         expected_account_api_token=_normalize_api_token(expected_account_api_token) or _dashboard_api_token_from_env(),
         billing_connection=connection,
-        polar_webhook_secret=_normalize_api_token(polar_webhook_secret) or _polar_webhook_secret_from_env(),
+        stripe_webhook_secret=_normalize_api_token(stripe_webhook_secret) or _stripe_webhook_secret_from_env(),
         account_session_secret=_normalize_api_token(account_session_secret) or _account_session_secret_from_env(),
         account_session_audience=_normalize_api_token(account_session_audience) or _account_session_audience_from_env(),
         account_session_ttl_seconds=account_session_ttl_seconds or _account_session_ttl_seconds_from_env(),
@@ -354,7 +360,7 @@ def build_app(
     expected_api_token: str | None = None,
     expected_account_api_token: str | None = None,
     billing_connection: Any | None = None,
-    polar_webhook_secret: str | None = None,
+    stripe_webhook_secret: str | None = None,
     account_session_secret: str | None = None,
     account_session_audience: str | None = None,
     account_session_ttl_seconds: int | None = None,
@@ -368,11 +374,15 @@ def build_app(
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
     from yutome.hosted.billing import (
-        PolarWebhookVerificationError,
-        polar_webhook_processing_statements,
-        process_polar_webhook_payload,
-        verify_standard_webhook_signature,
+        StripeWebhookVerificationError,
+        load_stripe_customer_sql,
+        process_stripe_webhook_event,
+        stripe_customer_id as _build_stripe_customer_id,
+        stripe_webhook_processing_statements,
+        upsert_stripe_customer_sql,
+        verify_stripe_webhook_signature,
     )
+    from yutome.hosted.billing import StripeCustomer as _StripeCustomer
 
     app = FastAPI(
         title="yutome-hosted-mcp",
@@ -383,7 +393,7 @@ def build_app(
     app.state.hosted_billing_connection = billing_connection
     normalized_api_token = _normalize_api_token(expected_api_token)
     normalized_account_api_token = _normalize_api_token(expected_account_api_token)
-    normalized_polar_webhook_secret = _normalize_api_token(polar_webhook_secret)
+    normalized_stripe_webhook_secret = _normalize_api_token(stripe_webhook_secret)
     normalized_account_session_secret = _normalize_api_token(account_session_secret)
     normalized_account_session_audience = (
         _normalize_api_token(account_session_audience) or DEFAULT_ACCOUNT_SESSION_AUDIENCE
@@ -397,7 +407,7 @@ def build_app(
     resolved_google_signin_settings = google_signin_settings or google_signin_settings_from_env(os.environ)
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
-    app.state.polar_webhook_configured = bool(normalized_polar_webhook_secret)
+    app.state.stripe_webhook_configured = bool(normalized_stripe_webhook_secret)
     app.state.account_session_signing_configured = bool(normalized_account_session_secret)
     app.state.hosted_account_api_configured = bool(normalized_account_api_token)
     app.state.youtube_oauth_configured = resolved_youtube_oauth_settings.configured
@@ -850,14 +860,13 @@ def build_app(
             "redirect_path": _safe_redirect_path(record.get("redirect_path")),
         }
 
-    @app.post("/billing/polar/webhook")
-    @app.post("/webhooks/polar")
-    async def polar_webhook(request: Request) -> dict[str, Any]:
-        if not normalized_polar_webhook_secret:
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request) -> dict[str, Any]:
+        if not normalized_stripe_webhook_secret:
             raise _http_error(
                 HostedMcpError(
-                    code="polar_webhook_secret_unconfigured",
-                    message=f"Set {POLAR_WEBHOOK_SECRET_ENV_VAR} before accepting Polar webhooks.",
+                    code="stripe_webhook_secret_unconfigured",
+                    message=f"Set {STRIPE_WEBHOOK_SECRET_ENV_VAR} before accepting Stripe webhooks.",
                     status_code=503,
                 )
             )
@@ -871,16 +880,16 @@ def build_app(
             )
         raw_body = await request.body()
         try:
-            webhook_event_id = verify_standard_webhook_signature(
+            verify_stripe_webhook_signature(
                 raw_body=raw_body,
-                headers=dict(request.headers),
-                secret=normalized_polar_webhook_secret,
+                header=request.headers.get("stripe-signature"),
+                secret=normalized_stripe_webhook_secret,
             )
-        except PolarWebhookVerificationError as exc:
+        except StripeWebhookVerificationError as exc:
             raise _http_error(
                 HostedMcpError(
                     code=str(exc),
-                    message="Invalid Polar webhook signature.",
+                    message="Invalid Stripe webhook signature.",
                     status_code=401,
                 )
             ) from exc
@@ -889,22 +898,53 @@ def build_app(
         except json.JSONDecodeError as exc:
             raise _http_error(
                 HostedMcpError(
-                    code="polar_webhook_invalid_json",
-                    message="Polar webhook body must be valid JSON.",
+                    code="stripe_webhook_invalid_json",
+                    message="Stripe webhook body must be valid JSON.",
                     status_code=400,
                 )
             ) from exc
-        result = process_polar_webhook_payload(payload, raw_body=raw_body, webhook_event_id=webhook_event_id)
-        _execute_billing_statements(billing_connection, polar_webhook_processing_statements(result))
+        result = process_stripe_webhook_event(payload)
+        _execute_billing_statements(billing_connection, stripe_webhook_processing_statements(result))
         return {
             "ok": True,
-            "event_id": result.snapshot.webhook_event_id,
-            "payload_hash": result.snapshot.payload_hash,
-            "event_type": result.snapshot.event_type,
-            "credit_entries": len(result.credit_entries),
-            "billing_customer": result.billing_customer.id if result.billing_customer else None,
+            "event_id": result.event.id,
+            "event_type": result.event.type,
+            "stripe_customer": result.stripe_customer.id if result.stripe_customer else None,
             "ignored": result.ignored,
         }
+
+    def _load_stripe_customer_row(workspace_id: str) -> Mapping[str, Any] | None:
+        statement = load_stripe_customer_sql(workspace_id=workspace_id)
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        return rows[0] if rows else None
+
+    def _get_or_create_stripe_customer(*, workspace_id: str, user_id: str) -> str:
+        existing = _load_stripe_customer_row(workspace_id)
+        if existing is not None and existing.get("stripe_customer_id"):
+            return str(existing["stripe_customer_id"])
+        created = _stripe_post(
+            "/v1/customers",
+            {"metadata[workspace_id]": workspace_id, "metadata[user_id]": user_id},
+        )
+        external_id = str(created.get("id") or "")
+        if not external_id:
+            raise _http_error(
+                HostedMcpError(
+                    code="stripe_customer_create_failed",
+                    message="Stripe did not return a customer id.",
+                    status_code=502,
+                )
+            )
+        customer = _StripeCustomer(
+            id=_build_stripe_customer_id(stripe_customer_id=external_id),
+            workspace_id=workspace_id,
+            stripe_customer_id=external_id,
+            subscription_status="none",
+            metadata={"created_via": "billing_checkout"},
+        )
+        statement = upsert_stripe_customer_sql(customer)
+        billing_connection.execute(statement.sql, statement.params)
+        return external_id
 
     def account_auth_dependency(
         authorization: str | None = Header(default=None),
@@ -965,6 +1005,65 @@ def build_app(
             user_id=claims.user_id,
             workspace_name=_optional_text(workspace.get("name")),
         )
+
+    @app.post("/billing/checkout")
+    def billing_checkout(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        price_id = _stripe_env(STRIPE_PRICE_ID_ENV_VAR)
+        success_url = _stripe_env(STRIPE_CHECKOUT_SUCCESS_URL_ENV_VAR)
+        cancel_url = _stripe_env(STRIPE_CHECKOUT_CANCEL_URL_ENV_VAR)
+        customer_external_id = _get_or_create_stripe_customer(
+            workspace_id=context.workspace_id, user_id=context.user_id
+        )
+        # Metered prices must OMIT line_items[0][quantity]; Stripe errors if it is sent.
+        session = _stripe_post(
+            "/v1/checkout/sessions",
+            {
+                "mode": "subscription",
+                "customer": customer_external_id,
+                "line_items[0][price]": price_id,
+                "success_url": success_url,
+                "cancel_url": cancel_url,
+                "client_reference_id": context.workspace_id,
+                "subscription_data[metadata][workspace_id]": context.workspace_id,
+            },
+        )
+        url = _optional_text(session.get("url"))
+        if url is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="stripe_checkout_session_failed",
+                    message="Stripe did not return a checkout session url.",
+                    status_code=502,
+                )
+            )
+        return {"ok": True, "url": url}
+
+    @app.post("/billing/portal")
+    def billing_portal(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        return_url = _stripe_env(STRIPE_PORTAL_RETURN_URL_ENV_VAR)
+        existing = _load_stripe_customer_row(context.workspace_id)
+        if existing is None or not existing.get("stripe_customer_id"):
+            raise _http_error(
+                HostedMcpError(
+                    code="stripe_customer_not_found",
+                    message="Subscribe via /billing/checkout before opening the customer portal.",
+                    status_code=409,
+                )
+            )
+        session = _stripe_post(
+            "/v1/billing_portal/sessions",
+            {"customer": str(existing["stripe_customer_id"]), "return_url": return_url},
+        )
+        url = _optional_text(session.get("url"))
+        if url is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="stripe_portal_session_failed",
+                    message="Stripe did not return a customer portal url.",
+                    status_code=502,
+                )
+            )
+        return {"ok": True, "url": url}
 
     def cli_auth_dependency(authorization: str | None = Header(default=None)) -> AccountCliApiContext:
         if billing_connection is None:
@@ -1449,9 +1548,55 @@ def _dashboard_api_token_from_env(environ: Mapping[str, str] | None = None) -> s
     return _normalize_api_token(env.get(DASHBOARD_TOKEN_ENV_VAR))
 
 
-def _polar_webhook_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:
+def _stripe_webhook_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
-    return _normalize_api_token(env.get(POLAR_WEBHOOK_SECRET_ENV_VAR))
+    return _normalize_api_token(env.get(STRIPE_WEBHOOK_SECRET_ENV_VAR))
+
+
+def _stripe_env(name: str) -> str:
+    value = _normalize_api_token(os.environ.get(name))
+    if value is None:
+        raise _http_error(
+            HostedMcpError(
+                code="stripe_configuration_missing",
+                message=f"Set {name} before serving Stripe billing routes.",
+                status_code=503,
+            )
+        )
+    return value
+
+
+def _stripe_post(path: str, form: Mapping[str, str]) -> dict[str, Any]:
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    secret_key = _stripe_env(STRIPE_SECRET_KEY_ENV_VAR)
+    api_base = (_normalize_api_token(os.environ.get(STRIPE_API_BASE_ENV_VAR)) or "https://api.stripe.com").rstrip("/")
+    body = urllib.parse.urlencode({key: value for key, value in form.items() if value is not None}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_base}{path}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "yutome-hosted-billing/0.1",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            text = response.read().decode("utf-8")
+            return json.loads(text) if text else {}
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        raise _http_error(
+            HostedMcpError(
+                code="stripe_api_error",
+                message=f"Stripe API call failed with HTTP {exc.code}: {error_text[:300]}",
+                status_code=502,
+            )
+        ) from exc
 
 
 def _account_session_secret_from_env(environ: Mapping[str, str] | None = None) -> str | None:

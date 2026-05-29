@@ -13,19 +13,20 @@ from decimal import Decimal
 import pytest
 
 from yutome.hosted.billing import (
-    BillingCustomer,
-    BillingExportEvent,
-    CreditLedgerEntry,
+    CREDITS_METER_EVENT_NAME,
     EntitlementPolicyRecord,
-    PolarWebhookSnapshot,
     PriceBook,
+    StripeCustomer,
+    StripeMeterExportEvent,
+    StripeWebhookEvent,
     WorkspaceBalanceSnapshot,
-    upsert_billing_customer_sql,
-    upsert_billing_export_sql,
-    upsert_credit_ledger_entry_sql,
+    claim_stripe_meter_exports_sql,
+    finish_stripe_meter_export_sql,
     upsert_entitlement_policy_sql,
-    upsert_polar_webhook_snapshot_sql,
     upsert_price_book_sql,
+    upsert_stripe_customer_sql,
+    upsert_stripe_meter_export_sql,
+    upsert_stripe_webhook_event_sql,
     upsert_workspace_balance_sql,
 )
 from yutome.hosted.indexing import complete_job_operation_success_sql, enqueue_index_video_job_sql
@@ -449,62 +450,35 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
             )
             cursor.execute(
                 """
-                CREATE TEMP TABLE billing_customers (
+                CREATE TEMP TABLE stripe_customers (
                     id text PRIMARY KEY,
-                    workspace_id text NOT NULL,
-                    provider text NOT NULL,
-                    external_customer_id text NOT NULL,
-                    external_subscription_id text,
+                    workspace_id text NOT NULL UNIQUE,
+                    stripe_customer_id text NOT NULL UNIQUE,
+                    stripe_subscription_id text,
+                    subscription_status text NOT NULL DEFAULT 'none',
                     subscription_status_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
                     last_webhook_at timestamptz,
                     status text NOT NULL DEFAULT 'active',
                     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
                     created_at timestamptz NOT NULL DEFAULT now(),
-                    updated_at timestamptz NOT NULL DEFAULT now(),
-                    UNIQUE(workspace_id, provider),
-                    UNIQUE(provider, external_customer_id)
+                    updated_at timestamptz NOT NULL DEFAULT now()
                 ) ON COMMIT DROP;
                 """
             )
             cursor.execute(
                 """
-                CREATE TEMP TABLE credit_ledger_entries (
-                    id text PRIMARY KEY,
-                    workspace_id text NOT NULL,
-                    idempotency_key text NOT NULL,
-                    provider text NOT NULL,
-                    external_order_id text,
-                    external_customer_id text,
-                    direction text NOT NULL,
-                    unit text NOT NULL,
-                    quantity_text text NOT NULL,
-                    reason text NOT NULL,
-                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                    occurred_at timestamptz NOT NULL,
-                    created_at timestamptz NOT NULL DEFAULT now(),
-                    UNIQUE(workspace_id, idempotency_key)
-                ) ON COMMIT DROP;
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TEMP TABLE billing_exports (
+                CREATE TEMP TABLE stripe_meter_exports (
                     id text PRIMARY KEY,
                     workspace_id text NOT NULL,
                     usage_event_id text NOT NULL,
                     reservation_id text,
-                    billing_customer_id text,
-                    price_book_id text,
-                    provider text NOT NULL,
-                    external_customer_id text,
-                    customer_id text,
-                    external_meter_key text,
-                    external_event_id text,
+                    stripe_customer_id text,
+                    meter_unit text NOT NULL,
                     event_name text NOT NULL,
-                    export_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    value_text text NOT NULL,
                     source_event_dedupe_key text NOT NULL,
                     status text NOT NULL DEFAULT 'pending',
-                    authorization_effect text NOT NULL DEFAULT 'none',
+                    stripe_meter_event_identifier text,
                     attempt_count integer NOT NULL DEFAULT 0,
                     last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
                     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -512,24 +486,18 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
                     created_at timestamptz NOT NULL DEFAULT now(),
                     exported_at timestamptz,
                     updated_at timestamptz NOT NULL DEFAULT now(),
-                    UNIQUE(provider, source_event_dedupe_key),
-                    UNIQUE(provider, external_event_id)
+                    UNIQUE(source_event_dedupe_key)
                 ) ON COMMIT DROP;
                 """
             )
             cursor.execute(
                 """
-                CREATE TEMP TABLE polar_webhook_snapshots (
+                CREATE TEMP TABLE stripe_webhook_events (
                     id text PRIMARY KEY,
-                    webhook_event_id text UNIQUE,
-                    payload_hash text NOT NULL,
-                    event_type text NOT NULL,
+                    type text NOT NULL,
                     workspace_id text,
-                    external_customer_id text,
-                    external_subscription_id text,
-                    customer_state_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
                     payload_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
-                    replay_status text NOT NULL DEFAULT 'pending',
+                    status text NOT NULL DEFAULT 'pending',
                     received_at timestamptz NOT NULL,
                     processed_at timestamptz,
                     last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -572,52 +540,73 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
                 "vectors": 10
             }
 
-            customer_statement = upsert_billing_customer_sql(
-                BillingCustomer(id="bc_1", workspace_id="ws_1", external_customer_id="cus_1", last_webhook_at=now)
-            )
-            assert cursor.execute(customer_statement.sql, customer_statement.params).fetchone()["external_customer_id"] == "cus_1"
-
-            credit_statement = upsert_credit_ledger_entry_sql(
-                CreditLedgerEntry(
-                    id="cred_1",
+            customer_statement = upsert_stripe_customer_sql(
+                StripeCustomer(
+                    id="sc_1",
                     workspace_id="ws_1",
-                    idempotency_key="order_1:vectors:0",
-                    unit="vectors",
-                    quantity=Decimal("10"),
-                    external_order_id="order_1",
-                    reason="order_grant",
-                    occurred_at=now,
+                    stripe_customer_id="cus_1",
+                    stripe_subscription_id="sub_1",
+                    subscription_status="active",
+                    last_webhook_at=now,
                 )
             )
-            assert cursor.execute(credit_statement.sql, credit_statement.params).fetchone()["quantity_text"] == "10"
+            customer_row = cursor.execute(customer_statement.sql, customer_statement.params).fetchone()
+            assert customer_row["stripe_customer_id"] == "cus_1"
+            assert customer_row["subscription_status"] == "active"
 
-            export_statement = upsert_billing_export_sql(
-                BillingExportEvent(
-                    idempotency_key="bill_1",
-                    usage_event_id="evt_1",
-                    reservation_id="res_1",
-                    workspace_id="ws_1",
-                    operation_key="voyage.embed_documents",
-                    event_name="yutome.voyage.embed_documents",
-                    actual_units={"vectors": 2},
-                    timestamp=now,
-                    external_customer_id="cus_1",
-                )
+            export = StripeMeterExportEvent(
+                idempotency_key="stripe:ws_1:evt_1:credits",
+                usage_event_id="evt_1",
+                reservation_id="res_1",
+                workspace_id="ws_1",
+                stripe_customer_id="cus_1",
+                operation_key="voyage.embed_documents",
+                value=Decimal("0.10002"),
+                timestamp=now,
             )
-            assert cursor.execute(export_statement.sql, export_statement.params).fetchone()["export_units_jsonb"] == {"vectors": 2}
+            export_statement = upsert_stripe_meter_export_sql(export)
+            export_row = cursor.execute(export_statement.sql, export_statement.params).fetchone()
+            assert export_row["value_text"] == "0.10002"
+            assert export_row["meter_unit"] == "credits"
+            assert export_row["event_name"] == CREDITS_METER_EVENT_NAME
 
-            snapshot_statement = upsert_polar_webhook_snapshot_sql(
-                PolarWebhookSnapshot(
-                    id="snap_1",
-                    webhook_event_id="evt_polar_1",
-                    payload_hash="sha256:abc",
-                    event_type="order.paid",
+            # Re-enqueue with the same dedupe key is a no-op upsert (one row only).
+            cursor.execute(export_statement.sql, export_statement.params)
+            count_row = cursor.execute("SELECT count(*) AS n FROM stripe_meter_exports;").fetchone()
+            assert count_row["n"] == 1
+
+            # The claim (FOR UPDATE SKIP LOCKED) and finish statements stay raw locks.
+            claim_statement = claim_stripe_meter_exports_sql(lease_owner="worker-1", now=now, limit=10)
+            claimed = cursor.execute(claim_statement.sql, claim_statement.params).fetchall()
+            assert [row["id"] for row in claimed] == ["stripe:ws_1:evt_1:credits"]
+            assert claimed[0]["status"] == "processing"
+
+            finish_statement = finish_stripe_meter_export_sql(
+                export_id="stripe:ws_1:evt_1:credits",
+                now=now,
+                replay_status="succeeded",
+                stripe_meter_event_identifier="stripe:ws_1:evt_1:credits",
+            )
+            finished = cursor.execute(finish_statement.sql, finish_statement.params).fetchone()
+            assert finished["status"] == "succeeded"
+            assert finished["exported_at"] is not None
+
+            webhook_statement = upsert_stripe_webhook_event_sql(
+                StripeWebhookEvent(
+                    id="evt_stripe_1",
+                    type="checkout.session.completed",
                     workspace_id="ws_1",
-                    payload={"id": "evt_polar_1"},
+                    payload={"id": "evt_stripe_1"},
                     received_at=now,
                 )
             )
-            assert cursor.execute(snapshot_statement.sql, snapshot_statement.params).fetchone()["payload_hash"] == "sha256:abc"
+            webhook_row = cursor.execute(webhook_statement.sql, webhook_statement.params).fetchone()
+            assert webhook_row["type"] == "checkout.session.completed"
+
+            # Replay of the same Stripe event id is exactly-once via the PK conflict.
+            cursor.execute(webhook_statement.sql, webhook_statement.params)
+            webhook_count = cursor.execute("SELECT count(*) AS n FROM stripe_webhook_events;").fetchone()
+            assert webhook_count["n"] == 1
 
         connection.rollback()
 

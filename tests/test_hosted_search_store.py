@@ -221,7 +221,7 @@ def test_resource_sql_is_workspace_scoped_for_supported_hosts() -> None:
     # Each resource lookup is workspace-scoped and parameterized. Assert on the bound
     # values, not generated SQL text or param key names (SQLAlchemy auto-names params).
     assert all("ws_alice" in statement.params.values() for statement in statements)
-    for statement, target_id in zip(statements, ["chunk_1", "vid_1", "chan_1", "tx_1", "src_1"]):
+    for statement, target_id in zip(statements, ["chunk_1", "vid_1", "chan_1", "tx_1", "src_1"], strict=True):
         assert target_id in statement.params.values()
 
 

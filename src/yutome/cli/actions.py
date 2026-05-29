@@ -743,7 +743,7 @@ def hosted_maintenance_tick(*, config: Path, once: bool, limit: int, poll_interv
         _die(str(exc), json_output=json_output)
 
 
-def hosted_billing_export_worker(
+def hosted_stripe_meter_export_worker(
     *,
     config: Path,
     once: bool,
@@ -755,8 +755,12 @@ def hosted_billing_export_worker(
     try:
         runner = _runner(config)
         while True:
-            result = runner.billing_export_once(lease_owner=_lease_owner(lease_owner), limit=limit)
-            _echo_result(result, json_output=json_output, message=f"Billing export claimed {result.affected_rows} rows.")
+            result = runner.stripe_meter_export_once(lease_owner=_lease_owner(lease_owner), limit=limit)
+            _echo_result(
+                result,
+                json_output=json_output,
+                message=f"Stripe meter export claimed {result.affected_rows} rows.",
+            )
             if once:
                 return
             time.sleep(poll_interval)

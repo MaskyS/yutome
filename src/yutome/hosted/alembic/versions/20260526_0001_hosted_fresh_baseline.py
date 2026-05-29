@@ -27,12 +27,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     for table_name in (
-        "polar_webhook_snapshots",
-        "billing_exports",
-        "credit_ledger_entries",
+        "stripe_webhook_events",
+        "stripe_meter_exports",
         "workspace_balances",
         "entitlement_policies",
-        "billing_customers",
+        "stripe_customers",
         "price_books",
         "chunk_embeddings",
         "chunks",

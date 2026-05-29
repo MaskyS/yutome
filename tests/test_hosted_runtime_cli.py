@@ -200,17 +200,16 @@ class FakeHostedRunner:
                             "metadata": {},
                         }
                     ],
-                    "billing_exports": [
+                    "meter_exports": [
                         {
-                            "id": "bill_evt_denied",
+                            "id": "stripe:ws:evt_denied:credits",
                             "usage_event_id": "evt_denied",
-                            "provider": "polar",
                             "replay_status": "skipped",
-                            "external_customer_id": workspace_id,
-                            "customer_id": None,
-                            "external_meter_key": "ai_usage",
-                            "external_event_id": None,
-                            "source_event_dedupe_key": "polar:evt_denied:gemini.transcribe_media",
+                            "stripe_customer_id": None,
+                            "meter_unit": "credits",
+                            "value": "0",
+                            "stripe_meter_event_identifier": None,
+                            "source_event_dedupe_key": "stripe:ws:evt_denied:credits",
                             "attempt_count": 0,
                             "last_error": {},
                             "exported_at": None,
@@ -221,10 +220,10 @@ class FakeHostedRunner:
             ],
         }
 
-    def billing_export_once(self, *, lease_owner: str, limit: int = 100) -> HostedTickResult:
-        self.calls.append(("billing_export_once", {"lease_owner": lease_owner, "limit": limit}))
+    def stripe_meter_export_once(self, *, lease_owner: str, limit: int = 100) -> HostedTickResult:
+        self.calls.append(("stripe_meter_export_once", {"lease_owner": lease_owner, "limit": limit}))
         class Result:
-            tick = "billing_export_once"
+            tick = "stripe_meter_export_once"
             attempted = True
             affected_rows = 1
             succeeded = 1
@@ -568,20 +567,19 @@ def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None
                         }
                     ]
                 ),
-                "billing_exports_json": json.dumps(
+                "meter_exports_json": json.dumps(
                     [
                         {
-                            "id": "bill_1",
+                            "id": "stripe:ws_cli:evt_1:credits",
                             "usage_event_id": "evt_1",
-                            "provider": "polar",
                             "replay_status": "failed",
-                            "external_customer_id": "ws_cli",
-                            "customer_id": None,
-                            "external_meter_key": "ai_usage",
-                            "external_event_id": None,
-                            "source_event_dedupe_key": "polar:evt_1:voyage.embed_documents",
+                            "stripe_customer_id": "cus_cli",
+                            "meter_unit": "credits",
+                            "value": "0.1",
+                            "stripe_meter_event_identifier": None,
+                            "source_event_dedupe_key": "stripe:ws_cli:evt_1:credits",
                             "attempt_count": 2,
-                            "last_error": {"code": "polar_unavailable"},
+                            "last_error": {"code": "stripe_meter_event_failed"},
                             "exported_at": None,
                             "updated_at": created_at.isoformat(),
                         }
@@ -602,42 +600,41 @@ def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None
     assert "FROM usage_reservations AS reservation" in connection.calls[0][0]
     assert result["rows"][0]["entitlement_decision"]["allowed"] is True
     assert result["rows"][0]["usage_events"][0]["id"] == "evt_1"
-    assert result["rows"][0]["billing_exports"][0]["replay_status"] == "failed"
+    assert result["rows"][0]["meter_exports"][0]["replay_status"] == "failed"
 
 
-def test_runner_billing_export_once_skips_without_claiming_when_token_missing(monkeypatch) -> None:
-    monkeypatch.delenv("POLAR_ACCESS_TOKEN", raising=False)
+def test_runner_stripe_meter_export_once_skips_without_claiming_when_key_missing(monkeypatch) -> None:
+    monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
     connection = RecordingConnection(rows=[])
     runner = HostedCommandRunner(AppConfig(), connection=connection)
 
-    result = runner.billing_export_once(lease_owner="worker-1", limit=1)
+    result = runner.stripe_meter_export_once(lease_owner="worker-1", limit=1)
 
     assert result.attempted is False
     assert result.affected_rows == 0
     assert result.skipped == 1
-    assert result.access_token_configured is False
+    assert result.secret_key_configured is False
     assert result.rows[0]["status"] == "skipped"
     assert connection.calls == []
 
 
-def test_runner_billing_export_once_posts_and_marks_success(monkeypatch) -> None:
+def test_runner_stripe_meter_export_once_posts_and_marks_success(monkeypatch) -> None:
     created_at = datetime(2026, 5, 26, 4, 0, tzinfo=timezone.utc)
     posted: list[dict[str, Any]] = []
     connection = RecordingConnection(
         rows=[
             {
-                "id": "bill_1",
+                "id": "stripe:ws_cli:evt_1:credits",
                 "workspace_id": "ws_cli",
                 "usage_event_id": "evt_1",
                 "reservation_id": "res_1",
-                "provider": "polar",
-                "event_name": "yutome.voyage.embed_documents",
-                "export_units_jsonb": json.dumps({"total_tokens": 91}),
-                "source_event_dedupe_key": "polar:evt_1:voyage.embed_documents",
+                "stripe_customer_id": "cus_cli",
+                "meter_unit": "credits",
+                "event_name": "yutome.credits",
+                "value_text": "0.1",
+                "source_event_dedupe_key": "stripe:ws_cli:evt_1:credits",
                 "status": "processing",
-                "authorization_effect": "none",
-                "external_customer_id": "ws_cli",
-                "customer_id": None,
+                "stripe_meter_event_identifier": None,
                 "event_timestamp": created_at,
                 "attempt_count": 1,
                 "metadata_json": json.dumps({"operation_key": "voyage.embed_documents"}),
@@ -645,29 +642,36 @@ def test_runner_billing_export_once_posts_and_marks_success(monkeypatch) -> None
         ]
     )
 
-    def fake_post(payload: dict[str, Any], *, access_token: str, api_base: str) -> dict[str, Any]:
-        posted.append({"payload": payload, "access_token": access_token, "api_base": api_base})
-        return {"inserted": 1}
+    def fake_post(payload: dict[str, Any], *, secret_key: str, api_base: str, idempotency_key: str) -> dict[str, Any]:
+        posted.append(
+            {"payload": payload, "secret_key": secret_key, "api_base": api_base, "idempotency_key": idempotency_key}
+        )
+        return {"object": "billing.meter_event", "identifier": payload["identifier"]}
 
-    monkeypatch.setattr("yutome.hosted.runtime._post_polar_usage_export", fake_post)
+    monkeypatch.setattr("yutome.hosted.runtime._post_stripe_meter_event", fake_post)
     runner = HostedCommandRunner(AppConfig(), connection=connection)
 
-    result = runner.billing_export_once(
+    result = runner.stripe_meter_export_once(
         lease_owner="worker-1",
         limit=1,
-        access_token="polar-token",
-        polar_api_base="https://api.polar.test",
+        secret_key="sk_test_123",
+        stripe_api_base="https://api.stripe.test",
     )
 
     assert result.succeeded == 1
     assert result.failed == 0
-    assert posted[0]["access_token"] == "polar-token"
-    assert posted[0]["api_base"] == "https://api.polar.test"
-    assert sorted(posted[0]["payload"]) == ["events"]
-    assert posted[0]["payload"]["events"][0]["metadata"]["total_tokens"] == 91
-    assert posted[0]["payload"]["events"][0]["external_id"] == "polar:ws_cli:evt_1:voyage.embed_documents"
+    assert posted[0]["secret_key"] == "sk_test_123"
+    assert posted[0]["api_base"] == "https://api.stripe.test"
+    assert posted[0]["idempotency_key"] == "stripe:ws_cli:evt_1:credits"
+    assert posted[0]["payload"]["event_name"] == "yutome.credits"
+    assert posted[0]["payload"]["payload"]["stripe_customer_id"] == "cus_cli"
+    assert posted[0]["payload"]["payload"]["value"] == "0.1"
+    # body identifier + persisted "what we sent" are the compact hash (Stripe's 100-char cap);
+    # the HTTP Idempotency-Key header (asserted above) keeps the readable dedupe key.
+    assert posted[0]["payload"]["identifier"].startswith("me_")
+    assert len(posted[0]["payload"]["identifier"]) <= 100
     assert connection.calls[1][1]["status"] == "succeeded"
-    assert connection.calls[1][1]["external_event_id"] == "polar:ws_cli:evt_1:voyage.embed_documents"
+    assert connection.calls[1][1]["stripe_meter_event_identifier"].startswith("me_")
 
 
 def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
@@ -676,19 +680,10 @@ def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
     connection = RecordingConnection(
         rows=[
             {
-                "row_kind": "credit",
-                "id": "cred_1",
-                "workspace_id": "ws_cli",
-                "direction": "grant",
-                "unit": "credits",
-                "quantity_text": "10",
-                "row_timestamp": period_start,
-            },
-            {
                 "row_kind": "usage",
                 "id": "evt_1",
                 "workspace_id": "ws_cli",
-                "actual_units_json": json.dumps({"credits": "3"}),
+                "actual_units_json": json.dumps({"total_tokens": "300"}),
             },
         ]
     )
@@ -699,10 +694,12 @@ def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
         entitlement_policy_id="policy_cli",
         period_start_at=period_start,
         period_end_at=period_end,
+        starting_units={"total_tokens": 1_000},
     )
 
-    assert result["remaining_units"] == {"credits": 7}
-    assert "FROM credit_ledger_entries" in connection.calls[0][0]
+    assert result["remaining_units"] == {"total_tokens": 700}
+    assert "FROM usage_events" in connection.calls[0][0]
+    assert "credit_ledger_entries" not in connection.calls[0][0]
     assert "INSERT INTO workspace_balances" in connection.calls[1][0]
 
 

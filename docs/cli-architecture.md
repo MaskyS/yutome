@@ -63,7 +63,7 @@ Hosted operations live under `hosted`, with diagnostics under `doctor`:
 
 - `yutome hosted <api|migrate|login|jobs|usage>`
 - `yutome hosted source add SOURCE`
-- `yutome hosted run <worker|billing-export|source-refresh|maintenance>`
+- `yutome hosted run <worker|stripe-meter-export|source-refresh|maintenance>`
 - `yutome doctor <local|proxy|gemini|eval|contract|remote|hosted-db>`
 
 Exports live under `export`:

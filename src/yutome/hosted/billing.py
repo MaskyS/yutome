@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
@@ -25,27 +24,46 @@ from yutome.hosted.models import (
     WorkspaceBalance,
     add_unit_maps,
     jsonable_exact,
-    normalize_unit_quantity,
     normalize_unit_map,
     normalize_usage_units,
     unit_quantity_decimal,
 )
 from yutome.hosted.schema import (
-    billing_customers,
-    billing_exports,
-    credit_ledger_entries,
     entitlement_policies,
-    polar_webhook_snapshots,
     price_books,
+    stripe_customers,
+    stripe_meter_exports,
+    stripe_webhook_events,
     workspace_balances,
 )
 from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
-BillingProvider = Literal["polar"]
+# Stripe is the only billing provider. The billing mirror never authorizes a call.
+BillingProvider = Literal["stripe"]
 BillingReplayStatus = Literal["pending", "processing", "succeeded", "failed", "skipped"]
 BillingRecordStatus = Literal["draft", "active", "paused", "archived"]
-CreditLedgerDirection = Literal["grant", "debit", "refund", "reversal"]
+SubscriptionStatus = Literal["active", "past_due", "canceled", "none"]
+
+# Single composite billable meter. Internal cost/quota units are collapsed into one
+# `credits` value reported to one Stripe Billing Meter. event_name must match the
+# event_name configured on the Stripe Billing Meter; the metered Price binds to that
+# meter via recurring.meter.
+CREDITS_METER_EVENT_NAME = "yutome.credits"
+CREDITS_METER_ID_ENV_VAR = "STRIPE_METER_CREDITS_ID"
+CREDITS_UNIT = "credits"
+
+# Internal usage units that contribute to one composite `credits` value. The weight is
+# credits charged per unit of usage. Units absent from this table (candidate_limit,
+# query_vector_dimensions, request_count, bytes, latency_ms, …) are cost-visibility /
+# quota units and are NEVER reported to Stripe — mirroring the workspace-balance
+# "untracked_units" discipline.
+STRIPE_CREDIT_UNIT_WEIGHTS: dict[str, Decimal] = {
+    "media_seconds": Decimal("0.001"),
+    "total_tokens": Decimal("0.0000001"),
+    "vectors": Decimal("0.00001"),
+    "queries": Decimal("0.0001"),
+}
 
 
 @dataclass(frozen=True)
@@ -54,7 +72,7 @@ class BillingSqlStatement:
     params: dict[str, Any]
 
 
-class PolarWebhookVerificationError(ValueError):
+class StripeWebhookVerificationError(ValueError):
     pass
 
 
@@ -64,15 +82,14 @@ class ProductLimit(BaseModel):
     unit: str
     included_quantity: UnitQuantity | None = None
     hard_limit: UnitQuantity | None = None
-    polar_meter_name: str | None = None
+    meter_event_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PriceBookProduct(BaseModel):
     code: str
     name: str
-    polar_product_id: str | None = None
-    polar_price_id: str | None = None
+    stripe_price_id: str | None = None
     limits: tuple[ProductLimit, ...] = ()
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -152,12 +169,16 @@ class WorkspaceBalanceSnapshot(BaseModel):
         )
 
 
-class BillingCustomer(BaseModel):
+class StripeCustomer(BaseModel):
+    """One Stripe Customer per workspace. A free workspace has no row until it
+    subscribes via /billing/checkout (lazy creation)."""
+
     id: str
     workspace_id: str
-    provider: BillingProvider = "polar"
-    external_customer_id: str
-    external_subscription_id: str | None = None
+    provider: BillingProvider = "stripe"
+    stripe_customer_id: str
+    stripe_subscription_id: str | None = None
+    subscription_status: SubscriptionStatus = "none"
     subscription_status_snapshot: dict[str, Any] = Field(default_factory=dict)
     last_webhook_at: datetime | None = None
     status: BillingRecordStatus = "active"
@@ -166,162 +187,84 @@ class BillingCustomer(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class CreditLedgerEntry(BaseModel):
-    id: str
-    workspace_id: str
+class StripeMeterExportEvent(BaseModel):
+    """A settled usage event mirrored out to the Stripe composite credits meter,
+    idempotent by source_event_dedupe_key (== row id == Stripe meter_event identifier)."""
+
     idempotency_key: str
-    direction: CreditLedgerDirection = "grant"
-    unit: str
-    quantity: UnitQuantity
-    provider: BillingProvider = "polar"
-    external_order_id: str | None = None
-    external_customer_id: str | None = None
-    reason: str
-    occurred_at: datetime
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("quantity", mode="before")
-    @classmethod
-    def _normalize_quantity(cls, value: Any) -> UnitQuantity:
-        quantity = normalize_unit_quantity(value)
-        if unit_quantity_decimal(quantity) <= 0:
-            raise ValueError("Credit ledger quantities must be positive; use direction to model reversals or debits.")
-        return quantity
-
-    @property
-    def signed_units(self) -> UnitMap:
-        sign = Decimal("-1") if self.direction in {"debit", "reversal"} else Decimal("1")
-        return {self.unit: sign * unit_quantity_decimal(self.quantity)}
-
-
-class PolarEventIngestionEvent(BaseModel):
-    name: str
-    external_customer_id: str | None = None
-    customer_id: str | None = None
-    external_id: str | None = None
-    timestamp: datetime | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class PolarUsageExport(BaseModel):
-    events: tuple[PolarEventIngestionEvent, ...]
-    idempotency_key: str
-    source: str = "yutome_usage_ledger"
-
-
-class PolarWebhookEvent(BaseModel):
-    type: str
-    timestamp: datetime
-    data: dict[str, Any] = Field(default_factory=dict)
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-
-class PolarWebhookSnapshot(BaseModel):
-    id: str
-    event_type: str
-    webhook_event_id: str | None = None
-    payload_hash: str
-    workspace_id: str | None = None
-    external_customer_id: str | None = None
-    external_subscription_id: str | None = None
-    customer_state_snapshot: dict[str, Any] = Field(default_factory=dict)
-    payload: dict[str, Any] = Field(default_factory=dict)
-    replay_status: BillingReplayStatus = "pending"
-    received_at: datetime
-    processed_at: datetime | None = None
-    last_error_code: str | None = None
-    last_error_message: str | None = None
-
-
-class BillingExportEvent(BaseModel):
-    idempotency_key: str
-    provider: BillingProvider = "polar"
     usage_event_id: str
     reservation_id: str | None = None
     workspace_id: str
-    billing_customer_id: str | None = None
-    price_book_id: str | None = None
+    stripe_customer_id: str | None = None
     operation_key: str
-    event_name: str
-    external_meter_key: str | None = None
+    meter_unit: str = CREDITS_UNIT
+    event_name: str = CREDITS_METER_EVENT_NAME
+    value: UnitQuantity = 0
     replay_status: BillingReplayStatus = "pending"
-    authorization_effect: Literal["none"] = "none"
-    actual_units: UnitMap = Field(default_factory=dict)
-    external_customer_id: str | None = None
-    customer_id: str | None = None
     timestamp: datetime
-    provider_event_id: str | None = None
-    external_event_id: str | None = None
+    stripe_meter_event_identifier: str | None = None
     attempt_count: int = 0
     last_error_code: str | None = None
     last_error_message: str | None = None
     exported_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("actual_units", mode="before")
+    @field_validator("value", mode="before")
     @classmethod
-    def _normalize_actual_units(cls, value: Any) -> UnitMap:
-        return normalize_unit_map(value)
+    def _normalize_value(cls, value: Any) -> UnitQuantity:
+        from yutome.hosted.models import normalize_unit_quantity
 
-    def to_polar_event(self) -> PolarEventIngestionEvent:
-        metadata = dict(jsonable_exact(self.metadata))
-        metadata.update(_polar_meter_metadata(self.actual_units))
-        metadata["billing_export_idempotency_key"] = self.idempotency_key
-        metadata["source_event_dedupe_key"] = self.source_event_dedupe_key
-        if self.price_book_id is not None:
-            metadata["price_book_id"] = self.price_book_id
-        if self.external_meter_key is not None:
-            metadata["external_meter_key"] = self.external_meter_key
-        return PolarEventIngestionEvent(
-            name=self.event_name,
-            external_customer_id=self.external_customer_id,
-            customer_id=self.customer_id,
-            external_id=self.source_event_dedupe_key,
-            timestamp=self.timestamp,
-            metadata=metadata,
-        )
-
-    def to_polar_export(self) -> PolarUsageExport:
-        return PolarUsageExport(events=(self.to_polar_event(),), idempotency_key=self.idempotency_key)
+        return normalize_unit_quantity(value)
 
     @property
     def source_event_dedupe_key(self) -> str:
-        return f"{self.provider}:{self.workspace_id}:{self.usage_event_id}:{self.operation_key}"
+        return f"stripe:{self.workspace_id}:{self.usage_event_id}:{self.meter_unit}"
+
+    @property
+    def value_decimal(self) -> Decimal:
+        return unit_quantity_decimal(self.value)
+
+    @property
+    def stripe_identifier(self) -> str:
+        """The value sent as Stripe meter_event.identifier (Stripe caps it at 100 chars).
+
+        source_event_dedupe_key embeds the 68-char `evt_<sha256>` usage event id, so the
+        readable key overruns the limit (~111 chars). Hash it to a stable, collision-
+        resistant id that is still 1:1 with the dedupe key, so Stripe's own >=24h
+        identifier dedupe holds across retries. The readable form stays in the DB key and
+        in metadata for debugging."""
+        return "me_" + hashlib.sha256(self.source_event_dedupe_key.encode("utf-8")).hexdigest()
 
 
-def _polar_meter_metadata(units: Mapping[str, UnitQuantity]) -> dict[str, Any]:
-    metadata: dict[str, Any] = {}
-    for unit, quantity in units.items():
-        exact = unit_quantity_decimal(quantity)
-        metadata[unit] = _polar_numeric_value(exact)
-        if isinstance(quantity, Decimal):
-            metadata[f"{unit}_exact"] = str(quantity)
-        if unit == "credits":
-            metadata["credits_micros"] = int((exact * Decimal("1000000")).to_integral_value())
-    return metadata
+class StripeWebhookEvent(BaseModel):
+    """A persisted Stripe webhook event. id is the Stripe event id (evt_...), giving
+    exactly-once processing via on_conflict_do_nothing on the PK."""
+
+    id: str
+    type: str
+    workspace_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    status: BillingReplayStatus = "pending"
+    received_at: datetime
+    processed_at: datetime | None = None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
 
 
-def _polar_numeric_value(value: Decimal) -> int | float:
-    if value == value.to_integral_value():
-        return int(value)
-    return float(value)
-
-
-class PolarWebhookProcessingResult(BaseModel):
-    snapshot: PolarWebhookSnapshot
-    billing_customer: BillingCustomer | None = None
-    credit_entries: tuple[CreditLedgerEntry, ...] = ()
+class StripeWebhookProcessingResult(BaseModel):
+    event: StripeWebhookEvent
+    stripe_customer: StripeCustomer | None = None
     ignored: bool = False
 
 
-class BillingExportWorkerResult(BaseModel):
-    tick: str = "billing_export_once"
+class StripeMeterExportWorkerResult(BaseModel):
+    tick: str = "stripe_meter_export_once"
     attempted: bool
     affected_rows: int
     succeeded: int = 0
     failed: int = 0
     skipped: int = 0
-    access_token_configured: bool = False
+    secret_key_configured: bool = False
     rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -339,12 +282,12 @@ class BillingDebugUsageEvent(BaseModel):
 class BillingDebugExport(BaseModel):
     id: str
     usage_event_id: str
-    provider: BillingProvider = "polar"
+    provider: BillingProvider = "stripe"
     replay_status: str
-    external_customer_id: str | None = None
-    customer_id: str | None = None
-    external_meter_key: str | None = None
-    external_event_id: str | None = None
+    stripe_customer_id: str | None = None
+    meter_unit: str | None = None
+    value: str | None = None
+    stripe_meter_event_identifier: str | None = None
     source_event_dedupe_key: str
     attempt_count: int = 0
     last_error: dict[str, Any] = Field(default_factory=dict)
@@ -375,7 +318,7 @@ class BillingDebugReservation(BaseModel):
     created_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     usage_events: tuple[BillingDebugUsageEvent, ...] = ()
-    billing_exports: tuple[BillingDebugExport, ...] = ()
+    meter_exports: tuple[BillingDebugExport, ...] = ()
 
 
 class BillingDebugSnapshot(BaseModel):
@@ -429,56 +372,32 @@ CREATE TABLE IF NOT EXISTS workspace_balances (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS billing_customers (
+CREATE TABLE IF NOT EXISTS stripe_customers (
     id text PRIMARY KEY,
-    workspace_id text NOT NULL REFERENCES workspaces(id),
-    provider text NOT NULL,
-    external_customer_id text NOT NULL,
-    external_subscription_id text,
+    workspace_id text NOT NULL REFERENCES workspaces(id) UNIQUE,
+    stripe_customer_id text NOT NULL UNIQUE,
+    stripe_subscription_id text,
+    subscription_status text NOT NULL DEFAULT 'none',
     subscription_status_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
     last_webhook_at timestamptz,
     status text NOT NULL DEFAULT 'active',
     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(workspace_id, provider),
-    UNIQUE(provider, external_customer_id)
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS credit_ledger_entries (
-    id text PRIMARY KEY,
-    workspace_id text NOT NULL REFERENCES workspaces(id),
-    idempotency_key text NOT NULL,
-    provider text NOT NULL,
-    external_order_id text,
-    external_customer_id text,
-    direction text NOT NULL,
-    unit text NOT NULL,
-    quantity_text text NOT NULL,
-    reason text NOT NULL,
-    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-    occurred_at timestamptz NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(workspace_id, idempotency_key)
-);
-
-CREATE TABLE IF NOT EXISTS billing_exports (
+CREATE TABLE IF NOT EXISTS stripe_meter_exports (
     id text PRIMARY KEY,
     workspace_id text NOT NULL REFERENCES workspaces(id),
     usage_event_id text NOT NULL REFERENCES usage_events(id),
     reservation_id text REFERENCES usage_reservations(id),
-    billing_customer_id text REFERENCES billing_customers(id),
-    price_book_id text REFERENCES price_books(id),
-    provider text NOT NULL,
-    external_customer_id text,
-    customer_id text,
-    external_meter_key text,
-    external_event_id text,
+    stripe_customer_id text,
+    meter_unit text NOT NULL,
     event_name text NOT NULL,
-    export_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+    value_text text NOT NULL,
     source_event_dedupe_key text NOT NULL,
     status text NOT NULL DEFAULT 'pending',
-    authorization_effect text NOT NULL DEFAULT 'none',
+    stripe_meter_event_identifier text,
     attempt_count integer NOT NULL DEFAULT 0,
     last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -486,77 +405,69 @@ CREATE TABLE IF NOT EXISTS billing_exports (
     created_at timestamptz NOT NULL DEFAULT now(),
     exported_at timestamptz,
     updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(provider, source_event_dedupe_key),
-    UNIQUE(provider, external_event_id)
+    UNIQUE(source_event_dedupe_key)
 );
 
-CREATE TABLE IF NOT EXISTS polar_webhook_snapshots (
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
     id text PRIMARY KEY,
-    webhook_event_id text,
-    payload_hash text NOT NULL,
-    event_type text NOT NULL,
+    type text NOT NULL,
     workspace_id text REFERENCES workspaces(id),
-    external_customer_id text,
-    external_subscription_id text,
-    customer_state_snapshot_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
     payload_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
-    replay_status text NOT NULL DEFAULT 'pending',
+    status text NOT NULL DEFAULT 'pending',
     received_at timestamptz NOT NULL,
     processed_at timestamptz,
     last_error_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(webhook_event_id)
+    created_at timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE polar_webhook_snapshots
-    ADD COLUMN IF NOT EXISTS payload_hash text;
-
-UPDATE polar_webhook_snapshots
-SET payload_hash = 'legacy-md5:' || md5(payload_jsonb::text)
-WHERE payload_hash IS NULL;
-
-ALTER TABLE polar_webhook_snapshots
-    ALTER COLUMN payload_hash SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_billing_exports_replay
-    ON billing_exports(status, updated_at)
+CREATE INDEX IF NOT EXISTS idx_stripe_meter_exports_replay
+    ON stripe_meter_exports(status, updated_at)
     WHERE status IN ('pending', 'failed');
-CREATE INDEX IF NOT EXISTS idx_polar_webhook_snapshots_replay
-    ON polar_webhook_snapshots(replay_status, received_at)
-    WHERE replay_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_replay
+    ON stripe_webhook_events(status, received_at)
+    WHERE status IN ('pending', 'failed');
 """.strip()
 
 
-def billing_export_idempotency_key(
-    event: UsageEvent,
-    *,
-    provider: BillingProvider = "polar",
-    version: str = "v1",
-) -> str:
-    return input_hash(
-        {
-            "provider": provider,
-            "version": version,
-            "usage_event_id": event.id,
-        },
-        prefix="bill",
-    )
+def credits_from_billable_units(units: Mapping[str, Any]) -> Decimal:
+    """Collapse internal billable units into one composite `credits` value.
+
+    Only units in STRIPE_CREDIT_UNIT_WEIGHTS contribute; all other units stay internal.
+    Returns an exact Decimal so fractional media_seconds/tokens are not truncated.
+    """
+
+    total = Decimal(0)
+    for unit, quantity in _billable_units(units).items():
+        weight = STRIPE_CREDIT_UNIT_WEIGHTS.get(unit)
+        if weight is None:
+            continue
+        total += unit_quantity_decimal(quantity) * weight
+    return total
 
 
-def billing_export_event_from_usage_event(
+def stripe_meter_export_idempotency_key(event: UsageEvent, *, meter_unit: str = CREDITS_UNIT) -> str:
+    return f"stripe:{event.workspace_id}:{event.id}:{meter_unit}"
+
+
+def stripe_meter_exports_from_usage_event(
     event: UsageEvent,
     *,
-    event_name: str | None = None,
-    billing_customer_id: str | None = None,
-    external_customer_id: str | None = None,
-    customer_id: str | None = None,
-    price_book_id: str | None = None,
-    price_book_version: str | None = None,
-    product_code: str | None = None,
-    external_meter_key: str | None = None,
-) -> BillingExportEvent:
-    replay_status: BillingReplayStatus = "pending" if event.status in {"succeeded", "released"} else "skipped"
-    metadata = {
+    stripe_customer_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[StripeMeterExportEvent, ...]:
+    """Build the composite credits meter export for a usage event.
+
+    One usage event maps to one credits meter export. The row is `pending` only when the
+    event settled (succeeded/released); otherwise `skipped`. A zero/empty credits value
+    is skipped (nothing to bill).
+    """
+
+    credits = credits_from_billable_units(event.actual_units)
+    if credits <= 0:
+        return ()
+    settled = event.status in {"succeeded", "released"}
+    replay_status: BillingReplayStatus = "pending" if settled else "skipped"
+    export_metadata = {
         "usage_event_id": event.id,
         "reservation_id": event.reservation_id,
         "workspace_id": event.workspace_id,
@@ -566,105 +477,46 @@ def billing_export_event_from_usage_event(
         "event_type": event.event_type,
         "status": event.status,
         "provider_request_id": event.provider_request_id,
+        "billable_units": {
+            unit: str(unit_quantity_decimal(quantity))
+            for unit, quantity in _billable_units(event.actual_units).items()
+            if unit in STRIPE_CREDIT_UNIT_WEIGHTS
+        },
     }
-    if price_book_version is not None:
-        metadata["price_book_version"] = price_book_version
-    if product_code is not None:
-        metadata["product_code"] = product_code
-    metadata.update(_redacted_metadata(event.metadata))
-
-    return BillingExportEvent(
-        idempotency_key=billing_export_idempotency_key(event),
+    export_metadata.update(_redacted_metadata(metadata or {}))
+    export = StripeMeterExportEvent(
+        idempotency_key=stripe_meter_export_idempotency_key(event),
         usage_event_id=event.id,
         reservation_id=event.reservation_id,
         workspace_id=event.workspace_id,
-        billing_customer_id=billing_customer_id,
-        price_book_id=price_book_id,
+        stripe_customer_id=stripe_customer_id,
         operation_key=event.operation_key,
-        event_name=event_name or f"yutome.{event.operation_key}",
-        external_meter_key=external_meter_key,
+        meter_unit=CREDITS_UNIT,
+        event_name=CREDITS_METER_EVENT_NAME,
+        value=credits,
         replay_status=replay_status,
-        actual_units=_billable_units(event.actual_units),
-        external_customer_id=external_customer_id or event.workspace_id,
-        customer_id=customer_id,
         timestamp=event.created_at,
-        metadata={key: value for key, value in metadata.items() if value is not None},
+        metadata={key: value for key, value in export_metadata.items() if value is not None},
     )
+    return (export,)
 
 
-def credit_order_idempotency_key(
-    *,
-    workspace_id: str,
-    provider: BillingProvider,
-    external_order_id: str,
-    unit: str,
-    reason: str = "order_grant",
-    billing_reason: str | None = None,
-    product_id: str | None = None,
-    billing_period_start: str | None = None,
-    billing_period_end: str | None = None,
-    grant_discriminator: str | None = None,
-) -> str:
-    return input_hash(
-        {
-            "workspace_id": workspace_id,
-            "provider": provider,
-            "external_order_id": external_order_id,
-            "unit": unit,
-            "reason": reason,
-            "billing_reason": billing_reason,
-            "product_id": product_id,
-            "billing_period_start": billing_period_start,
-            "billing_period_end": billing_period_end,
-            "grant_discriminator": grant_discriminator,
+def stripe_meter_event_payload(export: StripeMeterExportEvent) -> dict[str, Any]:
+    """Build the Stripe v1 /v1/billing/meter_events body for a meter export.
+
+    Stripe form-encodes payload[stripe_customer_id] and payload[value]; identifier dedupes
+    over a rolling >=24h window; timestamp must be within past 35 days / <=5min future.
+    """
+
+    return {
+        "event_name": export.event_name,
+        "payload": {
+            "stripe_customer_id": export.stripe_customer_id,
+            "value": str(export.value_decimal),
         },
-        prefix="cred",
-    )
-
-
-def credit_ledger_entry_from_order(
-    *,
-    workspace_id: str,
-    external_order_id: str,
-    unit: str,
-    quantity: UnitQuantity,
-    occurred_at: datetime,
-    provider: BillingProvider = "polar",
-    external_customer_id: str | None = None,
-    reason: str = "order_grant",
-    billing_reason: str | None = None,
-    product_id: str | None = None,
-    billing_period_start: str | None = None,
-    billing_period_end: str | None = None,
-    grant_discriminator: str | None = None,
-    metadata: dict[str, Any] | None = None,
-) -> CreditLedgerEntry:
-    idempotency_key = credit_order_idempotency_key(
-        workspace_id=workspace_id,
-        provider=provider,
-        external_order_id=external_order_id,
-        unit=unit,
-        reason=reason,
-        billing_reason=billing_reason,
-        product_id=product_id,
-        billing_period_start=billing_period_start,
-        billing_period_end=billing_period_end,
-        grant_discriminator=grant_discriminator,
-    )
-    return CreditLedgerEntry(
-        id=idempotency_key,
-        workspace_id=workspace_id,
-        idempotency_key=idempotency_key,
-        direction="grant",
-        unit=unit,
-        quantity=quantity,
-        provider=provider,
-        external_order_id=external_order_id,
-        external_customer_id=external_customer_id,
-        reason=reason,
-        occurred_at=occurred_at,
-        metadata=dict(metadata or {}),
-    )
+        "identifier": export.stripe_identifier,
+        "timestamp": int(export.timestamp.timestamp()),
+    }
 
 
 def derive_workspace_balance_snapshot(
@@ -674,23 +526,20 @@ def derive_workspace_balance_snapshot(
     period_start_at: datetime,
     period_end_at: datetime,
     starting_units: dict[str, UnitQuantity] | None = None,
-    credit_entries: tuple[CreditLedgerEntry, ...] = (),
     used_units: dict[str, UnitQuantity] | None = None,
     reserved_units: dict[str, UnitQuantity] | None = None,
     unlimited_units: tuple[str, ...] = (),
     updated_at: datetime | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> WorkspaceBalanceSnapshot:
-    opening = normalize_unit_map(starting_units or {})
-    credits = add_unit_maps(*(entry.signed_units for entry in credit_entries)) if credit_entries else {}
+    available = normalize_unit_map(starting_units or {})
     used = normalize_unit_map(used_units or {})
     reserved = normalize_unit_map(reserved_units or {})
-    available = add_unit_maps(opening, credits)
-    # The balance tracks only PROVISIONED units — those the plan includes, credits
-    # top up, or marks unlimited. Providers report far more (latency_ms,
-    # candidate_tokens, vector dimensions, request byte sizes, …); that usage stays
-    # in the usage ledger, but must not enter the balance, or each un-provisioned
-    # unit becomes a phantom quota that immediately goes negative.
+    # The balance tracks only PROVISIONED units — those the plan includes or marks
+    # unlimited. Providers report far more (latency_ms, candidate_tokens, vector
+    # dimensions, request byte sizes, …); that usage stays in the usage ledger, but
+    # must not enter the balance, or each un-provisioned unit becomes a phantom quota
+    # that immediately goes negative.
     tracked_units = set(available) | set(unlimited_units)
     untracked_units = sorted((set(used) | set(reserved)) - tracked_units)
     used = {unit: quantity for unit, quantity in used.items() if unit in tracked_units}
@@ -702,10 +551,7 @@ def derive_workspace_balance_snapshot(
     }
     remaining, overdrawn = _clamped_remaining_units(net_remaining)
     snapshot_metadata = dict(metadata or {})
-    snapshot_metadata["derived_from"] = {
-        "credit_entry_ids": [entry.id for entry in credit_entries],
-        "starting_units": opening,
-    }
+    snapshot_metadata["derived_from"] = {"starting_units": available}
     snapshot_metadata["balance_status"] = "overdrawn" if overdrawn else "available"
     snapshot_metadata["remaining_units_clamped"] = bool(overdrawn)
     snapshot_metadata["net_remaining_units"] = net_remaining
@@ -733,14 +579,12 @@ def derive_workspace_balance_snapshot_from_rows(
     entitlement_policy_id: str,
     period_start_at: datetime,
     period_end_at: datetime,
-    credit_rows: tuple[Mapping[str, Any], ...] = (),
     usage_rows: tuple[Mapping[str, Any], ...] = (),
     reserved_rows: tuple[Mapping[str, Any], ...] = (),
     starting_units: dict[str, UnitQuantity] | None = None,
     unlimited_units: tuple[str, ...] = (),
     updated_at: datetime | None = None,
 ) -> WorkspaceBalanceSnapshot:
-    credit_entries = tuple(_credit_ledger_entry_from_row(row) for row in credit_rows)
     used_units = add_unit_maps(*(_units_from_json_row(row, "actual_units_json") for row in usage_rows)) if usage_rows else {}
     reserved_units = (
         add_unit_maps(*(_units_from_json_row(row, "estimated_units_json") for row in reserved_rows)) if reserved_rows else {}
@@ -751,13 +595,12 @@ def derive_workspace_balance_snapshot_from_rows(
         period_start_at=period_start_at,
         period_end_at=period_end_at,
         starting_units=starting_units,
-        credit_entries=credit_entries,
         used_units=used_units,
         reserved_units=reserved_units,
         unlimited_units=unlimited_units,
         updated_at=updated_at,
         metadata={
-            "reconciliation": "credits_usage_reservations",
+            "reconciliation": "usage_reservations",
             "usage_event_ids": [row.get("id") for row in usage_rows if row.get("id") is not None],
             "reserved_reservation_ids": [row.get("id") for row in reserved_rows if row.get("id") is not None],
         },
@@ -772,26 +615,9 @@ def balance_reconciliation_input_sql(
 ) -> BillingSqlStatement:
     return BillingSqlStatement(
         sql="""
-SELECT 'credit' AS row_kind,
-       id,
-       workspace_id,
-       direction,
-       unit,
-       quantity_text,
-       NULL::jsonb AS actual_units_json,
-       NULL::jsonb AS estimated_units_json,
-       occurred_at AS row_timestamp
-FROM credit_ledger_entries
-WHERE workspace_id = %(workspace_id)s
-  AND occurred_at >= %(period_start_at)s
-  AND occurred_at < %(period_end_at)s
-UNION ALL
 SELECT 'usage' AS row_kind,
        id,
        workspace_id,
-       NULL::text AS direction,
-       NULL::text AS unit,
-       NULL::text AS quantity_text,
        actual_units_json,
        NULL::jsonb AS estimated_units_json,
        created_at AS row_timestamp
@@ -804,9 +630,6 @@ UNION ALL
 SELECT 'reservation' AS row_kind,
        id,
        workspace_id,
-       NULL::text AS direction,
-       NULL::text AS unit,
-       NULL::text AS quantity_text,
        NULL::jsonb AS actual_units_json,
        estimated_units_json,
        created_at AS row_timestamp
@@ -825,19 +648,18 @@ ORDER BY row_timestamp ASC, id ASC;
     )
 
 
-def mark_billing_export_replay(
-    export: BillingExportEvent,
+def mark_stripe_meter_export_replay(
+    export: StripeMeterExportEvent,
     *,
     replay_status: BillingReplayStatus,
-    provider_event_id: str | None = None,
+    stripe_meter_event_identifier: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
-) -> BillingExportEvent:
+) -> StripeMeterExportEvent:
     return export.model_copy(
         update={
             "replay_status": replay_status,
-            "provider_event_id": provider_event_id,
-            "external_event_id": provider_event_id,
+            "stripe_meter_event_identifier": stripe_meter_event_identifier or export.stripe_meter_event_identifier,
             "last_error_code": error_code,
             "last_error_message": error_message,
             "attempt_count": export.attempt_count + 1,
@@ -845,115 +667,88 @@ def mark_billing_export_replay(
     )
 
 
-def polar_webhook_event_from_payload(payload: dict[str, Any]) -> PolarWebhookEvent:
-    return PolarWebhookEvent(
-        type=str(payload["type"]),
-        timestamp=payload["timestamp"],
-        data=dict(payload.get("data") or {}),
-        raw=dict(payload),
-    )
+# --- Stripe webhook ---------------------------------------------------------
 
-
-def polar_webhook_snapshot_from_payload(
+def stripe_webhook_event_from_payload(
     payload: dict[str, Any],
     *,
-    raw_body: bytes | None = None,
-    webhook_event_id: str | None = None,
-    workspace_id: str | None = None,
     received_at: datetime | None = None,
-) -> PolarWebhookSnapshot:
-    event = polar_webhook_event_from_payload(payload)
-    data = event.data
-    customer = _first_mapping(data, "customer", "customer_state") or {}
-    subscription = _first_mapping(data, "subscription") or {}
-    resolved_event_id = _optional_string(webhook_event_id or payload.get("id") or payload.get("event_id"))
-
-    return PolarWebhookSnapshot(
-        id=polar_webhook_snapshot_id(payload),
-        webhook_event_id=resolved_event_id,
-        payload_hash=payload_sha256(raw_body if raw_body is not None else _json_param(payload).encode("utf-8")),
-        event_type=event.type,
-        workspace_id=workspace_id or _optional_string(customer.get("external_id") or customer.get("external_customer_id")),
-        external_customer_id=_optional_string(customer.get("id") or data.get("customer_id") or data.get("external_customer_id")),
-        external_subscription_id=_optional_string(subscription.get("id") or data.get("subscription_id")),
-        customer_state_snapshot=dict(data) if event.type == "customer.state_changed" else {},
-        payload=event.raw,
-        received_at=received_at or event.timestamp,
+) -> StripeWebhookEvent:
+    event_id = _optional_string(payload.get("id"))
+    if event_id is None:
+        raise StripeWebhookVerificationError("webhook_event_id_missing")
+    event_type = str(payload.get("type") or "")
+    return StripeWebhookEvent(
+        id=event_id,
+        type=event_type,
+        workspace_id=_workspace_id_from_event(payload),
+        payload=dict(payload),
+        received_at=received_at or _event_received_at(payload),
     )
 
 
-def polar_webhook_snapshot_id(payload: dict[str, Any]) -> str:
-    event_id = payload.get("id") or payload.get("event_id")
-    if event_id is not None:
-        return f"polar_wh_{event_id}"
-    return input_hash(payload, prefix="polar_wh")
-
-
-def payload_sha256(raw_body: bytes) -> str:
-    return hashlib.sha256(raw_body).hexdigest()
-
-
-def verify_standard_webhook_signature(
+def verify_stripe_webhook_signature(
     *,
     raw_body: bytes,
-    headers: Mapping[str, str],
+    header: str | None,
     secret: str,
     now: int | None = None,
     tolerance_seconds: int = 300,
-) -> str:
-    normalized_headers = {str(key).lower(): str(value) for key, value in headers.items()}
-    webhook_id = normalized_headers.get("webhook-id")
-    timestamp = normalized_headers.get("webhook-timestamp")
-    signature_header = normalized_headers.get("webhook-signature")
-    if not webhook_id or not timestamp or not signature_header:
-        raise PolarWebhookVerificationError("webhook_signature_missing")
+) -> None:
+    """Verify a Stripe webhook signature.
+
+    Stripe signs `'<ts>.' + raw_body` with HMAC-SHA256 keyed by the raw whsec_ secret
+    string (NOT base64-decoded). The Stripe-Signature header is `t=<ts>,v1=<sig>,...`.
+    Raises StripeWebhookVerificationError on any failure.
+    """
+
+    if not header or not header.strip():
+        raise StripeWebhookVerificationError("webhook_signature_missing")
+    timestamp: str | None = None
+    signatures: list[str] = []
+    for part in header.split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+    if timestamp is None or not signatures:
+        raise StripeWebhookVerificationError("webhook_signature_missing")
     try:
         timestamp_int = int(timestamp)
     except ValueError as exc:
-        raise PolarWebhookVerificationError("webhook_timestamp_invalid") from exc
+        raise StripeWebhookVerificationError("webhook_timestamp_invalid") from exc
     clock = int(time.time()) if now is None else int(now)
     if tolerance_seconds >= 0 and abs(clock - timestamp_int) > tolerance_seconds:
-        raise PolarWebhookVerificationError("webhook_timestamp_outside_tolerance")
-    signed = webhook_id.encode("utf-8") + b"." + timestamp.encode("utf-8") + b"." + raw_body
-    expected = base64.b64encode(hmac.new(_standard_webhook_secret_bytes(secret), signed, hashlib.sha256).digest()).decode("ascii")
-    if not any(hmac.compare_digest(expected, candidate) for candidate in _standard_webhook_signatures(signature_header)):
-        raise PolarWebhookVerificationError("webhook_signature_invalid")
-    return webhook_id
+        raise StripeWebhookVerificationError("webhook_timestamp_outside_tolerance")
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    if not any(hmac.compare_digest(expected, candidate) for candidate in signatures):
+        raise StripeWebhookVerificationError("webhook_signature_invalid")
 
 
-def process_polar_webhook_payload(
+def process_stripe_webhook_event(
     payload: dict[str, Any],
     *,
-    raw_body: bytes | None = None,
-    webhook_event_id: str | None = None,
-) -> PolarWebhookProcessingResult:
-    body = raw_body if raw_body is not None else _json_param(payload).encode("utf-8")
-    event = polar_webhook_event_from_payload(payload)
-    snapshot = polar_webhook_snapshot_from_payload(payload, raw_body=body, webhook_event_id=webhook_event_id)
-    billing_customer = _billing_customer_from_polar_event(event, snapshot=snapshot)
-    workspace_id = billing_customer.workspace_id if billing_customer else snapshot.workspace_id
-    credit_entries = tuple(_credit_entries_from_polar_event(event, workspace_id=workspace_id))
-    ignored = billing_customer is None and not credit_entries
-    return PolarWebhookProcessingResult(
-        snapshot=snapshot,
-        billing_customer=billing_customer,
-        credit_entries=credit_entries,
-        ignored=ignored,
-    )
+    received_at: datetime | None = None,
+) -> StripeWebhookProcessingResult:
+    event = stripe_webhook_event_from_payload(payload, received_at=received_at)
+    stripe_customer = _stripe_customer_from_event(event)
+    ignored = stripe_customer is None
+    return StripeWebhookProcessingResult(event=event, stripe_customer=stripe_customer, ignored=ignored)
 
 
-def polar_webhook_processing_statements(result: PolarWebhookProcessingResult) -> tuple[BillingSqlStatement, ...]:
-    statements: list[BillingSqlStatement] = [upsert_polar_webhook_snapshot_sql(result.snapshot)]
-    if result.billing_customer is not None:
-        statements.append(upsert_billing_customer_sql(result.billing_customer))
-    statements.extend(upsert_credit_ledger_entry_sql(entry) for entry in result.credit_entries)
-    final_snapshot = result.snapshot.model_copy(
+def stripe_webhook_processing_statements(result: StripeWebhookProcessingResult) -> tuple[BillingSqlStatement, ...]:
+    statements: list[BillingSqlStatement] = [upsert_stripe_webhook_event_sql(result.event)]
+    if result.stripe_customer is not None:
+        statements.append(upsert_stripe_customer_sql(result.stripe_customer))
+    final_event = result.event.model_copy(
         update={
-            "replay_status": "skipped" if result.ignored else "succeeded",
-            "processed_at": datetime.now(tz=result.snapshot.received_at.tzinfo),
+            "status": "skipped" if result.ignored else "succeeded",
+            "processed_at": datetime.now(tz=result.event.received_at.tzinfo),
         }
     )
-    statements.append(upsert_polar_webhook_snapshot_sql(final_snapshot))
+    statements.append(upsert_stripe_webhook_event_sql(final_event))
     return tuple(statements)
 
 
@@ -1073,14 +868,14 @@ def upsert_workspace_balance_sql(balance: WorkspaceBalanceSnapshot) -> BillingSq
     return _billing_sql_statement(statement)
 
 
-def upsert_billing_customer_sql(customer: BillingCustomer) -> BillingSqlStatement:
-    params = billing_customer_params(customer)
-    statement = insert(billing_customers).values(
+def upsert_stripe_customer_sql(customer: StripeCustomer) -> BillingSqlStatement:
+    params = stripe_customer_params(customer)
+    statement = insert(stripe_customers).values(
         id=params["id"],
         workspace_id=params["workspace_id"],
-        provider=params["provider"],
-        external_customer_id=params["external_customer_id"],
-        external_subscription_id=params["external_subscription_id"],
+        stripe_customer_id=params["stripe_customer_id"],
+        stripe_subscription_id=params["stripe_subscription_id"],
+        subscription_status=params["subscription_status"],
         subscription_status_snapshot_jsonb=params["subscription_status_snapshot_jsonb"],
         last_webhook_at=params["last_webhook_at"],
         status=params["status"],
@@ -1089,62 +884,37 @@ def upsert_billing_customer_sql(customer: BillingCustomer) -> BillingSqlStatemen
         updated_at=params["updated_at"] or func.now(),
     )
     statement = statement.on_conflict_do_update(
-        index_elements=[billing_customers.c.workspace_id, billing_customers.c.provider],
+        index_elements=[stripe_customers.c.workspace_id],
         set_={
-            "external_customer_id": statement.excluded.external_customer_id,
-            "external_subscription_id": statement.excluded.external_subscription_id,
+            "stripe_customer_id": statement.excluded.stripe_customer_id,
+            "stripe_subscription_id": func.coalesce(
+                statement.excluded.stripe_subscription_id, stripe_customers.c.stripe_subscription_id
+            ),
+            "subscription_status": statement.excluded.subscription_status,
             "subscription_status_snapshot_jsonb": statement.excluded.subscription_status_snapshot_jsonb,
             "last_webhook_at": statement.excluded.last_webhook_at,
             "status": statement.excluded.status,
             "metadata_json": statement.excluded.metadata_json,
             "updated_at": func.now(),
         },
-    ).returning(billing_customers)
+    ).returning(stripe_customers)
     return _billing_sql_statement(statement)
 
 
-def upsert_credit_ledger_entry_sql(entry: CreditLedgerEntry) -> BillingSqlStatement:
-    params = credit_ledger_entry_params(entry)
-    statement = insert(credit_ledger_entries).values(
-        id=params["id"],
-        workspace_id=params["workspace_id"],
-        idempotency_key=params["idempotency_key"],
-        provider=params["provider"],
-        external_order_id=params["external_order_id"],
-        external_customer_id=params["external_customer_id"],
-        direction=params["direction"],
-        unit=params["unit"],
-        quantity_text=params["quantity_text"],
-        reason=params["reason"],
-        metadata_json=params["metadata_json"],
-        occurred_at=params["occurred_at"],
-    )
-    statement = statement.on_conflict_do_update(
-        index_elements=[credit_ledger_entries.c.workspace_id, credit_ledger_entries.c.idempotency_key],
-        set_={"idempotency_key": credit_ledger_entries.c.idempotency_key},
-    ).returning(credit_ledger_entries)
-    return _billing_sql_statement(statement)
-
-
-def upsert_billing_export_sql(export: BillingExportEvent) -> BillingSqlStatement:
-    params = billing_export_params(export)
-    statement = insert(billing_exports).values(
+def upsert_stripe_meter_export_sql(export: StripeMeterExportEvent) -> BillingSqlStatement:
+    params = stripe_meter_export_params(export)
+    statement = insert(stripe_meter_exports).values(
         id=params["id"],
         workspace_id=params["workspace_id"],
         usage_event_id=params["usage_event_id"],
         reservation_id=params["reservation_id"],
-        billing_customer_id=params["billing_customer_id"],
-        price_book_id=params["price_book_id"],
-        provider=params["provider"],
-        external_customer_id=params["external_customer_id"],
-        customer_id=params["customer_id"],
-        external_meter_key=params["external_meter_key"],
-        external_event_id=params["external_event_id"],
+        stripe_customer_id=params["stripe_customer_id"],
+        meter_unit=params["meter_unit"],
         event_name=params["event_name"],
-        export_units_jsonb=params["export_units_jsonb"],
+        value_text=params["value_text"],
         source_event_dedupe_key=params["source_event_dedupe_key"],
         status=params["status"],
-        authorization_effect=params["authorization_effect"],
+        stripe_meter_event_identifier=params["stripe_meter_event_identifier"],
         attempt_count=params["attempt_count"],
         last_error_jsonb=params["last_error_jsonb"],
         metadata_json=params["metadata_json"],
@@ -1152,26 +922,75 @@ def upsert_billing_export_sql(export: BillingExportEvent) -> BillingSqlStatement
         exported_at=params["exported_at"],
     )
     statement = statement.on_conflict_do_update(
-        index_elements=[billing_exports.c.provider, billing_exports.c.source_event_dedupe_key],
+        index_elements=[stripe_meter_exports.c.source_event_dedupe_key],
         set_={
-            "external_event_id": func.coalesce(statement.excluded.external_event_id, billing_exports.c.external_event_id),
+            "stripe_customer_id": func.coalesce(
+                statement.excluded.stripe_customer_id, stripe_meter_exports.c.stripe_customer_id
+            ),
+            "stripe_meter_event_identifier": func.coalesce(
+                statement.excluded.stripe_meter_event_identifier,
+                stripe_meter_exports.c.stripe_meter_event_identifier,
+            ),
             "status": statement.excluded.status,
-            "attempt_count": func.greatest(statement.excluded.attempt_count, billing_exports.c.attempt_count),
+            "attempt_count": func.greatest(statement.excluded.attempt_count, stripe_meter_exports.c.attempt_count),
             "last_error_jsonb": statement.excluded.last_error_jsonb,
             "metadata_json": statement.excluded.metadata_json,
-            "exported_at": func.coalesce(statement.excluded.exported_at, billing_exports.c.exported_at),
+            "exported_at": func.coalesce(statement.excluded.exported_at, stripe_meter_exports.c.exported_at),
             "updated_at": func.now(),
         },
-    ).returning(billing_exports)
+    ).returning(stripe_meter_exports)
     return _billing_sql_statement(statement)
 
 
-def claim_billing_exports_sql(
+def enqueue_stripe_meter_export_sql(export: StripeMeterExportEvent) -> BillingSqlStatement:
+    """Insert a pending meter export at usage write time, leaving existing rows untouched."""
+
+    params = stripe_meter_export_params(export)
+    statement = insert(stripe_meter_exports).values(
+        id=params["id"],
+        workspace_id=params["workspace_id"],
+        usage_event_id=params["usage_event_id"],
+        reservation_id=params["reservation_id"],
+        stripe_customer_id=params["stripe_customer_id"],
+        meter_unit=params["meter_unit"],
+        event_name=params["event_name"],
+        value_text=params["value_text"],
+        source_event_dedupe_key=params["source_event_dedupe_key"],
+        status=params["status"],
+        stripe_meter_event_identifier=params["stripe_meter_event_identifier"],
+        attempt_count=params["attempt_count"],
+        last_error_jsonb=params["last_error_jsonb"],
+        metadata_json=params["metadata_json"],
+        event_timestamp=params["event_timestamp"],
+        exported_at=params["exported_at"],
+    )
+    statement = statement.on_conflict_do_nothing(
+        index_elements=[stripe_meter_exports.c.source_event_dedupe_key]
+    )
+    return _billing_sql_statement(statement)
+
+
+def load_stripe_customer_sql(*, workspace_id: str) -> BillingSqlStatement:
+    return BillingSqlStatement(
+        sql="""
+SELECT id,
+       workspace_id,
+       stripe_customer_id,
+       stripe_subscription_id,
+       subscription_status,
+       status
+FROM stripe_customers
+WHERE workspace_id = %(workspace_id)s;
+""".strip(),
+        params={"workspace_id": workspace_id},
+    )
+
+
+def claim_stripe_meter_exports_sql(
     *,
     lease_owner: str,
     now: datetime,
     limit: int = 100,
-    provider: BillingProvider = "polar",
 ) -> BillingSqlStatement:
     if limit <= 0:
         raise ValueError("limit must be positive")
@@ -1179,37 +998,36 @@ def claim_billing_exports_sql(
         sql="""
 WITH due AS (
     SELECT id
-    FROM billing_exports
-    WHERE provider = %(provider)s
-      AND status IN ('pending', 'failed')
+    FROM stripe_meter_exports
+    WHERE status IN ('pending', 'failed')
     ORDER BY updated_at ASC, id ASC
     LIMIT %(limit)s
     FOR UPDATE SKIP LOCKED
 )
-UPDATE billing_exports AS billing_export
+UPDATE stripe_meter_exports AS meter_export
 SET status = 'processing',
-    attempt_count = billing_export.attempt_count + 1,
+    attempt_count = meter_export.attempt_count + 1,
     metadata_json = jsonb_set(
-        billing_export.metadata_json,
+        meter_export.metadata_json,
         '{last_claim}',
-        jsonb_build_object('lease_owner', %(lease_owner)s, 'claimed_at', %(now)s::text),
+        jsonb_build_object('lease_owner', %(lease_owner)s::text, 'claimed_at', %(now)s::timestamptz::text),
         true
     ),
-    updated_at = %(now)s
+    updated_at = %(now)s::timestamptz
 FROM due
-WHERE billing_export.id = due.id
-RETURNING billing_export.*;
+WHERE meter_export.id = due.id
+RETURNING meter_export.*;
 """.strip(),
-        params={"lease_owner": lease_owner, "now": now, "limit": limit, "provider": provider},
+        params={"lease_owner": lease_owner, "now": now, "limit": limit},
     )
 
 
-def finish_billing_export_sql(
+def finish_stripe_meter_export_sql(
     *,
     export_id: str,
     now: datetime,
     replay_status: BillingReplayStatus,
-    external_event_id: str | None = None,
+    stripe_meter_event_identifier: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
 ) -> BillingSqlStatement:
@@ -1217,9 +1035,9 @@ def finish_billing_export_sql(
         raise ValueError("finish status must be terminal or retryable")
     return BillingSqlStatement(
         sql="""
-UPDATE billing_exports
+UPDATE stripe_meter_exports
 SET status = %(status)s,
-    external_event_id = COALESCE(%(external_event_id)s::text, external_event_id),
+    stripe_meter_event_identifier = COALESCE(%(stripe_meter_event_identifier)s::text, stripe_meter_event_identifier),
     last_error_jsonb = %(last_error_jsonb)s::jsonb,
     exported_at = CASE WHEN %(status)s = 'succeeded' THEN %(now)s ELSE exported_at END,
     updated_at = %(now)s
@@ -1230,62 +1048,53 @@ RETURNING *;
             "id": export_id,
             "now": now,
             "status": replay_status,
-            "external_event_id": external_event_id,
+            "stripe_meter_event_identifier": stripe_meter_event_identifier,
             "last_error_jsonb": _json_param(_error_snapshot(error_code, error_message)),
         },
     )
 
 
-def billing_export_event_from_row(row: Mapping[str, Any]) -> BillingExportEvent:
-    return BillingExportEvent(
+def stripe_meter_export_event_from_row(row: Mapping[str, Any]) -> StripeMeterExportEvent:
+    return StripeMeterExportEvent(
         idempotency_key=str(row["id"]),
-        provider=row.get("provider", "polar"),
         usage_event_id=str(row["usage_event_id"]),
         reservation_id=_optional_string(row.get("reservation_id")),
         workspace_id=str(row["workspace_id"]),
-        billing_customer_id=_optional_string(row.get("billing_customer_id")),
-        price_book_id=_optional_string(row.get("price_book_id")),
+        stripe_customer_id=_optional_string(row.get("stripe_customer_id")),
         operation_key=_operation_key_from_export_row(row),
-        event_name=str(row["event_name"]),
-        external_meter_key=_optional_string(row.get("external_meter_key")),
+        meter_unit=str(row.get("meter_unit") or CREDITS_UNIT),
+        event_name=str(row.get("event_name") or CREDITS_METER_EVENT_NAME),
+        value=row.get("value_text") or "0",
         replay_status=row.get("status", "pending"),
-        authorization_effect=row.get("authorization_effect", "none"),
-        actual_units=dict(_json_value(row.get("export_units_jsonb"), default={})),
-        external_customer_id=_optional_string(row.get("external_customer_id")),
-        customer_id=_optional_string(row.get("customer_id")),
         timestamp=row.get("event_timestamp"),
-        external_event_id=_optional_string(row.get("external_event_id")),
+        stripe_meter_event_identifier=_optional_string(row.get("stripe_meter_event_identifier")),
         attempt_count=int(row.get("attempt_count") or 0),
         metadata=dict(_json_value(row.get("metadata_json"), default={})),
     )
 
 
-def upsert_polar_webhook_snapshot_sql(snapshot: PolarWebhookSnapshot) -> BillingSqlStatement:
-    params = polar_webhook_snapshot_params(snapshot)
-    statement = insert(polar_webhook_snapshots).values(
+def upsert_stripe_webhook_event_sql(event: StripeWebhookEvent) -> BillingSqlStatement:
+    params = stripe_webhook_event_params(event)
+    statement = insert(stripe_webhook_events).values(
         id=params["id"],
-        webhook_event_id=params["webhook_event_id"],
-        payload_hash=params["payload_hash"],
-        event_type=params["event_type"],
+        type=params["type"],
         workspace_id=params["workspace_id"],
-        external_customer_id=params["external_customer_id"],
-        external_subscription_id=params["external_subscription_id"],
-        customer_state_snapshot_jsonb=params["customer_state_snapshot_jsonb"],
         payload_jsonb=params["payload_jsonb"],
-        replay_status=params["replay_status"],
+        status=params["status"],
         received_at=params["received_at"],
         processed_at=params["processed_at"],
         last_error_jsonb=params["last_error_jsonb"],
     )
+    # PK is the Stripe event id, so a replay of the same event is exactly-once: the
+    # snapshot insert is a no-op, and only the finalize statement updates status.
     statement = statement.on_conflict_do_update(
-        index_elements=[polar_webhook_snapshots.c.id],
+        index_elements=[stripe_webhook_events.c.id],
         set_={
-            "replay_status": statement.excluded.replay_status,
-            "payload_hash": statement.excluded.payload_hash,
-            "processed_at": func.coalesce(statement.excluded.processed_at, polar_webhook_snapshots.c.processed_at),
+            "status": statement.excluded.status,
+            "processed_at": func.coalesce(statement.excluded.processed_at, stripe_webhook_events.c.processed_at),
             "last_error_jsonb": statement.excluded.last_error_jsonb,
         },
-    ).returning(polar_webhook_snapshots)
+    ).returning(stripe_webhook_events)
     return _billing_sql_statement(statement)
 
 
@@ -1366,27 +1175,26 @@ SELECT
         (
             SELECT jsonb_agg(
                 jsonb_build_object(
-                    'id', billing_export.id,
-                    'usage_event_id', billing_export.usage_event_id,
-                    'provider', billing_export.provider,
-                    'replay_status', billing_export.status,
-                    'external_customer_id', billing_export.external_customer_id,
-                    'customer_id', billing_export.customer_id,
-                    'external_meter_key', billing_export.external_meter_key,
-                    'external_event_id', billing_export.external_event_id,
-                    'source_event_dedupe_key', billing_export.source_event_dedupe_key,
-                    'attempt_count', billing_export.attempt_count,
-                    'last_error', billing_export.last_error_jsonb,
-                    'exported_at', billing_export.exported_at,
-                    'updated_at', billing_export.updated_at
+                    'id', meter_export.id,
+                    'usage_event_id', meter_export.usage_event_id,
+                    'replay_status', meter_export.status,
+                    'stripe_customer_id', meter_export.stripe_customer_id,
+                    'meter_unit', meter_export.meter_unit,
+                    'value', meter_export.value_text,
+                    'stripe_meter_event_identifier', meter_export.stripe_meter_event_identifier,
+                    'source_event_dedupe_key', meter_export.source_event_dedupe_key,
+                    'attempt_count', meter_export.attempt_count,
+                    'last_error', meter_export.last_error_jsonb,
+                    'exported_at', meter_export.exported_at,
+                    'updated_at', meter_export.updated_at
                 )
-                ORDER BY billing_export.updated_at DESC, billing_export.id DESC
+                ORDER BY meter_export.updated_at DESC, meter_export.id DESC
             )
-            FROM billing_exports AS billing_export
-            WHERE billing_export.workspace_id = recent_reservations.workspace_id
+            FROM stripe_meter_exports AS meter_export
+            WHERE meter_export.workspace_id = recent_reservations.workspace_id
               AND (
-                  billing_export.reservation_id = recent_reservations.reservation_id
-                  OR billing_export.usage_event_id IN (
+                  meter_export.reservation_id = recent_reservations.reservation_id
+                  OR meter_export.usage_event_id IN (
                       SELECT usage_event.id
                       FROM usage_events AS usage_event
                       WHERE usage_event.workspace_id = recent_reservations.workspace_id
@@ -1395,7 +1203,7 @@ SELECT
               )
         ),
         '[]'::jsonb
-    ) AS billing_exports_json
+    ) AS meter_exports_json
 FROM recent_reservations
 ORDER BY created_at DESC, reservation_id DESC;
 """.strip(),
@@ -1423,9 +1231,9 @@ def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReser
         BillingDebugUsageEvent.model_validate(event)
         for event in _json_value(row.get("usage_events_json"), default=[])
     )
-    billing_exports = tuple(
+    meter_exports = tuple(
         BillingDebugExport.model_validate(export)
-        for export in _json_value(row.get("billing_exports_json"), default=[])
+        for export in _json_value(row.get("meter_exports_json"), default=[])
     )
     subject = str(row["subject"])
     operation = str(row["operation"])
@@ -1452,11 +1260,11 @@ def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReser
         created_at=row.get("created_at"),
         metadata=dict(_json_value(row.get("metadata_json"))),
         usage_events=usage_events,
-        billing_exports=billing_exports,
+        meter_exports=meter_exports,
     )
 
 
-def _billable_units(units: dict[str, Any]) -> UnitMap:
+def _billable_units(units: dict[str, Any] | Mapping[str, Any]) -> UnitMap:
     numeric: dict[str, UnitQuantity] = {}
     normalized = normalize_usage_units(units)
     for unit, quantity in normalized.items():
@@ -1464,7 +1272,7 @@ def _billable_units(units: dict[str, Any]) -> UnitMap:
             continue
         if unit_quantity_decimal(quantity) < 0:
             raise ValueError(
-                f"Negative billing unit {unit} must be modeled through reconciliation or credit ledger entries."
+                f"Negative billing unit {unit} must be modeled through reconciliation, not a meter event."
             )
         numeric[unit] = quantity
     return numeric
@@ -1546,13 +1354,13 @@ def workspace_balance_params(balance: WorkspaceBalanceSnapshot) -> dict[str, Any
     }
 
 
-def billing_customer_params(customer: BillingCustomer) -> dict[str, Any]:
+def stripe_customer_params(customer: StripeCustomer) -> dict[str, Any]:
     return {
         "id": customer.id,
         "workspace_id": customer.workspace_id,
-        "provider": customer.provider,
-        "external_customer_id": customer.external_customer_id,
-        "external_subscription_id": customer.external_subscription_id,
+        "stripe_customer_id": customer.stripe_customer_id,
+        "stripe_subscription_id": customer.stripe_subscription_id,
+        "subscription_status": customer.subscription_status,
         "subscription_status_snapshot_jsonb": _json_param(customer.subscription_status_snapshot),
         "last_webhook_at": customer.last_webhook_at,
         "status": customer.status,
@@ -1562,41 +1370,19 @@ def billing_customer_params(customer: BillingCustomer) -> dict[str, Any]:
     }
 
 
-def credit_ledger_entry_params(entry: CreditLedgerEntry) -> dict[str, Any]:
-    return {
-        "id": entry.id,
-        "workspace_id": entry.workspace_id,
-        "idempotency_key": entry.idempotency_key,
-        "provider": entry.provider,
-        "external_order_id": entry.external_order_id,
-        "external_customer_id": entry.external_customer_id,
-        "direction": entry.direction,
-        "unit": entry.unit,
-        "quantity_text": str(entry.quantity),
-        "reason": entry.reason,
-        "metadata_json": _json_param(entry.metadata),
-        "occurred_at": entry.occurred_at,
-    }
-
-
-def billing_export_params(export: BillingExportEvent) -> dict[str, Any]:
+def stripe_meter_export_params(export: StripeMeterExportEvent) -> dict[str, Any]:
     return {
         "id": export.idempotency_key,
         "workspace_id": export.workspace_id,
         "usage_event_id": export.usage_event_id,
         "reservation_id": export.reservation_id,
-        "billing_customer_id": export.billing_customer_id,
-        "price_book_id": export.price_book_id,
-        "provider": export.provider,
-        "external_customer_id": export.external_customer_id,
-        "customer_id": export.customer_id,
-        "external_meter_key": export.external_meter_key,
-        "external_event_id": export.external_event_id or export.provider_event_id,
+        "stripe_customer_id": export.stripe_customer_id,
+        "meter_unit": export.meter_unit,
         "event_name": export.event_name,
-        "export_units_jsonb": _json_param(export.actual_units),
+        "value_text": str(export.value_decimal),
         "source_event_dedupe_key": export.source_event_dedupe_key,
         "status": export.replay_status,
-        "authorization_effect": export.authorization_effect,
+        "stripe_meter_event_identifier": export.stripe_meter_event_identifier,
         "attempt_count": export.attempt_count,
         "last_error_jsonb": _json_param(_error_snapshot(export.last_error_code, export.last_error_message)),
         "metadata_json": _json_param(export.metadata),
@@ -1605,22 +1391,21 @@ def billing_export_params(export: BillingExportEvent) -> dict[str, Any]:
     }
 
 
-def polar_webhook_snapshot_params(snapshot: PolarWebhookSnapshot) -> dict[str, Any]:
+def stripe_webhook_event_params(event: StripeWebhookEvent) -> dict[str, Any]:
     return {
-        "id": snapshot.id,
-        "webhook_event_id": snapshot.webhook_event_id,
-        "payload_hash": snapshot.payload_hash,
-        "event_type": snapshot.event_type,
-        "workspace_id": snapshot.workspace_id,
-        "external_customer_id": snapshot.external_customer_id,
-        "external_subscription_id": snapshot.external_subscription_id,
-        "customer_state_snapshot_jsonb": _json_param(snapshot.customer_state_snapshot),
-        "payload_jsonb": _json_param(snapshot.payload),
-        "replay_status": snapshot.replay_status,
-        "received_at": snapshot.received_at,
-        "processed_at": snapshot.processed_at,
-        "last_error_jsonb": _json_param(_error_snapshot(snapshot.last_error_code, snapshot.last_error_message)),
+        "id": event.id,
+        "type": event.type,
+        "workspace_id": event.workspace_id,
+        "payload_jsonb": _json_param(event.payload),
+        "status": event.status,
+        "received_at": event.received_at,
+        "processed_at": event.processed_at,
+        "last_error_jsonb": _json_param(_error_snapshot(event.last_error_code, event.last_error_message)),
     }
+
+
+def stripe_customer_id(*, stripe_customer_id: str) -> str:
+    return input_hash({"provider": "stripe", "stripe_customer_id": stripe_customer_id}, prefix="sc")
 
 
 def _json_param(value: Any) -> str:
@@ -1654,29 +1439,6 @@ def _first_mapping(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
     return None
 
 
-def _customer_from_event_data(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
-    if event_type == "customer.state_changed":
-        return data
-    return _first_mapping(data, "customer", "customer_state") or {}
-
-
-def _credit_ledger_entry_from_row(row: Mapping[str, Any]) -> CreditLedgerEntry:
-    return CreditLedgerEntry(
-        id=str(row["id"]),
-        workspace_id=str(row["workspace_id"]),
-        idempotency_key=str(row.get("idempotency_key") or row["id"]),
-        provider=row.get("provider", "polar"),
-        external_order_id=_optional_string(row.get("external_order_id")),
-        external_customer_id=_optional_string(row.get("external_customer_id")),
-        direction=row.get("direction", "grant"),
-        unit=str(row["unit"]),
-        quantity=row.get("quantity") or row.get("quantity_text"),
-        reason=str(row.get("reason") or "reconciliation"),
-        occurred_at=row.get("occurred_at") or row.get("row_timestamp"),
-        metadata=dict(_json_value(row.get("metadata_json"), default={})),
-    )
-
-
 def _units_from_json_row(row: Mapping[str, Any], key: str) -> UnitMap:
     return _billable_units(dict(_json_value(row.get(key), default={})))
 
@@ -1688,194 +1450,115 @@ def _operation_key_from_export_row(row: Mapping[str, Any]) -> str:
         return str(operation_key)
     source_dedupe = str(row.get("source_event_dedupe_key") or "")
     parts = source_dedupe.split(":")
-    if len(parts) >= 4 and parts[-1]:
-        return parts[-1]
-    if len(parts) == 3 and parts[2]:
+    if len(parts) >= 3:
         return parts[2]
-    event_name = str(row.get("event_name") or "")
-    return event_name.removeprefix("yutome.") or "usage"
+    return "usage"
 
 
-def _billing_customer_from_polar_event(
-    event: PolarWebhookEvent,
-    *,
-    snapshot: PolarWebhookSnapshot,
-) -> BillingCustomer | None:
-    data = event.data
-    customer = _customer_from_event_data(event.type, data)
-    subscription = _first_mapping(data, "subscription") or {}
-    if event.type.startswith("subscription."):
-        subscription = data
-        customer = _first_mapping(data, "customer") or customer
-    external_customer_id = _optional_string(customer.get("id") or data.get("customer_id") or snapshot.external_customer_id)
-    workspace_id = _optional_string(
-        snapshot.workspace_id
-        or customer.get("external_id")
-        or customer.get("external_customer_id")
-        or _metadata_value(data, "workspace_id")
-        or _metadata_value(data, "billing_account_id")
+def _event_object(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        obj = data.get("object")
+        if isinstance(obj, Mapping):
+            return dict(obj)
+    return {}
+
+
+def _event_received_at(payload: dict[str, Any]) -> datetime:
+    from datetime import timezone
+
+    created = payload.get("created")
+    if isinstance(created, (int, float)):
+        return datetime.fromtimestamp(int(created), tz=timezone.utc)
+    return datetime.now(tz=timezone.utc)
+
+
+def _workspace_id_from_event(payload: dict[str, Any]) -> str | None:
+    obj = _event_object(payload)
+    metadata = _first_mapping(obj, "metadata") or {}
+    subscription_data = _first_mapping(obj, "subscription_data") or {}
+    subscription_metadata = _first_mapping(subscription_data, "metadata") or {}
+    return _optional_string(
+        metadata.get("workspace_id")
+        or subscription_metadata.get("workspace_id")
+        or obj.get("client_reference_id")
     )
-    if workspace_id is None or external_customer_id is None:
+
+
+def _stripe_customer_from_event(event: StripeWebhookEvent) -> StripeCustomer | None:
+    if event.type == "checkout.session.completed":
+        return _customer_from_checkout_session(event)
+    if event.type in {
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    }:
+        return _customer_from_subscription(event)
+    return None
+
+
+def _customer_from_checkout_session(event: StripeWebhookEvent) -> StripeCustomer | None:
+    obj = _event_object(event.payload)
+    stripe_customer_external_id = _optional_string(obj.get("customer"))
+    workspace_id = event.workspace_id
+    if stripe_customer_external_id is None or workspace_id is None:
         return None
-    subscription_id = _optional_string(
-        subscription.get("id")
-        or data.get("subscription_id")
-        or snapshot.external_subscription_id
-    )
-    status = _customer_record_status(event.type, data, subscription)
-    return BillingCustomer(
-        id=input_hash({"provider": "polar", "external_customer_id": external_customer_id}, prefix="bc"),
+    subscription_id = _optional_string(obj.get("subscription"))
+    status = _subscription_status(str(obj.get("status") or "active"))
+    return StripeCustomer(
+        id=stripe_customer_id(stripe_customer_id=stripe_customer_external_id),
         workspace_id=workspace_id,
-        external_customer_id=external_customer_id,
-        external_subscription_id=subscription_id,
-        subscription_status_snapshot=_billing_customer_state_snapshot(event, customer=customer, subscription=subscription),
-        last_webhook_at=event.timestamp,
-        status=status,
-        metadata={
-            "last_polar_event_type": event.type,
-            "webhook_snapshot_id": snapshot.id,
-            "webhook_event_id": snapshot.webhook_event_id,
-        },
+        stripe_customer_id=stripe_customer_external_id,
+        stripe_subscription_id=subscription_id,
+        subscription_status=status,
+        subscription_status_snapshot={"event_type": event.type, "checkout_session": obj},
+        last_webhook_at=event.received_at,
+        status=_record_status(status),
+        metadata={"last_stripe_event_type": event.type, "webhook_event_id": event.id},
     )
 
 
-def _credit_entries_from_polar_event(event: PolarWebhookEvent, *, workspace_id: str | None) -> list[CreditLedgerEntry]:
-    if event.type != "order.paid" or workspace_id is None:
-        return []
-    order = event.data
-    order_id = _optional_string(order.get("id"))
-    if order_id is None:
-        return []
-    external_customer_id = _optional_string(order.get("customer_id") or (_first_mapping(order, "customer") or {}).get("id"))
-    product_id = _optional_string(order.get("product_id") or (_first_mapping(order, "product") or {}).get("id"))
-    billing_reason = _optional_string(order.get("billing_reason")) or "purchase"
-    occurred_at = event.timestamp
-    entries: list[CreditLedgerEntry] = []
-    for grant_index, grant in enumerate(_credit_grants_from_order(order)):
-        unit = str(grant["unit"])
-        quantity = normalize_unit_quantity(grant["quantity"])
-        reason = str(grant.get("reason") or "order_grant")
-        period_start = _optional_string(grant.get("period_start") or order.get("current_period_start"))
-        period_end = _optional_string(grant.get("period_end") or order.get("current_period_end"))
-        entry = credit_ledger_entry_from_order(
-            workspace_id=workspace_id,
-            external_order_id=order_id,
-            unit=unit,
-            quantity=quantity,
-            occurred_at=occurred_at,
-            external_customer_id=external_customer_id,
-            reason=reason,
-            billing_reason=billing_reason,
-            product_id=product_id,
-            billing_period_start=period_start,
-            billing_period_end=period_end,
-            grant_discriminator=_credit_grant_discriminator(grant, grant_index),
-            metadata={
-                "polar_event_type": event.type,
-                "billing_reason": billing_reason,
-                "product_id": product_id,
-                "checkout_id": order.get("checkout_id"),
-                "subscription_id": order.get("subscription_id"),
-                "grant_index": grant_index,
-                **{key: value for key, value in grant.items() if key not in {"unit", "quantity"}},
-            },
-        )
-        entries.append(entry)
-    return entries
-
-
-def _credit_grants_from_order(order: dict[str, Any]) -> list[dict[str, Any]]:
-    metadata = _first_mapping(order, "metadata") or {}
-    product_metadata = (_first_mapping(order, "product") or {}).get("metadata")
-    grants_source: Any = (
-        metadata.get("yutome_credit_grants")
-        or metadata.get("credit_grants")
-        or (product_metadata or {}).get("yutome_credit_grants")
-        or (product_metadata or {}).get("credit_grants")
+def _customer_from_subscription(event: StripeWebhookEvent) -> StripeCustomer | None:
+    obj = _event_object(event.payload)
+    stripe_customer_external_id = _optional_string(obj.get("customer"))
+    workspace_id = event.workspace_id
+    if stripe_customer_external_id is None or workspace_id is None:
+        return None
+    subscription_id = _optional_string(obj.get("id"))
+    raw_status = "canceled" if event.type == "customer.subscription.deleted" else str(obj.get("status") or "")
+    status = _subscription_status(raw_status)
+    return StripeCustomer(
+        id=stripe_customer_id(stripe_customer_id=stripe_customer_external_id),
+        workspace_id=workspace_id,
+        stripe_customer_id=stripe_customer_external_id,
+        stripe_subscription_id=subscription_id,
+        subscription_status=status,
+        subscription_status_snapshot={"event_type": event.type, "subscription": obj},
+        last_webhook_at=event.received_at,
+        status=_record_status(status),
+        metadata={"last_stripe_event_type": event.type, "webhook_event_id": event.id},
     )
-    if isinstance(grants_source, str):
-        grants_source = json.loads(grants_source)
-    if isinstance(grants_source, list):
-        return [
-            dict(grant)
-            for grant in grants_source
-            if isinstance(grant, Mapping) and grant.get("unit") is not None and grant.get("quantity") is not None
-        ]
-    unit = metadata.get("yutome_credit_unit") or metadata.get("credit_unit")
-    quantity = metadata.get("yutome_credit_quantity") or metadata.get("credit_quantity")
-    if unit is not None and quantity is not None:
-        return [{"unit": unit, "quantity": quantity}]
-    return []
 
 
-def _credit_grant_discriminator(grant: Mapping[str, Any], index: int) -> str:
-    grant_id = _optional_string(grant.get("grant_id") or grant.get("id"))
-    if grant_id is not None:
-        return f"grant_id:{grant_id}"
-    return input_hash({"grant_index": index, "grant": dict(grant)}, prefix="grant")
+def _subscription_status(raw: str) -> SubscriptionStatus:
+    normalized = raw.strip().lower()
+    if normalized in {"active", "trialing", "complete"}:
+        return "active"
+    if normalized in {"past_due", "unpaid", "incomplete", "incomplete_expired"}:
+        return "past_due"
+    if normalized in {"canceled", "cancelled"}:
+        return "canceled"
+    return "none"
 
 
-def _metadata_value(data: dict[str, Any], key: str) -> Any:
-    metadata = data.get("metadata")
-    return metadata.get(key) if isinstance(metadata, Mapping) else None
-
-
-def _customer_record_status(
-    event_type: str,
-    data: dict[str, Any],
-    subscription: dict[str, Any],
-) -> BillingRecordStatus:
-    status = str(subscription.get("status") or data.get("status") or "").lower()
-    if event_type.endswith(".revoked") or status in {"revoked", "canceled", "deleted"}:
-        return "archived"
-    if event_type.endswith(".past_due") or status in {"past_due", "incomplete", "unpaid"}:
+def _record_status(subscription_status: SubscriptionStatus) -> BillingRecordStatus:
+    if subscription_status == "active":
+        return "active"
+    if subscription_status == "past_due":
         return "paused"
+    if subscription_status == "canceled":
+        return "archived"
     return "active"
-
-
-def _billing_customer_state_snapshot(
-    event: PolarWebhookEvent,
-    *,
-    customer: dict[str, Any],
-    subscription: dict[str, Any],
-) -> dict[str, Any]:
-    if event.type == "customer.state_changed":
-        return dict(event.data)
-    snapshot: dict[str, Any] = {
-        "event_type": event.type,
-        "customer": customer,
-    }
-    if subscription:
-        snapshot["subscription"] = subscription
-    else:
-        snapshot["subscription"] = event.data if event.type.startswith("subscription.") else {}
-    return snapshot
-
-
-def _standard_webhook_secret_bytes(secret: str) -> bytes:
-    stripped = secret.strip()
-    if stripped.startswith("whsec_"):
-        encoded = stripped[len("whsec_") :]
-        padding = "=" * (-len(encoded) % 4)
-        try:
-            return base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
-        except Exception:
-            return base64.b64decode((encoded + padding).encode("ascii"))
-    return stripped.encode("utf-8")
-
-
-def _standard_webhook_signatures(header: str) -> list[str]:
-    signatures: list[str] = []
-    for part in header.replace(" ", ",").split(","):
-        candidate = part.strip()
-        if not candidate or candidate == "v1":
-            continue
-        if candidate.startswith("v1,"):
-            candidate = candidate[3:]
-        elif candidate.startswith("v1="):
-            candidate = candidate[3:]
-        signatures.append(candidate)
-    return signatures
 
 
 def _optional_string(value: Any) -> str | None:
@@ -1889,60 +1572,59 @@ __all__ = [
     "BillingDebugReservation",
     "BillingDebugSnapshot",
     "BillingDebugUsageEvent",
-    "BillingExportEvent",
-    "BillingExportWorkerResult",
-    "BillingCustomer",
     "BillingProvider",
     "BillingRecordStatus",
     "BillingReplayStatus",
     "BillingSqlStatement",
-    "CreditLedgerDirection",
-    "CreditLedgerEntry",
+    "CREDITS_METER_EVENT_NAME",
+    "CREDITS_METER_ID_ENV_VAR",
+    "CREDITS_UNIT",
     "EntitlementPolicyRecord",
     "POSTGRES_BILLING_SCHEMA_SQL",
-    "PolarEventIngestionEvent",
-    "PolarUsageExport",
-    "PolarWebhookProcessingResult",
-    "PolarWebhookEvent",
-    "PolarWebhookSnapshot",
-    "PolarWebhookVerificationError",
     "PriceBook",
     "PriceBookProduct",
     "ProductLimit",
+    "STRIPE_CREDIT_UNIT_WEIGHTS",
+    "StripeCustomer",
+    "StripeMeterExportEvent",
+    "StripeMeterExportWorkerResult",
+    "StripeWebhookEvent",
+    "StripeWebhookProcessingResult",
+    "StripeWebhookVerificationError",
+    "SubscriptionStatus",
     "WorkspaceBalanceSnapshot",
     "balance_reconciliation_input_sql",
-    "billing_customer_params",
     "billing_debug_reservation_from_row",
     "billing_debug_snapshot_from_rows",
     "billing_debug_snapshot_sql",
-    "billing_export_event_from_row",
-    "billing_export_event_from_usage_event",
-    "billing_export_idempotency_key",
-    "billing_export_params",
     "billing_schema_statements",
-    "claim_billing_exports_sql",
-    "credit_ledger_entry_from_order",
-    "credit_ledger_entry_params",
-    "credit_order_idempotency_key",
-    "derive_workspace_balance_snapshot_from_rows",
+    "claim_stripe_meter_exports_sql",
+    "credits_from_billable_units",
     "derive_workspace_balance_snapshot",
+    "derive_workspace_balance_snapshot_from_rows",
+    "enqueue_stripe_meter_export_sql",
     "entitlement_policy_params",
-    "finish_billing_export_sql",
-    "mark_billing_export_replay",
-    "payload_sha256",
-    "polar_webhook_event_from_payload",
-    "polar_webhook_processing_statements",
-    "polar_webhook_snapshot_from_payload",
-    "polar_webhook_snapshot_id",
-    "polar_webhook_snapshot_params",
+    "finish_stripe_meter_export_sql",
+    "load_stripe_customer_sql",
+    "mark_stripe_meter_export_replay",
     "price_book_params",
-    "upsert_billing_customer_sql",
-    "upsert_credit_ledger_entry_sql",
-    "upsert_billing_export_sql",
+    "process_stripe_webhook_event",
+    "stripe_customer_id",
+    "stripe_customer_params",
+    "stripe_meter_event_payload",
+    "stripe_meter_export_event_from_row",
+    "stripe_meter_export_idempotency_key",
+    "stripe_meter_export_params",
+    "stripe_meter_exports_from_usage_event",
+    "stripe_webhook_event_from_payload",
+    "stripe_webhook_event_params",
+    "stripe_webhook_processing_statements",
     "upsert_entitlement_policy_sql",
-    "upsert_polar_webhook_snapshot_sql",
     "upsert_price_book_sql",
+    "upsert_stripe_customer_sql",
+    "upsert_stripe_meter_export_sql",
+    "upsert_stripe_webhook_event_sql",
     "upsert_workspace_balance_sql",
-    "verify_standard_webhook_signature",
+    "verify_stripe_webhook_signature",
     "workspace_balance_params",
 ]

@@ -44,15 +44,10 @@ def auth_headers(workspace_id: str, *, token: str = TEST_API_TOKEN) -> dict[str,
     return {WORKSPACE_HEADER: workspace_id, "Authorization": f"Bearer {token}"}
 
 
-def polar_headers(raw_body: bytes, *, secret: str = "polar-secret", webhook_id: str = "wh_msg_123") -> dict[str, str]:
+def stripe_signature_header(raw_body: bytes, *, secret: str = "whsec_test") -> dict[str, str]:
     timestamp = str(int(time.time()))
-    signed = webhook_id.encode() + b"." + timestamp.encode() + b"." + raw_body
-    signature = base64.b64encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest()).decode("ascii")
-    return {
-        "webhook-id": webhook_id,
-        "webhook-timestamp": timestamp,
-        "webhook-signature": f"v1,{signature}",
-    }
+    signature = hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+    return {"stripe-signature": f"t={timestamp},v1={signature}"}
 
 
 def decode_base64url_json(value: str) -> dict[str, Any]:
@@ -383,7 +378,7 @@ def test_postgres_app_builder_default_usage_context_denies_without_entitlement()
     assert any("FROM entitlement_policies" in statement for statement, _params in connection.calls)
 
 
-def test_polar_webhook_rejects_invalid_signature_before_db_write() -> None:
+def test_stripe_webhook_rejects_invalid_signature_before_db_write() -> None:
     connection = RecordingConnection()
     store = RecordingSearchStore()
     adapter = HostedMcpQueryAdapter(search_store=store)
@@ -391,21 +386,21 @@ def test_polar_webhook_rejects_invalid_signature_before_db_write() -> None:
         build_app(
             adapter=adapter,
             billing_connection=connection,
-            polar_webhook_secret="polar-secret",
+            stripe_webhook_secret="whsec_test",
         )
     )
-    raw_body = b'{"type":"customer.state_changed","timestamp":"2026-05-26T03:00:00Z","data":{"id":"cus_123"}}'
-    headers = polar_headers(raw_body)
-    headers["webhook-signature"] = "v1,wrong"
+    raw_body = b'{"id":"evt_1","type":"checkout.session.completed","data":{"object":{}}}'
+    headers = stripe_signature_header(raw_body)
+    headers["stripe-signature"] = headers["stripe-signature"].rsplit("=", 1)[0] + "=deadbeef"
 
-    response = client.post("/billing/polar/webhook", content=raw_body, headers=headers)
+    response = client.post("/webhooks/stripe", content=raw_body, headers=headers)
 
     assert response.status_code == 401
     assert error_body(response.json())["code"] == "webhook_signature_invalid"
     assert connection.calls == []
 
 
-def test_polar_webhook_accepts_signature_and_processes_order_credit() -> None:
+def test_stripe_webhook_accepts_signature_and_upserts_customer_exactly_once() -> None:
     connection = RecordingConnection()
     store = RecordingSearchStore()
     adapter = HostedMcpQueryAdapter(search_store=store)
@@ -413,42 +408,145 @@ def test_polar_webhook_accepts_signature_and_processes_order_credit() -> None:
         build_app(
             adapter=adapter,
             billing_connection=connection,
-            polar_webhook_secret="polar-secret",
+            stripe_webhook_secret="whsec_test",
         )
     )
     raw_body = json.dumps(
         {
-            "type": "order.paid",
-            "timestamp": "2026-05-26T03:00:00Z",
+            "id": "evt_123",
+            "type": "checkout.session.completed",
+            "created": 1779753600,
             "data": {
-                "id": "ord_123",
-                "customer_id": "cus_123",
-                "customer": {"id": "cus_123", "external_id": "ws_http"},
-                "metadata": {"yutome_credit_grants": [{"unit": "credits", "quantity": "5"}]},
+                "object": {
+                    "customer": "cus_123",
+                    "subscription": "sub_123",
+                    "status": "complete",
+                    "metadata": {"workspace_id": "ws_http"},
+                }
             },
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
 
-    response = client.post("/billing/polar/webhook", content=raw_body, headers=polar_headers(raw_body))
+    response = client.post("/webhooks/stripe", content=raw_body, headers=stripe_signature_header(raw_body))
 
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert body["event_id"] == "wh_msg_123"
-    assert body["credit_entries"] == 1
-    assert body["billing_customer"].startswith("bc_")
-    assert [call[0].split()[2] for call in connection.calls if call[0].startswith("INSERT INTO")] == [
-        "polar_webhook_snapshots",
-        "billing_customers",
-        "credit_ledger_entries",
-        "polar_webhook_snapshots",
+    assert body["event_id"] == "evt_123"
+    assert body["event_type"] == "checkout.session.completed"
+    assert body["stripe_customer"].startswith("sc_")
+    inserts = [call[0].split()[2] for call in connection.calls if call[0].startswith("INSERT INTO")]
+    # snapshot insert (exactly-once via PK), customer upsert, finalize snapshot.
+    assert inserts == ["stripe_webhook_events", "stripe_customers", "stripe_webhook_events"]
+    # The webhook snapshot is keyed by the Stripe event id, deduping replays via PK conflict.
+    assert "evt_123" in connection.calls[0][1].values()
+
+
+def _billing_client_with_customer(
+    monkeypatch: pytest.MonkeyPatch, *, customer_row: dict[str, Any] | None
+) -> tuple[TestClient, list[tuple[str, dict[str, str]]]]:
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_metered_123")
+    monkeypatch.setenv("STRIPE_CHECKOUT_SUCCESS_URL", "https://app.example.test/billing/success")
+    monkeypatch.setenv("STRIPE_CHECKOUT_CANCEL_URL", "https://app.example.test/billing/cancel")
+    monkeypatch.setenv("STRIPE_PORTAL_RETURN_URL", "https://app.example.test/billing")
+    posted: list[tuple[str, dict[str, str]]] = []
+
+    def fake_stripe_post(path: str, form: dict[str, str]) -> dict[str, Any]:
+        posted.append((path, dict(form)))
+        if path == "/v1/customers":
+            return {"id": "cus_created_1"}
+        if path == "/v1/checkout/sessions":
+            return {"id": "cs_1", "url": "https://checkout.stripe.test/cs_1"}
+        if path == "/v1/billing_portal/sessions":
+            return {"id": "bps_1", "url": "https://billing.stripe.test/bps_1"}
+        return {}
+
+    monkeypatch.setattr("yutome.hosted.http_api._stripe_post", fake_stripe_post)
+
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    rows = [{"id": "ws_http", "name": "Workspace", "status": "active"}]
+    if customer_row is not None:
+        rows = [customer_row]
+    connection = RecordingConnection(rows=rows)
+    app = build_app(
+        adapter=adapter,
+        billing_connection=connection,
+        expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+        account_session_secret=ACCOUNT_SESSION_SECRET,
+    )
+    return TestClient(app), posted
+
+
+def test_billing_checkout_requires_auth() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    connection = RecordingConnection(rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}])
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+            account_session_secret=ACCOUNT_SESSION_SECRET,
+        )
+    )
+
+    response = client.post("/billing/checkout", headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"})
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_session_required"
+
+
+def test_billing_checkout_creates_customer_and_returns_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, posted = _billing_client_with_customer(monkeypatch, customer_row=None)
+
+    response = client.post(
+        "/billing/checkout",
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["url"] == "https://checkout.stripe.test/cs_1"
+    paths = [path for path, _form in posted]
+    assert paths == ["/v1/customers", "/v1/checkout/sessions"]
+    checkout_form = posted[1][1]
+    assert checkout_form["mode"] == "subscription"
+    assert checkout_form["customer"] == "cus_created_1"
+    assert checkout_form["line_items[0][price]"] == "price_metered_123"
+    # Metered prices must omit quantity.
+    assert not any("quantity" in key for key in checkout_form)
+    assert checkout_form["client_reference_id"] == "ws_http"
+    assert checkout_form["subscription_data[metadata][workspace_id]"] == "ws_http"
+
+
+def test_billing_portal_returns_url_for_existing_customer(monkeypatch: pytest.MonkeyPatch) -> None:
+    customer_row = {
+        "id": "sc_1",
+        "workspace_id": "ws_http",
+        "stripe_customer_id": "cus_existing",
+        "stripe_subscription_id": "sub_1",
+        "subscription_status": "active",
+        "status": "active",
+    }
+    client, posted = _billing_client_with_customer(monkeypatch, customer_row=customer_row)
+
+    response = client.post(
+        "/billing/portal",
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["url"] == "https://billing.stripe.test/bps_1"
+    assert posted == [
+        (
+            "/v1/billing_portal/sessions",
+            {"customer": "cus_existing", "return_url": "https://app.example.test/billing"},
+        )
     ]
-    credit_params = connection.calls[2][1]
-    assert credit_params["workspace_id"] == "ws_http"
-    assert credit_params["external_order_id"] == "ord_123"
-    assert credit_params["quantity_text"] == "5"
 
 
 def test_account_bootstrap_creates_signed_session_and_persists_hash_only() -> None:

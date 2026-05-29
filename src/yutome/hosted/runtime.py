@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -19,14 +20,15 @@ from yutome.hosted.control_plane import Job, Source, SourceRefreshPolicy, TERMIN
 from yutome.hosted.errors import redact_sensitive_failure_text
 from yutome.hosted.ids import input_hash
 from yutome.hosted.billing import (
-    BillingExportWorkerResult,
+    StripeMeterExportWorkerResult,
     balance_reconciliation_input_sql,
     billing_debug_snapshot_from_rows,
     billing_debug_snapshot_sql,
-    billing_export_event_from_row,
-    claim_billing_exports_sql,
+    claim_stripe_meter_exports_sql,
     derive_workspace_balance_snapshot_from_rows,
-    finish_billing_export_sql,
+    finish_stripe_meter_export_sql,
+    stripe_meter_event_payload,
+    stripe_meter_export_event_from_row,
     upsert_workspace_balance_sql,
 )
 from yutome.hosted.indexing import (
@@ -378,7 +380,6 @@ class HostedCommandRunner:
             period_end_at=period_end_at,
         )
         rows = _rows_from_result(self.connect().execute(statement.sql, statement.params))
-        credit_rows = tuple(row for row in rows if row.get("row_kind") == "credit")
         usage_rows = tuple(row for row in rows if row.get("row_kind") == "usage")
         reserved_rows = tuple(row for row in rows if row.get("row_kind") == "reservation")
         snapshot = derive_workspace_balance_snapshot_from_rows(
@@ -386,7 +387,6 @@ class HostedCommandRunner:
             entitlement_policy_id=entitlement_policy_id,
             period_start_at=period_start_at,
             period_end_at=period_end_at,
-            credit_rows=credit_rows,
             usage_rows=usage_rows,
             reserved_rows=reserved_rows,
             starting_units=starting_units,
@@ -397,75 +397,92 @@ class HostedCommandRunner:
         self.connect().execute(upsert.sql, upsert.params)
         return snapshot.model_dump(mode="json")
 
-    def billing_export_once(
+    def stripe_meter_export_once(
         self,
         *,
         lease_owner: str,
         limit: int = 100,
-        access_token: str | None = None,
-        polar_api_base: str | None = None,
-    ) -> BillingExportWorkerResult:
-        token = access_token if access_token is not None else os.environ.get("POLAR_ACCESS_TOKEN")
-        if not token:
-            return BillingExportWorkerResult(
+        secret_key: str | None = None,
+        stripe_api_base: str | None = None,
+    ) -> StripeMeterExportWorkerResult:
+        key = secret_key if secret_key is not None else os.environ.get("STRIPE_SECRET_KEY")
+        if not key:
+            return StripeMeterExportWorkerResult(
                 attempted=False,
                 affected_rows=0,
                 skipped=1,
-                access_token_configured=False,
+                secret_key_configured=False,
                 rows=[
                     {
                         "status": "skipped",
-                        "reason": "POLAR_ACCESS_TOKEN is not configured; no billing export rows were claimed.",
+                        "reason": "STRIPE_SECRET_KEY is not configured; no Stripe meter exports were claimed.",
                     }
                 ],
             )
         now = datetime.now(timezone.utc)
-        claim = claim_billing_exports_sql(lease_owner=lease_owner, now=now, limit=limit)
+        claim = claim_stripe_meter_exports_sql(lease_owner=lease_owner, now=now, limit=limit)
         rows = _rows_from_result(self.connect().execute(claim.sql, claim.params))
-        api_base = (polar_api_base or os.environ.get("POLAR_API_BASE") or "https://api.polar.sh").rstrip("/")
-        result = BillingExportWorkerResult(
+        api_base = (stripe_api_base or os.environ.get("STRIPE_API_BASE") or "https://api.stripe.com").rstrip("/")
+        result = StripeMeterExportWorkerResult(
             attempted=True,
             affected_rows=len(rows),
-            access_token_configured=True,
+            secret_key_configured=True,
             rows=[],
         )
         for row in rows:
             export_id = str(row["id"])
             try:
-                export = billing_export_event_from_row(row)
-                payload = {"events": [export.to_polar_event().model_dump(mode="json", exclude_none=True)]}
-                response = _post_polar_usage_export(
-                    payload,
-                    access_token=token,
-                    api_base=api_base,
-                )
-                inserted = int(response.get("inserted") or 0)
-                duplicates = int(response.get("duplicates") or 0)
-                if inserted + duplicates < 1:
-                    raise HostedRuntimeError(
-                        f"Polar export did not acknowledge usage event: inserted={inserted}, duplicates={duplicates}"
+                export = stripe_meter_export_event_from_row(row)
+                if not export.stripe_customer_id:
+                    # No Stripe Customer yet (usage recorded before subscribe): cannot
+                    # bill; mark skipped (terminal) rather than POST a null customer.
+                    finish = finish_stripe_meter_export_sql(
+                        export_id=export_id,
+                        now=datetime.now(timezone.utc),
+                        replay_status="skipped",
+                        error_code="stripe_customer_missing",
+                        error_message="No active Stripe customer for the workspace at export time.",
                     )
-                finish = finish_billing_export_sql(
+                    self.connect().execute(finish.sql, finish.params)
+                    result.skipped += 1
+                    result.rows.append({"id": export_id, "status": "skipped", "reason": "stripe_customer_missing"})
+                    continue
+                payload = stripe_meter_event_payload(export)
+                response = _post_stripe_meter_event(
+                    payload,
+                    secret_key=key,
+                    api_base=api_base,
+                    idempotency_key=export.idempotency_key,
+                )
+                if str(response.get("object") or "") != "billing.meter_event":
+                    raise HostedRuntimeError(
+                        f"Stripe did not acknowledge the meter event: object={response.get('object')!r}"
+                    )
+                finish = finish_stripe_meter_export_sql(
                     export_id=export_id,
                     now=datetime.now(timezone.utc),
                     replay_status="succeeded",
-                    external_event_id=export.source_event_dedupe_key,
+                    stripe_meter_event_identifier=str(response.get("identifier") or export.stripe_identifier),
                 )
                 self.connect().execute(finish.sql, finish.params)
                 result.succeeded += 1
-                result.rows.append({"id": export_id, "status": "succeeded", "polar_response": response})
+                result.rows.append({"id": export_id, "status": "succeeded", "stripe_response": response})
             except Exception as exc:  # billing mirror failure must not affect authorization paths
                 error_message = redact_sensitive_failure_text(str(exc))
-                finish = finish_billing_export_sql(
+                replay_status = "skipped" if _stripe_timestamp_out_of_range(error_message) else "failed"
+                finish = finish_stripe_meter_export_sql(
                     export_id=export_id,
                     now=datetime.now(timezone.utc),
-                    replay_status="failed",
-                    error_code="polar_export_failed" if token else "polar_access_token_missing",
+                    replay_status=replay_status,
+                    error_code="stripe_meter_event_failed",
                     error_message=error_message,
                 )
                 self.connect().execute(finish.sql, finish.params)
-                result.failed += 1
-                result.rows.append({"id": export_id, "status": "failed", "error": error_message})
+                if replay_status == "skipped":
+                    result.skipped += 1
+                else:
+                    result.failed += 1
+                result.rows.append({"id": export_id, "status": replay_status, "error": error_message})
         return result
 
 
@@ -856,14 +873,28 @@ def _execution_result_dict(value: Any) -> dict[str, Any]:
     return dict(getattr(value, "__dict__", {}))
 
 
-def _post_polar_usage_export(payload: dict[str, Any], *, access_token: str, api_base: str) -> dict[str, Any]:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def _post_stripe_meter_event(
+    payload: dict[str, Any],
+    *,
+    secret_key: str,
+    api_base: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    form = {
+        "event_name": payload["event_name"],
+        "payload[stripe_customer_id]": payload["payload"]["stripe_customer_id"],
+        "payload[value]": payload["payload"]["value"],
+        "identifier": payload["identifier"],
+        "timestamp": str(payload["timestamp"]),
+    }
+    body = urllib.parse.urlencode(form).encode("utf-8")
     request = urllib.request.Request(
-        f"{api_base}/v1/events/ingest",
+        f"{api_base}/v1/billing/meter_events",
         data=body,
         headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Idempotency-Key": idempotency_key,
             "User-Agent": "yutome-hosted-billing/0.1",
         },
         method="POST",
@@ -874,7 +905,12 @@ def _post_polar_usage_export(payload: dict[str, Any], *, access_token: str, api_
             return json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="replace")
-        raise HostedRuntimeError(f"Polar export failed with HTTP {exc.code}: {error_text[:500]}") from exc
+        raise HostedRuntimeError(f"Stripe meter event failed with HTTP {exc.code}: {error_text[:500]}") from exc
+
+
+def _stripe_timestamp_out_of_range(message: str) -> bool:
+    lowered = message.lower()
+    return "timestamp" in lowered and ("range" in lowered or "older" in lowered or "future" in lowered)
 
 
 def _validate_positive(name: str, value: int) -> None:

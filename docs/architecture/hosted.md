@@ -38,10 +38,10 @@ flowchart TB
         a1["account_sessions · account_grants<br/>email_login_tokens · youtube_grants"]
     end
     subgraph B["Entitlements / Billing"]
-        b1["provider_allocations · service_allocations<br/>entitlement_policies · workspace_balances<br/>price_books · billing_customers"]
+        b1["provider_allocations · service_allocations<br/>entitlement_policies · workspace_balances<br/>price_books · stripe_customers"]
     end
     subgraph C["Usage / Metering (append-only)"]
-        c1["usage_reservations · usage_events<br/>credit_ledger_entries · billing_exports<br/>polar_webhook_snapshots"]
+        c1["usage_reservations · usage_events<br/>stripe_meter_exports · stripe_webhook_events"]
     end
     subgraph D["Ingest / Jobs"]
         d1["sources · source_refresh_policies<br/>jobs · job_operations"]
@@ -130,7 +130,7 @@ erDiagram
     workspaces ||--o{ entitlement_policies : has
     entitlement_policies ||--|| workspace_balances : funds
     workspaces ||--|| workspace_balances : has
-    workspaces ||--o{ billing_customers : has
+    workspaces ||--|| stripe_customers : has
 
     provider_allocations {
         text id PK
@@ -182,7 +182,7 @@ The four roles here are distinct and easy to confuse — keep them straight:
 |---|---|---|
 | **allocation** | `provider_allocations` / `service_allocations` | *Is this operation authorized, and where do its credentials come from?* (`credential_mode`) |
 | **EntitlementPolicy** | `entitlement_policies` | *Which operations are allowed, and what are the hard/soft per-operation ceilings?* |
-| **WorkspaceBalance** | `workspace_balances` | *How many prepaid units remain this period (and which units are unlimited)?* |
+| **WorkspaceBalance** | `workspace_balances` | *How many free-tier quota units remain this period (and which units are unlimited)?* |
 | **price_book** | `price_books` | *What does a unit cost / how do product units map?* |
 
 ### 2.4 Usage / Metering (append-only)
@@ -192,11 +192,9 @@ erDiagram
     workspaces ||--o{ usage_reservations : holds
     usage_reservations ||--o{ usage_events : "settled by"
     workspaces ||--o{ usage_events : records
-    usage_events ||--o{ billing_exports : mirrors
-    usage_reservations ||--o{ billing_exports : references
-    billing_customers ||--o{ billing_exports : bills
-    workspaces ||--o{ credit_ledger_entries : credits
-    workspaces ||--o{ polar_webhook_snapshots : "webhooks for"
+    usage_events ||--o{ stripe_meter_exports : mirrors
+    usage_reservations ||--o{ stripe_meter_exports : references
+    workspaces ||--o{ stripe_webhook_events : "webhooks for"
 
     usage_reservations {
         text id PK
@@ -220,35 +218,31 @@ erDiagram
         jsonb actual_units_json
         text provider_request_id
     }
-    billing_exports {
+    stripe_meter_exports {
         text id PK
         text usage_event_id FK
-        text source_event_dedupe_key "unique per provider"
-        text external_event_id "unique per provider"
-        text status "pending|failed|exported"
+        text meter_unit "credits"
+        text value_text
+        text source_event_dedupe_key "unique"
+        text stripe_meter_event_identifier
+        text status "pending|failed|succeeded|skipped"
         int attempt_count
     }
-    credit_ledger_entries {
-        text id PK
-        text workspace_id FK
-        text idempotency_key "unique per ws"
-        text direction "in|out"
-        text unit
-        text quantity_text
-    }
-    polar_webhook_snapshots {
-        text id PK
-        text webhook_event_id "unique"
-        text replay_status
+    stripe_webhook_events {
+        text id PK "= Stripe evt_ id"
+        text type
+        text status
     }
 ```
 
 The **usage ledger** (`usage_reservations` + `usage_events`) is the source of truth for pre-call
-authorization. `billing_exports` is a *mirror* of settled events shipped to Polar — Polar webhooks
-(`polar_webhook_snapshots` → `credit_ledger_entries`) are the source of truth for credits. Billing
-is therefore decoupled from authorization. Idempotency is enforced by unique constraints:
-`(workspace_id, idempotency_key)` on reservations and credits, and `(provider, source_event_dedupe_key)`
-+ `(provider, external_event_id)` on exports (`schema.py:151, 313, 342-343`).
+authorization. `stripe_meter_exports` is a *mirror* of settled events: one settled usage event maps
+to one pending row carrying the composite `credits` value, which the `stripe-meter-export` worker
+POSTs to Stripe `/v1/billing/meter_events`. Stripe is pure metered (billed in arrears); the prepaid
+credit-purchase path was removed. Billing is decoupled from authorization. Idempotency is enforced
+by unique constraints: `(workspace_id, idempotency_key)` on reservations, `(source_event_dedupe_key)`
+on meter exports (the row id == the Stripe meter_event `identifier`), and the Stripe event id as the
+`stripe_webhook_events` PK for exactly-once webhook processing.
 
 ### 2.5 Search / Transcripts
 
@@ -644,7 +638,9 @@ Grouped by auth dependency. Method/path anchored to `http_api.py`.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/account/cli/token` (`:921`) | PKCE token exchange (no auth) |
-| POST | `/billing/polar/webhook`, `/webhooks/polar` (`:697`) | Polar webhook (signature-verified) |
+| POST | `/billing/checkout` | Create a Stripe Checkout session (subscription, metered price); session-authenticated |
+| POST | `/billing/portal` | Create a Stripe Customer Portal session; session-authenticated |
+| POST | `/webhooks/stripe` | Stripe webhook (signature-verified, exactly-once by event id) |
 
 The dashboard `/account/{search,show,list}` endpoints derive the workspace from the session and call
 `adapter.call_tool(...)` — the **tenant scope is never read from the request body**.

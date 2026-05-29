@@ -103,10 +103,26 @@ all of them.
   [code: `models.UsageEvent`]
 - **ledger (usage ledger)** — the append-only log of reservations and usage events. It is
   the **source of truth** for pre-call authorization.
-- **billing export** — a settled, product-unit event mirrored out to the billing provider,
-  idempotent by a dedupe key.
-- **billing mirror (Polar)** — the external billing provider. A **mirror only**: it never
-  authorizes a call and its availability never changes a `UsageGate` decision.
+- **billable meter** — an internal usage unit (or composite of units) that is reported to
+  Stripe. Yutome reports a single composite `credits` meter: the billable units
+  (`media_seconds`, `total_tokens`, `vectors`, `queries`) are collapsed into one `credits`
+  value via fixed per-unit weights. All other units (`candidate_limit`,
+  `query_vector_dimensions`, `request_count`, `bytes`, …) are cost-visibility/quota units
+  and are never reported to Stripe. [code: `billing.STRIPE_CREDIT_UNIT_WEIGHTS`]
+- **Stripe meter export** — a queued usage→meter-event row: one settled usage event maps to
+  one pending `stripe_meter_exports` row, claimed by the `stripe-meter-export` worker and
+  POSTed to Stripe `/v1/billing/meter_events`. [code: `stripe_meter_exports` table,
+  `billing.StripeMeterExportEvent`]
+- **meter event identifier** — the deterministic dedupe key
+  (`stripe:{workspace_id}:{usage_event_id}:{meter_unit}`) used as the row id AND the Stripe
+  meter_event `identifier`; Stripe dedupes identical identifiers over a rolling ≥24h window,
+  so re-enqueues and retries are no-ops.
+- **billing mirror (Stripe)** — the external billing provider. A **mirror only**: it never
+  authorizes a call and its availability never changes a `UsageGate` decision. Subscriptions
+  are created via Stripe Checkout (`mode=subscription`, metered price); usage is charged in
+  arrears by reporting the `credits` meter. A free/unsubscribed workspace has no Stripe
+  Customer until its first `/billing/checkout` (lazy creation); pre-subscription usage is
+  enqueued as `skipped`, not billed.
 - **provider broker** — the component that holds provider credentials and meters and
   authorizes provider/service calls on a workspace's behalf. (Kept; it is the name of the
   plan and the `yt-indexer-pvq` epic. Defined here so it stops being used vaguely.)

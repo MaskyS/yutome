@@ -121,6 +121,7 @@ class PostgresUsageLedger:
             row = _execute_one(self.connection, insert_usage_event_sql(durable, idempotency=idempotency))
             persisted = usage_event_from_row(row) if row else durable
             _reconcile_balance_for_usage_event(self.connection, persisted)
+            _enqueue_stripe_meter_exports(self.connection, persisted)
             return persisted
 
     def recent(self, *, workspace_id: str, limit: int = 20) -> list[UsageEvent]:
@@ -263,6 +264,42 @@ def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> No
             status=next_status,
         ),
     )
+
+
+def _enqueue_stripe_meter_exports(connection: Any, event: UsageEvent) -> None:
+    """Close the usage -> Stripe meter loop at write time.
+
+    Enqueue a pending Stripe meter export only when the event settled
+    (succeeded/released) AND the workspace has an active stripe_customers row.
+    Best-effort: a missing/inactive customer (free/unsubscribed workspace) enqueues
+    nothing and never blocks the usage write. The billing mirror never authorizes a call.
+    """
+
+    from yutome.hosted.billing import (
+        enqueue_stripe_meter_export_sql,
+        stripe_meter_exports_from_usage_event,
+    )
+
+    if event.status not in {"succeeded", "released"}:
+        return
+    customer_row = _execute_one(
+        connection,
+        SqlStatement(
+            sql=_ACTIVE_STRIPE_CUSTOMER_SQL,
+            params={"workspace_id": event.workspace_id},
+        ),
+    )
+    if customer_row is None:
+        return
+    stripe_customer_external_id = customer_row.get("stripe_customer_id")
+    if not stripe_customer_external_id:
+        return
+    for export in stripe_meter_exports_from_usage_event(
+        event,
+        stripe_customer_id=str(stripe_customer_external_id),
+    ):
+        statement = enqueue_stripe_meter_export_sql(export)
+        connection.execute(statement.sql, statement.params)
 
 
 def _lock_reservation_by_id(connection: Any, *, workspace_id: str, reservation_id: str) -> Mapping[str, Any] | None:
@@ -489,6 +526,15 @@ def _text_array(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
     return tuple(str(item) for item in value)
+
+
+_ACTIVE_STRIPE_CUSTOMER_SQL = """
+SELECT stripe_customer_id
+FROM stripe_customers
+WHERE workspace_id = %(workspace_id)s
+  AND status = 'active'
+  AND subscription_status = 'active';
+""".strip()
 
 
 _LOCK_ACTIVE_WORKSPACE_BALANCE_SQL = """
