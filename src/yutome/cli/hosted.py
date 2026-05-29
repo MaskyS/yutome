@@ -104,7 +104,10 @@ def source_add_command(
 @app.command("run")
 def run_command(
     ctx: typer.Context,
-    job: str = typer.Argument(..., help="worker, stripe-meter-export, source-refresh, or maintenance."),
+    job: str = typer.Argument(
+        ...,
+        help="worker, stripe-meter-export, source-refresh, maintenance, or balance-rollover.",
+    ),
     once: bool = typer.Option(False, "--once", help="Run one tick and exit where supported."),
     lease_owner: str | None = typer.Option(None, "--lease-owner", help="Lease owner id."),
     workspace_id: str | None = typer.Option(None, "--workspace-id", help="Optional workspace scope for worker."),
@@ -158,4 +161,15 @@ def run_command(
             json_output=json_output,
         )
         return
-    raise typer.BadParameter("job must be one of: worker, stripe-meter-export, source-refresh, maintenance")
+    if normalized == "balance-rollover":
+        actions.hosted_balance_rollover(
+            config=config_path(ctx),
+            once=once,
+            limit=limit,
+            poll_interval=poll_interval,
+            json_output=json_output,
+        )
+        return
+    raise typer.BadParameter(
+        "job must be one of: worker, stripe-meter-export, source-refresh, maintenance, balance-rollover"
+    )

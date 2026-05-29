@@ -346,6 +346,26 @@ class HostedCommandRunner:
             params={**statement.params, "released_unknown_usage_reservations": released_unknown},
         )
 
+    def balance_rollover_once(self, *, limit: int = 100) -> HostedTickResult:
+        """Open the current monthly period for every workspace whose balance period has ended.
+
+        For each ``workspace_balances`` row with ``period_end_at <= now()`` it advances the
+        period to the calendar month containing now and re-seeds ``remaining_units_jsonb`` from
+        the workspace's active EntitlementPolicy ``included_units_jsonb`` (carry-nothing: a
+        hard-cap seat, so unspent allowance does not roll over). ``FOR UPDATE ... SKIP LOCKED``
+        keeps concurrent replica ticks from rolling the same row twice.
+        """
+
+        statement = balance_rollover_tick_sql(now=datetime.now(timezone.utc), limit=limit)
+        rows = _rows_from_result(self.connect().execute(statement.sql, statement.params))
+        return HostedTickResult(
+            tick="balance_rollover_once",
+            attempted=True,
+            affected_rows=len(rows),
+            sql=statement.sql,
+            params={**statement.params, "rolled_workspace_ids": [row.get("workspace_id") for row in rows]},
+        )
+
     def billing_status(
         self,
         *,
@@ -668,6 +688,67 @@ SELECT 'source_refresh_policy' AS target, id FROM released_source_locks;
     )
 
 
+def balance_rollover_tick_sql(*, now: datetime, limit: int = 100) -> SqlStatement:
+    """Re-seed expired monthly WorkspaceBalance periods from the active EntitlementPolicy.
+
+    Period math (carry-nothing, never double-credits, never skips a live month):
+      - A row is due when ``period_end_at <= now()``. Every seeded period ends on a calendar
+        month boundary (``date_trunc('month', ...) + interval '1 month'``), so the live month's
+        balance always has ``period_end_at`` in the future and is never picked up.
+      - The new window snaps directly to the calendar month containing ``now``:
+        ``period_start_at = date_trunc('month', now())`` and
+        ``period_end_at  = date_trunc('month', now()) + interval '1 month'``. Because we carry
+        nothing, jumping straight to now's month is correct even after missed cron ticks — there
+        is no per-month allowance to accrue — and re-running is a no-op (the freshly set
+        ``period_end_at`` is in the future).
+      - ``remaining_units_jsonb`` is re-seeded from the workspace's active policy
+        ``included_units_jsonb``; ``used``/``reserved`` reset to ``{}`` for the fresh period.
+
+    Concurrency: ``FOR UPDATE OF balance SKIP LOCKED`` lets multiple replica ticks run in
+    parallel; each locked row is rolled by exactly one tick.
+    """
+
+    _validate_positive("limit", limit)
+    return SqlStatement(
+        sql="""
+WITH due AS (
+    SELECT
+        balance.workspace_id,
+        policy.id AS entitlement_policy_id,
+        policy.included_units_jsonb
+    FROM workspace_balances AS balance
+    JOIN entitlement_policies AS policy
+      ON policy.id = balance.entitlement_policy_id
+     AND policy.status = 'active'
+    WHERE balance.period_end_at <= %(now)s
+    ORDER BY balance.period_end_at ASC, balance.workspace_id ASC
+    LIMIT %(limit)s
+    FOR UPDATE OF balance SKIP LOCKED
+)
+UPDATE workspace_balances AS balance
+SET period_start_at = date_trunc('month', %(now)s::timestamptz),
+    period_end_at = date_trunc('month', %(now)s::timestamptz) + interval '1 month',
+    used_units_jsonb = '{}'::jsonb,
+    reserved_units_jsonb = '{}'::jsonb,
+    remaining_units_jsonb = due.included_units_jsonb,
+    metadata_json = jsonb_set(
+        balance.metadata_json,
+        '{last_rollover}',
+        jsonb_build_object(
+            'rolled_at', %(now)s::timestamptz::text,
+            'entitlement_policy_id', due.entitlement_policy_id
+        ),
+        true
+    ),
+    updated_at = %(now)s::timestamptz
+FROM due
+WHERE balance.workspace_id = due.workspace_id
+RETURNING balance.workspace_id, balance.period_start_at, balance.period_end_at;
+""".strip(),
+        params={"now": now, "limit": limit},
+    )
+
+
 def _sql_statement(statement: Any) -> SqlStatement:
     sql, params = compile_postgres_statement(statement)
     return SqlStatement(sql=sql + ";", params=params)
@@ -940,6 +1021,7 @@ __all__ = [
     "HostedRealIndexingSmokeResult",
     "HostedRuntimeError",
     "HostedTickResult",
+    "balance_rollover_tick_sql",
     "build_hosted_api_app",
     "connect_postgres",
     "ensure_workspace_sql",

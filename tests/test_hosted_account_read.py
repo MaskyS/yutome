@@ -163,6 +163,85 @@ def test_account_summary_returns_plan_and_units() -> None:
     assert all(params.get("workspace_id") == "ws_pg" for _, params in connection.calls)
 
 
+def test_account_summary_carries_subscription_status_and_trial_ends_at() -> None:
+    trial_ends = datetime.now(timezone.utc) + timedelta(days=10)
+    connection = RoutingConnection(
+        # Stripe webhook mirror reports a card-gated trial; trial_ends_at lives on
+        # the workspaces row. The summary must surface both so the dashboard can
+        # tell a trialing workspace apart from an active (paid) one.
+        workspace=[
+            {
+                "id": "ws_pg",
+                "name": "Demo",
+                "status": "active",
+                "subscription_status": "trialing",
+                "trial_ends_at": trial_ends,
+            }
+        ],
+        policy=[{"id": "pol_pg", "plan_key": "starter", "included_units_jsonb": {"queries": 10000}}],
+        balance=_period_rows(),
+    )
+    client = build_account_app(connection)
+
+    response = client.get("/account/summary", headers=account_headers(mint_session()))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["state"] == "active"
+    assert body["subscription_status"] == "trialing"
+    assert body["trial_ends_at"] is not None
+    # The status SELECT joins the Stripe customer mirror onto the workspace row.
+    assert any(
+        "FROM workspaces" in statement and "stripe_customers" in statement
+        for statement, _ in connection.calls
+    )
+
+
+def test_account_summary_subscription_status_fail_soft_when_no_stripe_customer() -> None:
+    # No stripe_customers row (no checkout yet) → the LEFT JOIN leaves the column
+    # null; the summary reports 'none' and a null trial_ends_at without failing.
+    connection = RoutingConnection(
+        workspace=[{"id": "ws_pg", "name": "Demo", "status": "active"}],
+        policy=[{"id": "pol_pg", "plan_key": "starter", "included_units_jsonb": {"queries": 10000}}],
+        balance=_period_rows(),
+    )
+    client = build_account_app(connection)
+
+    response = client.get("/account/summary", headers=account_headers(mint_session()))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["subscription_status"] == "none"
+    assert body["trial_ends_at"] is None
+
+
+def test_account_summary_subscription_fields_present_on_no_active_plan() -> None:
+    # Fields ride along even when there is no active plan/policy, so the dashboard
+    # can still render trial state for a not-yet-provisioned workspace.
+    trial_ends = datetime.now(timezone.utc) + timedelta(days=3)
+    connection = RoutingConnection(
+        workspace=[
+            {
+                "id": "ws_pg",
+                "name": "Demo",
+                "status": "active",
+                "subscription_status": "trialing",
+                "trial_ends_at": trial_ends,
+            }
+        ],
+        policy=[],
+    )
+    client = build_account_app(connection)
+
+    response = client.get("/account/summary", headers=account_headers(mint_session()))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["state"] == "no_active_plan"
+    assert body["subscription_status"] == "trialing"
+    assert body["trial_ends_at"] is not None
+
+
 def test_account_summary_entitlements_are_curated_and_clamped() -> None:
     connection = RoutingConnection(
         policy=[

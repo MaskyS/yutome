@@ -840,6 +840,34 @@ WHERE id = %(workspace_id)s;
     )
 
 
+def provision_starter_entitlement_statements(workspace_id: str) -> tuple[BillingSqlStatement, ...]:
+    """Idempotently ensure a subscribed workspace has a usable EntitlementPolicy + seeded
+    WorkspaceBalance for the current monthly period.
+
+    Reuses the account-bootstrap starter builders so a workspace that subscribed before ever
+    signing in (or whose bootstrap predated entitlement provisioning) still gets the same
+    `starter` plan rows. All three upserts are idempotent: the price book and policy upsert by
+    their natural keys, and the balance upsert preserves an existing `remaining_units_jsonb`
+    (the reserve/settle ledger is the source of truth for the live period), so re-running on a
+    `customer.subscription.updated` replay never resets a mid-period balance.
+    """
+
+    from yutome.hosted.account import (
+        upsert_starter_entitlement_policy_sql,
+        upsert_starter_price_book_sql,
+        upsert_starter_workspace_balance_sql,
+    )
+
+    return tuple(
+        _as_billing_statement(statement)
+        for statement in (
+            upsert_starter_price_book_sql(),
+            upsert_starter_entitlement_policy_sql(workspace_id),
+            upsert_starter_workspace_balance_sql(workspace_id),
+        )
+    )
+
+
 def stripe_webhook_processing_statements(result: StripeWebhookProcessingResult) -> tuple[BillingSqlStatement, ...]:
     statements: list[BillingSqlStatement] = [upsert_stripe_webhook_event_sql(result.event)]
     if result.stripe_customer is not None:
@@ -850,6 +878,13 @@ def stripe_webhook_processing_statements(result: StripeWebhookProcessingResult) 
                 subscription_status=result.stripe_customer.subscription_status,
             )
         )
+        # The StripeCustomer model normalizes Stripe `trialing`/`complete` to `active`, so a
+        # subscribe/renew event that lands the workspace in the entitled state seeds the starter
+        # EntitlementPolicy + WorkspaceBalance for the current period. Without this, a workspace
+        # that subscribed before signing in (no account bootstrap) would have no policy/balance
+        # and every spend would fail closed.
+        if result.stripe_customer.subscription_status == "active":
+            statements.extend(provision_starter_entitlement_statements(result.stripe_customer.workspace_id))
     final_event = result.event.model_copy(
         update={
             "status": "skipped" if result.ignored else "succeeded",
@@ -858,6 +893,10 @@ def stripe_webhook_processing_statements(result: StripeWebhookProcessingResult) 
     )
     statements.append(upsert_stripe_webhook_event_sql(final_event))
     return tuple(statements)
+
+
+def _as_billing_statement(statement: Any) -> BillingSqlStatement:
+    return BillingSqlStatement(sql=statement.sql, params=dict(statement.params))
 
 
 def billing_schema_statements(sql: str = POSTGRES_BILLING_SCHEMA_SQL) -> list[str]:
@@ -1720,6 +1759,7 @@ __all__ = [
     "overage_metering_enabled",
     "price_book_params",
     "process_stripe_webhook_event",
+    "provision_starter_entitlement_statements",
     "stripe_customer_id",
     "stripe_customer_params",
     "stripe_meter_event_payload",

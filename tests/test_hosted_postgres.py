@@ -30,6 +30,7 @@ from yutome.hosted.billing import (
     upsert_stripe_webhook_event_sql,
     upsert_workspace_balance_sql,
 )
+from yutome.hosted.runtime import balance_rollover_tick_sql
 from yutome.hosted.indexing import complete_job_operation_success_sql, enqueue_index_video_job_sql
 from yutome.hosted.jobs import (
     active_job_lease_sql,
@@ -627,6 +628,99 @@ def test_live_postgres_executes_core_built_billing_upserts(live_postgres_dsn: st
                 "SELECT subscription_status FROM workspaces WHERE id = 'ws_1';"
             ).fetchone()
             assert workspace_row["subscription_status"] == "active"
+
+        connection.rollback()
+
+
+def test_live_postgres_balance_rollover_reseeds_due_periods_and_is_idempotent(live_postgres_dsn: str) -> None:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    # Run "now" mid-month so date_trunc('month', now()) is unambiguous.
+    now = datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc)
+    with psycopg.connect(live_postgres_dsn, autocommit=False, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE entitlement_policies (
+                    id text PRIMARY KEY,
+                    workspace_id text NOT NULL,
+                    included_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    status text NOT NULL DEFAULT 'active'
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TEMP TABLE workspace_balances (
+                    workspace_id text PRIMARY KEY,
+                    entitlement_policy_id text NOT NULL,
+                    period_start_at timestamptz NOT NULL,
+                    period_end_at timestamptz NOT NULL,
+                    used_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    reserved_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    remaining_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    unlimited_units text[] NOT NULL DEFAULT ARRAY[]::text[],
+                    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                ) ON COMMIT DROP;
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO entitlement_policies (id, workspace_id, included_units_jsonb, status)
+                VALUES ('pol_due', 'ws_due', '{"total_tokens": 430000, "vectors": 600}'::jsonb, 'active'),
+                       ('pol_live', 'ws_live', '{"total_tokens": 430000}'::jsonb, 'active');
+                """
+            )
+            # ws_due: previous month's period already ended (drained allowance) -> due.
+            cursor.execute(
+                """
+                INSERT INTO workspace_balances
+                    (workspace_id, entitlement_policy_id, period_start_at, period_end_at,
+                     used_units_jsonb, remaining_units_jsonb)
+                VALUES
+                    ('ws_due', 'pol_due',
+                     timestamptz '2026-05-01 00:00+00', timestamptz '2026-06-01 00:00+00',
+                     '{"total_tokens": 430000}'::jsonb, '{}'::jsonb);
+                """
+            )
+            # ws_live: current month, period_end_at in the future -> NOT due.
+            cursor.execute(
+                """
+                INSERT INTO workspace_balances
+                    (workspace_id, entitlement_policy_id, period_start_at, period_end_at, remaining_units_jsonb)
+                VALUES
+                    ('ws_live', 'pol_live',
+                     timestamptz '2026-06-01 00:00+00', timestamptz '2026-07-01 00:00+00',
+                     '{"total_tokens": 1234}'::jsonb);
+                """
+            )
+
+            rollover = balance_rollover_tick_sql(now=now, limit=100)
+            rolled = cursor.execute(rollover.sql, rollover.params).fetchall()
+
+            # Only the ended period rolls; the live month is skipped.
+            assert [row["workspace_id"] for row in rolled] == ["ws_due"]
+            due_row = cursor.execute(
+                "SELECT period_start_at, period_end_at, used_units_jsonb, reserved_units_jsonb, remaining_units_jsonb "
+                "FROM workspace_balances WHERE workspace_id = 'ws_due';"
+            ).fetchone()
+            # New window snaps to June (the calendar month containing now); allowance re-seeded.
+            assert due_row["period_start_at"] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+            assert due_row["period_end_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+            assert due_row["remaining_units_jsonb"] == {"total_tokens": 430000, "vectors": 600}
+            assert due_row["used_units_jsonb"] == {}
+            assert due_row["reserved_units_jsonb"] == {}
+            # The live month's balance is untouched.
+            live_row = cursor.execute(
+                "SELECT remaining_units_jsonb, period_end_at FROM workspace_balances WHERE workspace_id = 'ws_live';"
+            ).fetchone()
+            assert live_row["remaining_units_jsonb"] == {"total_tokens": 1234}
+
+            # Idempotent: a second tick at the same now finds nothing due (no double-credit).
+            second = cursor.execute(rollover.sql, rollover.params).fetchall()
+            assert second == []
 
         connection.rollback()
 

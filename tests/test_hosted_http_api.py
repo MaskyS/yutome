@@ -456,8 +456,17 @@ def test_stripe_webhook_accepts_signature_and_upserts_customer_exactly_once() ->
     assert body["event_type"] == "checkout.session.completed"
     assert body["stripe_customer"].startswith("sc_")
     inserts = [call[0].split()[2] for call in connection.calls if call[0].startswith("INSERT INTO")]
-    # snapshot insert (exactly-once via PK), customer upsert, finalize snapshot.
-    assert inserts == ["stripe_webhook_events", "stripe_customers", "stripe_webhook_events"]
+    # snapshot insert (exactly-once via PK), customer upsert, then — because `complete` normalizes
+    # to the entitled `active` status — provision the starter price book, EntitlementPolicy, and
+    # WorkspaceBalance, and finally finalize the snapshot.
+    assert inserts == [
+        "stripe_webhook_events",
+        "stripe_customers",
+        "price_books",
+        "entitlement_policies",
+        "workspace_balances",
+        "stripe_webhook_events",
+    ]
     # The webhook snapshot is keyed by the Stripe event id, deduping replays via PK conflict.
     assert "evt_123" in connection.calls[0][1].values()
 

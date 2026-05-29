@@ -29,6 +29,7 @@ from yutome.hosted.schema import (
     account_grants,
     entitlement_policies,
     sources,
+    stripe_customers,
     usage_events,
     videos,
     workspace_balances,
@@ -90,6 +91,15 @@ class WorkspaceSummary(BaseModel):
     state: WorkspaceState
     plan_key: str | None = None
     workspace: WorkspaceRef
+    # Webhook-synced Stripe subscription status (e.g. 'trialing', 'active', 'past_due').
+    # 'none' when the workspace has no stripe_customers row yet (no checkout). The
+    # dashboard distinguishes a card-gated trial from a paid subscription by pairing
+    # this with trial_ends_at: a 'trialing' (or 'none' with a future trial_ends_at)
+    # workspace is on its 14-day trial; 'active' is a paid subscription.
+    subscription_status: str | None = None
+    # When the workspace's card-gated trial ends; carried straight from the
+    # workspaces row. None once converted to a paid plan or if never on a trial.
+    trial_ends_at: datetime | None = None
     period: BalancePeriod | None = None
     # Raw per-unit balances (every metered key, including internal telemetry).
     # Kept for debugging/back-compat; the dashboard renders `entitlements` instead.
@@ -130,6 +140,32 @@ class ConnectedAssistant(BaseModel):
 def _active_workspace_sql(*, workspace_id: str) -> SqlStatement:
     statement = (
         select(workspaces.c.id, workspaces.c.name, workspaces.c.status)
+        .where(workspaces.c.id == bindparam("workspace_id", value=workspace_id))
+        .limit(bindparam("limit", value=1))
+    )
+    sql, params = compile_postgres_statement(statement)
+    return SqlStatement(sql=sql + ";", params=params)
+
+
+def _summary_subscription_sql(*, workspace_id: str) -> SqlStatement:
+    # Subscription/trial state for the dashboard summary. LEFT JOIN the Stripe
+    # customer mirror so subscription_status is the webhook-synced value; a workspace
+    # has no stripe_customers row until its first checkout (lazy creation), so the
+    # join is outer and the column is null until then — read as 'none' downstream.
+    # trial_ends_at always comes from the workspaces row. Kept separate from
+    # _active_workspace_sql (which only needs id/name/status for the 404 check) so
+    # the lean liveness query never carries subscription columns.
+    statement = (
+        select(
+            workspaces.c.trial_ends_at,
+            stripe_customers.c.subscription_status.label("subscription_status"),
+        )
+        .select_from(
+            workspaces.outerjoin(
+                stripe_customers,
+                stripe_customers.c.workspace_id == workspaces.c.id,
+            )
+        )
         .where(workspaces.c.id == bindparam("workspace_id", value=workspace_id))
         .limit(bindparam("limit", value=1))
     )
@@ -386,11 +422,27 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         id=workspace_id,
         name=_optional_str(workspace_row.get("name")) if workspace_row else None,
     )
+    # Subscription/trial state, fail-soft: a missing stripe_customers row leaves
+    # subscription_status null in the LEFT JOIN → report 'none'; trial_ends_at is
+    # whatever the workspaces row carries (the dashboard infers trialing from it).
+    subscription_statement = _summary_subscription_sql(workspace_id=workspace_id)
+    subscription_row = _one(
+        connection.execute(subscription_statement.sql, subscription_statement.params)
+    )
+    subscription_status = (
+        _optional_str(subscription_row.get("subscription_status")) if subscription_row else None
+    ) or "none"
+    trial_ends_at = subscription_row.get("trial_ends_at") if subscription_row else None
 
     policy_statement = _summary_policy_sql(workspace_id=workspace_id)
     policy_row = _one(connection.execute(policy_statement.sql, policy_statement.params))
     if policy_row is None:
-        return WorkspaceSummary(state="no_active_plan", workspace=workspace)
+        return WorkspaceSummary(
+            state="no_active_plan",
+            workspace=workspace,
+            subscription_status=subscription_status,
+            trial_ends_at=trial_ends_at,
+        )
 
     plan_key = _optional_str(policy_row.get("plan_key"))
     included = _json_mapping(policy_row.get("included_units_jsonb"))
@@ -411,6 +463,8 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
             state="no_active_plan",
             plan_key=plan_key,
             workspace=workspace,
+            subscription_status=subscription_status,
+            trial_ends_at=trial_ends_at,
             units=units,
             entitlements=_build_entitlements(included, {}, set()),
         )
@@ -441,6 +495,8 @@ def read_workspace_summary(connection: SqlConnection, *, workspace_id: str) -> W
         state="active",
         plan_key=plan_key,
         workspace=workspace,
+        subscription_status=subscription_status,
+        trial_ends_at=trial_ends_at,
         period=BalancePeriod(start_at=balance_row["period_start_at"], end_at=balance_row["period_end_at"]),
         units=units,
         entitlements=_build_entitlements(included, used, unlimited),

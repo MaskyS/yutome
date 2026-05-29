@@ -30,6 +30,7 @@ from yutome.hosted.billing import (
     mark_stripe_meter_export_replay,
     overage_credits_for_event,
     process_stripe_webhook_event,
+    provision_starter_entitlement_statements,
     stripe_meter_event_payload,
     stripe_meter_export_event_from_row,
     stripe_meter_export_idempotency_key,
@@ -382,6 +383,99 @@ def test_stripe_webhook_ignores_unrelated_event_types() -> None:
 
     assert result.ignored is True
     assert result.stripe_customer is None
+
+
+def test_active_subscription_webhook_provisions_entitlement_policy_and_balance() -> None:
+    # A workspace that subscribes (or renews into active/trialing) must come out of the webhook
+    # with a usable EntitlementPolicy + seeded WorkspaceBalance for the current period, even if
+    # it never bootstrapped an account first.
+    payload = {
+        "id": "evt_active",
+        "type": "customer.subscription.created",
+        "created": 1779753600,
+        "data": {
+            "object": {
+                "id": "sub_active",
+                "customer": "cus_active",
+                "status": "active",
+                "metadata": {"workspace_id": "ws_pay"},
+            }
+        },
+    }
+
+    result = process_stripe_webhook_event(payload)
+    statements = stripe_webhook_processing_statements(result)
+    sqls = [statement.sql for statement in statements]
+
+    assert result.stripe_customer is not None
+    assert result.stripe_customer.subscription_status == "active"
+    policy_stmt = next(stmt for stmt in statements if "INSERT INTO entitlement_policies" in stmt.sql)
+    balance_stmt = next(stmt for stmt in statements if "INSERT INTO workspace_balances" in stmt.sql)
+    assert "ws_pay" in policy_stmt.params.values()
+    assert "ws_pay" in balance_stmt.params.values()
+    # Provisioning seeds the price book the starter policy references, so the FK holds on a
+    # never-bootstrapped workspace.
+    assert any("INSERT INTO price_books" in sql for sql in sqls)
+    # The starter included allowance lands in the seeded balance.
+    assert any("\"total_tokens\":430000" in str(value) for value in balance_stmt.params.values())
+
+
+def test_trialing_subscription_webhook_provisions_entitlement() -> None:
+    # Stripe `trialing` normalizes to the entitled `active` status, so a card-gated trial seat is
+    # also provisioned.
+    payload = {
+        "id": "evt_trialing",
+        "type": "customer.subscription.updated",
+        "created": 1779753600,
+        "data": {
+            "object": {
+                "id": "sub_trial",
+                "customer": "cus_trial",
+                "status": "trialing",
+                "metadata": {"workspace_id": "ws_trial"},
+            }
+        },
+    }
+
+    statements = stripe_webhook_processing_statements(process_stripe_webhook_event(payload))
+
+    assert any("INSERT INTO entitlement_policies" in stmt.sql for stmt in statements)
+    assert any("INSERT INTO workspace_balances" in stmt.sql for stmt in statements)
+
+
+def test_non_entitled_subscription_webhook_does_not_provision_entitlement() -> None:
+    # past_due / canceled events mirror the status onto the workspace but must NOT seed a fresh
+    # balance (that would silently re-credit an unpaid workspace).
+    payload = {
+        "id": "evt_pd",
+        "type": "customer.subscription.updated",
+        "created": 1779753600,
+        "data": {
+            "object": {
+                "id": "sub_pd",
+                "customer": "cus_pd",
+                "status": "past_due",
+                "metadata": {"workspace_id": "ws_pd"},
+            }
+        },
+    }
+
+    statements = stripe_webhook_processing_statements(process_stripe_webhook_event(payload))
+
+    assert not any("INSERT INTO entitlement_policies" in stmt.sql for stmt in statements)
+    assert not any("INSERT INTO workspace_balances" in stmt.sql for stmt in statements)
+    # The subscription status is still mirrored onto the workspace row.
+    assert any("UPDATE workspaces" in stmt.sql for stmt in statements)
+
+
+def test_provision_starter_entitlement_statements_preserve_existing_balance_on_replay() -> None:
+    # Idempotent: the balance upsert keeps the existing remaining_units_jsonb (the ledger owns
+    # the live period), so a webhook replay never resets a mid-period balance.
+    statements = provision_starter_entitlement_statements("ws_replay")
+
+    balance_stmt = next(stmt for stmt in statements if "INSERT INTO workspace_balances" in stmt.sql)
+    assert "ON CONFLICT" in balance_stmt.sql
+    assert "remaining_units_jsonb = workspace_balances.remaining_units_jsonb" in balance_stmt.sql
 
 
 def test_billing_schema_statements_cover_durable_stripe_tables() -> None:

@@ -11,6 +11,7 @@ from yutome.hosted.runtime import (
     HostedCommandRunner,
     HostedDbCheck,
     HostedTickResult,
+    balance_rollover_tick_sql,
     build_hosted_api_app,
     maintenance_tick_sql,
     postgres_url_from_env,
@@ -374,6 +375,55 @@ def test_maintenance_tick_sql_releases_expired_job_and_source_locks() -> None:
     assert "lease_expires_at <= %(now)s" in statement.sql
     assert "locked_until <= %(now)s" in statement.sql
     assert statement.params["limit"] == 10
+
+
+def test_balance_rollover_tick_sql_reseeds_expired_periods_with_skip_locked() -> None:
+    now = datetime(2026, 6, 1, 0, 5, tzinfo=timezone.utc)
+
+    statement = balance_rollover_tick_sql(now=now, limit=50)
+
+    # Only ended periods are claimed; the live month (period_end_at in the future) is skipped.
+    assert "balance.period_end_at <= %(now)s" in statement.sql
+    # Concurrent replica ticks are safe: each row is rolled by exactly one tick.
+    assert "FOR UPDATE OF balance SKIP LOCKED" in statement.sql
+    # The new window snaps to the calendar month containing now (carry-nothing).
+    assert "period_start_at = date_trunc('month', %(now)s::timestamptz)" in statement.sql
+    assert "period_end_at = date_trunc('month', %(now)s::timestamptz) + interval '1 month'" in statement.sql
+    # remaining_units is re-seeded from the active EntitlementPolicy included allowance.
+    assert "remaining_units_jsonb = due.included_units_jsonb" in statement.sql
+    assert "policy.status = 'active'" in statement.sql
+    # used/reserved reset for the fresh period.
+    assert "used_units_jsonb = '{}'::jsonb" in statement.sql
+    assert "reserved_units_jsonb = '{}'::jsonb" in statement.sql
+    assert statement.params["limit"] == 50
+
+
+def test_runner_balance_rollover_once_executes_tick_and_reports_rolled_workspaces() -> None:
+    connection = RecordingConnection(
+        rows=[
+            {"workspace_id": "ws_a", "period_start_at": "2026-06-01", "period_end_at": "2026-07-01"},
+            {"workspace_id": "ws_b", "period_start_at": "2026-06-01", "period_end_at": "2026-07-01"},
+        ]
+    )
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.balance_rollover_once(limit=10)
+
+    assert result.tick == "balance_rollover_once"
+    assert result.affected_rows == 2
+    assert result.params["rolled_workspace_ids"] == ["ws_a", "ws_b"]
+    assert "FROM workspace_balances" in connection.calls[0][0]
+    assert connection.calls[0][1]["limit"] == 10
+
+
+def test_runner_balance_rollover_once_no_ops_when_nothing_due() -> None:
+    connection = RecordingConnection(rows=[])
+    runner = HostedCommandRunner(AppConfig(), connection=connection)
+
+    result = runner.balance_rollover_once(limit=10)
+
+    assert result.affected_rows == 0
+    assert result.params["rolled_workspace_ids"] == []
 
 
 def test_runner_tick_methods_return_affected_rows() -> None:

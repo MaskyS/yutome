@@ -743,6 +743,23 @@ def hosted_maintenance_tick(*, config: Path, once: bool, limit: int, poll_interv
         _die(str(exc), json_output=json_output)
 
 
+def hosted_balance_rollover(*, config: Path, once: bool, limit: int, poll_interval: float, json_output: bool) -> None:
+    try:
+        runner = _runner(config)
+        while True:
+            result = runner.balance_rollover_once(limit=limit)
+            _echo_result(
+                result,
+                json_output=json_output,
+                message=f"Balance rollover opened {result.affected_rows or 0} periods.",
+            )
+            if once:
+                return
+            time.sleep(poll_interval)
+    except HostedRuntimeError as exc:
+        _die(str(exc), json_output=json_output)
+
+
 def hosted_stripe_meter_export_worker(
     *,
     config: Path,
