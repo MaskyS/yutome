@@ -337,9 +337,9 @@ def _connect(config: AppConfig) -> Any:
 
 
 def _workspace_id(config: AppConfig) -> str:
-    workspace_id = config.hosted.workspace_id.strip()
+    workspace_id = (config.hosted.workspace_id or config.hosted.local_workspace_id).strip()
     if not workspace_id:
-        raise ValueError("Set [hosted].workspace_id before using the Postgres search store.")
+        raise ValueError("No workspace configured. Run: yutome setup.")
     return workspace_id
 
 

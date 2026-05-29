@@ -204,9 +204,9 @@ def tool_index(
     )
 
     rt = runtime.current()
-    workspace_id = rt.config.hosted.workspace_id.strip()
+    workspace_id = (rt.config.hosted.workspace_id or rt.config.hosted.local_workspace_id).strip()
     if not workspace_id:
-        raise RuntimeError("Set [hosted].workspace_id before using the Yutome MCP index tool.")
+        raise RuntimeError("No workspace configured. Run: yutome setup before using the Yutome MCP index tool.")
     request = HostedSourcesImportRequest(
         sources=[HostedSourceImportDescriptor(source_url=source)],
         refresh_enabled=refresh_enabled,
@@ -224,9 +224,9 @@ def tool_jobs(limit: int = 10, source_id: str | None = None) -> dict[str, Any]:
     from yutome.hosted.source_import import list_source_jobs
 
     rt = runtime.current()
-    workspace_id = rt.config.hosted.workspace_id.strip()
+    workspace_id = (rt.config.hosted.workspace_id or rt.config.hosted.local_workspace_id).strip()
     if not workspace_id:
-        raise RuntimeError("Set [hosted].workspace_id before using the Yutome MCP jobs tool.")
+        raise RuntimeError("No workspace configured. Run: yutome setup before using the Yutome MCP jobs tool.")
     return list_source_jobs(
         HostedCommandRunner(rt.config).connect(),
         workspace_id=workspace_id,

@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 import typer
 
-from yutome import runtime
+from yutome import runtime, setup_prompts
 from yutome.config import DEFAULT_CONFIG_FILENAME, AppConfig, load_config, write_default_config
 from yutome.env import apply_env_to_config, load_dotenv
 from yutome.exports import export_markdown
@@ -111,9 +111,9 @@ def _runner(config_path: Path) -> HostedCommandRunner:
 
 
 def _workspace_id(app_config: AppConfig, explicit: str | None = None) -> str:
-    value = (explicit or app_config.hosted.workspace_id).strip()
+    value = (explicit or app_config.hosted.workspace_id or app_config.hosted.local_workspace_id).strip()
     if not value:
-        raise HostedRuntimeError("Set --workspace-id or [hosted].workspace_id before running this command.")
+        raise HostedRuntimeError("No workspace configured. Run: yutome setup")
     return value
 
 
@@ -283,13 +283,46 @@ def setup(
     """Create a greenfield Postgres-backed Yutome project config."""
     project_root = _project_root(config)
     wrote = write_default_config(config, overwrite=False)
-    load_dotenv(project_root / ".env")
+    env_path = project_root / ".env"
+    load_dotenv(env_path)
     app_config = apply_env_to_config(load_config(config))
-    paths = ProjectPaths.from_config(app_config, project_root=project_root)
-    paths.ensure_base_dirs()
 
     typer.echo(f"[OK] {'Wrote' if wrote else 'Using existing'} config: {config}")
+
+    # Ensure a local workspace identity so corpus/search commands don't hard-fail. A
+    # personal workspace_id (written by `yutome hosted login`) takes precedence; otherwise
+    # generate and persist a local fallback once. Beginners never have to learn the concept.
+    if not app_config.hosted.workspace_id and not app_config.hosted.local_workspace_id:
+        local_workspace_id = _generate_local_workspace_id()
+        _set_toml_string(config, "hosted", "local_workspace_id", local_workspace_id)
+        app_config = apply_env_to_config(load_config(config))
+        typer.echo(f"[OK] Local workspace: {local_workspace_id}")
+
+    # Interactive first-run wizard: capture the Postgres DSN and an optional Voyage key
+    # into ./.env. Skipped entirely under -y; on a non-TTY the setup_prompts wrappers fall
+    # back to typer.prompt so scripted `yutome setup < input` still works.
+    if not yes and setup_prompts.is_interactive():
+        dsn_env = app_config.database.postgres_url_env
+        current_dsn = os.environ.get(dsn_env, "")
+        dsn = setup_prompts.text(
+            f"Postgres DSN (VectorChord Suite) [{dsn_env}]",
+            default=current_dsn or "postgresql://yutome:yutome@localhost:5432/yutome",
+        )
+        if dsn and dsn != current_dsn:
+            _set_env_var(env_path, dsn_env, dsn)
+            os.environ[dsn_env] = dsn
+        if not os.environ.get("VOYAGE_API_KEY"):
+            voyage_key = setup_prompts.password(
+                "Voyage API key (optional — enables semantic/hybrid search; press Enter to skip)"
+            )
+            if voyage_key:
+                _set_env_var(env_path, "VOYAGE_API_KEY", voyage_key)
+                os.environ["VOYAGE_API_KEY"] = voyage_key
+
+    paths = ProjectPaths.from_config(app_config, project_root=project_root)
+    paths.ensure_base_dirs()
     typer.echo(f"[OK] Data directory: {paths.data_dir}")
+
     url = postgres_url_from_env(url_env=app_config.database.postgres_url_env)
     if url:
         applied = HostedCommandRunner(app_config).migrate(phase="hosted")
@@ -493,6 +526,12 @@ def doctor(*, config: Path) -> None:
     if not url:
         typer.echo(f"[FAIL] {rt.config.database.postgres_url_env} is not set.", err=True)
         raise typer.Exit(code=1)
+    try:
+        workspace_id = _workspace_id(rt.config)
+    except HostedRuntimeError:
+        typer.echo("[FAIL] No workspace configured. Run: yutome setup", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"[OK] Workspace: {workspace_id}")
     result = HostedCommandRunner(rt.config).db_check()
     _echo_json(result)
     if not result.ok:
@@ -947,3 +986,30 @@ def _set_toml_string(config_path: Path, section: str, key: str, value: str) -> N
             output.extend(["", target])
         output.append(f'{key} = "{value}"')
     config_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def _generate_local_workspace_id() -> str:
+    # Matches the ws_<24hex> shape of deterministic_personal_workspace_id (account.py) so
+    # every workspace_id-keyed row and SQL path stays uniform. Generated (not a constant)
+    # so two local installs — or a later hosted sign-in — never share one tenant partition.
+    return "ws_" + secrets.token_hex(12)
+
+
+def _set_env_var(env_path: Path, key: str, value: str) -> None:
+    # Persist a bare KEY=VALUE line to .env, replacing an existing line for the same key in
+    # place. Matches the .env.example convention; load_dotenv (env.py) splits on the first
+    # '=' and strips quotes, and uses os.environ.setdefault so an already-exported shell var
+    # still wins over the file.
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    output: list[str] = []
+    wrote = False
+    for line in lines:
+        if not wrote and line.split("=", 1)[0].strip() == key:
+            output.append(f"{key}={value}")
+            wrote = True
+            continue
+        output.append(line)
+    if not wrote:
+        output.append(f"{key}={value}")
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")

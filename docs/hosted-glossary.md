@@ -22,6 +22,11 @@ are deferred to a whole-project pass and are called out inline.
 - **workspace** — the unit of tenancy. Owns sources, jobs, usage, entitlements, and
   balances. Every hosted query, idempotency key, and usage event is scoped by
   `workspace_id`. [code: `control_plane.Workspace`]
+- **local_workspace_id** — the generated fallback tenant key (`ws_<24hex>`) used in local
+  mode when no signed-in personal `workspace_id` is set. `yutome setup` generates and
+  persists it to `yutome.toml` once so local corpus/search commands resolve a workspace
+  without the user managing the concept; a personal `workspace_id` (written by
+  `yutome hosted login`) always takes precedence. [code: `config.HostedConfig.local_workspace_id`]
 - **user** — a person who signs in and belongs to one or more workspaces.
   [code: `control_plane.User`]
 - **connector grant** — the OAuth authorization that binds **one assistant client to one

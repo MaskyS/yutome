@@ -23,8 +23,6 @@ required_extensions = ["vchord", "vchord_bm25", "pg_tokenizer", "vector"]
 workers = 2
 batch_size = 25
 max_videos_per_run = 50
-request_delay_min_seconds = 5
-request_delay_max_seconds = 30
 
 [scheduler]
 enabled = false
@@ -137,6 +135,7 @@ default_mode = "hybrid"
 
 [hosted]
 workspace_id = ""
+local_workspace_id = ""
 app_url = "https://app.getyutome.com"
 api_url = "https://api-production-e072.up.railway.app"
 """
@@ -261,6 +260,7 @@ class FindConfig(ConfigModel):
 
 class HostedConfig(ConfigModel):
     workspace_id: str = ""
+    local_workspace_id: str = ""
     app_url: str = "https://app.getyutome.com"
     api_url: str = "https://api-production-e072.up.railway.app"
 

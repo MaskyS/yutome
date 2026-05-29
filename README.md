@@ -49,13 +49,22 @@ uv run yutome --help
 ## Quickstart
 
 ```bash
-yutome setup                                  # guided first-run: creates ./yutome.toml, ./data, etc.
+# 1. Start a VectorChord-Suite Postgres (the four extensions can't be installed on managed PG)
+docker run -d --name yutome-pg \
+  -e POSTGRES_USER=yutome -e POSTGRES_PASSWORD=yutome -e POSTGRES_DB=yutome \
+  -p 5432:5432 tensorchord/vchord-suite:pg17-latest
+export YUTOME_POSTGRES_URL=postgresql://yutome:yutome@localhost:5432/yutome
+
+# 2. Guided first-run: writes ./yutome.toml + ./data, generates a local workspace,
+#    and runs the CREATE EXTENSION migrations against the database above
+yutome setup
+
 yutome corpus add https://www.youtube.com/@LexClips  # add a YouTube channel or video as a source
 yutome corpus sync                                   # discover videos, fetch transcripts, build indexes
 yutome search find "first principles"                # ranked search across everything indexed
 ```
 
-`yutome setup` is interactive by default; pass `-y` to skip prompts and just print what would happen. It expects `YUTOME_POSTGRES_URL` to point at a Postgres database with VectorChord Suite installed (`vchord`, `vchord_bm25`, `pg_tokenizer`, and `vector`). To set keys ahead of time, copy `.env.example` to `.env`. The only commonly-needed provider key is `VOYAGE_API_KEY` (semantic search) — get one at [voyageai.com](https://www.voyageai.com/). Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
+`yutome setup` is interactive by default — the wizard offers to save your Postgres DSN and an optional `VOYAGE_API_KEY` into `./.env`; pass `-y` to run non-interactively. It needs `YUTOME_POSTGRES_URL` to point at a Postgres database with the **VectorChord Suite** extensions (`vchord`, `vchord_bm25`, `pg_tokenizer`, `vector`). Those are native extensions that must be installed at the server level, so managed Postgres (Supabase, RDS, Neon) can't run them — use the Docker image above (it preconfigures `shared_preload_libraries`) or your own Postgres, and `yutome setup` runs the `CREATE EXTENSION` migrations for you. The only commonly-needed provider key is `VOYAGE_API_KEY` (semantic/hybrid search) — get one at [voyageai.com](https://www.voyageai.com/). Every other key in `.env.example` is optional and tied to a specific feature (Gemini transcript cleanup, Webshare residential proxy, OAuth subscription import, etc.).
 
 Postgres is the database for catalog rows, jobs, lexical indexes, vectors, and usage records. The `./data/` directory next to `yutome.toml` holds transcript artifacts, exports, remote connector state, and logs.
 
