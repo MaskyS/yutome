@@ -1,6 +1,7 @@
 """HTTP API for yutome query verbs."""
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -16,6 +17,16 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 TOKEN_ENV_VAR = "YUTOME_HTTP_TOKEN"
 CORS_ENV_VAR = "YUTOME_HTTP_CORS_ORIGINS"
+LOGGER = logging.getLogger(__name__)
+
+NO_TOKEN_AUTH_DETAIL = (
+    f"{TOKEN_ENV_VAR} is not configured; protected HTTP endpoints deny unauthenticated access by default. "
+    f"Set {TOKEN_ENV_VAR} or restart with --insecure/--allow-no-auth to opt into unauthenticated access."
+)
+INSECURE_NO_AUTH_WARNING = (
+    f"INSECURE: {TOKEN_ENV_VAR} is not configured and no-auth HTTP mode is enabled. "
+    "Protected endpoints will accept unauthenticated requests."
+)
 
 
 class FindRequest(BaseModel):
@@ -58,13 +69,19 @@ class ShowRequest(BaseModel):
     transcript_limit: int | None = Field(None, ge=1, le=5000)
 
 
-def _verify_token_dependency():  # noqa: ANN202 - factory returns a FastAPI Depends value.
+def _configured_token() -> str:
+    return os.environ.get(TOKEN_ENV_VAR, "").strip()
+
+
+def _verify_token_dependency(*, allow_no_auth: bool = False):  # noqa: ANN202 - factory returns a FastAPI Depends value.
     from fastapi import Header, HTTPException
 
     def _verify(authorization: str | None = Header(default=None)) -> None:
-        expected = os.environ.get(TOKEN_ENV_VAR)
+        expected = _configured_token()
         if not expected:
-            return
+            if allow_no_auth:
+                return
+            raise HTTPException(status_code=401, detail=NO_TOKEN_AUTH_DETAIL)
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="missing bearer token")
         if not secrets.compare_digest(authorization.removeprefix("Bearer ").strip(), expected):
@@ -73,15 +90,29 @@ def _verify_token_dependency():  # noqa: ANN202 - factory returns a FastAPI Depe
     return _verify
 
 
+def _auth_required(*, allow_no_auth: bool) -> bool:
+    return bool(_configured_token()) or not allow_no_auth
+
+
+def _log_auth_mode(*, allow_no_auth: bool) -> None:
+    if _configured_token():
+        return
+    if allow_no_auth:
+        LOGGER.warning(INSECURE_NO_AUTH_WARNING)
+        return
+    LOGGER.warning(NO_TOKEN_AUTH_DETAIL)
+
+
 def _cors_origins_from_env() -> list[str]:
     raw = os.environ.get(CORS_ENV_VAR, "")
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
-def build_app() -> Any:
+def build_app(*, allow_no_auth: bool = False) -> Any:
     """Build and return the FastAPI app. Runtime config must already be loaded."""
     from fastapi import Depends, FastAPI, HTTPException
 
+    _log_auth_mode(allow_no_auth=allow_no_auth)
     app = FastAPI(
         title="yutome",
         description="Postgres+VectorChord YouTube corpus HTTP API.",
@@ -99,7 +130,7 @@ def build_app() -> Any:
             allow_headers=["Authorization", "Content-Type"],
         )
 
-    verify_token = _verify_token_dependency()
+    verify_token = _verify_token_dependency(allow_no_auth=allow_no_auth)
     auth = [Depends(verify_token)]
 
     @app.middleware("http")
@@ -114,7 +145,7 @@ def build_app() -> Any:
     def healthz() -> dict[str, Any]:
         return {
             "ok": True,
-            "auth_required": bool(os.environ.get(TOKEN_ENV_VAR)),
+            "auth_required": _auth_required(allow_no_auth=allow_no_auth),
             "cors_enabled": bool(cors_origins),
         }
 
@@ -124,7 +155,7 @@ def build_app() -> Any:
         row = status["rows"][0] if status.get("rows") else {}
         return {
             "ok": True,
-            "auth_required": bool(os.environ.get(TOKEN_ENV_VAR)),
+            "auth_required": _auth_required(allow_no_auth=allow_no_auth),
             "searchable_now": row.get("searchable_now", 0),
             "needs_attention": row.get("needs_attention", 0),
             "videos": row.get("videos", 0),
@@ -231,6 +262,7 @@ def run_http_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     require_token_for_non_loopback: bool = True,
+    allow_no_auth: bool = False,
     cors_origins: list[str] | None = None,
 ) -> None:
     """Configure runtime, build the FastAPI app, and run uvicorn."""
@@ -239,11 +271,12 @@ def run_http_server(
     configure(config_path)
     if cors_origins:
         os.environ[CORS_ENV_VAR] = ",".join(cors_origins)
-    if require_token_for_non_loopback and not _is_loopback_host(host) and not os.environ.get(TOKEN_ENV_VAR):
+    if require_token_for_non_loopback and not allow_no_auth and not _is_loopback_host(host) and not _configured_token():
         raise RuntimeError(
-            f"{TOKEN_ENV_VAR} is required when binding the HTTP API to non-loopback host {host!r}"
+            f"{TOKEN_ENV_VAR} is required when binding the HTTP API to non-loopback host {host!r}. "
+            "Set the token or pass --insecure/--allow-no-auth to opt into unauthenticated access."
         )
-    app = build_app()
+    app = build_app(allow_no_auth=allow_no_auth)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

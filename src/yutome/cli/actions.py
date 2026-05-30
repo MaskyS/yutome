@@ -812,14 +812,15 @@ def http_serve(
     host: str,
     port: int,
     cors_origin: list[str] | None,
-    allow_unauthenticated_remote: bool,
+    insecure: bool,
 ) -> None:
     run_http_server(
         config,
         host=host,
         port=port,
         cors_origins=cors_origin,
-        require_token_for_non_loopback=not allow_unauthenticated_remote,
+        require_token_for_non_loopback=True,
+        allow_no_auth=insecure,
     )
 
 

@@ -26,10 +26,11 @@ def http_command(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
     port: int = typer.Option(8765, "--port", help="Bind port."),
     cors_origin: list[str] | None = typer.Option(None, "--cors-origin", help="Allowed browser origin."),
-    allow_unauthenticated_remote: bool = typer.Option(
+    insecure: bool = typer.Option(
         False,
-        "--allow-unauthenticated-remote",
-        help="Permit non-loopback HTTP binding without YUTOME_HTTP_TOKEN.",
+        "--insecure",
+        "--allow-no-auth",
+        help="Permit protected HTTP endpoints without YUTOME_HTTP_TOKEN. Insecure; use only in trusted environments.",
     ),
 ) -> None:
     """Run the local HTTP API."""
@@ -38,7 +39,7 @@ def http_command(
         host=host,
         port=port,
         cors_origin=cors_origin,
-        allow_unauthenticated_remote=allow_unauthenticated_remote,
+        insecure=insecure,
     )
 
 
