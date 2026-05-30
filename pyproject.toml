@@ -53,6 +53,7 @@ dependencies = [
     "yt-dlp>=2025.6.9",
     "youtube-transcript-api>=1.2",
     "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
 ]
 
 [project.urls]

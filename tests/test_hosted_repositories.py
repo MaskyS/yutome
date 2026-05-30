@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
+
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.ledger import stable_usage_event, stable_usage_reservation
 from yutome.hosted.models import UsageDecision, UsageEvent, UsageReservation
@@ -14,6 +15,11 @@ from yutome.hosted.repositories import (
     usage_reservation_from_row,
 )
 from yutome.hosted.schema import hosted_metadata, usage_events, usage_reservations
+
+
+def _jsonb_obj(value: object) -> object:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 def test_usage_repository_tables_are_in_hosted_metadata() -> None:
@@ -43,8 +49,8 @@ def test_usage_reservation_upsert_preserves_idempotency_boundary() -> None:
     assert "ON CONFLICT (workspace_id, idempotency_key) DO UPDATE" in statement.sql
     assert "SET idempotency_key = usage_reservations.idempotency_key" in statement.sql
     assert statement.params["workspace_id"] == "ws_alice"
-    assert json.loads(statement.params["estimated_units_json"]) == {"total_tokens": 2000}
-    assert json.loads(statement.params["decision_json"]) == {
+    assert _jsonb_obj(statement.params["estimated_units_json"]) == {"total_tokens": 2000}
+    assert _jsonb_obj(statement.params["decision_json"]) == {
         "allowed": True,
         "denial_effect": "hard",
         "message": None,
@@ -72,8 +78,8 @@ def test_usage_event_insert_supports_event_id_and_provider_request_idempotency()
     assert "ON CONFLICT (id) DO UPDATE" in by_id.sql
     assert "ON CONFLICT (workspace_id, subject, operation, event_type, provider_request_id)" in by_request.sql
     assert "WHERE provider_request_id IS NOT NULL" in by_request.sql
-    assert json.loads(by_id.params["actual_units_json"]) == {"total_tokens": 91, "vectors": 2}
-    assert json.loads(by_id.params["raw_usage_json"]) == {"usage": {"total_tokens": 91}}
+    assert _jsonb_obj(by_id.params["actual_units_json"]) == {"total_tokens": 91, "vectors": 2}
+    assert _jsonb_obj(by_id.params["raw_usage_json"]) == {"usage": {"total_tokens": 91}}
 
 
 def test_usage_repository_constraints_make_idempotency_explicit() -> None:
@@ -107,11 +113,11 @@ def test_usage_repository_row_mappers_round_trip_json_fields() -> None:
             "operation": "cleanup_transcript",
             "allocation_id": "alloc_gemini",
             "credential_mode": "hosted",
-            "estimated_units_json": '{"total_tokens":2000}',
+            "estimated_units_json": {"total_tokens": 2000},
             "idempotency_key": "idem",
             "status": "reserved",
-            "decision_json": '{"allowed":true,"reason":"allowed","message":null}',
-            "metadata_json": '{"job_id":"job_1"}',
+            "decision_json": {"allowed": True, "reason": "allowed", "message": None},
+            "metadata_json": {"job_id": "job_1"},
             "created_at": created_at,
         }
     )
@@ -127,7 +133,7 @@ def test_usage_repository_row_mappers_round_trip_json_fields() -> None:
             "actual_units_json": {"total_tokens": 91},
             "provider_request_id": "req_123",
             "error_code": None,
-            "raw_usage_json": '{"usage":{"total_tokens":91}}',
+            "raw_usage_json": {"usage": {"total_tokens": 91}},
             "metadata_json": {"job_id": "job_1"},
             "created_at": created_at.isoformat(),
         }

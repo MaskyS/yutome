@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.migrations import (
     HOSTED_DEFAULT_EMBEDDING_DIMENSION,
@@ -577,7 +578,7 @@ WITH upserted AS (
     )
     VALUES (
         %(transcript_version_id)s, %(workspace_id)s, %(video_id)s, %(source)s,
-        %(language_code)s, %(content_hash)s, %(metadata_json)s::jsonb
+        %(language_code)s, %(content_hash)s, %(metadata_json)s
     )
     ON CONFLICT (id) DO UPDATE
     SET source = EXCLUDED.source,
@@ -604,7 +605,7 @@ SELECT * FROM activated;
             "source": source,
             "language_code": language_code,
             "content_hash": content_hash,
-            "metadata_json": _json_param(metadata or {}),
+            "metadata_json": Jsonb(dict(metadata or {})),
         },
     )
 
@@ -994,12 +995,6 @@ def _usage(
         units=units,
         metadata=metadata or {},
     )
-
-
-def _json_param(value: Mapping[str, Any]) -> str:
-    import json
-
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _vector_literal(vector: Sequence[float]) -> str:

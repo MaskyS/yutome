@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.gate import Allocation, UsageGate
 from yutome.hosted.ids import input_hash
@@ -89,8 +90,8 @@ class PostgresUsageGate:
                         params={
                             "workspace_id": workspace_id,
                             "entitlement_policy_id": policy.id,
-                            "remaining_units_jsonb": _json_param(remaining_units),
-                            "reserved_units_jsonb": _json_param(reserved_units),
+                            "remaining_units_jsonb": Jsonb(jsonable_exact(remaining_units)),
+                            "reserved_units_jsonb": Jsonb(jsonable_exact(reserved_units)),
                         },
                     ),
                 )
@@ -268,8 +269,8 @@ def _reconcile_balance_for_usage_event(connection: Any, event: UsageEvent) -> De
                 sql=_UPDATE_CURRENT_WORKSPACE_BALANCE_SQL,
                 params={
                     "workspace_id": event.workspace_id,
-                    "remaining_units_jsonb": _json_param(remaining_units),
-                    "reserved_units_jsonb": _json_param(reserved_units),
+                    "remaining_units_jsonb": Jsonb(jsonable_exact(remaining_units)),
+                    "reserved_units_jsonb": Jsonb(jsonable_exact(reserved_units)),
                 },
             ),
         )
@@ -570,21 +571,11 @@ def _one_row_from_result(result: Any) -> Mapping[str, Any] | None:
     return dict(row)
 
 
-def _json_param(value: Any) -> str:
-    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
-
-
 def _json_mapping(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
     if isinstance(value, Mapping):
         return dict(value)
-    if isinstance(value, str) and value.strip():
-        parsed = json.loads(value)
-        return dict(parsed) if isinstance(parsed, Mapping) else {}
-    if isinstance(value, bytes):
-        parsed = json.loads(value.decode("utf-8"))
-        return dict(parsed) if isinstance(parsed, Mapping) else {}
     return {}
 
 
@@ -672,8 +663,8 @@ LIMIT %(limit)s;
 
 _UPDATE_WORKSPACE_BALANCE_RESERVATION_SQL = """
 UPDATE workspace_balances
-SET remaining_units_jsonb = %(remaining_units_jsonb)s::jsonb,
-    reserved_units_jsonb = %(reserved_units_jsonb)s::jsonb,
+SET remaining_units_jsonb = %(remaining_units_jsonb)s,
+    reserved_units_jsonb = %(reserved_units_jsonb)s,
     updated_at = now()
 WHERE workspace_id = %(workspace_id)s
   AND entitlement_policy_id = %(entitlement_policy_id)s
@@ -683,8 +674,8 @@ RETURNING *;
 
 _UPDATE_CURRENT_WORKSPACE_BALANCE_SQL = """
 UPDATE workspace_balances
-SET remaining_units_jsonb = %(remaining_units_jsonb)s::jsonb,
-    reserved_units_jsonb = %(reserved_units_jsonb)s::jsonb,
+SET remaining_units_jsonb = %(remaining_units_jsonb)s,
+    reserved_units_jsonb = %(reserved_units_jsonb)s,
     updated_at = now()
 WHERE workspace_id = %(workspace_id)s
 RETURNING *;

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping, Sequence
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
+from psycopg.types.json import Jsonb
 from sqlalchemy import case, func, literal_column
 from sqlalchemy.dialects.postgresql import insert
 
@@ -1327,7 +1327,7 @@ class HostedIndexingExecutor:
         row = _execute_one(self.connection, job_operation_output_sql(workspace_id=workspace_id, operation_id=operation_id))
         if row is None or row.get("status") in {"denied", "failed_final"}:
             return None
-        output = dict(_json_value(row.get("output_json")))
+        output = dict(row.get("output_json") or {})
         return output or None
 
     def _renew_job_lease_or_raise(self, job: Job, *, lease_owner: str, now: Any, lease_seconds: int) -> Any:
@@ -1482,7 +1482,7 @@ WHERE id = %(source_id)s
                     status=row.get("status", "active"),
                     model_or_plan=row.get("model_or_plan"),
                     external_allocation_id=row.get("external_allocation_id"),
-                    metadata=dict(_json_value(row.get("metadata_json"))),
+                    metadata=dict(row.get("metadata_json") or {}),
                 )
             )
         for row in service_rows:
@@ -1498,7 +1498,7 @@ WHERE id = %(source_id)s
                     status=row.get("status", "active"),
                     backend=str(row["backend"]),
                     index_profile_ref=row.get("index_profile_ref"),
-                    metadata=dict(_json_value(row.get("metadata_json"))),
+                    metadata=dict(row.get("metadata_json") or {}),
                 )
             )
         return tuple(allocations)
@@ -1524,7 +1524,7 @@ LIMIT 1;
             id=str(row["id"]),
             workspace_id=str(row["workspace_id"]),
             allowed_operations=set(row.get("allowed_operations") or ()),
-            hard_limits_by_operation=dict(_json_value(row.get("hard_limits_jsonb"))),
+            hard_limits_by_operation=dict(row.get("hard_limits_jsonb") or {}),
         )
 
     def _load_balance(self, workspace_id: str) -> WorkspaceBalance:
@@ -1539,7 +1539,7 @@ LIMIT 1;
             return WorkspaceBalance(workspace_id=workspace_id)
         return WorkspaceBalance(
             workspace_id=str(row["workspace_id"]),
-            remaining_units=dict(_json_value(row.get("remaining_units_jsonb"))),
+            remaining_units=dict(row.get("remaining_units_jsonb") or {}),
             unlimited_units=set(row.get("unlimited_units") or ()),
         )
 
@@ -1813,7 +1813,7 @@ def upsert_video_sql(source: Source, video: HostedVideoInput, *, hosted_video_id
         description=video.description,
         published_at=video.published_at,
         duration_seconds=video.duration_seconds,
-        metadata_json=_json_param(video.metadata or {}),
+        metadata_json=Jsonb(dict(video.metadata or {})),
     )
     statement = statement.on_conflict_do_update(
         index_elements=[videos.c.workspace_id, videos.c.youtube_video_id],
@@ -1840,7 +1840,7 @@ def upsert_index_profile_sql(workspace_id: str, profile: IndexProfileInput) -> S
         embedding_dimension=profile.embedding_dimension,
         chunking_version=profile.chunking_version,
         tokenizer=profile.tokenizer,
-        metadata_json=_json_param(profile.metadata or {}),
+        metadata_json=Jsonb(dict(profile.metadata or {})),
     )
     statement = statement.on_conflict_do_update(
         index_elements=[search_index_profiles.c.id],
@@ -1873,7 +1873,7 @@ def upsert_transcript_version_sql(
         source=source,
         language_code=language_code,
         content_hash=content_hash,
-        metadata_json=_json_param(metadata or {}),
+        metadata_json=Jsonb(dict(metadata or {})),
     )
     statement = statement.on_conflict_do_update(
         index_elements=[transcript_versions.c.id],
@@ -1906,7 +1906,7 @@ INSERT INTO chunks (
 VALUES (
     %(id)s, %(workspace_id)s, %(video_id)s, %(transcript_version_id)s,
     %(index_profile_id)s, %(chunk_index)s, %(start_seconds)s, %(end_seconds)s,
-    %(text)s, tokenize(%(text)s, %(tokenizer)s)::bm25vector, %(metadata_json)s::jsonb
+    %(text)s, tokenize(%(text)s, %(tokenizer)s)::bm25vector, %(metadata_json)s
 )
 ON CONFLICT (workspace_id, transcript_version_id, index_profile_id, chunk_index) DO UPDATE
 SET start_seconds = EXCLUDED.start_seconds,
@@ -1927,7 +1927,7 @@ RETURNING *;
             "end_seconds": chunk.end_seconds,
             "text": chunk.text,
             "tokenizer": tokenizer,
-            "metadata_json": _json_param(chunk.metadata or {}),
+            "metadata_json": Jsonb(dict(chunk.metadata or {})),
         },
     )
 
@@ -1948,7 +1948,7 @@ INSERT INTO chunk_embeddings (
 )
 VALUES (
     %(id)s, %(workspace_id)s, %(chunk_id)s, %(index_profile_id)s,
-    %(embedding)s::vector, %(metadata_json)s::jsonb
+    %(embedding)s::vector, %(metadata_json)s
 )
 ON CONFLICT (workspace_id, chunk_id, index_profile_id) DO UPDATE
 SET embedding = EXCLUDED.embedding,
@@ -1961,7 +1961,7 @@ RETURNING *;
             "chunk_id": chunk_id,
             "index_profile_id": index_profile_id,
             "embedding": _vector_literal(embedding),
-            "metadata_json": _json_param({"usage_reservation_id": usage_reservation_id}),
+            "metadata_json": Jsonb({"usage_reservation_id": usage_reservation_id}),
         },
     )
 
@@ -1979,7 +1979,7 @@ def upsert_job_operation_sql(operation: JobOperation) -> SqlStatement:
         status=operation.status,
         attempt_count=operation.attempt_count,
         usage_reservation_id=operation.metadata_jsonb.get("usage_reservation_id") or None,
-        metadata_json=_json_param(operation.metadata_jsonb),
+        metadata_json=Jsonb(operation.metadata_jsonb),
     )
     terminal_statuses = ("denied", "succeeded", "failed_final", "reconciled", "released")
     early_statuses = ("planned", "reserved", "started")
@@ -2026,7 +2026,7 @@ def update_job_operation_output_sql(
     return SqlStatement(
         sql="""
 UPDATE job_operations
-SET output_json = %(output_json)s::jsonb,
+SET output_json = %(output_json)s,
     usage_reservation_id = COALESCE(%(usage_reservation_id)s::text, usage_reservation_id),
     updated_at = %(now)s
 WHERE workspace_id = %(workspace_id)s
@@ -2036,7 +2036,7 @@ RETURNING *;
         params={
             "workspace_id": workspace_id,
             "operation_id": operation_id,
-            "output_json": _json_param(output),
+            "output_json": Jsonb(dict(output)),
             "usage_reservation_id": usage_reservation_id,
             "now": now,
         },
@@ -2056,7 +2056,7 @@ def complete_job_operation_success_sql(
     return SqlStatement(
         sql="""
 UPDATE job_operations
-SET output_json = %(output_json)s::jsonb,
+SET output_json = %(output_json)s,
     status = 'succeeded',
     usage_reservation_id = COALESCE(%(usage_reservation_id)s::text, usage_reservation_id),
     updated_at = %(now)s
@@ -2079,7 +2079,7 @@ RETURNING *;
         params={
             "workspace_id": workspace_id,
             "operation_id": operation_id,
-            "output_json": _json_param(output),
+            "output_json": Jsonb(dict(output)),
             "usage_reservation_id": usage_reservation_id,
             "now": now,
             "job_id": job_id,
@@ -2144,7 +2144,7 @@ def enqueue_index_video_job_sql(
         run_after=now,
         executor_kind="railway",
         executor_ref="source_discovery",
-        metadata_json=_json_param({"youtube_video_id": video_id, **dict(metadata or {})}),
+        metadata_json=Jsonb({"youtube_video_id": video_id, **dict(metadata or {})}),
         created_at=now,
     )
     statement = statement.on_conflict_do_update(
@@ -2209,7 +2209,7 @@ def enqueue_discover_source_job_sql(
         run_after=now,
         executor_kind="railway",
         executor_ref="source_discovery",
-        metadata_json=_json_param(metadata_payload),
+        metadata_json=Jsonb(metadata_payload),
         created_at=now,
     )
     statement = statement.on_conflict_do_update(
@@ -2249,7 +2249,7 @@ WITH source_update AS (
     UPDATE sources
     SET last_discovered_at = %(now)s,
         status = CASE WHEN %(error_code)s::text IS NULL THEN 'active' ELSE status END,
-        metadata_json = metadata_json || %(source_metadata_json)s::jsonb,
+        metadata_json = metadata_json || %(source_metadata_json)s,
         updated_at = %(now)s
     WHERE workspace_id = %(workspace_id)s
       AND id = %(source_id)s
@@ -2260,7 +2260,7 @@ policy_update AS (
     SET last_succeeded_at = CASE WHEN %(error_code)s::text IS NULL THEN %(now)s ELSE last_succeeded_at END,
         failure_code = %(error_code)s,
         failure_message = %(error_message)s,
-        cursor_json = cursor_json || %(cursor_json)s::jsonb,
+        cursor_json = cursor_json || %(cursor_json)s,
         locked_by = CASE WHEN locked_by = %(lease_owner)s THEN NULL ELSE locked_by END,
         locked_until = CASE WHEN locked_by = %(lease_owner)s THEN NULL ELSE locked_until END,
         updated_at = %(now)s
@@ -2280,7 +2280,7 @@ SELECT
             "lease_owner": lease_owner,
             "error_code": error_code,
             "error_message": error_message,
-            "source_metadata_json": _json_param(
+            "source_metadata_json": Jsonb(
                 {
                     "last_discovery": {
                         "discovered_videos": discovered_videos,
@@ -2290,7 +2290,7 @@ SELECT
                     }
                 }
             ),
-            "cursor_json": _json_param(
+            "cursor_json": Jsonb(
                 {
                     "last_discovered_at": getattr(now, "isoformat", lambda: str(now))(),
                     "last_video_ids": list(video_ids),
@@ -2600,7 +2600,7 @@ def _source_from_row(row: Mapping[str, Any]) -> Source:
         auto_index_allowed=bool(row.get("auto_index_allowed", True)),
         import_source=row["import_source"],
         auth_grant_id=_optional_str(row.get("auth_grant_id")),
-        metadata_jsonb=dict(_json_value(row.get("metadata_json"))),
+        metadata_jsonb=dict(row.get("metadata_json") or {}),
         status=row.get("status", "active"),
         last_discovered_at=row.get("last_discovered_at"),
         last_indexed_at=row.get("last_indexed_at"),
@@ -2631,16 +2631,6 @@ def _rows_from_result(result: Any) -> list[dict[str, Any]]:
         return []
 
 
-def _json_value(value: Any) -> Any:
-    if value is None:
-        return {}
-    if isinstance(value, str):
-        return json.loads(value)
-    if isinstance(value, bytes):
-        return json.loads(value.decode("utf-8"))
-    return value
-
-
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -2664,10 +2654,6 @@ def _vector_literal(vector: Sequence[float]) -> str:
 def _sql_statement(statement: Any) -> SqlStatement:
     sql, params = compile_postgres_statement(statement)
     return SqlStatement(sql=sql + ";", params=params)
-
-
-def _json_param(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _is_youtube_host(host: str) -> bool:

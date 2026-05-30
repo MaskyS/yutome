@@ -15,8 +15,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import bindparam, cast, func, literal, or_, select, update
-from sqlalchemy.dialects.postgresql import JSONB, insert
+from psycopg.types.json import Jsonb
+from sqlalchemy import bindparam, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
 
 from yutome.hosted.ids import input_hash
 from yutome.hosted.repositories import SqlStatement
@@ -632,7 +633,7 @@ def create_pending_youtube_grant_sql(
             workspace_id=bindparam("workspace_id", value=workspace_id),
             scopes=bindparam("scopes", value=[YOUTUBE_READONLY_SCOPE]),
             status=literal("pending"),
-            metadata_json=cast(bindparam("metadata_json", value=_json_param(metadata)), JSONB),
+            metadata_json=bindparam("metadata_json", value=Jsonb(dict(metadata))),
             created_at=bindparam("created_at", value=now),
             updated_at=bindparam("updated_at", value=now),
             expires_at=bindparam("expires_at", value=expires_at),
@@ -663,7 +664,7 @@ def activate_youtube_grant_sql(
         .values(
             status=literal("active"),
             scopes=bindparam("scopes", value=[YOUTUBE_READONLY_SCOPE]),
-            metadata_json=cast(bindparam("metadata_json", value=_json_param(metadata)), JSONB),
+            metadata_json=bindparam("metadata_json", value=Jsonb(dict(metadata))),
             expires_at=bindparam("grant_expires_at", value=grant_expires_at),
             updated_at=func.now(),
             last_used_at=func.now(),
@@ -686,7 +687,7 @@ def update_youtube_grant_token_sql(
             youtube_grants.c.status == literal("active"),
         )
         .values(
-            metadata_json=cast(bindparam("metadata_json", value=_json_param(metadata)), JSONB),
+            metadata_json=bindparam("metadata_json", value=Jsonb(dict(metadata))),
             expires_at=bindparam("grant_expires_at", value=grant_expires_at),
             updated_at=func.now(),
             last_used_at=func.now(),
@@ -897,16 +898,6 @@ def _validate_dashboard_redirect_uri(value: str) -> str:
 def _sql_statement(statement: Any) -> SqlStatement:
     sql, params = compile_postgres_statement(statement)
     return SqlStatement(sql=sql + ";", params=params)
-
-
-def _json_param(value: Mapping[str, Any]) -> str:
-    return json.dumps(dict(value), sort_keys=True, separators=(",", ":"), default=_json_default)
-
-
-def _json_default(value: Any) -> str:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
 
 
 def _encrypt_metadata_secret(value: str, *, token_encryption_key: str, aad: bytes) -> str:

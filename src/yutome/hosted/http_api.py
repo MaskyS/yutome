@@ -363,6 +363,11 @@ def build_postgres_app(
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
     app.state.hosted_adapter = adapter
+
+    def close_postgres_pool() -> None:
+        close_hosted_connection(connection)
+
+    app.router.on_shutdown.append(close_postgres_pool)
     return app
 
 
@@ -387,6 +392,7 @@ def build_app(
     requests_per_minute: int | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
+    from fastapi.concurrency import run_in_threadpool
     from fastapi.responses import JSONResponse
     from yutome.hosted.billing import (
         StripeWebhookVerificationError,
@@ -399,10 +405,19 @@ def build_app(
     )
     from yutome.hosted.billing import StripeCustomer as _StripeCustomer
 
+    async def request_connection_lease() -> Any:
+        lease_factory = getattr(billing_connection, "request_lease", None)
+        if not callable(lease_factory):
+            yield
+            return
+        with lease_factory():
+            yield
+
     app = FastAPI(
         title="yutome-hosted-mcp",
         description="Hosted Yutome MCP query API for the Cloudflare MCP edge.",
         version="0.1.0",
+        dependencies=[Depends(request_connection_lease)],
     )
     app.state.hosted_adapter = adapter
     app.state.hosted_billing_connection = billing_connection
@@ -1004,7 +1019,11 @@ def build_app(
                 )
             ) from exc
         result = process_stripe_webhook_event(payload)
-        _execute_billing_statements(billing_connection, stripe_webhook_processing_statements(result))
+        await run_in_threadpool(
+            _execute_billing_statements,
+            billing_connection,
+            stripe_webhook_processing_statements(result),
+        )
         return {
             "ok": True,
             "event_id": result.event.id,
@@ -1658,6 +1677,12 @@ def build_app(
         return {"ok": True, "result": result}
 
     return app
+
+
+def close_hosted_connection(connection: Any) -> None:
+    close = getattr(connection, "close", None)
+    if callable(close):
+        close()
 
 
 def _parse_scopes(scopes_header: str | None) -> set[str]:

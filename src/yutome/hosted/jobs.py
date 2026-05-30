@@ -4,6 +4,8 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Literal
 
+from psycopg.types.json import Jsonb
+
 from yutome.hosted.control_plane import CLAIMABLE_JOB_STATUSES, TERMINAL_JOB_STATUSES, Job, JobOperationStatus, JobStatus
 from yutome.hosted.repositories import SqlStatement
 
@@ -273,7 +275,7 @@ SET status = %(status)s,
         WHEN %(status)s IN ('started', 'failed_retryable', 'failed_final') THEN attempt_count + 1
         ELSE attempt_count
     END,
-    metadata_json = metadata_json || %(status_metadata_json)s::jsonb,
+    metadata_json = metadata_json || %(status_metadata_json)s,
     updated_at = %(now)s
 WHERE id = %(operation_id)s
   AND workspace_id = %(workspace_id)s
@@ -300,7 +302,7 @@ RETURNING *;
             "job_id": job_id,
             "lease_owner": lease_owner,
             "terminal_statuses": sorted(TERMINAL_JOB_STATUSES),
-            "status_metadata_json": _json_param({"error_code": error_code, "error_message": error_message}),
+            "status_metadata_json": Jsonb({"error_code": error_code, "error_message": error_message}),
         },
     )
 
@@ -358,12 +360,6 @@ def _lease_params(*, lease_owner: str, now: datetime, lease_seconds: int) -> dic
 def _validate_positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
-
-
-def _json_param(value: object) -> str:
-    import json
-
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 __all__: Sequence[str] = [

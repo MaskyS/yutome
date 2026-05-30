@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
+from psycopg.types.json import Jsonb
 from yutome.hosted.billing import (
     CREDITS_METER_EVENT_NAME,
     EntitlementPolicyRecord,
@@ -47,6 +47,11 @@ from yutome.hosted.billing import (
 )
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, WorkspaceBalance
+
+
+def _jsonb_obj(value: object) -> object:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 def _usage_event(**overrides: object) -> UsageEvent:
@@ -417,7 +422,7 @@ def test_active_subscription_webhook_provisions_entitlement_policy_and_balance()
     # never-bootstrapped workspace.
     assert any("INSERT INTO price_books" in sql for sql in sqls)
     # The starter included allowance lands in the seeded balance.
-    assert any("\"total_tokens\":430000" in str(value) for value in balance_stmt.params.values())
+    assert _jsonb_obj(balance_stmt.params["remaining_units_jsonb"])["total_tokens"] == 430000
 
 
 def test_trialing_subscription_webhook_provisions_entitlement() -> None:
@@ -518,7 +523,7 @@ def test_price_book_upsert_persists_products_and_unit_mapping() -> None:
     assert "INSERT INTO price_books" in statement.sql
     assert "ON CONFLICT (version) DO UPDATE" in statement.sql
     assert "active" in statement.params.values()
-    products = next(json.loads(value) for value in statement.params.values() if isinstance(value, str) and "limits" in value)
+    products = _jsonb_obj(statement.params["products_jsonb"])
     assert products[0]["limits"][0]["meter_event_name"] == CREDITS_METER_EVENT_NAME
 
 
@@ -574,11 +579,7 @@ def test_workspace_balance_derives_from_starting_units_usage_and_reservations() 
 
     assert snapshot.remaining_units == {"credits": Decimal("0.50"), "total_tokens": 750}
     assert snapshot.metadata["derived_from"]["starting_units"] == {"credits": Decimal("1.00"), "total_tokens": 1_000}
-    remaining = next(
-        json.loads(value)
-        for value in statement.params.values()
-        if isinstance(value, str) and value.startswith("{") and "total_tokens" in value and "0.50" in value
-    )
+    remaining = _jsonb_obj(statement.params["remaining_units_jsonb"])
     assert remaining == {"credits": "0.50", "total_tokens": 750}
 
 
@@ -650,11 +651,7 @@ def test_stripe_customer_and_meter_export_sql_preserve_local_replay_keys() -> No
 
     assert "ON CONFLICT (workspace_id) DO UPDATE" in customer_statement.sql
     assert "provider" not in customer_statement.sql
-    assert {"status": "active"} == next(
-        json.loads(value)
-        for value in customer_statement.params.values()
-        if isinstance(value, str) and value == '{"status":"active"}'
-    )
+    assert _jsonb_obj(customer_statement.params["subscription_status_snapshot_jsonb"]) == {"status": "active"}
     assert "ON CONFLICT (source_event_dedupe_key) DO UPDATE" in export_statement.sql
     assert export.idempotency_key in export_statement.params.values()
     assert "stripe:ws_alice:evt_usage_1:credits" in export_statement.params.values()
@@ -679,7 +676,7 @@ def test_meter_export_event_from_row_round_trips() -> None:
         "stripe_meter_event_identifier": None,
         "attempt_count": 1,
         "event_timestamp": created_at,
-        "metadata_json": json.dumps({"operation_key": "voyage.embed_documents"}),
+        "metadata_json": {"operation_key": "voyage.embed_documents"},
     }
 
     export = stripe_meter_export_event_from_row(row)
@@ -757,49 +754,43 @@ def test_billing_debug_snapshot_maps_denied_decision_events_and_replay_status() 
         "allocation_id": "alloc_gemini_fallback",
         "credential_mode": "hosted",
         "reservation_status": "denied",
-        "decision_json": json.dumps(
-            {
-                "allowed": False,
-                "reason": "usage_limit_exceeded",
-                "message": "Estimated media_seconds exceeds the operation limit.",
-            }
-        ),
-        "estimated_units_json": json.dumps({"media_seconds": 14_400}),
+        "decision_json": {
+            "allowed": False,
+            "reason": "usage_limit_exceeded",
+            "message": "Estimated media_seconds exceeds the operation limit.",
+        },
+        "estimated_units_json": {"media_seconds": 14_400},
         "idempotency_key": "ws_alice:vid_1:gemini.transcribe_media:h_media",
         "created_at": created_at,
-        "metadata_json": json.dumps({"estimate_method": "duration_seconds"}),
-        "usage_events_json": json.dumps(
-            [
-                {
-                    "id": "evt_denied",
-                    "event_type": "reservation_created",
-                    "status": "denied",
-                    "actual_units": {},
-                    "error_code": "usage_limit_exceeded",
-                    "provider_request_id": None,
-                    "created_at": created_at.isoformat(),
-                    "metadata": {"message": "policy denied"},
-                }
-            ]
-        ),
-        "meter_exports_json": json.dumps(
-            [
-                {
-                    "id": "stripe:ws_alice:evt_denied:credits",
-                    "usage_event_id": "evt_denied",
-                    "replay_status": "skipped",
-                    "stripe_customer_id": None,
-                    "meter_unit": "credits",
-                    "value": "0",
-                    "stripe_meter_event_identifier": None,
-                    "source_event_dedupe_key": "stripe:ws_alice:evt_denied:credits",
-                    "attempt_count": 0,
-                    "last_error": {},
-                    "exported_at": None,
-                    "updated_at": created_at.isoformat(),
-                }
-            ]
-        ),
+        "metadata_json": {"estimate_method": "duration_seconds"},
+        "usage_events_json": [
+            {
+                "id": "evt_denied",
+                "event_type": "reservation_created",
+                "status": "denied",
+                "actual_units": {},
+                "error_code": "usage_limit_exceeded",
+                "provider_request_id": None,
+                "created_at": created_at.isoformat(),
+                "metadata": {"message": "policy denied"},
+            }
+        ],
+        "meter_exports_json": [
+            {
+                "id": "stripe:ws_alice:evt_denied:credits",
+                "usage_event_id": "evt_denied",
+                "replay_status": "skipped",
+                "stripe_customer_id": None,
+                "meter_unit": "credits",
+                "value": "0",
+                "stripe_meter_event_identifier": None,
+                "source_event_dedupe_key": "stripe:ws_alice:evt_denied:credits",
+                "attempt_count": 0,
+                "last_error": {},
+                "exported_at": None,
+                "updated_at": created_at.isoformat(),
+            }
+        ],
     }
 
     mapped = billing_debug_reservation_from_row(row)

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from yutome import contract
 from yutome.hosted.allocation_policy import default_search_store_allocation
@@ -18,6 +18,12 @@ from yutome.hosted.mcp_query import (
 from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, UsageNormalization, WorkspaceBalance
 from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
 from yutome.hosted.search_store import SearchFilters, SearchStoreUsage
+
+
+def _jsonb_obj(value: object) -> dict[str, Any]:
+    assert isinstance(value, Jsonb)
+    assert isinstance(value.obj, dict)
+    return dict(value.obj)
 
 
 class RecordingSearchStore:
@@ -343,7 +349,7 @@ class RecordingSourceImportConnection:
                 "auto_index_allowed": params["auto_index_allowed"],
                 "import_source": params["import_source"],
                 "auth_grant_id": params["auth_grant_id"],
-                "metadata_json": json.loads(params["metadata_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
                 "status": params["status"],
             }
             self.source_url_index[source_key] = source_id
@@ -364,7 +370,7 @@ class RecordingSourceImportConnection:
             return [dict(row)]
         if statement.startswith("INSERT INTO jobs"):
             key = (params["workspace_id"], params["idempotency_key"])
-            metadata = json.loads(params["metadata_json"])
+            metadata = _jsonb_obj(params["metadata_json"])
             row = self.jobs.get(key)
             if row is None:
                 row = {

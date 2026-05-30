@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 from decimal import Decimal
+
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.errors import classify_provider_http_error
@@ -23,6 +24,11 @@ from yutome.hosted.normalizers import (
     normalize_webshare_stats,
     normalize_webshare_subuser,
 )
+
+
+def _jsonb_obj(value: object) -> object:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 def test_input_hash_is_stable_for_equivalent_payloads() -> None:
@@ -292,11 +298,11 @@ class AtomicReservationConnection:
                 "operation": params["operation"],
                 "allocation_id": params["allocation_id"],
                 "credential_mode": params["credential_mode"],
-                "estimated_units_json": params["estimated_units_json"],
+                "estimated_units_json": _jsonb_obj(params["estimated_units_json"]),
                 "idempotency_key": params["idempotency_key"],
                 "status": params["status"],
-                "decision_json": params["decision_json"],
-                "metadata_json": params["metadata_json"],
+                "decision_json": _jsonb_obj(params["decision_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
                 "created_at": params["created_at"],
             }
             self.reservations[str(params["idempotency_key"])] = row
@@ -311,11 +317,11 @@ class AtomicReservationConnection:
                     "operation": params["operation"],
                     "event_type": params["event_type"],
                     "status": params["status"],
-                    "actual_units_json": params["actual_units_json"],
+                    "actual_units_json": _jsonb_obj(params["actual_units_json"]),
                     "provider_request_id": params["provider_request_id"],
                     "error_code": params["error_code"],
-                    "raw_usage_json": params["raw_usage_json"],
-                    "metadata_json": params["metadata_json"],
+                    "raw_usage_json": _jsonb_obj(params["raw_usage_json"]),
+                    "metadata_json": _jsonb_obj(params["metadata_json"]),
                     "created_at": params["created_at"],
                 }
             ]
@@ -326,8 +332,8 @@ class AtomicReservationConnection:
                     return [row]
             return []
         if "UPDATE workspace_balances" in statement:
-            self.balance["remaining_units_jsonb"] = json.loads(str(params["remaining_units_jsonb"]))
-            self.balance["reserved_units_jsonb"] = json.loads(str(params["reserved_units_jsonb"]))
+            self.balance["remaining_units_jsonb"] = _jsonb_obj(params["remaining_units_jsonb"])
+            self.balance["reserved_units_jsonb"] = _jsonb_obj(params["reserved_units_jsonb"])
             return [dict(self.balance)]
         return []
 
@@ -545,7 +551,7 @@ def test_usage_beyond_included_allowance_meters_only_the_overage(monkeypatch) ->
     # Remaining included allowance is now overdrawn (2 - 10 = -8 vectors).
     assert connection.balance["remaining_units_jsonb"] == {"vectors": -8}
     # event_credits records the full event; metered_credits is just the overage.
-    metadata = json.loads(str(connection.meter_export_params[0]["metadata_json"]))
+    metadata = _jsonb_obj(connection.meter_export_params[0]["metadata_json"])
     assert metadata["event_credits"] == "0.070"
     assert metadata["metered_credits"] == "0.056"
 

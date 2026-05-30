@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 import time
 from collections.abc import Mapping
@@ -12,6 +11,7 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+from psycopg.types.json import Jsonb
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 
@@ -1185,7 +1185,7 @@ def finish_stripe_meter_export_sql(
 UPDATE stripe_meter_exports
 SET status = %(status)s,
     stripe_meter_event_identifier = COALESCE(%(stripe_meter_event_identifier)s::text, stripe_meter_event_identifier),
-    last_error_jsonb = %(last_error_jsonb)s::jsonb,
+    last_error_jsonb = %(last_error_jsonb)s,
     exported_at = CASE WHEN %(status)s = 'succeeded' THEN %(now)s ELSE exported_at END,
     updated_at = %(now)s
 WHERE id = %(id)s
@@ -1196,7 +1196,7 @@ RETURNING *;
             "now": now,
             "status": replay_status,
             "stripe_meter_event_identifier": stripe_meter_event_identifier,
-            "last_error_jsonb": _json_param(_error_snapshot(error_code, error_message)),
+            "last_error_jsonb": Jsonb(_error_snapshot(error_code, error_message)),
         },
     )
 
@@ -1216,7 +1216,7 @@ def stripe_meter_export_event_from_row(row: Mapping[str, Any]) -> StripeMeterExp
         timestamp=row.get("event_timestamp"),
         stripe_meter_event_identifier=_optional_string(row.get("stripe_meter_event_identifier")),
         attempt_count=int(row.get("attempt_count") or 0),
-        metadata=dict(_json_value(row.get("metadata_json"), default={})),
+        metadata=dict(row.get("metadata_json") or {}),
     )
 
 
@@ -1376,11 +1376,11 @@ def billing_debug_snapshot_from_rows(
 def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReservation:
     usage_events = tuple(
         BillingDebugUsageEvent.model_validate(event)
-        for event in _json_value(row.get("usage_events_json"), default=[])
+        for event in (row.get("usage_events_json") or [])
     )
     meter_exports = tuple(
         BillingDebugExport.model_validate(export)
-        for export in _json_value(row.get("meter_exports_json"), default=[])
+        for export in (row.get("meter_exports_json") or [])
     )
     subject = str(row["subject"])
     operation = str(row["operation"])
@@ -1401,11 +1401,11 @@ def billing_debug_reservation_from_row(row: dict[str, Any]) -> BillingDebugReser
         allocation_id=_optional_string(row.get("allocation_id")),
         credential_mode=str(row["credential_mode"]),
         reservation_status=str(row["reservation_status"]),
-        entitlement_decision=dict(_json_value(row.get("decision_json"))),
-        estimated_units=dict(_json_value(row.get("estimated_units_json"))),
+        entitlement_decision=dict(row.get("decision_json") or {}),
+        estimated_units=dict(row.get("estimated_units_json") or {}),
         idempotency_key=str(row["idempotency_key"]),
         created_at=row.get("created_at"),
-        metadata=dict(_json_value(row.get("metadata_json"))),
+        metadata=dict(row.get("metadata_json") or {}),
         usage_events=usage_events,
         meter_exports=meter_exports,
     )
@@ -1461,10 +1461,10 @@ def price_book_params(price_book: PriceBook) -> dict[str, Any]:
         "version": price_book.version,
         "effective_at": price_book.effective_at,
         "currency": price_book.currency,
-        "products_jsonb": _json_param([product.model_dump(mode="json") for product in price_book.products]),
-        "unit_mapping_jsonb": _json_param(price_book.unit_mapping),
+        "products_jsonb": Jsonb(jsonable_exact([product.model_dump(mode="json") for product in price_book.products])),
+        "unit_mapping_jsonb": Jsonb(jsonable_exact(price_book.unit_mapping)),
         "status": price_book.status,
-        "metadata_json": _json_param(price_book.metadata),
+        "metadata_json": Jsonb(jsonable_exact(price_book.metadata)),
         "created_at": price_book.created_at,
     }
 
@@ -1476,12 +1476,12 @@ def entitlement_policy_params(policy: EntitlementPolicyRecord) -> dict[str, Any]
         "plan_key": policy.plan_key,
         "price_book_id": policy.price_book_id,
         "allowed_operations": list(policy.allowed_operations),
-        "included_units_jsonb": _json_param(policy.included_units),
-        "hard_limits_jsonb": _json_param(policy.hard_limits),
-        "soft_limits_jsonb": _json_param(policy.soft_limits),
-        "grace_policy_jsonb": _json_param(policy.grace_policy),
+        "included_units_jsonb": Jsonb(jsonable_exact(policy.included_units)),
+        "hard_limits_jsonb": Jsonb(jsonable_exact(policy.hard_limits)),
+        "soft_limits_jsonb": Jsonb(jsonable_exact(policy.soft_limits)),
+        "grace_policy_jsonb": Jsonb(jsonable_exact(policy.grace_policy)),
         "status": policy.status,
-        "metadata_json": _json_param(policy.metadata),
+        "metadata_json": Jsonb(jsonable_exact(policy.metadata)),
         "created_at": policy.created_at,
     }
 
@@ -1492,11 +1492,11 @@ def workspace_balance_params(balance: WorkspaceBalanceSnapshot) -> dict[str, Any
         "entitlement_policy_id": balance.entitlement_policy_id,
         "period_start_at": balance.period_start_at,
         "period_end_at": balance.period_end_at,
-        "used_units_jsonb": _json_param(balance.used_units),
-        "reserved_units_jsonb": _json_param(balance.reserved_units),
-        "remaining_units_jsonb": _json_param(balance.remaining_units),
+        "used_units_jsonb": Jsonb(jsonable_exact(balance.used_units)),
+        "reserved_units_jsonb": Jsonb(jsonable_exact(balance.reserved_units)),
+        "remaining_units_jsonb": Jsonb(jsonable_exact(balance.remaining_units)),
         "unlimited_units": list(balance.unlimited_units),
-        "metadata_json": _json_param(balance.metadata),
+        "metadata_json": Jsonb(jsonable_exact(balance.metadata)),
         "updated_at": balance.updated_at,
     }
 
@@ -1508,10 +1508,10 @@ def stripe_customer_params(customer: StripeCustomer) -> dict[str, Any]:
         "stripe_customer_id": customer.stripe_customer_id,
         "stripe_subscription_id": customer.stripe_subscription_id,
         "subscription_status": customer.subscription_status,
-        "subscription_status_snapshot_jsonb": _json_param(customer.subscription_status_snapshot),
+        "subscription_status_snapshot_jsonb": Jsonb(jsonable_exact(customer.subscription_status_snapshot)),
         "last_webhook_at": customer.last_webhook_at,
         "status": customer.status,
-        "metadata_json": _json_param(customer.metadata),
+        "metadata_json": Jsonb(jsonable_exact(customer.metadata)),
         "created_at": customer.created_at,
         "updated_at": customer.updated_at,
     }
@@ -1531,8 +1531,8 @@ def stripe_meter_export_params(export: StripeMeterExportEvent) -> dict[str, Any]
         "status": export.replay_status,
         "stripe_meter_event_identifier": export.stripe_meter_event_identifier,
         "attempt_count": export.attempt_count,
-        "last_error_jsonb": _json_param(_error_snapshot(export.last_error_code, export.last_error_message)),
-        "metadata_json": _json_param(export.metadata),
+        "last_error_jsonb": Jsonb(_error_snapshot(export.last_error_code, export.last_error_message)),
+        "metadata_json": Jsonb(jsonable_exact(export.metadata)),
         "event_timestamp": export.timestamp,
         "exported_at": export.exported_at,
     }
@@ -1543,30 +1543,16 @@ def stripe_webhook_event_params(event: StripeWebhookEvent) -> dict[str, Any]:
         "id": event.id,
         "type": event.type,
         "workspace_id": event.workspace_id,
-        "payload_jsonb": _json_param(event.payload),
+        "payload_jsonb": Jsonb(jsonable_exact(event.payload)),
         "status": event.status,
         "received_at": event.received_at,
         "processed_at": event.processed_at,
-        "last_error_jsonb": _json_param(_error_snapshot(event.last_error_code, event.last_error_message)),
+        "last_error_jsonb": Jsonb(_error_snapshot(event.last_error_code, event.last_error_message)),
     }
 
 
 def stripe_customer_id(*, stripe_customer_id: str) -> str:
     return input_hash({"provider": "stripe", "stripe_customer_id": stripe_customer_id}, prefix="sc")
-
-
-def _json_param(value: Any) -> str:
-    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
-
-
-def _json_value(value: Any, *, default: Any | None = None) -> Any:
-    if value is None:
-        return {} if default is None else default
-    if isinstance(value, str):
-        return json.loads(value)
-    if isinstance(value, bytes):
-        return json.loads(value.decode("utf-8"))
-    return value
 
 
 def _error_snapshot(code: str | None, message: str | None) -> dict[str, str]:
@@ -1587,11 +1573,11 @@ def _first_mapping(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
 
 
 def _units_from_json_row(row: Mapping[str, Any], key: str) -> UnitMap:
-    return _billable_units(dict(_json_value(row.get(key), default={})))
+    return _billable_units(dict(row.get(key) or {}))
 
 
 def _operation_key_from_export_row(row: Mapping[str, Any]) -> str:
-    metadata = dict(_json_value(row.get("metadata_json"), default={}))
+    metadata = dict(row.get("metadata_json") or {})
     operation_key = metadata.get("operation_key")
     if operation_key:
         return str(operation_key)

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from psycopg.types.json import Jsonb
 from sqlalchemy import bindparam, case, func, literal, literal_column, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
@@ -557,10 +558,10 @@ def upsert_starter_price_book_sql() -> SqlStatement:
             "id": STARTER_PRICE_BOOK_ID,
             "version": STARTER_PRICE_BOOK_VERSION,
             "currency": "usd",
-            "products_jsonb": _json_param([{"plan_key": STARTER_PLAN_KEY, "label": "Starter"}]),
-            "unit_mapping_jsonb": _json_param({"source": "account_bootstrap"}),
+            "products_jsonb": Jsonb([{"plan_key": STARTER_PLAN_KEY, "label": "Starter"}]),
+            "unit_mapping_jsonb": Jsonb({"source": "account_bootstrap"}),
             "status": "active",
-            "metadata_json": _json_param({"managed_by": "yutome_account_core"}),
+            "metadata_json": Jsonb({"managed_by": "yutome_account_core"}),
             "created_at": func.now(),
         }
     )
@@ -583,12 +584,12 @@ def upsert_starter_entitlement_policy_sql(workspace_id: str) -> SqlStatement:
             "plan_key": STARTER_PLAN_KEY,
             "price_book_id": STARTER_PRICE_BOOK_ID,
             "allowed_operations": list(STARTER_ALLOWED_OPERATIONS),
-            "included_units_jsonb": _json_param(STARTER_INCLUDED_UNITS),
-            "hard_limits_jsonb": _json_param(STARTER_HARD_LIMITS),
-            "soft_limits_jsonb": _json_param({}),
-            "grace_policy_jsonb": _json_param({}),
+            "included_units_jsonb": Jsonb(STARTER_INCLUDED_UNITS),
+            "hard_limits_jsonb": Jsonb(STARTER_HARD_LIMITS),
+            "soft_limits_jsonb": Jsonb({}),
+            "grace_policy_jsonb": Jsonb({}),
             "status": "active",
-            "metadata_json": _json_param({"source": "account_bootstrap"}),
+            "metadata_json": Jsonb({"source": "account_bootstrap"}),
             "created_at": func.now(),
         }
     )
@@ -617,11 +618,11 @@ def upsert_starter_workspace_balance_sql(workspace_id: str) -> SqlStatement:
             "entitlement_policy_id": starter_entitlement_policy_id(workspace_id),
             "period_start_at": text("date_trunc('month', now())"),
             "period_end_at": text("date_trunc('month', now()) + interval '1 month'"),
-            "used_units_jsonb": _json_param({}),
-            "reserved_units_jsonb": _json_param({}),
-            "remaining_units_jsonb": _json_param(STARTER_INCLUDED_UNITS),
+            "used_units_jsonb": Jsonb({}),
+            "reserved_units_jsonb": Jsonb({}),
+            "remaining_units_jsonb": Jsonb(STARTER_INCLUDED_UNITS),
             "unlimited_units": [],
-            "metadata_json": _json_param({"source": "account_bootstrap"}),
+            "metadata_json": Jsonb({"source": "account_bootstrap"}),
             "updated_at": func.now(),
         }
     )
@@ -650,7 +651,7 @@ def upsert_starter_provider_allocation_sql(workspace_id: str, *, provider: str, 
             "status": "active",
             "model_or_plan": model_or_plan,
             "external_allocation_id": external_allocation_id,
-            "metadata_json": _json_param({"source": "account_bootstrap", "allocation_mode": "hosted"}),
+            "metadata_json": Jsonb({"source": "account_bootstrap", "allocation_mode": "hosted"}),
             "created_at": func.now(),
         }
     )
@@ -686,7 +687,7 @@ def upsert_starter_service_allocation_sql(
             "status": "active",
             "backend": HOSTED_VECTOR_BACKEND,
             "index_profile_ref": None,
-            "metadata_json": _json_param({"source": "account_bootstrap"}),
+            "metadata_json": Jsonb({"source": "account_bootstrap"}),
             "created_at": func.now(),
         }
     )
@@ -720,7 +721,7 @@ def upsert_account_session_sql(account: AccountBootstrapInput) -> SqlStatement:
             "audience": account.session_audience,
             "client_id": account.session_client_id,
             "expires_at": account.session_expires_at,
-            "metadata_json": _json_param({"source": "account_bootstrap"}),
+            "metadata_json": Jsonb({"source": "account_bootstrap"}),
             "created_at": func.now(),
         }
     )
@@ -773,6 +774,8 @@ def sql_params_contain_provider_credentials(statement: SqlStatement) -> bool:
 
 
 def _contains_credential_shape(value: Any) -> bool:
+    if isinstance(value, Jsonb):
+        return _contains_credential_shape(value.obj)
     if isinstance(value, Mapping):
         for key, item in value.items():
             lowered = str(key).lower()
@@ -797,10 +800,6 @@ def _contains_credential_shape(value: Any) -> bool:
 def _stable_id(prefix: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
     return f"{prefix}_{digest}"
-
-
-def _json_param(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _base64url(value: bytes) -> str:

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from yutome.config import AppConfig, GeminiConfig, ProxyConfig
 from yutome.hashing import sha256_json
@@ -40,6 +40,11 @@ from yutome.youtube import DiscoveredVideo, TranscriptFetchResult
 NOW = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
 ALWAYS_CLEAN_SOURCE_METADATA = {"gemini_cleanup": "always"}
 NEVER_CLEAN_SOURCE_METADATA = {"gemini_cleanup": "never"}
+
+
+def _jsonb_obj(value: object) -> object:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 class RecordingGate(UsageGate):
@@ -169,7 +174,7 @@ class HostedExecutorConnection:
         if "UPDATE workspace_balances" in statement:
             self.balance = WorkspaceBalance(
                 workspace_id=self.balance.workspace_id,
-                remaining_units=json.loads(str((params or {})["remaining_units_jsonb"])),
+                remaining_units=_jsonb_obj((params or {})["remaining_units_jsonb"]),
                 unlimited_units=self.balance.unlimited_units,
             )
             return [
@@ -177,7 +182,7 @@ class HostedExecutorConnection:
                     "workspace_id": self.balance.workspace_id,
                     "entitlement_policy_id": self.policy.id,
                     "remaining_units_jsonb": self.balance.remaining_units,
-                    "reserved_units_jsonb": json.loads(str((params or {})["reserved_units_jsonb"])),
+                    "reserved_units_jsonb": _jsonb_obj((params or {})["reserved_units_jsonb"]),
                     "unlimited_units": list(self.balance.unlimited_units),
                 }
             ]
@@ -759,7 +764,7 @@ def test_real_hosted_executor_orders_provider_calls_before_transactional_writes(
         if statement.startswith("UPDATE job_operations") and "output_json" in statement
     ]
     embedding_metadata = [
-        json.loads(params["metadata_json"])
+        _jsonb_obj(params["metadata_json"])
         for statement, params in connection.calls
         if statement.startswith("INSERT INTO chunk_embeddings")
     ]
@@ -1374,7 +1379,7 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     assert result.status == "succeeded"
     assert result.enqueued_jobs == 2
     assert result.video_ids == ("OEDoJyhQhXs", "abcdefghijk")
-    assert [json.loads(params["metadata_json"])["youtube_video_id"] for params in job_inserts] == [
+    assert [_jsonb_obj(params["metadata_json"])["youtube_video_id"] for params in job_inserts] == [
         "OEDoJyhQhXs",
         "abcdefghijk",
     ]

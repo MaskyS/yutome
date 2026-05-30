@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import bindparam, cast, func, literal, select, update
-from sqlalchemy.dialects.postgresql import JSONB, insert
+from psycopg.types.json import Jsonb
+from sqlalchemy import bindparam, func, literal, select, update
+from sqlalchemy.dialects.postgresql import insert
 
 from yutome import contract
 from yutome.hosted.account import AccountSessionError
@@ -116,12 +117,9 @@ def create_pending_cli_grant_sql(
             client_id=bindparam("client_id", value=client_id),
             install_id=bindparam("install_id", value=code_hash_value),
             token_version=literal(1),
-            metadata_json=cast(
-                bindparam(
-                    "metadata_json",
-                    value=_json_param({key: value for key, value in metadata.items() if value is not None}),
-                ),
-                JSONB,
+            metadata_json=bindparam(
+                "metadata_json",
+                value=Jsonb({key: value for key, value in metadata.items() if value is not None}),
             ),
             expires_at=bindparam("expires_at", value=expires_at),
             created_at=func.now(),
@@ -170,7 +168,7 @@ def activate_pending_cli_grant_sql(
             expires_at=bindparam("token_expires_at", value=token_expires_at),
             last_used_at=func.now(),
             metadata_json=account_grants.c.metadata_json.op("||")(
-                cast(bindparam("metadata_json", value=_json_param(merged_metadata)), JSONB)
+                bindparam("metadata_json", value=Jsonb(merged_metadata))
             ),
         )
         .returning(account_grants)
@@ -321,10 +319,6 @@ def _int_claim(payload: Mapping[str, Any], key: str) -> int | None:
 def _str_claim(payload: Mapping[str, Any], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value.strip() else None
-
-
-def _json_param(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _base64url(value: bytes) -> str:

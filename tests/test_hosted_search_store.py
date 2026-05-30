@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.search_store import (
     PGVECTOR_COMPATIBLE_SEMANTIC_BACKEND,
@@ -408,7 +409,8 @@ def test_replace_active_transcript_sql_upserts_version_then_updates_video_pointe
     assert "UPDATE videos" in statement.sql
     assert "active_transcript_version_id = upserted.id" in statement.sql
     assert statement.params["workspace_id"] == "ws_alice"
-    assert statement.params["metadata_json"] == '{"job_id":"job_1"}'
+    assert isinstance(statement.params["metadata_json"], Jsonb)
+    assert statement.params["metadata_json"].obj == {"job_id": "job_1"}
 
 
 def test_query_plans_reject_non_positive_limits() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import AbstractContextManager
 import threading
 import urllib.error
 import urllib.parse
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from psycopg.types.json import Jsonb
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 
@@ -103,6 +105,13 @@ class HostedPostgresSettings:
     fallback_envs: tuple[str, ...] = ("DATABASE_URL",)
 
 
+POSTGRES_POOL_MAX_SIZE_ENV_VAR = "YUTOME_PG_POOL_MAX_SIZE"
+POSTGRES_POOL_MIN_SIZE_ENV_VAR = "YUTOME_PG_POOL_MIN_SIZE"
+POSTGRES_POOL_TIMEOUT_SECONDS_ENV_VAR = "YUTOME_PG_POOL_TIMEOUT_SECONDS"
+DEFAULT_POSTGRES_POOL_MAX_SIZE = 10
+DEFAULT_POSTGRES_POOL_MIN_SIZE = 2
+
+
 @dataclass
 class HostedCommandRunner:
     config: AppConfig
@@ -112,11 +121,8 @@ class HostedCommandRunner:
     def connect(self) -> Any:
         if self.connection is not None:
             return self.connection
-        # Per-thread connections: the hosted API serves concurrent requests from a
-        # threadpool over this handle, so a single shared psycopg connection would
-        # let transactions from different requests interleave on one connection.
         url_env = self.config.database.postgres_url_env
-        self.connection = ThreadLocalConnection(lambda: connect_postgres(url_env=url_env))
+        self.connection = connect_postgres_pool(url_env=url_env)
         return self.connection
 
     def migrate(self, phase: MigrationPhase = "hosted") -> int:
@@ -778,7 +784,7 @@ def upsert_hosted_source_sql(source: Source) -> SqlStatement:
         auto_index_allowed=source.auto_index_allowed,
         import_source=source.import_source,
         auth_grant_id=source.auth_grant_id,
-        metadata_json=_json_param(source.metadata_jsonb),
+        metadata_json=Jsonb(source.metadata_jsonb),
         status=source.status,
     )
     statement = statement.on_conflict_do_update(
@@ -813,7 +819,7 @@ def upsert_source_refresh_policy_sql(policy: SourceRefreshPolicy) -> SqlStatemen
         next_run_at=policy.next_run_at,
         max_new_videos_per_run=policy.max_new_videos_per_run,
         max_index_jobs_per_day=policy.max_index_jobs_per_day,
-        policy_snapshot_json=_json_param(policy.policy_snapshot_jsonb),
+        policy_snapshot_json=Jsonb(policy.policy_snapshot_jsonb),
     )
     statement = statement.on_conflict_do_update(
         index_elements=[source_refresh_policies.c.workspace_id, source_refresh_policies.c.source_id],
@@ -864,36 +870,151 @@ def connect_postgres(*, url: str | None = None, url_env: str = "YUTOME_POSTGRES_
     return psycopg.connect(resolved, autocommit=True, row_factory=dict_row)
 
 
-class ThreadLocalConnection:
-    """A connection handle that hands each thread its own psycopg connection.
+def connect_postgres_pool(
+    *,
+    url: str | None = None,
+    url_env: str = "YUTOME_POSTGRES_URL",
+    environ: Mapping[str, str] | None = None,
+) -> PostgresConnectionPool:
+    resolved = url or postgres_url_from_env(url_env=url_env, environ=environ)
+    if resolved is None:
+        raise HostedRuntimeError(f"Set {url_env} or DATABASE_URL to use hosted Postgres.")
+    return PostgresConnectionPool(
+        resolved,
+        min_size=_env_int(
+            POSTGRES_POOL_MIN_SIZE_ENV_VAR,
+            DEFAULT_POSTGRES_POOL_MIN_SIZE,
+            environ=environ,
+        ),
+        max_size=_env_int(
+            POSTGRES_POOL_MAX_SIZE_ENV_VAR,
+            DEFAULT_POSTGRES_POOL_MAX_SIZE,
+            environ=environ,
+        ),
+        timeout=_env_float(POSTGRES_POOL_TIMEOUT_SECONDS_ENV_VAR, None, environ=environ),
+    )
 
-    The hosted API runs sync request handlers in FastAPI's threadpool, and the
-    gate/ledger wrap work in ``connection.transaction()``. A single shared
-    psycopg connection is not safe for concurrent use across threads — overlapping
-    transactions raise ``OutOfOrderTransactionNesting`` and an error on one request
-    can poison the next. This proxy keeps the connection object stable for the
-    adapter/gate/ledger/search-store (so nothing else changes) while routing every
-    call to a connection owned by the calling thread. Concurrency is bounded by the
-    threadpool, so the open-connection count is bounded too. Single-threaded callers
-    (CLI migrate/worker) transparently get exactly one connection, as before.
+
+class PostgresConnectionPool:
+    """Stable psycopg facade backed by a bounded ConnectionPool.
+
+    FastAPI installs a request lease around each route. The first execute/cursor/
+    transaction call checks out one physical connection and every later DB call in
+    that request reuses it until dependency cleanup returns it to the pool.
     """
 
-    def __init__(self, factory: Callable[[], Any]) -> None:
-        self._factory = factory
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        min_size: int = DEFAULT_POSTGRES_POOL_MIN_SIZE,
+        max_size: int = DEFAULT_POSTGRES_POOL_MAX_SIZE,
+        timeout: float | None = None,
+    ) -> None:
+        from contextvars import ContextVar
+
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+
+        if min_size < 0:
+            raise HostedRuntimeError(f"{POSTGRES_POOL_MIN_SIZE_ENV_VAR} must be non-negative.")
+        if max_size <= 0:
+            raise HostedRuntimeError(f"{POSTGRES_POOL_MAX_SIZE_ENV_VAR} must be positive.")
+        if min_size > max_size:
+            raise HostedRuntimeError(f"{POSTGRES_POOL_MIN_SIZE_ENV_VAR} must be <= {POSTGRES_POOL_MAX_SIZE_ENV_VAR}.")
+        kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
+        pool_kwargs: dict[str, Any] = {
+            "conninfo": conninfo,
+            "min_size": min_size,
+            "max_size": max_size,
+            "kwargs": kwargs,
+            "check": ConnectionPool.check_connection,
+            "open": True,
+        }
+        if timeout is not None:
+            pool_kwargs["timeout"] = timeout
+        self._pool = ConnectionPool(**pool_kwargs)
+        self._lease_var: ContextVar[_PostgresPoolLease | None] = ContextVar("yutome_postgres_pool_lease", default=None)
         self._local = threading.local()
 
+    def request_lease(self) -> _PostgresPoolLease:
+        return _PostgresPoolLease(self)
+
+    def lease(self) -> _PostgresPoolLease:
+        return self.request_lease()
+
     def _connection(self) -> Any:
-        conn = getattr(self._local, "conn", None)
-        if conn is None or getattr(conn, "closed", False):
-            conn = self._factory()
-            self._local.conn = conn
-        return conn
+        lease = self._lease_var.get()
+        if lease is not None:
+            return lease.connection()
+        fallback = getattr(self._local, "lease", None)
+        if fallback is None or fallback.closed:
+            fallback = self.request_lease()
+            fallback.__enter__()
+            self._local.lease = fallback
+        return fallback.connection()
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        return self._connection().execute(*args, **kwargs)
+
+    def cursor(self, *args: Any, **kwargs: Any) -> Any:
+        return self._connection().cursor(*args, **kwargs)
+
+    def transaction(self, *args: Any, **kwargs: Any) -> Any:
+        return self._connection().transaction(*args, **kwargs)
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._pool.closed)
+
+    def pool_stats(self) -> dict[str, Any]:
+        return dict(self._pool.get_stats())
+
+    def close(self) -> None:
+        fallback = getattr(self._local, "lease", None)
+        if fallback is not None and not fallback.closed:
+            fallback.close()
+            self._local.lease = None
+        self._pool.close()
 
     def __getattr__(self, name: str) -> Any:
-        # Only reached for names not defined on the proxy itself, so every real
-        # connection method/attribute (execute, transaction, cursor, pgconn, ...)
-        # resolves against the calling thread's connection.
         return getattr(self._connection(), name)
+
+
+class _PostgresPoolLease(AbstractContextManager["_PostgresPoolLease"]):
+    def __init__(self, owner: PostgresConnectionPool) -> None:
+        self._owner = owner
+        self._connection_context: Any | None = None
+        self._connection: Any | None = None
+        self._token: Any | None = None
+        self.closed = False
+
+    def __enter__(self) -> _PostgresPoolLease:
+        self._token = self._owner._lease_var.set(self)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def connection(self) -> Any:
+        if self.closed:
+            raise HostedRuntimeError("Postgres connection lease is already closed.")
+        if self._connection is None:
+            self._connection_context = self._owner._pool.connection()
+            self._connection = self._connection_context.__enter__()
+        return self._connection
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self._token is not None:
+            self._owner._lease_var.reset(self._token)
+            self._token = None
+        if self._connection_context is not None:
+            self._connection_context.__exit__(None, None, None)
+            self._connection_context = None
+            self._connection = None
 
 
 def _rows_from_result(result: Any) -> list[dict[str, Any]]:
@@ -931,7 +1052,7 @@ def _job_from_row(row: Mapping[str, Any]) -> Job:
         cancelled_at=row.get("cancelled_at"),
         error_code=row.get("error_code"),
         error_message=row.get("error_message"),
-        metadata_jsonb=dict(_json_value(row.get("metadata_json"))),
+        metadata_jsonb=dict(row.get("metadata_json") or {}),
     )
 
 
@@ -999,18 +1120,26 @@ def _validate_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be positive")
 
 
-def _json_param(value: Mapping[str, Any]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+def _env_int(name: str, fallback: int, *, environ: Mapping[str, str] | None = None) -> int:
+    env = os.environ if environ is None else environ
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return fallback
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise HostedRuntimeError(f"{name} must be an integer.") from exc
 
 
-def _json_value(value: Any) -> Any:
-    if value is None:
-        return {}
-    if isinstance(value, str):
-        return json.loads(value)
-    if isinstance(value, bytes):
-        return json.loads(value.decode("utf-8"))
-    return value
+def _env_float(name: str, fallback: float | None, *, environ: Mapping[str, str] | None = None) -> float | None:
+    env = os.environ if environ is None else environ
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return fallback
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise HostedRuntimeError(f"{name} must be a number.") from exc
 
 
 __all__ = [
@@ -1023,6 +1152,7 @@ __all__ = [
     "HostedTickResult",
     "balance_rollover_tick_sql",
     "build_hosted_api_app",
+    "connect_postgres_pool",
     "connect_postgres",
     "ensure_workspace_sql",
     "maintenance_tick_sql",

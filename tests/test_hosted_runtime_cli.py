@@ -598,43 +598,39 @@ def test_runner_billing_status_executes_debug_sql_and_returns_snapshot() -> None
                 "allocation_id": "alloc_voyage",
                 "credential_mode": "hosted",
                 "reservation_status": "reserved",
-                "decision_json": json.dumps({"allowed": True, "reason": "allowed"}),
-                "estimated_units_json": json.dumps({"total_tokens": 100}),
+                "decision_json": {"allowed": True, "reason": "allowed"},
+                "estimated_units_json": {"total_tokens": 100},
                 "idempotency_key": "idem_1",
                 "created_at": created_at,
-                "metadata_json": json.dumps({}),
-                "usage_events_json": json.dumps(
-                    [
-                        {
-                            "id": "evt_1",
-                            "event_type": "provider_attempt_succeeded",
-                            "status": "succeeded",
-                            "actual_units": {"total_tokens": 91},
-                            "error_code": None,
-                            "provider_request_id": "req_1",
-                            "created_at": created_at.isoformat(),
-                            "metadata": {},
-                        }
-                    ]
-                ),
-                "meter_exports_json": json.dumps(
-                    [
-                        {
-                            "id": "stripe:ws_cli:evt_1:credits",
-                            "usage_event_id": "evt_1",
-                            "replay_status": "failed",
-                            "stripe_customer_id": "cus_cli",
-                            "meter_unit": "credits",
-                            "value": "0.1",
-                            "stripe_meter_event_identifier": None,
-                            "source_event_dedupe_key": "stripe:ws_cli:evt_1:credits",
-                            "attempt_count": 2,
-                            "last_error": {"code": "stripe_meter_event_failed"},
-                            "exported_at": None,
-                            "updated_at": created_at.isoformat(),
-                        }
-                    ]
-                ),
+                "metadata_json": {},
+                "usage_events_json": [
+                    {
+                        "id": "evt_1",
+                        "event_type": "provider_attempt_succeeded",
+                        "status": "succeeded",
+                        "actual_units": {"total_tokens": 91},
+                        "error_code": None,
+                        "provider_request_id": "req_1",
+                        "created_at": created_at.isoformat(),
+                        "metadata": {},
+                    }
+                ],
+                "meter_exports_json": [
+                    {
+                        "id": "stripe:ws_cli:evt_1:credits",
+                        "usage_event_id": "evt_1",
+                        "replay_status": "failed",
+                        "stripe_customer_id": "cus_cli",
+                        "meter_unit": "credits",
+                        "value": "0.1",
+                        "stripe_meter_event_identifier": None,
+                        "source_event_dedupe_key": "stripe:ws_cli:evt_1:credits",
+                        "attempt_count": 2,
+                        "last_error": {"code": "stripe_meter_event_failed"},
+                        "exported_at": None,
+                        "updated_at": created_at.isoformat(),
+                    }
+                ],
             }
         ]
     )
@@ -687,7 +683,7 @@ def test_runner_stripe_meter_export_once_posts_and_marks_success(monkeypatch) ->
                 "stripe_meter_event_identifier": None,
                 "event_timestamp": created_at,
                 "attempt_count": 1,
-                "metadata_json": json.dumps({"operation_key": "voyage.embed_documents"}),
+                "metadata_json": {"operation_key": "voyage.embed_documents"},
             }
         ]
     )
@@ -733,7 +729,7 @@ def test_runner_reconcile_balance_reads_inputs_and_upserts_snapshot() -> None:
                 "row_kind": "usage",
                 "id": "evt_1",
                 "workspace_id": "ws_cli",
-                "actual_units_json": json.dumps({"total_tokens": "300"}),
+                "actual_units_json": {"total_tokens": "300"},
             },
         ]
     )

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from psycopg.types.json import Jsonb
 from sqlalchemy import bindparam, update
 from sqlalchemy.dialects.postgresql import insert
 
@@ -14,7 +14,6 @@ from yutome.hosted.schema import usage_events, usage_reservations
 from yutome.hosted.sqlalchemy_core import compile_postgres_statement
 
 
-JsonParam = str
 SqlParams = dict[str, Any]
 UsageEventIdempotency = Literal["event_id", "provider_request"]
 
@@ -81,11 +80,11 @@ def usage_reservation_params(reservation: UsageReservation) -> SqlParams:
         "operation": reservation.operation,
         "allocation_id": reservation.allocation_id,
         "credential_mode": reservation.credential_mode,
-        "estimated_units_json": _json_param(reservation.estimated_units),
+        "estimated_units_json": Jsonb(jsonable_exact(reservation.estimated_units)),
         "idempotency_key": reservation.idempotency_key,
         "status": reservation.status,
-        "decision_json": _json_param(reservation.decision.model_dump(mode="json")),
-        "metadata_json": _json_param(reservation.metadata),
+        "decision_json": Jsonb(jsonable_exact(reservation.decision.model_dump(mode="json"))),
+        "metadata_json": Jsonb(jsonable_exact(reservation.metadata)),
         "created_at": reservation.created_at,
     }
 
@@ -145,11 +144,11 @@ def usage_event_params(event: UsageEvent) -> SqlParams:
         "operation": event.operation,
         "event_type": event.event_type,
         "status": event.status,
-        "actual_units_json": _json_param(event.actual_units),
+        "actual_units_json": Jsonb(jsonable_exact(event.actual_units)),
         "provider_request_id": event.provider_request_id,
         "error_code": event.error_code,
-        "raw_usage_json": _json_param(event.raw_usage),
-        "metadata_json": _json_param(event.metadata),
+        "raw_usage_json": Jsonb(jsonable_exact(event.raw_usage)),
+        "metadata_json": Jsonb(jsonable_exact(event.metadata)),
         "created_at": event.created_at,
     }
 
@@ -162,11 +161,11 @@ def usage_reservation_from_row(row: MappingRow) -> UsageReservation:
         operation=str(row["operation"]),
         allocation_id=_optional_str(row.get("allocation_id")),
         credential_mode=row["credential_mode"],
-        estimated_units=dict(_json_value(row.get("estimated_units_json"))),
+        estimated_units=dict(row.get("estimated_units_json") or {}),
         idempotency_key=str(row["idempotency_key"]),
         status=row["status"],
-        decision=UsageDecision.model_validate(_json_value(row.get("decision_json"))),
-        metadata=dict(_json_value(row.get("metadata_json"))),
+        decision=UsageDecision.model_validate(row.get("decision_json") or {}),
+        metadata=dict(row.get("metadata_json") or {}),
         created_at=_datetime_value(row["created_at"]),
     )
 
@@ -180,30 +179,16 @@ def usage_event_from_row(row: MappingRow) -> UsageEvent:
         operation=str(row["operation"]),
         event_type=str(row["event_type"]),
         status=row["status"],
-        actual_units=dict(_json_value(row.get("actual_units_json"))),
+        actual_units=dict(row.get("actual_units_json") or {}),
         provider_request_id=_optional_str(row.get("provider_request_id")),
         error_code=_optional_str(row.get("error_code")),
-        raw_usage=dict(_json_value(row.get("raw_usage_json"))),
-        metadata=dict(_json_value(row.get("metadata_json"))),
+        raw_usage=dict(row.get("raw_usage_json") or {}),
+        metadata=dict(row.get("metadata_json") or {}),
         created_at=_datetime_value(row["created_at"]),
     )
 
 
 MappingRow = dict[str, Any]
-
-
-def _json_param(value: Any) -> JsonParam:
-    return json.dumps(jsonable_exact(value), sort_keys=True, separators=(",", ":"))
-
-
-def _json_value(value: Any) -> Any:
-    if value is None:
-        return {}
-    if isinstance(value, str):
-        return json.loads(value)
-    if isinstance(value, bytes):
-        return json.loads(value.decode("utf-8"))
-    return value
 
 
 def _optional_str(value: Any) -> str | None:

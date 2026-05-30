@@ -11,6 +11,7 @@ from pathlib import Path
 from decimal import Decimal
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from yutome.hosted.billing import (
     CREDITS_METER_EVENT_NAME,
@@ -30,7 +31,13 @@ from yutome.hosted.billing import (
     upsert_stripe_webhook_event_sql,
     upsert_workspace_balance_sql,
 )
-from yutome.hosted.runtime import balance_rollover_tick_sql
+from yutome.hosted.runtime import (
+    POSTGRES_POOL_MAX_SIZE_ENV_VAR,
+    POSTGRES_POOL_MIN_SIZE_ENV_VAR,
+    POSTGRES_POOL_TIMEOUT_SECONDS_ENV_VAR,
+    balance_rollover_tick_sql,
+    connect_postgres_pool,
+)
 from yutome.hosted.indexing import complete_job_operation_success_sql, enqueue_index_video_job_sql
 from yutome.hosted.jobs import (
     active_job_lease_sql,
@@ -115,6 +122,157 @@ def _wait_for_postgres(dsn: str) -> None:
             last_error = exc
             time.sleep(0.25)
     raise AssertionError("could not connect to live Postgres test DSN") from last_error
+
+
+def _tiny_pool_env() -> dict[str, str]:
+    return {
+        POSTGRES_POOL_MIN_SIZE_ENV_VAR: "0",
+        POSTGRES_POOL_MAX_SIZE_ENV_VAR: "2",
+        POSTGRES_POOL_TIMEOUT_SECONDS_ENV_VAR: "5",
+    }
+
+
+def test_live_postgres_jsonb_round_trips_as_decoded_dict(live_postgres_dsn: str) -> None:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(live_postgres_dsn, autocommit=False, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE jsonb_round_trip (
+                    id text PRIMARY KEY,
+                    payload jsonb NOT NULL
+                ) ON COMMIT DROP;
+                """
+            )
+            row = cursor.execute(
+                """
+                INSERT INTO jsonb_round_trip (id, payload)
+                VALUES ('row_1', %(payload)s)
+                RETURNING payload;
+                """,
+                {"payload": Jsonb({"nested": {"ok": True}, "items": [1, 2]})},
+            ).fetchone()
+
+            assert isinstance(row["payload"], dict)
+            assert row["payload"] == {"nested": {"ok": True}, "items": [1, 2]}
+
+        connection.rollback()
+
+
+def test_live_postgres_pool_transaction_reuses_one_connection_for_balance_update(
+    live_postgres_dsn: str,
+) -> None:
+    pool = connect_postgres_pool(url=live_postgres_dsn, environ=_tiny_pool_env())
+    try:
+        with pool.request_lease():
+            with pool.transaction():
+                pool.execute(
+                    """
+                    CREATE TEMP TABLE pool_workspace_balances (
+                        workspace_id text PRIMARY KEY,
+                        remaining_units_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb
+                    ) ON COMMIT DROP;
+                    """
+                )
+                pool.execute(
+                    """
+                    INSERT INTO pool_workspace_balances (workspace_id, remaining_units_jsonb)
+                    VALUES ('ws_pool', %(remaining)s);
+                    """,
+                    {"remaining": Jsonb({"total_tokens": 100})},
+                )
+                first_pid = pool.execute("SELECT pg_backend_pid() AS pid;").fetchone()["pid"]
+                pool.execute(
+                    """
+                    UPDATE pool_workspace_balances
+                    SET remaining_units_jsonb = %(remaining)s
+                    WHERE workspace_id = 'ws_pool';
+                    """,
+                    {"remaining": Jsonb({"total_tokens": 75})},
+                )
+                row = pool.execute(
+                    """
+                    SELECT pg_backend_pid() AS pid, remaining_units_jsonb
+                    FROM pool_workspace_balances
+                    WHERE workspace_id = 'ws_pool';
+                    """
+                ).fetchone()
+
+                assert row["pid"] == first_pid
+                assert row["remaining_units_jsonb"] == {"total_tokens": 75}
+    finally:
+        pool.close()
+
+
+def test_live_postgres_job_claim_runs_through_pool_with_skip_locked(live_postgres_dsn: str) -> None:
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    pool = connect_postgres_pool(url=live_postgres_dsn, environ=_tiny_pool_env())
+    try:
+        with pool.request_lease():
+            with pool.transaction():
+                pool.execute(
+                    """
+                    CREATE TEMP TABLE jobs (
+                        id text PRIMARY KEY,
+                        workspace_id text NOT NULL,
+                        source_id text,
+                        job_type text NOT NULL,
+                        status text NOT NULL,
+                        priority integer NOT NULL DEFAULT 100,
+                        idempotency_key text NOT NULL DEFAULT 'idem',
+                        run_after timestamptz,
+                        executor_kind text,
+                        executor_ref text,
+                        lease_owner text,
+                        leased_at timestamptz,
+                        lease_expires_at timestamptz,
+                        retry_after timestamptz,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        started_at timestamptz,
+                        finished_at timestamptz,
+                        cancelled_at timestamptz,
+                        error_code text,
+                        error_message text,
+                        metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb
+                    ) ON COMMIT DROP;
+                    """
+                )
+                pool.execute(
+                    """
+                    INSERT INTO jobs (id, workspace_id, job_type, status, priority, idempotency_key, created_at)
+                    VALUES ('job_pool', 'ws_pool', 'index_video', 'queued', 10, 'idem_pool', %(now)s);
+                    """,
+                    {"now": now},
+                )
+
+                claim = claim_jobs_sql(
+                    lease_owner="worker_pool",
+                    now=now,
+                    lease_seconds=900,
+                    limit=1,
+                    workspace_id="ws_pool",
+                    job_types=["index_video"],
+                )
+                claimed = pool.execute(claim.sql, claim.params).fetchall()
+
+                assert [row["id"] for row in claimed] == ["job_pool"]
+                assert claimed[0]["lease_owner"] == "worker_pool"
+    finally:
+        pool.close()
+
+
+def test_live_postgres_pool_drains_on_close(live_postgres_dsn: str) -> None:
+    pool = connect_postgres_pool(url=live_postgres_dsn, environ=_tiny_pool_env())
+    with pool.request_lease():
+        assert pool.execute("SELECT 1 AS n;").fetchone()["n"] == 1
+
+    assert pool.closed is False
+    pool.close()
+
+    assert pool.closed is True
+    assert pool.pool_stats().get("pool_available", 0) == 0
 
 
 def test_hosted_sql_does_not_leave_postgres_params_untyped_in_ambiguous_contexts() -> None:

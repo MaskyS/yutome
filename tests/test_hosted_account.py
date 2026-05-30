@@ -5,6 +5,8 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from psycopg.types.json import Jsonb
+
 from yutome.hosted.account import (
     STARTER_ALLOWED_OPERATIONS,
     AccountBootstrapInput,
@@ -23,6 +25,11 @@ from yutome.hosted.account import (
     upsert_user_sql,
 )
 from yutome.hosted.postgres import phase1_schema_statements
+
+
+def _jsonb_obj(value: object) -> object:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 class RecordingAccountConnection:
@@ -102,9 +109,10 @@ def test_account_bootstrap_sql_creates_owner_membership_starter_entitlements_and
     assert "search_store.lexical_query" in policy_params["allowed_operations"]
     assert "search_store.resource_read" in policy_params["allowed_operations"]
     assert "voyage.embed_query" in policy_params["allowed_operations"]
-    assert json.loads(balance_params["remaining_units_jsonb"])["total_tokens"] > 0
-    assert json.loads(balance_params["remaining_units_jsonb"])["queries"] > 0
-    assert json.loads(balance_params["remaining_units_jsonb"])["resource_reads"] > 0
+    remaining_units = _jsonb_obj(balance_params["remaining_units_jsonb"])
+    assert remaining_units["total_tokens"] > 0
+    assert remaining_units["queries"] > 0
+    assert remaining_units["resource_reads"] > 0
     assert "ON CONFLICT (workspace_id) DO UPDATE" in statements["workspace_balance"].sql
 
     provider_ids = {

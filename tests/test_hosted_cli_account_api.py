@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
+from psycopg.types.json import Jsonb
 
 from yutome.channels import channel_from_input
 from yutome.hosted.account import DEFAULT_ACCOUNT_SESSION_AUDIENCE, sign_account_session_token
@@ -20,6 +20,12 @@ from yutome.youtube_oauth import OAuthClient
 MCP_TOKEN = "mcp-test-token"
 DASHBOARD_TOKEN = "dashboard-test-token"
 HMAC_SECRET = "account-session-secret"
+
+
+def _jsonb_obj(value: object) -> dict[str, Any]:
+    assert isinstance(value, Jsonb)
+    assert isinstance(value.obj, dict)
+    return dict(value.obj)
 
 
 class _NoopSearchStore:
@@ -53,7 +59,7 @@ class StatefulAccountConnection:
                 "client_id": params["client_id"],
                 "install_id": params["install_id"],
                 "token_version": 1,
-                "metadata_json": json.loads(params["metadata_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
                 "created_at": datetime.now(timezone.utc),
                 "last_used_at": None,
                 "expires_at": params["expires_at"],
@@ -76,7 +82,7 @@ class StatefulAccountConnection:
                     "last_used_at": datetime.now(timezone.utc),
                 }
             )
-            row["metadata_json"].update(json.loads(params["metadata_json"]))
+            row["metadata_json"].update(_jsonb_obj(params["metadata_json"]))
             return [dict(row)]
         if "FROM account_grants" in statement and "grant_id" in params:
             row = self.grants.get(params["grant_id"])
@@ -93,7 +99,7 @@ class StatefulAccountConnection:
                 "workspace_id": params["workspace_id"],
                 "scopes": params["scopes"],
                 "status": "pending",
-                "metadata_json": json.loads(params["metadata_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
                 "created_at": params["created_at"],
                 "updated_at": params["updated_at"],
                 "last_used_at": None,
@@ -129,7 +135,7 @@ class StatefulAccountConnection:
                 {
                     "status": "active",
                     "scopes": params["scopes"],
-                    "metadata_json": json.loads(params["metadata_json"]),
+                    "metadata_json": _jsonb_obj(params["metadata_json"]),
                     "expires_at": params["grant_expires_at"],
                     "updated_at": datetime.now(timezone.utc),
                     "last_used_at": datetime.now(timezone.utc),
@@ -140,7 +146,7 @@ class StatefulAccountConnection:
             row = self.youtube_grants.get(params["grant_id"])
             if row is None or row["status"] != "active":
                 return []
-            row["metadata_json"] = json.loads(params["metadata_json"])
+            row["metadata_json"] = _jsonb_obj(params["metadata_json"])
             row["expires_at"] = params["grant_expires_at"]
             row["updated_at"] = datetime.now(timezone.utc)
             row["last_used_at"] = datetime.now(timezone.utc)
@@ -177,7 +183,7 @@ class StatefulAccountConnection:
                 "auto_index_allowed": params["auto_index_allowed"],
                 "import_source": params["import_source"],
                 "auth_grant_id": params["auth_grant_id"],
-                "metadata_json": json.loads(params["metadata_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
                 "status": params["status"],
                 "created_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
@@ -212,7 +218,7 @@ class StatefulAccountConnection:
                 "cancelled_at": None,
                 "error_code": None,
                 "error_message": None,
-                "metadata_json": json.loads(params["metadata_json"]),
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
             }
             self.jobs[row["id"]] = row
             return [dict(row)]
