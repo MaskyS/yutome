@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from yutome import contract
+from yutome import contract, search_presets
 from yutome.hosted.allocation_policy import (
     estimate_search_store_query,
     estimate_voyage_embeddings,
@@ -1027,7 +1027,7 @@ class HostedFindRequest:
     offset: int = 0
     filters: SearchFilters = field(default_factory=SearchFilters)
     group_by: str | None = None
-    per_group_limit: int = 3
+    per_group_limit: int = search_presets.PER_GROUP_LIMIT_DEFAULT
     notes: list[str] = field(default_factory=list)
     mcp_tool: str = SUPPORTED_TOOL
     reservation_metadata: dict[str, Any] = field(default_factory=dict)
@@ -1076,14 +1076,14 @@ class HostedFindRequest:
                 data={"project": project},
             )
         group_by = _normalize_group_by(arguments.get("group_by"), capability="find.group_by")
-        per_group_limit = _coerce_per_group_limit(arguments.get("per_group_limit", 3))
+        per_group_limit = _coerce_per_group_limit(arguments.get("per_group_limit", search_presets.PER_GROUP_LIMIT_DEFAULT))
 
         return cls(
             text=text,
-            limit=_coerce_limit(arguments.get("limit", 10)),
+            limit=_coerce_limit(arguments.get("limit", search_presets.FIND_LIMIT_DEFAULT)),
             mode=normalized_mode,
             project=None if project == "thin" else project,
-            offset=_coerce_offset(arguments.get("offset", 0)),
+            offset=_coerce_offset(arguments.get("offset", search_presets.OFFSET_MIN)),
             filters=SearchFilters(
                 channel=_optional_str(arguments.get("channel")),
                 since=_optional_str(arguments.get("since")),
@@ -1099,11 +1099,11 @@ class HostedFindRequest:
 
 @dataclass(frozen=True)
 class HostedShowRequest:
-    SUPPORTED_KINDS = frozenset({"channel", "chunk", "context", "source", "transcript", "video"})
+    SUPPORTED_KINDS = frozenset(search_presets.SHOW_KINDS)
 
     kind: str
     id_: str
-    token_budget: int = 3000
+    token_budget: int = search_presets.TOKEN_BUDGET_DEFAULT
     video_id: str | None = None
     time_seconds: int | None = None
     youtube_url: str | None = None
@@ -1141,14 +1141,18 @@ class HostedShowRequest:
         return cls(
             kind=kind,
             id_=id_,
-            token_budget=max(200, min(_coerce_int(arguments.get("token_budget", 3000), name="token_budget"), 8000)),
+            token_budget=search_presets.clamp_token_budget(
+                _coerce_int(arguments.get("token_budget", search_presets.TOKEN_BUDGET_DEFAULT), name="token_budget")
+            ),
             video_id=video_id,
             time_seconds=time_seconds,
             youtube_url=youtube_url,
-            transcript_offset=max(0, _coerce_int(arguments.get("transcript_offset", 0), name="transcript_offset")),
+            transcript_offset=search_presets.clamp_offset(
+                _coerce_int(arguments.get("transcript_offset", search_presets.OFFSET_MIN), name="transcript_offset")
+            ),
             transcript_limit=None
             if transcript_limit is None
-            else max(1, min(_coerce_int(transcript_limit, name="transcript_limit"), 5000)),
+            else search_presets.clamp_transcript_limit(_coerce_int(transcript_limit, name="transcript_limit")),
         )
 
 
@@ -1260,8 +1264,8 @@ class HostedListRequest:
             )
         return cls(
             entity=entity,
-            limit=_coerce_limit(arguments.get("limit", 20)),
-            offset=_coerce_offset(arguments.get("offset", 0)),
+            limit=_coerce_limit(arguments.get("limit", search_presets.LIST_LIMIT_DEFAULT)),
+            offset=_coerce_offset(arguments.get("offset", search_presets.OFFSET_MIN)),
             channel=_optional_str(arguments.get("channel")),
             since=_optional_str(arguments.get("since")),
             until=_optional_str(arguments.get("until")),
@@ -1284,7 +1288,7 @@ class HostedQRequest:
     video_id: str | None = None
     filters: SearchFilters = field(default_factory=SearchFilters)
     group_by: str | None = None
-    per_group_limit: int = 3
+    per_group_limit: int = search_presets.PER_GROUP_LIMIT_DEFAULT
     selected: bool | None = None
     order_by: str | None = None
 
@@ -1307,8 +1311,8 @@ class HostedQRequest:
         _reject_workspace_argument_injection(raw_request)
         entity = str(raw_request.get("entity") or "chunk")
         project = raw_request.get("project", "thin")
-        limit = _coerce_limit(raw_request.get("limit", 10))
-        offset = _coerce_offset(raw_request.get("offset", 0))
+        limit = _coerce_limit(raw_request.get("limit", search_presets.FIND_LIMIT_DEFAULT))
+        offset = _coerce_offset(raw_request.get("offset", search_presets.OFFSET_MIN))
         order_by = _q_order_by(raw_request.get("order_by"))
         raw_filter = raw_request.get("filter")
         filter_obj = {} if raw_filter is None else raw_filter
@@ -1398,7 +1402,9 @@ class HostedQRequest:
                 text=text,
                 filters=_search_filters_from_q_filter(filter_obj),
                 group_by=_normalize_group_by(raw_request.get("group_by"), capability="q.group_by"),
-                per_group_limit=_coerce_per_group_limit(raw_request.get("per_group_limit", 3)),
+                per_group_limit=_coerce_per_group_limit(
+                    raw_request.get("per_group_limit", search_presets.PER_GROUP_LIMIT_DEFAULT)
+                ),
             )
 
         raise _unsupported_q(f"Hosted MCP q does not support entity={entity!r}.")
@@ -1818,11 +1824,11 @@ def _find_query_result(*, rows: list[dict[str, Any]], request: HostedFindRequest
 def _search_limit(request: HostedFindRequest) -> int:
     if request.group_by is None:
         return request.limit
-    return min(200, request.limit * max(1, request.per_group_limit) * 8)
+    return search_presets.grouped_candidate_limit(request.limit, request.per_group_limit)
 
 
 def _search_offset(request: HostedFindRequest) -> int:
-    return 0 if request.group_by else request.offset
+    return search_presets.OFFSET_MIN if request.group_by else request.offset
 
 
 def _group_chunk_hits(
@@ -1925,11 +1931,11 @@ def _time_ms(row: Mapping[str, Any], prefix: str) -> int:
 
 
 def _coerce_limit(value: Any) -> int:
-    return max(1, min(_coerce_int(value, name="limit"), 200))
+    return search_presets.clamp_limit(_coerce_int(value, name="limit"))
 
 
 def _coerce_offset(value: Any) -> int:
-    return max(0, _coerce_int(value, name="offset"))
+    return search_presets.clamp_offset(_coerce_int(value, name="offset"))
 
 
 def _coerce_int(value: Any, *, name: str) -> int:
@@ -2077,7 +2083,7 @@ def _normalize_group_by(value: Any, *, capability: str) -> str | None:
     if value is None or value == "":
         return None
     normalized = str(value)
-    if normalized not in {"video", "channel", "transcript_source"}:
+    if normalized not in search_presets.GROUP_BY_KEYS:
         raise HostedMcpError(
             code="unsupported_group_by",
             message="Hosted MCP grouping supports video, channel, and transcript_source.",
@@ -2085,14 +2091,14 @@ def _normalize_group_by(value: Any, *, capability: str) -> str | None:
             data=_capability_data(
                 capability=capability,
                 requested=normalized,
-                supported={"video", "channel", "transcript_source"},
+                supported=set(search_presets.GROUP_BY_KEYS),
             ),
         )
     return normalized
 
 
 def _coerce_per_group_limit(value: Any) -> int:
-    return max(1, min(_coerce_int(value, name="per_group_limit"), 20))
+    return search_presets.clamp_per_group_limit(_coerce_int(value, name="per_group_limit"))
 
 
 def _normalize_list_order(value: Any) -> str | None:

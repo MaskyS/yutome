@@ -4,6 +4,7 @@ from pathlib import Path
 
 import typer
 
+from yutome import search_presets
 from yutome.api import find as api_find
 from yutome.api import list_ as api_list
 from yutome.api import q as api_q
@@ -28,8 +29,14 @@ def find_command(
     source: str | None = typer.Option(None, "--source", help="Filter active transcript source prefix."),
     language: str | None = typer.Option(None, "--language", help="Filter active transcript language."),
     group_by: str | None = typer.Option(None, "--group-by", help="Group ranked chunk hits by video."),
-    limit: int = typer.Option(10, "--limit", min=1, max=200, help="Maximum rows to return."),
-    offset: int = typer.Option(0, "--offset", min=0, help="Rows to skip."),
+    limit: int = typer.Option(
+        search_presets.FIND_LIMIT_DEFAULT,
+        "--limit",
+        min=search_presets.LIMIT_MIN,
+        max=search_presets.LIMIT_MAX,
+        help="Maximum rows to return.",
+    ),
+    offset: int = typer.Option(search_presets.OFFSET_MIN, "--offset", min=search_presets.OFFSET_MIN, help="Rows to skip."),
     project: str | None = typer.Option(None, "--project", help="Projection name."),
     json_output: bool = typer.Option(False, "--json", help="Emit the full QueryResult envelope."),
 ) -> None:
@@ -69,14 +76,20 @@ def list_command(
     language: str | None = typer.Option(None, "--language", help="Filter active transcript language."),
     selected: bool | None = typer.Option(None, "--selected/--any-selection", help="Only selected library channels."),
     order_by: str | None = typer.Option(None, "--order-by", help="Sort field, optionally field:asc."),
-    limit: int = typer.Option(20, "--limit", min=1, max=200, help="Maximum rows to return."),
-    offset: int = typer.Option(0, "--offset", min=0, help="Rows to skip."),
+    limit: int = typer.Option(
+        search_presets.LIST_LIMIT_DEFAULT,
+        "--limit",
+        min=search_presets.LIMIT_MIN,
+        max=search_presets.LIMIT_MAX,
+        help="Maximum rows to return.",
+    ),
+    offset: int = typer.Option(search_presets.OFFSET_MIN, "--offset", min=search_presets.OFFSET_MIN, help="Rows to skip."),
     project: str | None = typer.Option(None, "--project", help="Projection name."),
     json_output: bool = typer.Option(False, "--json", help="Emit the full QueryResult envelope."),
 ) -> None:
     """Enumerate corpus objects."""
     normalized = entity.lower()
-    if normalized not in {"video", "videos", "channel", "channels", "status"}:
+    if normalized not in search_presets.LIST_ENTITIES:
         raise typer.BadParameter("entity must be one of: videos, channels, status")
     runtime = get_context(ctx).runtime()
     result = api_list(
@@ -103,16 +116,33 @@ def show_command(
     ctx: typer.Context,
     kind: str = typer.Argument(..., help="chunk, video, channel, transcript, context, or source."),
     id_: str | None = typer.Argument(None, metavar="ID", help="Resource id, selector, or timestamped URL."),
-    token_budget: int = typer.Option(3000, "--token-budget", min=200, max=8000, help="Context token budget."),
+    token_budget: int = typer.Option(
+        search_presets.TOKEN_BUDGET_DEFAULT,
+        "--token-budget",
+        min=search_presets.TOKEN_BUDGET_MIN,
+        max=search_presets.TOKEN_BUDGET_MAX,
+        help="Context token budget.",
+    ),
     video_id: str | None = typer.Option(None, "--video-id", help="Video id for timestamp lookup."),
     time_seconds: int | None = typer.Option(None, "--time", min=0, help="Timestamp in seconds for video lookup."),
     youtube_url: str | None = typer.Option(None, "--youtube-url", help="Timestamped YouTube URL."),
-    transcript_offset: int = typer.Option(0, "--offset", min=0, help="Segment offset for long transcript paging."),
-    transcript_limit: int | None = typer.Option(None, "--limit", min=1, max=5000, help="Maximum transcript segments."),
+    transcript_offset: int = typer.Option(
+        search_presets.OFFSET_MIN,
+        "--offset",
+        min=search_presets.OFFSET_MIN,
+        help="Segment offset for long transcript paging.",
+    ),
+    transcript_limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=search_presets.TRANSCRIPT_LIMIT_MIN,
+        max=search_presets.TRANSCRIPT_LIMIT_MAX,
+        help="Maximum transcript segments.",
+    ),
 ) -> None:
     """Fetch resources or resolve citations."""
     normalized = kind.lower()
-    if normalized not in {"chunk", "video", "channel", "transcript", "context", "source"}:
+    if normalized not in search_presets.SHOW_KINDS:
         raise typer.BadParameter("kind must be one of: chunk, video, channel, transcript, context, source")
     runtime = get_context(ctx).runtime()
     try:

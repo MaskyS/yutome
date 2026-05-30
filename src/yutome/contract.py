@@ -10,9 +10,9 @@ hand-curated metadata for the TypeScript runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
-from yutome import runtime
+from yutome import runtime, search_presets
 
 
 AUTH_SCOPE = "yutome.search.read"
@@ -77,15 +77,15 @@ class ResourceSpec:
 
 def tool_find(
     text: str,
-    mode: Literal["lexical", "semantic", "hybrid", "none"] | None = None,
+    mode: search_presets.SearchMode | None = None,
     channel: str | None = None,
     since: str | None = None,
     until: str | None = None,
     source: str | None = None,
     language: str | None = None,
-    group_by: Literal["video", "channel", "transcript_source"] | None = None,
-    limit: int = 10,
-    offset: int = 0,
+    group_by: search_presets.GroupByKey | None = None,
+    limit: int = search_presets.FIND_LIMIT_DEFAULT,
+    offset: int = search_presets.OFFSET_MIN,
     project: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks to search their Yutome YouTube corpus by topic,
@@ -105,14 +105,14 @@ def tool_find(
         source=source,
         language=language,
         group_by=group_by,
-        limit=max(1, min(limit, 200)),
-        offset=max(0, offset),
+        limit=search_presets.clamp_limit(limit),
+        offset=search_presets.clamp_offset(offset),
         project=project,
     ).model_dump()
 
 
 def tool_list(
-    entity: Literal["video", "videos", "channel", "channels", "status"],
+    entity: search_presets.ListEntity,
     channel: str | None = None,
     since: str | None = None,
     until: str | None = None,
@@ -121,8 +121,8 @@ def tool_list(
     language: str | None = None,
     selected: bool | None = None,
     order_by: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = search_presets.LIST_LIMIT_DEFAULT,
+    offset: int = search_presets.OFFSET_MIN,
     project: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks to list newest videos, channels, corpus status,
@@ -143,20 +143,20 @@ def tool_list(
         language=language,
         selected=selected,
         order_by=order_by,
-        limit=max(1, min(limit, 200)),
-        offset=max(0, offset),
+        limit=search_presets.clamp_limit(limit),
+        offset=search_presets.clamp_offset(offset),
         project=project,
     ).model_dump()
 
 
 def tool_show(
-    kind: Literal["chunk", "video", "channel", "transcript", "context", "source"],
+    kind: search_presets.ShowKind,
     id_: str | None = None,
-    token_budget: int = 3000,
+    token_budget: int = search_presets.TOKEN_BUDGET_DEFAULT,
     video_id: str | None = None,
     time_seconds: int | None = None,
     youtube_url: str | None = None,
-    transcript_offset: int = 0,
+    transcript_offset: int = search_presets.OFFSET_MIN,
     transcript_limit: int | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks to open or inspect a specific Yutome chunk,
@@ -169,11 +169,11 @@ def tool_show(
         paths=rt.paths,
         kind=kind,
         id_=id_,
-        token_budget=max(200, min(token_budget, 8000)),
+        token_budget=search_presets.clamp_token_budget(token_budget),
         video_id=video_id,
         time_seconds=time_seconds,
         youtube_url=youtube_url,
-        transcript_offset=max(0, transcript_offset),
+        transcript_offset=search_presets.clamp_offset(transcript_offset),
         transcript_limit=transcript_limit,
     )
 

@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
+from yutome import search_presets
 from yutome.config import AppConfig
 from yutome.embeddings import _embed_voyage_query
 from yutome.hosted.resources import HostedResourceNotFound
@@ -122,15 +123,15 @@ def find(
     config: AppConfig,
     paths: ProjectPaths,
     text: str,
-    mode: Literal["lexical", "semantic", "hybrid", "none"] | None = None,
+    mode: search_presets.SearchMode | None = None,
     channel: str | None = None,
     since: str | None = None,
     until: str | None = None,
     source: str | None = None,
     language: str | None = None,
-    group_by: Literal["video", "channel", "transcript_source"] | None = None,
-    limit: int = 10,
-    offset: int = 0,
+    group_by: search_presets.GroupByKey | None = None,
+    limit: int = search_presets.FIND_LIMIT_DEFAULT,
+    offset: int = search_presets.OFFSET_MIN,
     project: str | None = None,
 ) -> QueryResult:
     del paths
@@ -151,7 +152,7 @@ def find(
         project=project or "thin",
         filters=SearchFilters(channel=channel, since=since, until=until, source=source, language=language),
         group_by=group_by,
-        per_group_limit=3,
+        per_group_limit=search_presets.PER_GROUP_LIMIT_DEFAULT,
         mode_defaulted=mode_defaulted,
     )
 
@@ -160,7 +161,7 @@ def list_(
     *,
     config: AppConfig,
     paths: ProjectPaths,
-    entity: Literal["video", "videos", "channel", "channels", "status"],
+    entity: search_presets.ListEntity,
     channel: str | None = None,
     since: str | None = None,
     until: str | None = None,
@@ -169,8 +170,8 @@ def list_(
     language: str | None = None,
     selected: bool | None = None,
     order_by: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = search_presets.LIST_LIMIT_DEFAULT,
+    offset: int = search_presets.OFFSET_MIN,
     project: str | None = None,
 ) -> QueryResult:
     del paths, project
@@ -215,13 +216,13 @@ def show(
     *,
     config: AppConfig,
     paths: ProjectPaths,
-    kind: Literal["chunk", "video", "channel", "transcript", "context", "source"],
+    kind: search_presets.ShowKind,
     id_: str | None = None,
-    token_budget: int = 3000,
+    token_budget: int = search_presets.TOKEN_BUDGET_DEFAULT,
     video_id: str | None = None,
     time_seconds: int | None = None,
     youtube_url: str | None = None,
-    transcript_offset: int = 0,
+    transcript_offset: int = search_presets.OFFSET_MIN,
     transcript_limit: int | None = None,
 ) -> dict[str, Any]:
     if kind == "context":
@@ -260,7 +261,7 @@ def context_expand(
     config: AppConfig,
     paths: ProjectPaths,
     request: ContextRequest,
-    token_budget: int = 3000,
+    token_budget: int = search_presets.TOKEN_BUDGET_DEFAULT,
 ) -> dict[str, Any]:
     del paths
     connection = _connect(config)
@@ -332,7 +333,7 @@ def resource_transcript(
     config: AppConfig,
     paths: ProjectPaths,
     transcript_version_id: str,
-    offset: int = 0,
+    offset: int = search_presets.OFFSET_MIN,
     limit: int | None = None,
 ) -> dict[str, Any]:
     del paths
@@ -364,14 +365,14 @@ def _find_chunks(
     mode: str,
     limit: int,
     project: str | None = None,
-    offset: int = 0,
+    offset: int = search_presets.OFFSET_MIN,
     filters: SearchFilters | None = None,
     group_by: str | None = None,
-    per_group_limit: int = 3,
+    per_group_limit: int = search_presets.PER_GROUP_LIMIT_DEFAULT,
     mode_defaulted: bool = False,
 ) -> QueryResult:
-    search_limit = min(200, limit * max(1, per_group_limit) * 8) if group_by else limit
-    search_offset = 0 if group_by else offset
+    search_limit = search_presets.grouped_candidate_limit(limit, per_group_limit) if group_by else limit
+    search_offset = search_presets.OFFSET_MIN if group_by else offset
     degraded_to_lexical = False
     if mode == "lexical":
         rows, usage = store.lexical_search(
