@@ -222,12 +222,16 @@ class RecordingConnection:
         *,
         account_session_rows: list[dict[str, Any]] | None = None,
         account_session_update_rows: list[dict[str, Any]] | None = None,
+        workspace_row: dict[str, Any] | None = None,
+        stripe_customer_rows: list[dict[str, Any]] | None = None,
         workspace_subscription_status: str = "trialing",
         workspace_trial_ends_at: Any = "2999-01-01T00:00:00+00:00",
     ) -> None:
         self.rows = rows or []
         self.account_session_rows = account_session_rows or []
         self.account_session_update_rows = account_session_update_rows or []
+        self.workspace_row = workspace_row
+        self.stripe_customer_rows = stripe_customer_rows or []
         self.workspace_subscription_status = workspace_subscription_status
         self.workspace_trial_ends_at = workspace_trial_ends_at
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -238,6 +242,16 @@ class RecordingConnection:
             return list(self.account_session_rows)
         if "UPDATE account_sessions" in statement:
             return list(self.account_session_update_rows)
+        if "FROM workspaces" in statement and "owner_user_id" in statement:
+            if self.workspace_row is None:
+                return []
+            return [dict(self.workspace_row)] if params.get("workspace_id") == self.workspace_row["id"] else []
+        if "FROM stripe_customers" in statement and "LIMIT" in statement:
+            return [
+                dict(row)
+                for row in self.stripe_customer_rows
+                if row.get("workspace_id") == params.get("workspace_id")
+            ]
         # The entitlement provider checks trial-expiry before loading policy/balance; model an
         # entitled (trialing) workspace by default so denials fall through to the path under
         # test rather than short-circuiting at the trial gate.
@@ -830,6 +844,121 @@ def test_account_bootstrap_requires_connection_and_signing_secret() -> None:
     assert secret_response.status_code == 503
     assert error_body(secret_response.json())["code"] == "account_session_signing_unconfigured"
     assert ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR in error_body(secret_response.json())["message"]
+
+
+def test_account_delete_requires_admin_token() -> None:
+    connection = RecordingConnection(
+        workspace_row={
+            "id": "ws_test",
+            "name": "Synthetic",
+            "status": "active",
+            "subscription_status": "trialing",
+            "owner_user_id": "user_test",
+        }
+    )
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(adapter=adapter, billing_connection=connection, expected_api_token=TEST_API_TOKEN)
+    )
+
+    response = client.delete("/account/ws_test")
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "api_token_required"
+    assert connection.calls == []
+
+
+def test_account_delete_rejects_dashboard_token() -> None:
+    connection = RecordingConnection(
+        workspace_row={
+            "id": "ws_test",
+            "name": "Synthetic",
+            "status": "active",
+            "subscription_status": "trialing",
+            "owner_user_id": "user_test",
+        }
+    )
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+        )
+    )
+
+    response = client.delete("/account/ws_test", headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"})
+
+    assert response.status_code == 503
+    assert error_body(response.json())["code"] == "api_token_unconfigured"
+    assert connection.calls == []
+
+
+def test_account_delete_requires_connection() -> None:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(build_app(adapter=adapter, expected_api_token=TEST_API_TOKEN))
+
+    response = client.delete("/account/ws_test", headers={"Authorization": f"Bearer {TEST_API_TOKEN}"})
+
+    assert response.status_code == 503
+    assert error_body(response.json())["code"] == "account_delete_connection_unconfigured"
+
+
+def test_account_delete_refuses_active_subscription() -> None:
+    connection = RecordingConnection(
+        workspace_row={
+            "id": "ws_real",
+            "name": "Real Workspace",
+            "status": "active",
+            "subscription_status": "active",
+            "owner_user_id": "user_real",
+        }
+    )
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(adapter=adapter, billing_connection=connection, expected_api_token=TEST_API_TOKEN)
+    )
+
+    response = client.delete("/account/ws_real", headers={"Authorization": f"Bearer {TEST_API_TOKEN}"})
+
+    assert response.status_code == 409
+    assert error_body(response.json())["code"] == "workspace_not_synthetic"
+    assert not any(sql.startswith("DELETE FROM workspaces") for sql, _params in connection.calls)
+
+
+def test_account_delete_purges_synthetic_workspace() -> None:
+    workspace_id = "ws_0123456789abcdef01234567"
+    connection = RecordingConnection(
+        workspace_row={
+            "id": workspace_id,
+            "name": "Synthetic",
+            "status": "active",
+            "subscription_status": "trialing",
+            "owner_user_id": "user_synth",
+        }
+    )
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(adapter=adapter, billing_connection=connection, expected_api_token=TEST_API_TOKEN)
+    )
+
+    response = client.delete(f"/account/{workspace_id}", headers={"Authorization": f"Bearer {TEST_API_TOKEN}"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["workspace_id"] == workspace_id
+    delete_calls = [(sql, params) for sql, params in connection.calls if sql.startswith("DELETE FROM")]
+    delete_sql = [sql for sql, _params in delete_calls]
+    assert any(sql.startswith("DELETE FROM sources") for sql in delete_sql)
+    assert any(sql.startswith("DELETE FROM jobs") for sql in delete_sql)
+    assert delete_sql[-1].startswith("DELETE FROM workspaces")
+    assert all(params == {"workspace_id": workspace_id} for _sql, params in delete_calls)
 
 
 def test_tool_call_endpoint_uses_workspace_from_auth_header(

@@ -29,6 +29,7 @@ from yutome.hosted.account import (
     sign_account_session_token,
     verify_account_session_token,
 )
+from yutome.hosted.account_cleanup import AccountCleanupError, delete_synthetic_workspace
 from yutome.hosted.auth_login import (
     DEFAULT_LOGIN_TOKEN_TTL_SECONDS,
     consume_login_token_sql,
@@ -991,6 +992,34 @@ def build_app(
                 "max_age_seconds": account_session_ttl,
             },
             "redirect_path": _safe_redirect_path(record.get("redirect_path")),
+        }
+
+    @app.delete("/account/{workspace_id}")
+    def account_delete(
+        workspace_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        # This cleanup path is reserved for MCP/admin live-smoke cleanup. Dashboard
+        # sessions and dashboard bearer tokens must not delete arbitrary workspaces.
+        _verify_bearer_token(authorization=authorization, expected_api_token=normalized_api_token)
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="account_delete_connection_unconfigured",
+                    message="Hosted account deletion requires a database connection.",
+                    status_code=503,
+                )
+            )
+        try:
+            result = delete_synthetic_workspace(billing_connection, workspace_id=workspace_id)
+        except AccountCleanupError as exc:
+            raise _http_error(
+                HostedMcpError(code=exc.code, message=exc.message, status_code=exc.status_code)
+            ) from exc
+        return {
+            "ok": True,
+            "workspace_id": result.workspace_id,
+            "deleted_tables": list(result.deleted_tables),
         }
 
     @app.post("/webhooks/stripe")
