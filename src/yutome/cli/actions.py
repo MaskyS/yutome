@@ -68,6 +68,7 @@ from yutome.youtube_oauth import fetch_subscription_channels, load_oauth_client,
 DEFAULT_HOSTED_APP_URL = "https://app.getyutome.com"
 DEFAULT_HOSTED_API_URL = "https://api-production-e072.up.railway.app"
 HOSTED_AUTH_FILENAME = "yutome-hosted-cli.json"
+TRUSTED_PROXY_IPS_ENV_VAR = "YUTOME_TRUSTED_PROXY_IPS"
 
 
 def _version_callback(value: bool) -> None:
@@ -108,6 +109,11 @@ def _load_runtime(config_path: Path) -> runtime.Runtime:
 
 def _runner(config_path: Path) -> HostedCommandRunner:
     return HostedCommandRunner(_load_config_or_exit(config_path))
+
+
+def _trusted_proxy_ips_from_env(environ: Mapping[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    return (env.get(TRUSTED_PROXY_IPS_ENV_VAR) or "*").strip() or "*"
 
 
 def _workspace_id(app_config: AppConfig, explicit: str | None = None) -> str:
@@ -542,7 +548,19 @@ def hosted_api(*, config: Path, host: str, port: int, log_level: str = "info") -
     api_app = build_hosted_api_app(_runner(config))
     import uvicorn
 
-    uvicorn.run(api_app, host=host, port=port, log_level=log_level)
+    trusted_proxy_ips = _trusted_proxy_ips_from_env()
+    # Railway-hosted containers are reachable only through Railway's edge proxy,
+    # so the default trusts that connecting proxy hop. The rate-limit middleware
+    # still keys on the proxy-appended right-most X-Forwarded-For entry, not a
+    # caller-supplied left-most value.
+    uvicorn.run(
+        api_app,
+        host=host,
+        port=port,
+        log_level=log_level,
+        proxy_headers=True,
+        forwarded_allow_ips=trusted_proxy_ips,
+    )
 
 
 def hosted_migrate(*, config: Path, phase: str, json_output: bool = False) -> None:

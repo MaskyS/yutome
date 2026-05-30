@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import case, func, literal_column, text
+from sqlalchemy import bindparam, case, func, literal, literal_column, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from yutome.hosted.migrations import HOSTED_DEFAULT_EMBEDDING_MODEL, HOSTED_VECTOR_BACKEND
@@ -737,6 +737,25 @@ def upsert_account_session_sql(account: AccountBootstrapInput) -> SqlStatement:
     return _sql_statement(statement)
 
 
+def load_account_session_sql(*, session_hash: str) -> SqlStatement:
+    statement = (
+        select(account_sessions)
+        .where(account_sessions.c.session_hash == bindparam("session_hash", value=session_hash))
+        .limit(1)
+    )
+    return _sql_statement(statement)
+
+
+def revoke_account_session_sql(*, session_hash: str, now: datetime) -> SqlStatement:
+    statement = (
+        update(account_sessions)
+        .where(account_sessions.c.session_hash == bindparam("session_hash", value=session_hash))
+        .values(status=literal("revoked"), revoked_at=bindparam("revoked_at", value=now))
+        .returning(account_sessions)
+    )
+    return _sql_statement(statement)
+
+
 def starter_entitlement_policy_id(workspace_id: str) -> str:
     return _stable_id("ent", f"{workspace_id}:{STARTER_PLAN_KEY}:{STARTER_PRICE_BOOK_ID}")
 
@@ -832,7 +851,9 @@ __all__ = [
     "deterministic_account_session_id",
     "deterministic_personal_workspace_id",
     "deterministic_user_id",
+    "load_account_session_sql",
     "normalize_email",
+    "revoke_account_session_sql",
     "session_token_hash",
     "sign_account_session_token",
     "sql_params_contain_provider_credentials",

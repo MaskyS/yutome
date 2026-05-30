@@ -143,6 +143,7 @@ class EntitlementPolicy(BaseModel):
     allowed_operations: set[str] = Field(default_factory=set)
     hard_limits_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
     soft_limits_by_operation: dict[str, UnitMap] = Field(default_factory=dict)
+    requests_per_minute: int | None = None
 
     @field_validator("hard_limits_by_operation", "soft_limits_by_operation", mode="before")
     @classmethod

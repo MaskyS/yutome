@@ -160,7 +160,14 @@ def test_account_summary_returns_plan_and_units() -> None:
     statements = [statement for statement, _ in connection.calls]
     assert any("FROM entitlement_policies" in s for s in statements)
     assert any("FROM workspace_balances" in s for s in statements)
-    assert all(params.get("workspace_id") == "ws_pg" for _, params in connection.calls)
+    # The account-session lookup is keyed by session_hash and carries no
+    # workspace_id; every workspace-scoped query must still use the verified
+    # session's workspace (tenant isolation), not a client-supplied header.
+    assert all(
+        params.get("workspace_id") == "ws_pg"
+        for _, params in connection.calls
+        if "workspace_id" in params
+    )
 
 
 def test_account_summary_carries_subscription_status_and_trial_ends_at() -> None:

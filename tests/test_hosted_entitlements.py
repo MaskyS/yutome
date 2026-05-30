@@ -8,6 +8,9 @@ from yutome.hosted.gate import UsageGate
 from yutome.hosted.mcp_query import HostedMcpAuthContext
 
 
+_MISSING = object()
+
+
 class EntitlementConnection:
     def __init__(
         self,
@@ -19,6 +22,7 @@ class EntitlementConnection:
         subscription_status: str = "trialing",
         trial_ends_at: Any = "2999-01-01T00:00:00+00:00",
         workspace_row: bool = True,
+        requests_per_minute: Any = _MISSING,
     ) -> None:
         self.policy = policy
         self.balance = balance
@@ -27,6 +31,7 @@ class EntitlementConnection:
         self.subscription_status = subscription_status
         self.trial_ends_at = trial_ends_at
         self.workspace_row = workspace_row
+        self.requests_per_minute = requests_per_minute
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -76,15 +81,16 @@ class EntitlementConnection:
         if "FROM entitlement_policies" in statement:
             if not self.policy:
                 return []
-            return [
-                {
-                    "id": "policy_ws_prod_pro",
-                    "workspace_id": params["workspace_id"],
-                    "allowed_operations": ["search_store.*", "voyage.embed_query"],
-                    "hard_limits_jsonb": {"search_store.lexical_query": {"candidate_limit": 100}},
-                    "soft_limits_jsonb": {"voyage.embed_query": {"total_tokens": 1000}},
-                }
-            ]
+            row = {
+                "id": "policy_ws_prod_pro",
+                "workspace_id": params["workspace_id"],
+                "allowed_operations": ["search_store.*", "voyage.embed_query"],
+                "hard_limits_jsonb": {"search_store.lexical_query": {"candidate_limit": 100}},
+                "soft_limits_jsonb": {"voyage.embed_query": {"total_tokens": 1000}},
+            }
+            if self.requests_per_minute is not _MISSING:
+                row["requests_per_minute"] = self.requests_per_minute
+            return [row]
         if "FROM workspace_balances" in statement:
             if not self.balance:
                 return []
@@ -128,6 +134,26 @@ def test_postgres_usage_context_provider_loads_search_store_entitlement_inputs()
     assert context.allocation.id == "svc_ws_prod_search_store"
     assert context.policy.operation_allowed("search_store.lexical_query")
     assert context.balance.has_units({"queries": 1}) == (True, None)
+
+
+def test_active_policy_carries_requests_per_minute_when_present() -> None:
+    connection = EntitlementConnection(requests_per_minute="37")
+    provider = PostgresUsageContextProvider(connection)
+
+    policy = provider._active_policy(workspace_id="ws_prod")
+
+    assert policy is not None
+    assert policy.requests_per_minute == 37
+
+
+def test_active_policy_defaults_requests_per_minute_to_none_when_absent() -> None:
+    connection = EntitlementConnection()
+    provider = PostgresUsageContextProvider(connection)
+
+    policy = provider._active_policy(workspace_id="ws_prod")
+
+    assert policy is not None
+    assert policy.requests_per_minute is None
 
 
 def test_postgres_usage_context_provider_loads_voyage_allocation() -> None:

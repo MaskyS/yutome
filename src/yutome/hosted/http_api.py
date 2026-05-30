@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import json
+import logging
 import os
 import re
 import secrets
-import json
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,7 +22,10 @@ from yutome.hosted.account import (
     AccountBootstrapInput,
     AccountSessionError,
     bootstrap_hosted_account,
+    load_account_session_sql,
     normalize_email,
+    revoke_account_session_sql,
+    session_token_hash,
     sign_account_session_token,
     verify_account_session_token,
 )
@@ -68,6 +74,7 @@ from yutome.hosted.account_read import (
     read_workspace_summary,
 )
 from yutome.hosted.mcp_query import HostedMcpAuthContext, HostedMcpError, HostedMcpQueryAdapter
+from yutome.hosted.rate_gate import DEFAULT_REQUESTS_PER_MINUTE, RateGate
 from yutome.hosted.source_import import (
     HostedSourceImportActor,
     HostedSourceImportDescriptor,
@@ -116,11 +123,13 @@ ACCOUNT_SESSION_COOKIE_NAME = "yutome_account_session"
 ACCOUNT_SESSION_TTL_SECONDS = 60 * 60
 APP_BASE_URL_ENV_VAR = "YUTOME_APP_URL"
 LOGIN_TOKEN_TTL_SECONDS_ENV_VAR = "YUTOME_AUTH_LOGIN_TTL_SECONDS"
+RATE_LIMIT_RPM_ENV_VAR = "YUTOME_HOSTED_RATE_LIMIT_RPM"
 AUTH_DEV_RETURN_LINK_ENV_VAR = "YUTOME_AUTH_DEV_RETURN_LINK"
 _SAFE_READINESS_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _READINESS_ERROR_FIELDS = frozenset({"error", "message", "detail"})
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 _ENCODED_SLASH_OR_BACKSLASH = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
+_AUDIT_LOGGER = logging.getLogger("yutome.hosted.audit")
 
 
 class ToolCallRequest(BaseModel):
@@ -316,6 +325,7 @@ def build_postgres_app(
     dev_return_login_link: bool | None = None,
     youtube_oauth_settings: YouTubeOAuthSettings | None = None,
     google_signin_settings: GoogleSignInSettings | None = None,
+    requests_per_minute: int | None = None,
 ) -> Any:
     from yutome.hosted.entitlements import PostgresUsageContextProvider
     from yutome.hosted.search_store import PostgresVectorChordSearchStore
@@ -348,6 +358,7 @@ def build_postgres_app(
         else _auth_dev_return_link_from_env(),
         youtube_oauth_settings=youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ),
         google_signin_settings=google_signin_settings or google_signin_settings_from_env(os.environ),
+        requests_per_minute=requests_per_minute,
     )
     app.state.hosted_connection = connection
     app.state.hosted_search_store = search_store
@@ -373,6 +384,7 @@ def build_app(
     dev_return_login_link: bool | None = None,
     youtube_oauth_settings: YouTubeOAuthSettings | None = None,
     google_signin_settings: GoogleSignInSettings | None = None,
+    requests_per_minute: int | None = None,
 ) -> Any:
     from fastapi import Depends, FastAPI, Header
     from fastapi.responses import JSONResponse
@@ -408,8 +420,19 @@ def build_app(
     resolved_dev_return_login_link = bool(dev_return_login_link)
     resolved_youtube_oauth_settings = youtube_oauth_settings or youtube_oauth_settings_from_env(os.environ)
     resolved_google_signin_settings = google_signin_settings or google_signin_settings_from_env(os.environ)
+    configured_requests_per_minute = (
+        requests_per_minute if requests_per_minute is not None else _rate_limit_rpm_from_env()
+    )
+    resolved_rate_limit_rpm = (
+        configured_requests_per_minute
+        if configured_requests_per_minute is not None
+        else DEFAULT_REQUESTS_PER_MINUTE
+    )
+    app.state.hosted_rate_gate = RateGate(requests_per_minute=resolved_rate_limit_rpm)
+    app.state.hosted_rate_limit_requests_per_minute = resolved_rate_limit_rpm
     app.state.hosted_api_auth_required = True
     app.state.hosted_api_auth_configured = auth_dependency is not None or bool(normalized_api_token)
+    app.state.hosted_rate_limit_configured = True
     app.state.stripe_webhook_configured = bool(normalized_stripe_webhook_secret)
     app.state.account_session_signing_configured = bool(normalized_account_session_secret)
     app.state.hosted_account_api_configured = bool(normalized_account_api_token)
@@ -448,6 +471,80 @@ def build_app(
             raise _http_error(exc) from exc
 
     auth = auth_dependency or default_auth_dependency
+
+    @app.middleware("http")
+    async def rate_limit(request: Any, call_next: Any) -> Any:
+        path = request.url.path
+        authorization = request.headers.get("authorization")
+        workspace_id = _optional_text(request.headers.get(WORKSPACE_HEADER))
+        bearer_token = _bearer_token_or_none(authorization)
+        client_ip = _rate_limit_client_ip(request)
+
+        if path in {"/healthz", "/readyz"}:
+            response = await call_next(request)
+            _audit_hosted_request(
+                request=request,
+                response=response,
+                workspace_id=workspace_id,
+                auth_bearer_present=bearer_token is not None,
+                client_ip=client_ip,
+                rate_limit_outcome="allowed",
+            )
+            return response
+
+        if path == "/webhooks/stripe":
+            # The billing mirror (Stripe) webhook is exempt from the frequency gate; the
+            # handler performs Stripe signature verification before it mutates state.
+            response = await call_next(request)
+            _audit_hosted_request(
+                request=request,
+                response=response,
+                workspace_id=workspace_id,
+                auth_bearer_present=bearer_token is not None,
+                client_ip=client_ip,
+                rate_limit_outcome="allowed",
+            )
+            return response
+
+        key = _rate_limit_key(bearer_token=bearer_token, client_ip=client_ip)
+        rpm = int(getattr(app.state, "hosted_rate_limit_requests_per_minute", DEFAULT_REQUESTS_PER_MINUTE))
+        # TODO: EntitlementPolicy.requests_per_minute is hydrated for a future shared
+        # store/UsageGate path. This single-process middleware uses the app default to
+        # avoid a DB read before auth dependencies run.
+        decision = app.state.hosted_rate_gate.check(key, requests_per_minute=rpm)
+        if not decision.allowed:
+            error = HostedMcpError(
+                code="rate_limited",
+                message=decision.message or "Too many requests.",
+                status_code=429,
+            )
+            response = JSONResponse(
+                status_code=429,
+                content={"detail": error.to_dict()["error"]},
+                headers=_rate_limit_headers(decision, include_retry_after=True),
+            )
+            _audit_hosted_request(
+                request=request,
+                response=response,
+                workspace_id=workspace_id,
+                auth_bearer_present=bearer_token is not None,
+                client_ip=client_ip,
+                rate_limit_outcome="limited",
+            )
+            return response
+
+        response = await call_next(request)
+        for name, value in _rate_limit_headers(decision).items():
+            response.headers.setdefault(name, value)
+        _audit_hosted_request(
+            request=request,
+            response=response,
+            workspace_id=workspace_id,
+            auth_bearer_present=bearer_token is not None,
+            client_ip=client_ip,
+            rate_limit_outcome="allowed",
+        )
+        return response
 
     @app.middleware("http")
     async def security_headers(request: Any, call_next: Any) -> Any:
@@ -989,15 +1086,29 @@ def build_app(
                     status_code=401,
                 )
             )
+        account_session_token = account_session.strip()
         try:
             claims = verify_account_session_token(
-                account_session.strip(),
+                account_session_token,
                 secret=normalized_account_session_secret,
                 audience=normalized_account_session_audience,
                 max_age_seconds=account_session_ttl,
             )
         except AccountSessionError as exc:
             raise _http_error(HostedMcpError(code=exc.code, message=exc.message, status_code=exc.status_code)) from exc
+        session_hash = session_token_hash(account_session_token)
+        statement = load_account_session_sql(session_hash=session_hash)
+        session_rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        if session_rows:
+            session_row = session_rows[0]
+            if session_row.get("status") == "revoked" or session_row.get("revoked_at") is not None:
+                raise _http_error(
+                    HostedMcpError(
+                        code="account_session_revoked",
+                        message="Account session has been revoked.",
+                        status_code=401,
+                    )
+                )
         workspace = load_active_workspace(billing_connection, workspace_id=claims.workspace_id)
         if workspace is None:
             raise _http_error(
@@ -1445,6 +1556,26 @@ def build_app(
         except HostedYouTubeOAuthError as exc:
             raise _youtube_oauth_http_error(exc) from exc
 
+    @app.post("/account/session/revoke")
+    def account_session_revoke(
+        context: AccountApiContext = Depends(account_auth_dependency),
+        account_session: str | None = Header(default=None, alias=ACCOUNT_SESSION_TOKEN_HEADER),
+    ) -> dict[str, Any]:
+        if account_session is None or not account_session.strip():
+            raise _http_error(
+                HostedMcpError(
+                    code="account_session_required",
+                    message=f"Missing required {ACCOUNT_SESSION_TOKEN_HEADER} token.",
+                    status_code=401,
+                )
+            )
+        statement = revoke_account_session_sql(
+            session_hash=session_token_hash(account_session.strip()),
+            now=datetime.now(timezone.utc),
+        )
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        return {"ok": True, "revoked": bool(rows), "session_id": str(rows[0]["id"]) if rows else None}
+
     @app.get("/account/source-jobs")
     def account_source_jobs(
         limit: int = 25,
@@ -1654,6 +1785,17 @@ def _login_token_ttl_seconds_from_env(environ: Mapping[str, str] | None = None) 
         return None
 
 
+def _rate_limit_rpm_from_env(environ: Mapping[str, str] | None = None) -> int | None:
+    env = os.environ if environ is None else environ
+    raw = _normalize_api_token(env.get(RATE_LIMIT_RPM_ENV_VAR))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _auth_dev_return_link_from_env(environ: Mapping[str, str] | None = None) -> bool:
     env = os.environ if environ is None else environ
     raw = (env.get(AUTH_DEV_RETURN_LINK_ENV_VAR) or "").strip().lower()
@@ -1723,6 +1865,93 @@ def _verify_bearer_token(*, authorization: str | None, expected_api_token: str |
                 status_code=401,
             )
         )
+
+
+def _bearer_token_or_none(authorization: str | None) -> str | None:
+    if authorization is None or not authorization.strip():
+        return None
+    scheme, _, token = authorization.partition(" ")
+    candidate = token.strip()
+    if scheme.lower() != "bearer" or not candidate:
+        return None
+    return candidate
+
+
+def _rate_limit_client_ip(request: Any) -> str | None:
+    forwarded_ip = _client_ip_from_x_forwarded_for(request.headers.get("x-forwarded-for"))
+    if forwarded_ip is not None:
+        return forwarded_ip
+    return request.client.host if request.client is not None else None
+
+
+def _client_ip_from_x_forwarded_for(value: str | None) -> str | None:
+    raw = _optional_text(value)
+    if raw is None:
+        return None
+    # Railway's trusted edge appends the real connecting client to X-Forwarded-For.
+    # Any earlier entries may have been supplied by the caller, so the limiter
+    # keys on the proxy-inserted right-most hop only.
+    candidate = next((part.strip() for part in reversed(raw.split(",")) if part.strip()), None)
+    if candidate is None:
+        return None
+    return _normalize_forwarded_ip(candidate)
+
+
+def _normalize_forwarded_ip(value: str) -> str:
+    candidate = value.strip()
+    if candidate.startswith("["):
+        host, separator, _rest = candidate[1:].partition("]")
+        if separator:
+            candidate = host
+    elif candidate.count(":") == 1 and "." in candidate:
+        host, port = candidate.rsplit(":", 1)
+        if port.isdigit():
+            candidate = host
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return candidate
+
+
+def _rate_limit_key(*, bearer_token: str | None, client_ip: str | None) -> str:
+    if bearer_token:
+        token_hash = hashlib.sha256(bearer_token.encode("utf-8")).hexdigest()[:16]
+        return f"tok:{token_hash}"
+    return f"ip:{client_ip or 'unknown'}"
+
+
+def _rate_limit_headers(decision: Any, *, include_retry_after: bool = False) -> dict[str, str]:
+    headers = {
+        "RateLimit-Limit": str(decision.limit),
+        "RateLimit-Remaining": str(decision.remaining),
+        "RateLimit-Reset": str(decision.reset_seconds),
+    }
+    if include_retry_after and decision.retry_after_seconds is not None:
+        headers["Retry-After"] = str(decision.retry_after_seconds)
+    return headers
+
+
+def _audit_hosted_request(
+    *,
+    request: Any,
+    response: Any,
+    workspace_id: str | None,
+    auth_bearer_present: bool,
+    client_ip: str | None,
+    rate_limit_outcome: str,
+) -> None:
+    _AUDIT_LOGGER.info(
+        "hosted_http_request",
+        extra={
+            "http_method": request.method,
+            "path": request.url.path,
+            "status_code": getattr(response, "status_code", None),
+            "workspace_id": workspace_id,
+            "auth_bearer_present": auth_bearer_present,
+            "client_ip": client_ip,
+            "rate_limit_outcome": rate_limit_outcome,
+        },
+    )
 
 
 def _verify_bearer_token_any(*, authorization: str | None, expected_tokens: tuple[str | None, ...]) -> None:

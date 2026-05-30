@@ -217,16 +217,24 @@ class RecordingConnection:
         self,
         rows: list[dict[str, Any]] | None = None,
         *,
+        account_session_rows: list[dict[str, Any]] | None = None,
+        account_session_update_rows: list[dict[str, Any]] | None = None,
         workspace_subscription_status: str = "trialing",
         workspace_trial_ends_at: Any = "2999-01-01T00:00:00+00:00",
     ) -> None:
         self.rows = rows or []
+        self.account_session_rows = account_session_rows or []
+        self.account_session_update_rows = account_session_update_rows or []
         self.workspace_subscription_status = workspace_subscription_status
         self.workspace_trial_ends_at = workspace_trial_ends_at
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.calls.append((statement, dict(params or {})))
+        if "FROM account_sessions" in statement:
+            return list(self.account_session_rows)
+        if "UPDATE account_sessions" in statement:
+            return list(self.account_session_update_rows)
         # The entitlement provider checks trial-expiry before loading policy/balance; model an
         # entitled (trialing) workspace by default so denials fall through to the path under
         # test rather than short-circuiting at the trial gate.
@@ -261,6 +269,27 @@ def hosted_http_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Rec
     return TestClient(build_app(adapter=adapter, expected_api_token=TEST_API_TOKEN)), store, ledger
 
 
+def _tool_call_payload() -> dict[str, Any]:
+    return {"name": "find", "arguments": {"text": "Crohn", "mode": "lexical", "limit": 4}}
+
+
+def _rate_limited_client(*, requests_per_minute: int) -> TestClient:
+    store = RecordingSearchStore()
+    ledger = RecordingLedger()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=ledger,
+        usage_context_provider=_allow_search_usage_context,
+    )
+    return TestClient(
+        build_app(
+            adapter=adapter,
+            expected_api_token=TEST_API_TOKEN,
+            requests_per_minute=requests_per_minute,
+        )
+    )
+
+
 def test_health_endpoint_shape(hosted_http_client: tuple[TestClient, RecordingSearchStore, RecordingLedger]) -> None:
     client, _, _ = hosted_http_client
 
@@ -272,6 +301,119 @@ def test_health_endpoint_shape(hosted_http_client: tuple[TestClient, RecordingSe
     assert body["service"] == "yutome-hosted-mcp"
     assert body["contract"]["auth_scope"] == "yutome.search.read"
     assert "find" in body["contract"]["tools"]
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_rate_gate_returns_429_with_retry_after_and_ratelimit_headers() -> None:
+    client = _rate_limited_client(requests_per_minute=2)
+
+    first = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_http"))
+    second = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_http"))
+    limited = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_http"))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"]
+    assert limited.headers["RateLimit-Limit"] == "2"
+    assert limited.headers["RateLimit-Remaining"] == "0"
+    assert limited.headers["RateLimit-Reset"]
+    assert error_body(limited.json())["code"] == "rate_limited"
+
+
+def test_rate_gate_exempts_healthz_and_readyz() -> None:
+    client = _rate_limited_client(requests_per_minute=1)
+
+    responses = [client.get(path) for _ in range(4) for path in ("/healthz", "/readyz")]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+
+
+def test_rate_gate_exempts_stripe_webhook() -> None:
+    connection = RecordingConnection()
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(search_store=store)
+    client = TestClient(
+        build_app(
+            adapter=adapter,
+            billing_connection=connection,
+            stripe_webhook_secret="whsec_test",
+            requests_per_minute=1,
+        )
+    )
+
+    responses = []
+    for index in range(4):
+        raw_body = json.dumps(
+            {
+                "id": f"evt_rate_{index}",
+                "type": "checkout.session.completed",
+                "created": 1779753600,
+                "data": {
+                    "object": {
+                        "customer": "cus_123",
+                        "subscription": "sub_123",
+                        "status": "complete",
+                        "metadata": {"workspace_id": "ws_http"},
+                    }
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        responses.append(client.post("/webhooks/stripe", content=raw_body, headers=stripe_signature_header(raw_body)))
+
+    assert all(response.status_code != 429 for response in responses)
+    assert all(error_body(response.json()).get("code") != "rate_limited" for response in responses)
+
+
+def test_rate_gate_uses_proxy_appended_client_ip_for_unauthenticated_requests() -> None:
+    client = _rate_limited_client(requests_per_minute=1)
+
+    first_real_ip = client.post(
+        "/tools/call",
+        json=_tool_call_payload(),
+        headers={"X-Forwarded-For": "198.51.100.10, 203.0.113.10"},
+    )
+    second_real_ip = client.post(
+        "/tools/call",
+        json=_tool_call_payload(),
+        headers={"X-Forwarded-For": "198.51.100.10, 203.0.113.11"},
+    )
+    spoofed_leftmost = client.post(
+        "/tools/call",
+        json=_tool_call_payload(),
+        headers={"X-Forwarded-For": "198.51.100.99, 203.0.113.10"},
+    )
+
+    assert first_real_ip.status_code == 401
+    assert error_body(first_real_ip.json())["code"] == "api_token_required"
+    assert second_real_ip.status_code == 401
+    assert error_body(second_real_ip.json())["code"] == "api_token_required"
+    assert spoofed_leftmost.status_code == 429
+    assert error_body(spoofed_leftmost.json())["code"] == "rate_limited"
+
+
+def test_rate_gate_does_not_key_on_unvalidated_workspace_header() -> None:
+    client = _rate_limited_client(requests_per_minute=1)
+
+    allowed_a = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_rate_a"))
+    limited_b = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_rate_b"))
+
+    assert allowed_a.status_code == 200
+    assert limited_b.status_code == 429
+    assert error_body(limited_b.json())["code"] == "rate_limited"
+
+
+def test_successful_response_carries_ratelimit_headers() -> None:
+    client = _rate_limited_client(requests_per_minute=2)
+
+    response = client.post("/tools/call", json=_tool_call_payload(), headers=auth_headers("ws_http"))
+
+    assert response.status_code == 200
+    assert response.headers["RateLimit-Limit"] == "2"
+    assert response.headers["RateLimit-Remaining"] == "1"
+    assert response.headers["RateLimit-Reset"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
@@ -999,6 +1141,22 @@ def _account_search_client() -> tuple[TestClient, RecordingSearchStore]:
     return TestClient(app), store
 
 
+def _account_client_with_connection(connection: Any) -> tuple[TestClient, RecordingSearchStore]:
+    store = RecordingSearchStore()
+    adapter = HostedMcpQueryAdapter(
+        search_store=store,
+        ledger=RecordingLedger(),
+        usage_context_provider=_allow_search_usage_context,
+    )
+    app = build_app(
+        adapter=adapter,
+        billing_connection=connection,
+        expected_account_api_token=ACCOUNT_DASHBOARD_TOKEN,
+        account_session_secret=ACCOUNT_SESSION_SECRET,
+    )
+    return TestClient(app), store
+
+
 def test_account_search_uses_workspace_from_session_not_arguments() -> None:
     client, store = _account_search_client()
 
@@ -1105,6 +1263,83 @@ def test_account_search_rejects_invalid_session_before_search_store() -> None:
     assert expired.status_code == 401
     assert error_body(expired.json())["code"] == "account_session_expired"
     assert store.calls == []
+
+
+def test_account_session_revoke_marks_session_revoked() -> None:
+    raw_token = _account_session_token("ws_http")
+    expected_hash = session_token_hash(raw_token)
+    connection = RecordingConnection(
+        rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}],
+        account_session_update_rows=[{"id": "sess_x"}],
+    )
+    client, _store = _account_client_with_connection(connection)
+
+    response = client.post("/account/session/revoke", headers=_account_headers(raw_token))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["revoked"] is True
+    assert body["session_id"] == "sess_x"
+    update_calls = [(sql, params) for sql, params in connection.calls if "UPDATE account_sessions" in sql]
+    assert len(update_calls) == 1
+    update_sql, update_params = update_calls[0]
+    assert "status" in update_sql
+    assert "revoked_at" in update_sql
+    assert update_params["status"] == "revoked"
+    assert update_params["revoked_at"] is not None
+    assert expected_hash in update_params.values()
+
+
+def test_account_session_revoke_requires_session_token() -> None:
+    connection = RecordingConnection(rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}])
+    client, _store = _account_client_with_connection(connection)
+
+    response = client.post(
+        "/account/session/revoke",
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_session_required"
+
+
+def test_account_auth_dependency_denies_revoked_session() -> None:
+    connection = RecordingConnection(
+        rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}],
+        account_session_rows=[
+            {"id": "sess_x", "status": "revoked", "revoked_at": "2026-01-01T00:00:00+00:00"}
+        ],
+    )
+    client, store = _account_client_with_connection(connection)
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 401
+    assert error_body(response.json())["code"] == "account_session_revoked"
+    assert store.calls == []
+
+
+def test_account_auth_dependency_allows_session_with_no_persisted_row() -> None:
+    connection = RecordingConnection(
+        rows=[{"id": "ws_http", "name": "Workspace", "status": "active"}],
+        account_session_rows=[],
+    )
+    client, store = _account_client_with_connection(connection)
+
+    response = client.post(
+        "/account/search",
+        json={"text": "Crohn", "mode": "lexical", "limit": 4},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert store.calls == [{"workspace_id": "ws_http", "query": "Crohn", "limit": 4}]
 
 
 class RecordingEmailSender:

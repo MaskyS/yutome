@@ -142,6 +142,7 @@ class PostgresUsageContextProvider:
             allowed_operations=set(_text_array(row.get("allowed_operations"))),
             hard_limits_by_operation=_json_mapping(row.get("hard_limits_jsonb")),
             soft_limits_by_operation=_json_mapping(row.get("soft_limits_jsonb")),
+            requests_per_minute=_optional_int(row.get("requests_per_minute")),
         )
 
     def _active_balance(self, *, workspace_id: str, entitlement_policy_id: str | None) -> WorkspaceBalance | None:
@@ -356,6 +357,15 @@ def _text_array(value: Any) -> list[str]:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _now_utc() -> datetime:

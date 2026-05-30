@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 from yutome.hosted.account import (
@@ -12,7 +13,9 @@ from yutome.hosted.account import (
     account_bootstrap_sql,
     bootstrap_hosted_account,
     deterministic_user_id,
+    load_account_session_sql,
     normalize_email,
+    revoke_account_session_sql,
     session_token_hash,
     sql_params_contain_provider_credentials,
     starter_provider_allocation_id,
@@ -141,6 +144,30 @@ def test_bootstrap_helper_is_idempotent_and_persists_hashed_session_only() -> No
     user_calls = [params for sql, params in connection.calls if "INSERT INTO users" in sql]
     assert {params["id"] for params in user_calls} == {account.user_id}
     assert {params["normalized_email"] for params in user_calls} == {"alice@yutome.com"}
+
+
+def test_load_account_session_sql_selects_by_session_hash() -> None:
+    statement = load_account_session_sql(session_hash="sha256:abc")
+
+    assert "FROM account_sessions" in statement.sql
+    assert "session_hash" in statement.sql
+    assert statement.sql.endswith(";")
+    assert "sha256:abc" in statement.params.values()
+
+
+def test_revoke_account_session_sql_sets_revoked_status_and_timestamp() -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    statement = revoke_account_session_sql(session_hash="sha256:abc", now=now)
+
+    assert statement.sql.startswith("UPDATE account_sessions")
+    assert "status" in statement.sql
+    assert "revoked_at" in statement.sql
+    assert "RETURNING" in statement.sql
+    assert "updated_at" not in statement.sql
+    assert "revoked" in statement.params.values()
+    assert "sha256:abc" in statement.params.values()
+    assert now in statement.params.values()
 
 
 def test_account_bootstrap_sql_does_not_persist_provider_credentials() -> None:
