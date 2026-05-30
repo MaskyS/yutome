@@ -66,6 +66,8 @@ class _StaticBearerVerifier:
         return AccessToken(
             token=token,
             client_id="yutome-remote",
+            # On local/private MCP surfaces this bearer token is the corpus-owner
+            # proof and grants the full registry, not read-only access.
             scopes=[AUTH_SCOPE],
         )
 
@@ -112,9 +114,10 @@ def build_server(
 
     server = FastMCP(**server_kwargs)
 
-    # Register tools from the registry. FastMCP introspects each handler's
-    # signature to derive its JSON Schema, so the handler functions in
-    # contract.py carry the canonical parameter shape.
+    # Register the full registry for local/private MCP surfaces, including
+    # index/jobs by design. See docs/architecture/mcp-capabilities.md.
+    # FastMCP introspects each handler's signature to derive its JSON Schema,
+    # so the handler functions in contract.py carry the canonical parameter shape.
     for tool in contract.TOOLS:
         annotations = ToolAnnotations(
             title=tool.title,

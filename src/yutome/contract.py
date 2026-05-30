@@ -15,6 +15,10 @@ from typing import Any, Callable
 from yutome import runtime, search_presets
 
 
+# Baseline MCP auth scope. Local/private MCP surfaces treat possession of their
+# local/private bearer proof as full-capability access to the corpus owner data,
+# including write-capable tools. Hosted MCP uses this as the baseline read scope
+# and requires the write scopes below for hosted source indexing.
 AUTH_SCOPE = "yutome.search.read"
 SOURCE_WRITE_SCOPE = "yutome.source.write"
 JOB_WRITE_SCOPE = "yutome.job.write"
