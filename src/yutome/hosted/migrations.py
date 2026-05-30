@@ -412,6 +412,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_email_login_tokens_token_hash
     ON email_login_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_email_login_tokens_email
     ON email_login_tokens(normalized_email, created_at DESC);
+CREATE TABLE IF NOT EXISTS api_keys (
+    id text PRIMARY KEY,
+    workspace_id text NOT NULL REFERENCES workspaces(id),
+    user_id text NOT NULL REFERENCES users(id),
+    key_hash text NOT NULL,
+    name text,
+    scopes text[] NOT NULL DEFAULT ARRAY[]::text[],
+    status text NOT NULL DEFAULT 'active',
+    metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    expires_at timestamptz,
+    revoked_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash
+    ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_workspace_status
+    ON api_keys(workspace_id, status);
 """
 
 

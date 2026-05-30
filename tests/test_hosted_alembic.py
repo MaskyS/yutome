@@ -21,5 +21,7 @@ def test_hosted_core_metadata_tracks_hosted_schema_tables() -> None:
     ddl_tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+)", ddl))
 
     assert set(hosted_metadata.tables) == ddl_tables
+    assert "api_keys" in hosted_metadata.tables
+    assert "key_hash" in hosted_metadata.tables["api_keys"].c
     assert "bm25_document" in hosted_metadata.tables["chunks"].c
     assert "embedding" in hosted_metadata.tables["chunk_embeddings"].c

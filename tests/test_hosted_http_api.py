@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,12 +14,14 @@ from fastapi.testclient import TestClient
 
 from datetime import datetime, timedelta, timezone
 
+from yutome import contract
 from yutome.hosted.allocation_policy import default_search_store_allocation
 from yutome.hosted.account import (
     DEFAULT_ACCOUNT_SESSION_AUDIENCE,
     session_token_hash,
     sign_account_session_token,
 )
+from yutome.hosted.api_keys import API_KEY_PREFIX, api_key_hash
 from yutome.hosted.http_api import (
     ACCOUNT_SESSION_COOKIE_NAME,
     ACCOUNT_SESSION_HMAC_SECRET_ENV_VAR,
@@ -1157,6 +1160,96 @@ def _account_client_with_connection(connection: Any) -> tuple[TestClient, Record
     return TestClient(app), store
 
 
+def _jsonb_obj(value: object) -> dict[str, Any]:
+    obj = getattr(value, "obj", value)
+    assert isinstance(obj, Mapping)
+    return dict(obj)
+
+
+def _contains_raw_key(value: object, raw_key: str) -> bool:
+    if isinstance(value, str):
+        return raw_key in value
+    obj = getattr(value, "obj", value)
+    if isinstance(obj, Mapping):
+        return any(_contains_raw_key(item, raw_key) for item in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return any(_contains_raw_key(item, raw_key) for item in obj)
+    return False
+
+
+class StatefulApiKeyConnection:
+    def __init__(self) -> None:
+        self.workspace = {"id": "ws_http", "name": "Workspace", "status": "active"}
+        self.api_keys: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        params = dict(params or {})
+        self.calls.append((statement, params))
+        if "FROM account_sessions" in statement:
+            return []
+        if "UPDATE account_sessions" in statement:
+            return []
+        if "FROM workspaces" in statement:
+            return [dict(self.workspace)] if params.get("workspace_id") == self.workspace["id"] else []
+        if statement.startswith("INSERT INTO api_keys"):
+            row = {
+                "id": params["id"],
+                "workspace_id": params["workspace_id"],
+                "user_id": params["user_id"],
+                "key_hash": params["key_hash"],
+                "name": params["name"],
+                "scopes": params["scopes"],
+                "status": "active",
+                "metadata_json": _jsonb_obj(params["metadata_json"]),
+                "created_at": datetime.now(timezone.utc),
+                "last_used_at": None,
+                "expires_at": params["expires_at"],
+                "revoked_at": None,
+            }
+            self.api_keys[row["id"]] = row
+            return [dict(row)]
+        if "FROM api_keys" in statement and "key_hash" in params:
+            rows = [
+                row
+                for row in self.api_keys.values()
+                if row["key_hash"] == params["key_hash"] and row["status"] == "active" and row["revoked_at"] is None
+            ]
+            return [dict(rows[0])] if rows else []
+        if "FROM api_keys" in statement and "workspace_id" in params:
+            rows = [row for row in self.api_keys.values() if row["workspace_id"] == params["workspace_id"]]
+            return [dict(row) for row in sorted(rows, key=lambda row: row["created_at"], reverse=True)]
+        if statement.startswith("UPDATE api_keys") and "revoked_at" in statement:
+            row = self.api_keys.get(params["key_id"])
+            if row is None or row["workspace_id"] != params["workspace_id"] or row["revoked_at"] is not None:
+                return []
+            row["status"] = "revoked"
+            row["revoked_at"] = params["now"]
+            return [{"id": row["id"]}]
+        if statement.startswith("UPDATE api_keys") and "last_used_at" in statement:
+            row = self.api_keys.get(params["key_id"])
+            if row is not None:
+                row["last_used_at"] = params["now"]
+            return []
+        return []
+
+
+def _api_key_test_client() -> tuple[TestClient, RecordingSearchStore, StatefulApiKeyConnection]:
+    connection = StatefulApiKeyConnection()
+    client, store = _account_client_with_connection(connection)
+    return client, store, connection
+
+
+def _create_api_key(client: TestClient, *, name: str = "Dev key") -> dict[str, Any]:
+    response = client.post(
+        "/account/api-keys",
+        json={"name": name},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def test_account_search_uses_workspace_from_session_not_arguments() -> None:
     client, store = _account_search_client()
 
@@ -1340,6 +1433,147 @@ def test_account_auth_dependency_allows_session_with_no_persisted_row() -> None:
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert store.calls == [{"workspace_id": "ws_http", "query": "Crohn", "limit": 4}]
+
+
+def test_create_api_key_returns_raw_once_and_persists_hash_only() -> None:
+    client, _store, connection = _api_key_test_client()
+
+    body = _create_api_key(client, name="Local dev")
+
+    raw_key = body["key"]
+    assert raw_key.startswith(API_KEY_PREFIX)
+    stored = connection.api_keys[body["id"]]
+    assert stored["key_hash"] == api_key_hash(raw_key)
+    assert stored["name"] == "Local dev"
+    assert raw_key not in json.dumps(stored, default=str)
+    assert all(
+        not _contains_raw_key(value, raw_key)
+        for _sql, params in connection.calls
+        for value in params.values()
+    )
+
+
+def test_list_api_keys_never_leaks_hash_or_raw() -> None:
+    client, _store, _connection = _api_key_test_client()
+    first = _create_api_key(client, name="First key")
+    second = _create_api_key(client, name="Second key")
+
+    response = client.get("/account/api-keys", headers=_account_headers(_account_session_token("ws_http")))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    payload = json.dumps(body)
+    assert body["ok"] is True
+    assert {item["name"] for item in body["api_keys"]} == {"First key", "Second key"}
+    assert all({"id", "name", "scopes", "status", "created_at"} <= set(item) for item in body["api_keys"])
+    assert "key_hash" not in payload
+    assert first["key"] not in payload
+    assert second["key"] not in payload
+
+
+def test_revoke_api_key_is_idempotent_and_tenant_scoped() -> None:
+    client, _store, connection = _api_key_test_client()
+    created = _create_api_key(client)
+
+    revoked = client.delete(
+        f"/account/api-keys/{created['id']}",
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+    repeated = client.delete(
+        f"/account/api-keys/{created['id']}",
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["revoked"] is True
+    assert repeated.status_code == 404
+    assert error_body(repeated.json())["code"] == "api_key_not_found"
+    stored = connection.api_keys[created["id"]]
+    assert stored["status"] == "revoked"
+    assert stored["revoked_at"] is not None
+
+
+def test_api_key_bearer_can_call_find() -> None:
+    client, store, connection = _api_key_test_client()
+    created = _create_api_key(client)
+
+    response = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical", "limit": 4},
+        headers={"Authorization": f"Bearer {created['key']}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+    assert store.calls == [{"workspace_id": "ws_http", "query": "Crohn", "limit": 4}]
+    assert connection.api_keys[created["id"]]["last_used_at"] is not None
+
+
+def test_api_key_bearer_rejects_unknown_revoked_and_expired() -> None:
+    client, _store, connection = _api_key_test_client()
+
+    unknown = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": "Bearer yk_unknown"},
+    )
+    revoked_key = _create_api_key(client, name="Revoked key")
+    connection.api_keys[revoked_key["id"]]["status"] = "revoked"
+    connection.api_keys[revoked_key["id"]]["revoked_at"] = datetime.now(timezone.utc)
+    revoked = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": f"Bearer {revoked_key['key']}"},
+    )
+    expired_key = _create_api_key(client, name="Expired key")
+    connection.api_keys[expired_key["id"]]["expires_at"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+    expired = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": f"Bearer {expired_key['key']}"},
+    )
+
+    assert unknown.status_code == 401
+    assert error_body(unknown.json())["code"] == "api_key_invalid"
+    assert revoked.status_code == 401
+    assert error_body(revoked.json())["code"] == "api_key_invalid"
+    assert expired.status_code == 401
+    assert error_body(expired.json())["code"] == "api_key_expired"
+
+
+def test_api_key_bearer_cannot_use_infra_or_dashboard_token() -> None:
+    client, store, _connection = _api_key_test_client()
+
+    infra = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
+    )
+    dashboard = client.post(
+        "/account/keys/find",
+        json={"text": "Crohn", "mode": "lexical"},
+        headers={"Authorization": f"Bearer {ACCOUNT_DASHBOARD_TOKEN}"},
+    )
+
+    assert infra.status_code == 401
+    assert error_body(infra.json())["code"] == "api_key_invalid"
+    assert dashboard.status_code == 401
+    assert error_body(dashboard.json())["code"] == "api_key_invalid"
+    assert store.calls == []
+
+
+def test_create_api_key_rejects_out_of_allowlist_scope() -> None:
+    client, _store, connection = _api_key_test_client()
+
+    response = client.post(
+        "/account/api-keys",
+        json={"scopes": [contract.SOURCE_WRITE_SCOPE]},
+        headers=_account_headers(_account_session_token("ws_http")),
+    )
+
+    assert response.status_code == 400
+    assert error_body(response.json())["code"] == "api_key_scope_invalid"
+    assert connection.api_keys == {}
 
 
 class RecordingEmailSender:

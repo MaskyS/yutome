@@ -208,6 +208,26 @@ Index(
     postgresql_where=account_grants.c.install_id.is_not(None),
 )
 
+api_keys = Table(
+    "api_keys",
+    hosted_metadata,
+    Column("id", Text, primary_key=True),
+    Column("workspace_id", Text, ForeignKey("workspaces.id"), nullable=False),
+    Column("user_id", Text, ForeignKey("users.id"), nullable=False),
+    Column("key_hash", Text, nullable=False),
+    Column("name", Text),
+    Column("scopes", ARRAY(Text), nullable=False, server_default=text("ARRAY[]::text[]")),
+    Column("status", Text, nullable=False, server_default=text("'active'")),
+    Column("metadata_json", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("last_used_at", DateTime(timezone=True)),
+    Column("expires_at", DateTime(timezone=True)),
+    Column("revoked_at", DateTime(timezone=True)),
+)
+
+Index("idx_api_keys_key_hash", api_keys.c.key_hash, unique=True)
+Index("idx_api_keys_workspace_status", api_keys.c.workspace_id, api_keys.c.status)
+
 youtube_grants = Table(
     "youtube_grants",
     hosted_metadata,
@@ -557,6 +577,7 @@ __all__ = [
     "hosted_metadata",
     "account_grants",
     "account_sessions",
+    "api_keys",
     "chunk_embeddings",
     "chunks",
     "email_login_tokens",

@@ -67,6 +67,17 @@ from yutome.hosted.account_cli import (
     sign_cli_token,
     verify_cli_token,
 )
+from yutome.hosted.api_keys import (
+    DEFAULT_API_KEY_SCOPES,
+    api_key_hash,
+    insert_api_key_sql,
+    list_api_keys_sql,
+    load_active_api_key_by_hash_sql,
+    mark_api_key_used_sql,
+    new_api_key,
+    new_api_key_id,
+    revoke_api_key_sql,
+)
 from yutome.hosted.account_read import (
     load_active_workspace,
     read_active_account_grants,
@@ -200,6 +211,13 @@ class AccountCliTokenRequest(BaseModel):
     code: str
     code_verifier: str
     redirect_uri: str
+
+
+class ApiKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    scopes: list[str] = Field(default_factory=list)
 
 
 class AccountYouTubeAuthorizeRequest(BaseModel):
@@ -1281,6 +1299,61 @@ def build_app(
             install_id=claims.install_id,
         )
 
+    def api_key_auth_dependency(authorization: str | None = Header(default=None)) -> HostedMcpAuthContext:
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="api_key_connection_unconfigured",
+                    message="Hosted personal API key authentication requires a database connection.",
+                    status_code=503,
+                )
+            )
+        try:
+            presented_key = _bearer_token(authorization)
+            presented_hash = api_key_hash(presented_key)
+        except (AccountSessionError, ValueError) as exc:
+            raise _http_error(
+                HostedMcpError(
+                    code="api_key_required",
+                    message="Missing required Authorization bearer API key.",
+                    status_code=401,
+                )
+            ) from exc
+
+        statement = load_active_api_key_by_hash_sql(key_hash=presented_hash)
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        row = rows[0] if rows else None
+        if row is None or str(row.get("status") or "") != "active" or row.get("revoked_at") is not None:
+            raise _http_error(
+                HostedMcpError(code="api_key_invalid", message="Personal API key is invalid.", status_code=401)
+            )
+
+        expires_at = _row_datetime(row.get("expires_at"))
+        if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+            raise _http_error(
+                HostedMcpError(code="api_key_expired", message="Personal API key has expired.", status_code=401)
+            )
+
+        workspace_id = str(row.get("workspace_id") or "")
+        workspace = load_active_workspace(billing_connection, workspace_id=workspace_id)
+        if workspace is None:
+            raise _http_error(
+                HostedMcpError(code="workspace_not_found", message="Workspace not found.", status_code=404)
+            )
+
+        used_statement = mark_api_key_used_sql(key_id=str(row.get("id") or ""), now=datetime.now(timezone.utc))
+        billing_connection.execute(used_statement.sql, used_statement.params)
+        scopes = frozenset(_row_scopes(row.get("scopes"))) or frozenset(DEFAULT_API_KEY_SCOPES)
+        try:
+            return HostedMcpAuthContext(
+                workspace_id=workspace_id,
+                scopes=scopes,
+                user_id=str(row.get("user_id") or "") or None,
+                grant_id=str(row.get("id") or "") or None,
+            ).validated()
+        except HostedMcpError as exc:
+            raise _http_error(exc) from exc
+
     @app.post("/account/cli/authorize")
     def account_cli_authorize(
         request: AccountCliAuthorizeRequest,
@@ -1595,6 +1668,76 @@ def build_app(
         rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
         return {"ok": True, "revoked": bool(rows), "session_id": str(rows[0]["id"]) if rows else None}
 
+    @app.post("/account/api-keys")
+    def account_api_key_create(
+        request: ApiKeyCreateRequest,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="api_key_connection_unconfigured",
+                    message="Hosted personal API key management requires a database connection.",
+                    status_code=503,
+                )
+            )
+        scopes = _normalize_api_key_scopes(request.scopes)
+        raw_key = new_api_key()
+        statement = insert_api_key_sql(
+            key_id=new_api_key_id(),
+            key_hash=api_key_hash(raw_key),
+            workspace_id=context.workspace_id,
+            user_id=context.user_id,
+            scopes=scopes,
+            name=_optional_text(request.name),
+            expires_at=None,
+        )
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        row = rows[0] if rows else {"id": statement.params["id"], "name": request.name, "created_at": None}
+        return {
+            "ok": True,
+            "key": raw_key,
+            "id": str(row.get("id") or statement.params["id"]),
+            "name": _api_key_name(row.get("name")),
+            "scopes": list(_row_scopes(row.get("scopes")) or scopes),
+            "created_at": _datetime_json(row.get("created_at")),
+        }
+
+    @app.get("/account/api-keys")
+    def account_api_keys_list(context: AccountApiContext = Depends(account_auth_dependency)) -> dict[str, Any]:
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="api_key_connection_unconfigured",
+                    message="Hosted personal API key management requires a database connection.",
+                    status_code=503,
+                )
+            )
+        statement = list_api_keys_sql(workspace_id=context.workspace_id)
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        return {"ok": True, "api_keys": [_api_key_row_json(row) for row in rows]}
+
+    @app.delete("/account/api-keys/{key_id}")
+    def account_api_key_revoke(
+        key_id: str,
+        context: AccountApiContext = Depends(account_auth_dependency),
+    ) -> dict[str, Any]:
+        if billing_connection is None:
+            raise _http_error(
+                HostedMcpError(
+                    code="api_key_connection_unconfigured",
+                    message="Hosted personal API key management requires a database connection.",
+                    status_code=503,
+                )
+            )
+        statement = revoke_api_key_sql(key_id=key_id, workspace_id=context.workspace_id, now=datetime.now(timezone.utc))
+        rows = _rows_from_result(billing_connection.execute(statement.sql, statement.params))
+        if not rows:
+            raise _http_error(
+                HostedMcpError(code="api_key_not_found", message="Personal API key not found.", status_code=404)
+            )
+        return {"ok": True, "id": str(rows[0]["id"]), "revoked": True}
+
     @app.get("/account/source-jobs")
     def account_source_jobs(
         limit: int = 25,
@@ -1676,6 +1819,49 @@ def build_app(
             raise _http_error(exc) from exc
         return {"ok": True, "result": result}
 
+    @app.post("/account/keys/find")
+    def account_key_find(
+        request: AccountSearchRequest,
+        context: HostedMcpAuthContext = Depends(api_key_auth_dependency),
+    ) -> dict[str, Any]:
+        return _account_key_tool_response(
+            adapter=adapter,
+            auth=context,
+            name="find",
+            arguments=request.model_dump(exclude_none=True, by_alias=True),
+        )
+
+    @app.post("/account/keys/show")
+    def account_key_show(
+        request: AccountShowRequest,
+        context: HostedMcpAuthContext = Depends(api_key_auth_dependency),
+    ) -> dict[str, Any]:
+        return _account_key_tool_response(
+            adapter=adapter,
+            auth=context,
+            name="show",
+            arguments=request.model_dump(exclude_none=True),
+        )
+
+    @app.post("/account/keys/list")
+    def account_key_list(
+        request: AccountListRequest,
+        context: HostedMcpAuthContext = Depends(api_key_auth_dependency),
+    ) -> dict[str, Any]:
+        return _account_key_tool_response(
+            adapter=adapter,
+            auth=context,
+            name="list",
+            arguments=request.model_dump(exclude_none=True),
+        )
+
+    @app.post("/account/keys/q")
+    def account_key_q(
+        arguments: dict[str, Any],
+        context: HostedMcpAuthContext = Depends(api_key_auth_dependency),
+    ) -> dict[str, Any]:
+        return _account_key_tool_response(adapter=adapter, auth=context, name="q", arguments=arguments)
+
     return app
 
 
@@ -1706,6 +1892,39 @@ def _account_query_auth(context: AccountApiContext) -> HostedMcpAuthContext:
         user_id=context.user_id,
         dashboard_read=True,
     ).validated()
+
+
+def _account_key_tool_response(
+    *,
+    adapter: HostedMcpQueryAdapter,
+    auth: HostedMcpAuthContext,
+    name: str,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        result = adapter.call_tool(auth=auth, name=name, arguments=arguments)
+    except HostedMcpError as exc:
+        raise _http_error(exc) from exc
+    return {"ok": True, "result": result}
+
+
+def _api_key_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _optional_text(str(value))
+
+
+def _api_key_row_json(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row.get("id") or ""),
+        "name": _api_key_name(row.get("name")),
+        "scopes": list(_row_scopes(row.get("scopes"))),
+        "status": str(row.get("status") or ""),
+        "created_at": _datetime_json(row.get("created_at")),
+        "last_used_at": _datetime_json(row.get("last_used_at")),
+        "expires_at": _datetime_json(row.get("expires_at")),
+        "revoked_at": _datetime_json(row.get("revoked_at")),
+    }
 
 
 def _api_token_from_env(environ: Mapping[str, str] | None = None) -> str | None:
@@ -2054,6 +2273,23 @@ def _normalize_cli_scopes(scopes: list[str]) -> tuple[str, ...]:
         raise _http_error(
             HostedMcpError(
                 code="cli_scope_invalid", message=f"Unsupported hosted CLI scope: {unknown[0]}", status_code=400
+            )
+        )
+    return tuple(dict.fromkeys(requested))
+
+
+def _normalize_api_key_scopes(scopes: list[str]) -> tuple[str, ...]:
+    allowed = set(DEFAULT_API_KEY_SCOPES)
+    requested = tuple(scope.strip() for scope in scopes if scope and scope.strip())
+    if not requested:
+        return DEFAULT_API_KEY_SCOPES
+    unknown = [scope for scope in requested if scope not in allowed]
+    if unknown:
+        raise _http_error(
+            HostedMcpError(
+                code="api_key_scope_invalid",
+                message=f"Unsupported personal API key scope: {unknown[0]}",
+                status_code=400,
             )
         )
     return tuple(dict.fromkeys(requested))
