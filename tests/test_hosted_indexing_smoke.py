@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from psycopg.types.json import Jsonb
 
+from yutome.channels import LibraryChannel
 from yutome.config import AppConfig, GeminiConfig, ProxyConfig
 from yutome.hashing import sha256_json
 from yutome.hosted.control_plane import Job, Source
@@ -22,6 +23,7 @@ from yutome.hosted.models import (
     WorkspaceBalance,
 )
 from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied, execute_provider_call
+from yutome.hosted.youtube_oauth_service import HostedYouTubeOAuthError
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
     HostedIndexingError,
@@ -1386,6 +1388,185 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     finish_sql = "\n".join(statement for statement, _params in connection.calls if "UPDATE source_refresh_policies" in statement)
     assert "cursor_json = cursor_json ||" in finish_sql
     assert "cursor_jsonb" not in finish_sql
+
+
+class _SubscriptionDiscoveryConnection:
+    def __init__(
+        self,
+        *,
+        auth_grant_id: str | None = "ytg_alice",
+        grant_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.auth_grant_id = auth_grant_id
+        self.grant_rows = list(grant_rows or [])
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        params = dict(params or {})
+        self.calls.append((statement, params))
+        if "UPDATE jobs" in statement and "lease_expires_at = %(lease_expires_at)s" in statement:
+            return [{"id": params.get("job_id"), "lease_owner": params.get("lease_owner")}]
+        if "FROM sources" in statement:
+            return [
+                {
+                    "id": "src_subs",
+                    "workspace_id": "ws_alice",
+                    "source_type": "subscription_collection",
+                    "source_url": "youtube://subscriptions/mine",
+                    "canonical_channel_id": None,
+                    "canonical_playlist_id": None,
+                    "canonical_video_id": None,
+                    "display_name": "Alice subscriptions",
+                    "selected": True,
+                    "auto_index_allowed": True,
+                    "import_source": "oauth_sync",
+                    "auth_grant_id": self.auth_grant_id,
+                    "metadata_json": {},
+                    "status": "active",
+                }
+            ]
+        if "FROM youtube_grants" in statement:
+            return self.grant_rows
+        if statement.startswith("INSERT INTO sources"):
+            return [
+                {
+                    "id": params["id"],
+                    "source_type": params.get("source_type"),
+                    "source_url": params.get("source_url"),
+                }
+            ]
+        if statement.startswith("INSERT INTO source_refresh_policies"):
+            return [
+                {
+                    "id": params["id"],
+                    "enabled": params.get("enabled"),
+                    "cadence_seconds": params.get("cadence_seconds"),
+                }
+            ]
+        if statement.startswith("INSERT INTO jobs"):
+            return [
+                {
+                    "id": params["id"],
+                    "job_type": params.get("job_type"),
+                    "status": params.get("status"),
+                    "source_id": params.get("source_id"),
+                }
+            ]
+        return []
+
+
+def _subscription_discovery_job() -> Job:
+    return Job(
+        id="job_discover_subs",
+        workspace_id="ws_alice",
+        source_id="src_subs",
+        job_type="discover_source",
+        status="queued",
+        priority=10,
+        idempotency_key="ws_alice:src_subs:discover_source",
+        lease_owner="worker-1",
+        metadata_jsonb={"source_refresh_policy_id": "srp_subs", "max_new_videos_per_run": 5},
+        created_at=NOW,
+    )
+
+
+def test_subscription_collection_discovery_fans_out_to_channel_sources() -> None:
+    def lister(_connection: Any, source: Source) -> list[LibraryChannel]:
+        assert source.auth_grant_id == "ytg_alice"
+        return [
+            LibraryChannel(
+                library_channel_id="c1",
+                source="youtube:channel:UCaaaaaaaaaaaaaaaaaaaaaa",
+                source_url="https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa",
+                channel_id="UCaaaaaaaaaaaaaaaaaaaaaa",
+                title="A",
+            ),
+            LibraryChannel(
+                library_channel_id="c2",
+                source="youtube:channel:UCbbbbbbbbbbbbbbbbbbbbbb",
+                source_url="https://www.youtube.com/channel/UCbbbbbbbbbbbbbbbbbbbbbb",
+                channel_id="UCbbbbbbbbbbbbbbbbbbbbbb",
+                title="B",
+            ),
+        ]
+
+    connection = _SubscriptionDiscoveryConnection()
+    executor = HostedSourceDiscoveryExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        subscription_channel_lister=lister,
+    )
+
+    result = executor.execute(_subscription_discovery_job(), lease_owner="worker-1", now=NOW)
+
+    source_inserts = [params for statement, params in connection.calls if statement.startswith("INSERT INTO sources")]
+    job_inserts = [params for statement, params in connection.calls if statement.startswith("INSERT INTO jobs")]
+    child_discover_jobs = [params for params in job_inserts if params.get("job_type") == "discover_source"]
+
+    assert result.status == "succeeded"
+    assert result.discovered_videos == 2
+    assert result.enqueued_jobs == 2
+    assert len(source_inserts) == 2
+    assert {params["import_source"] for params in source_inserts} == {"public_api"}
+    assert {params.get("auth_grant_id") for params in source_inserts} == {None}
+    assert len(child_discover_jobs) == 2
+    assert {params["source_id"] for params in child_discover_jobs} == {params["id"] for params in source_inserts}
+    assert [params for params in job_inserts if params.get("job_type") == "index_video"] == []
+    finish_sql = "\n".join(statement for statement, _params in connection.calls if "UPDATE source_refresh_policies" in statement)
+    assert "cursor_json = cursor_json ||" in finish_sql
+
+
+def test_subscription_collection_discovery_marks_source_auth_failed_on_revoked_grant() -> None:
+    def lister(_connection: Any, _source: Source) -> list[LibraryChannel]:
+        raise HostedYouTubeOAuthError(
+            code="youtube_oauth_reconnect_required",
+            message="reconnect",
+            status_code=401,
+        )
+
+    connection = _SubscriptionDiscoveryConnection()
+    executor = HostedSourceDiscoveryExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        subscription_channel_lister=lister,
+    )
+
+    result = executor.execute(_subscription_discovery_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "denied"
+    assert result.error_code == "source_auth_failed"
+    assert any("UPDATE sources" in statement and "status = 'auth_failed'" in statement for statement, _params in connection.calls)
+    assert any(
+        "UPDATE jobs" in statement and params.get("status") == "denied" and params.get("error_code") == "source_auth_failed"
+        for statement, params in connection.calls
+    )
+    assert not any("UPDATE jobs" in statement and params.get("status") == "retry_wait" for statement, params in connection.calls)
+    assert not any("retry_after" in params for _statement, params in connection.calls)
+    assert not any(statement.startswith("INSERT INTO jobs") for statement, _params in connection.calls)
+
+
+def test_subscription_collection_discovery_missing_grant_id_is_auth_failed() -> None:
+    connection = _SubscriptionDiscoveryConnection(auth_grant_id=None, grant_rows=[])
+    executor = HostedSourceDiscoveryExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        youtube_oauth_settings=None,
+    )
+
+    result = executor.execute(_subscription_discovery_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "denied"
+    assert result.error_code == "source_auth_failed"
+    assert any("FROM youtube_grants" in statement for statement, _params in connection.calls)
+    assert any("UPDATE sources" in statement and "status = 'auth_failed'" in statement for statement, _params in connection.calls)
+    assert not any("UPDATE jobs" in statement and params.get("status") == "retry_wait" for statement, params in connection.calls)
+    assert not any(statement.startswith("INSERT INTO jobs") for statement, _params in connection.calls)
 
 
 def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:

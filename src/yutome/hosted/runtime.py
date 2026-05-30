@@ -47,6 +47,7 @@ from yutome.hosted.repositories import SqlStatement, usage_repository_constraint
 from yutome.hosted.schema import source_refresh_policies, sources, workspaces
 from yutome.hosted.search_store import PostgresVectorChordSearchStore
 from yutome.hosted.sqlalchemy_core import compile_postgres_statement
+from yutome.hosted.youtube_oauth_service import youtube_oauth_settings_from_env
 
 
 MigrationPhase = Literal["phase1", "phase4", "hosted"]
@@ -296,6 +297,7 @@ class HostedCommandRunner:
             config=self.config,
             gate=self.usage_gate(),
             ledger=self.usage_ledger(),
+            youtube_oauth_settings=youtube_oauth_settings_from_env(os.environ),
         )
         executions = []
         for row in rows:

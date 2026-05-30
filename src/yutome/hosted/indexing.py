@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from psycopg.types.json import Jsonb
@@ -78,6 +78,9 @@ DEFAULT_EMBEDDING_DIMENSION = HOSTED_DEFAULT_EMBEDDING_DIMENSION
 DEFAULT_CHUNKING_VERSION = "hosted_chunker_v1"
 REAL_HOSTED_CHUNKING_VERSION = CHUNKER_VERSION
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+if TYPE_CHECKING:
+    from yutome.hosted.youtube_oauth_service import YouTubeOAuthSettings
 
 
 @dataclass(frozen=True)
@@ -1563,6 +1566,7 @@ LIMIT 1;
 
 
 SourceVideoDiscoverer = Callable[[Source, ProviderCallContext | None, int | None], Sequence[DiscoveredVideo]]
+SubscriptionChannelLister = Callable[[Any, Source], Sequence[Any]]
 
 
 class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
@@ -1577,6 +1581,8 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
         ledger: Any | None = None,
         usage_context_provider: Any | None = None,
         video_discoverer: SourceVideoDiscoverer | None = None,
+        youtube_oauth_settings: YouTubeOAuthSettings | None = None,
+        subscription_channel_lister: SubscriptionChannelLister | None = None,
         cwd: Path | None = None,
     ) -> None:
         super().__init__(
@@ -1588,6 +1594,8 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
             cwd=cwd,
         )
         self.video_discoverer = video_discoverer or self._discover_public_source_videos
+        self.youtube_oauth_settings = youtube_oauth_settings
+        self.subscription_channel_lister = subscription_channel_lister or self._list_subscription_channels
 
     def execute(
         self,
@@ -1611,6 +1619,15 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="discovering", now=clock))
             source = self._load_source(job)
+            if source.source_type == "subscription_collection" or source.requires_youtube_grant:
+                return self._discover_subscription_collection(
+                    job,
+                    source,
+                    lease_owner=lease_owner,
+                    clock=clock,
+                    current_time=current_time,
+                    lease_seconds=lease_seconds,
+                )
             decision = source_discovery_decision(source)
             if not decision.discoverable:
                 self._execute_statement(
@@ -1763,6 +1780,210 @@ class HostedSourceDiscoveryExecutor(HostedIndexingExecutor):
                 error_code=getattr(exc, "code", type(exc).__name__),
                 error_message=error_message,
             )
+
+    def _discover_subscription_collection(
+        self,
+        job: Job,
+        source: Source,
+        *,
+        lease_owner: str,
+        clock: Any,
+        current_time: Callable[[], Any],
+        lease_seconds: int,
+    ) -> HostedSourceDiscoveryExecutionResult:
+        from yutome.hosted.jobs import update_job_status_sql
+        from yutome.hosted.source_import import (
+            HostedSourceImportActor,
+            HostedSourceImportDescriptor,
+            HostedSourcesImportRequest,
+            import_sources,
+        )
+        from yutome.hosted.youtube_oauth_service import HostedYouTubeOAuthError
+
+        decision = source_discovery_decision(source)
+        if not decision.discoverable and (decision.code != "source_auth_failed" or source.status == "auth_failed"):
+            self._execute_statement(
+                update_job_status_sql(
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                    status="denied",
+                    now=clock,
+                    error_code=decision.code,
+                    error_message=decision.message,
+                )
+            )
+            return HostedSourceDiscoveryExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source.id,
+                status="denied",
+                error_code=decision.code,
+                error_message=decision.message,
+            )
+
+        max_videos = _positive_int_or_none(job.metadata_jsonb.get("max_new_videos_per_run")) or 25
+        try:
+            self._renew_job_lease_or_raise(
+                job,
+                lease_owner=lease_owner,
+                now=current_time(),
+                lease_seconds=lease_seconds,
+            )
+            channels = tuple(self.subscription_channel_lister(self.connection, source))
+        except HostedYouTubeOAuthError as exc:
+            if not _is_youtube_oauth_auth_failure(exc):
+                raise
+            error_message = redact_sensitive_failure_text(getattr(exc, "message", str(exc)))
+            clock = self._renew_job_lease_or_raise(
+                job,
+                lease_owner=lease_owner,
+                now=current_time(),
+                lease_seconds=lease_seconds,
+            )
+            self._execute_statement(
+                finish_source_discovery_sql(
+                    workspace_id=job.workspace_id,
+                    source_id=source.id,
+                    policy_id=_optional_str(job.metadata_jsonb.get("source_refresh_policy_id")),
+                    now=clock,
+                    discovered_videos=0,
+                    enqueued_jobs=0,
+                    video_ids=[],
+                    lease_owner=lease_owner,
+                    error_code="source_auth_failed",
+                    error_message=error_message,
+                )
+            )
+            self._execute_statement(
+                mark_source_auth_failed_sql(
+                    workspace_id=job.workspace_id,
+                    source_id=source.id,
+                    now=clock,
+                    error_code="source_auth_failed",
+                    error_message=error_message,
+                )
+            )
+            self._execute_statement(
+                update_job_status_sql(
+                    job_id=job.id,
+                    lease_owner=lease_owner,
+                    status="denied",
+                    now=clock,
+                    error_code="source_auth_failed",
+                    error_message=error_message,
+                )
+            )
+            return HostedSourceDiscoveryExecutionResult(
+                job_id=job.id,
+                workspace_id=job.workspace_id,
+                source_id=source.id,
+                status="denied",
+                error_code="source_auth_failed",
+                error_message=error_message,
+            )
+
+        clock = self._renew_job_lease_or_raise(
+            job,
+            lease_owner=lease_owner,
+            now=current_time(),
+            lease_seconds=lease_seconds,
+        )
+        self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="queued_video_jobs", now=clock))
+
+        descriptors: list[HostedSourceImportDescriptor] = []
+        seen_channel_ids: set[str] = set()
+        for channel in channels:
+            channel_id = _optional_str(getattr(channel, "channel_id", None))
+            if not channel_id or channel_id in seen_channel_ids:
+                continue
+            seen_channel_ids.add(channel_id)
+            descriptors.append(
+                HostedSourceImportDescriptor(
+                    source_url=_optional_str(getattr(channel, "source_url", None))
+                    or f"https://www.youtube.com/channel/{channel_id}",
+                    channel_id=channel_id,
+                    display_name=_optional_str(getattr(channel, "title", None)),
+                    selected=True,
+                    import_source="public_api",
+                    metadata={
+                        "selected_from": "subscription_collection_discovery",
+                        "youtube_grant_id": source.auth_grant_id,
+                        "parent_source_id": source.id,
+                    },
+                )
+            )
+            if len(descriptors) >= 250:
+                break
+
+        import_result: Mapping[str, Any] = {"jobs": []}
+        if descriptors:
+            cadence_seconds = _positive_int_or_none(job.metadata_jsonb.get("cadence_seconds")) or 900
+            import_result = import_sources(
+                self.connection,
+                request=HostedSourcesImportRequest(
+                    sources=descriptors,
+                    refresh_enabled=True,
+                    max_new_videos=max(1, min(max_videos, 250)),
+                    cadence_seconds=max(1, min(cadence_seconds, 86400)),
+                ),
+                actor=HostedSourceImportActor(
+                    workspace_id=job.workspace_id,
+                    seeded_by="subscription_collection_discovery",
+                ),
+                now=clock,
+            )
+        enqueued = sum(1 for row in import_result.get("jobs", ()) if str(row.get("job_type") or "") == "discover_source")
+
+        clock = self._renew_job_lease_or_raise(
+            job,
+            lease_owner=lease_owner,
+            now=current_time(),
+            lease_seconds=lease_seconds,
+        )
+        self._execute_statement(
+            finish_source_discovery_sql(
+                workspace_id=job.workspace_id,
+                source_id=source.id,
+                policy_id=_optional_str(job.metadata_jsonb.get("source_refresh_policy_id")),
+                now=clock,
+                discovered_videos=len(channels),
+                enqueued_jobs=enqueued,
+                video_ids=[],
+                lease_owner=lease_owner,
+            )
+        )
+        clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+        self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="succeeded", now=clock))
+        return HostedSourceDiscoveryExecutionResult(
+            job_id=job.id,
+            workspace_id=job.workspace_id,
+            source_id=source.id,
+            status="succeeded",
+            discovered_videos=len(channels),
+            enqueued_jobs=enqueued,
+            video_ids=(),
+        )
+
+    def _list_subscription_channels(self, connection: Any, source: Source) -> Sequence[Any]:
+        from yutome.hosted.youtube_oauth_service import (
+            HostedYouTubeOAuthError,
+            _fetch_channels_or_mark_invalid,
+            access_token_for_grant,
+            load_youtube_grant_by_id,
+        )
+
+        grant = load_youtube_grant_by_id(connection, grant_id=source.auth_grant_id or "")
+        if grant is None or not _youtube_grant_row_is_active(grant):
+            raise HostedYouTubeOAuthError(
+                code="youtube_oauth_reconnect_required",
+                message="YouTube grant is missing, revoked, or inactive.",
+                status_code=401,
+            )
+        settings = self.youtube_oauth_settings
+        if settings is None or not settings.configured:
+            raise HostedIndexingError("YouTube OAuth settings are not configured for hosted subscription discovery")
+        access_token = access_token_for_grant(connection, settings=settings, grant=grant)
+        return _fetch_channels_or_mark_invalid(connection, grant=grant, access_token=access_token)
 
     def _discover_public_source_videos(
         self,
@@ -2300,6 +2521,40 @@ SELECT
     )
 
 
+def mark_source_auth_failed_sql(
+    *,
+    workspace_id: str,
+    source_id: str,
+    now: Any,
+    error_code: str,
+    error_message: str | None,
+) -> SqlStatement:
+    return SqlStatement(
+        sql="""
+UPDATE sources
+SET status = 'auth_failed',
+    metadata_json = metadata_json || %(meta)s::jsonb,
+    updated_at = %(now)s
+WHERE workspace_id = %(workspace_id)s
+  AND id = %(source_id)s
+RETURNING id;
+""".strip(),
+        params={
+            "workspace_id": workspace_id,
+            "source_id": source_id,
+            "now": now,
+            "meta": Jsonb(
+                {
+                    "auth_failure": {
+                        "error_code": error_code,
+                        "error_message": error_message,
+                    }
+                }
+            ),
+        },
+    )
+
+
 def _validate_public_indexing_inputs(
     *,
     source: Source,
@@ -2701,6 +2956,38 @@ def _looks_retryable_discovery_error(exc: BaseException) -> bool:
     return any(marker in text for marker in ("timeout", "temporarily", "try again", "connection reset", "unavailable"))
 
 
+def _is_youtube_oauth_auth_failure(exc: BaseException) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    if code == "youtube_oauth_reconnect_required":
+        return True
+    if code in {"youtube_oauth_unconfigured", "youtube_subscriptions_fetch_failed"}:
+        return False
+    return getattr(exc, "status_code", None) in {400, 401, 403}
+
+
+def _youtube_grant_row_is_active(grant: Mapping[str, Any]) -> bool:
+    if str(grant.get("status") or "") != "active":
+        return False
+    if grant.get("revoked_at") is not None:
+        return False
+    expires_at = _datetime_from_value(grant.get("expires_at"))
+    return expires_at is None or expires_at > datetime.now(timezone.utc)
+
+
+def _datetime_from_value(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
 def _looks_retryable_indexing_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(
@@ -2742,6 +3029,7 @@ __all__ = [
     "enqueue_discover_source_job_sql",
     "enqueue_index_video_job_sql",
     "finish_source_discovery_sql",
+    "mark_source_auth_failed_sql",
     "complete_job_operation_success_sql",
     "job_operation_output_sql",
     "plan_real_hosted_public_indexing",
