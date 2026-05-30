@@ -93,6 +93,7 @@ flowchart LR
 | The web dashboard: routes, the BFF seam to the hosted API, session auth, what each page shows (codex-built — **priority**) | [`frontend.md`](frontend.md) |
 | The CLI command surface and the local retrieval engine: query algebra, store dispatch, ingest pipeline, local storage, local MCP/HTTP serving | [`cli-and-engine.md`](cli-and-engine.md) |
 | How hosted SQL is built: SQLAlchemy Core conventions, JSONB rules, parameter naming, and which queries stay raw | [`hosted-sql.md`](hosted-sql.md) |
+| **RFC under evaluation:** hosted Postgres data-access architecture (Core-string-gen + raw psycopg vs. psycopg-native pool/`Jsonb()` vs. full SQLAlchemy Engine) | [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md) |
 
 ## How to read the diagrams
 

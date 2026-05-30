@@ -111,7 +111,9 @@ Where to paste it:
 
 `yutome setup` does this interactively: shows the snippet, copies it to your clipboard, and opens the Claude Desktop config folder for you. If yutome's installed via `uv tool install`, the `yutome` binary on your PATH is what gets invoked — no `uv run` wrapper needed.
 
-### Remote (Claude.ai web, ChatGPT, phone, any device)
+### Remote bridge (unstable advanced path)
+
+For hosted Yutome, use the production MCP endpoint shown in the web dashboard. The laptop-backed remote bridge below is still kept for self-hosting and local-first experiments, but its command shape and setup flow are not stable yet.
 
 ```bash
 yutome connect --deploy        # one-time: deploy the Worker, generate secrets, auto-start the bridge

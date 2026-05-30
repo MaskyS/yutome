@@ -54,8 +54,8 @@
 <rect x="3084.35" y="196" width="632.6" height="36" rx="0" ry="0" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="0.75" />
 <text x="2089.6749999999997" y="58" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;workspaces&lt;br/&gt;(+ users, members)&quot;</text>
 <text x="346.125" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;account_sessions · account_grants&lt;br/&gt;email_login_tokens · youtube_grants&quot;</text>
-<text x="1160.6999999999998" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;provider_allocations · service_allocations&lt;br/&gt;entitlement_policies · workspace_balances&lt;br/&gt;price_books · billing_customers&quot;</text>
-<text x="2089.6749999999997" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;usage_reservations · usage_events&lt;br/&gt;credit_ledger_entries · billing_exports&lt;br/&gt;polar_webhook_snapshots&quot;</text>
+<text x="1160.6999999999998" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;provider_allocations · service_allocations&lt;br/&gt;entitlement_policies · workspace_balances&lt;br/&gt;price_books · stripe_customers&quot;</text>
+<text x="2089.6749999999997" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;usage_reservations · usage_events&lt;br/&gt;stripe_meter_exports · stripe_webhook_events&quot;</text>
 <text x="2786.275" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;sources · source_refresh_policies&lt;br/&gt;jobs · job_operations&quot;</text>
 <text x="3400.65" y="214" text-anchor="middle" dy="0.35em" font-size="13" font-weight="500" fill="var(--_text)">&quot;videos · transcript_versions&lt;br/&gt;search_index_profiles · chunks · chunk_embeddings&quot;</text>
 </svg>

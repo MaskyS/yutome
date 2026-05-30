@@ -1,5 +1,12 @@
 # Hosted SQL: SQLAlchemy Core conventions
 
+> **⚠ Under evaluation.** The data-access architecture this guide encodes (SQLAlchemy
+> Core compiled to strings + executed on raw psycopg3 with hand-rolled per-thread
+> connections + manual JSONB handling) is being reconsidered. See
+> [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md). Several sections below — the
+> entire **JSONB** section in particular — may become moot if Direction A is adopted.
+> Do not invest in deeper changes to this convention until the RFC is resolved.
+
 How hosted query/command SQL is built, and the rules an agent should follow when adding or
 changing it. The hosted backend builds SQL with **SQLAlchemy Core** and compiles it to a
 parameterized `SqlStatement` (raw SQL string + psycopg named params) via
