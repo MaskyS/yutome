@@ -1,18 +1,19 @@
-# Hosted SQL: SQLAlchemy Core conventions
+# Hosted SQL: SQLAlchemy Core + psycopg conventions
 
-> **⚠ Under evaluation.** The data-access architecture this guide encodes (SQLAlchemy
-> Core compiled to strings + executed on raw psycopg3 with hand-rolled per-thread
-> connections + manual JSONB handling) is being reconsidered. See
-> [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md). Several sections below — the
-> entire **JSONB** section in particular — may become moot if Direction A is adopted.
-> Do not invest in deeper changes to this convention until the RFC is resolved.
+> **Resolved data-access standard.** Direction A from
+> [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md) was adopted. Hosted code still uses
+> SQLAlchemy Core as a SQL construction tool where it earns its keep, but execution goes through a
+> bounded `psycopg_pool.ConnectionPool` with a per-request connection lease. JSONB writes use
+> `psycopg.types.json.Jsonb(value)`, and reads return decoded Python values under `dict_row`. The
+> old `_json_param` string-serialization and cast-helper rules are superseded.
 
 How hosted query/command SQL is built, and the rules an agent should follow when adding or
-changing it. The hosted backend builds SQL with **SQLAlchemy Core** and compiles it to a
+changing it. The hosted backend builds complex SQL with **SQLAlchemy Core** and compiles it to a
 parameterized `SqlStatement` (raw SQL string + psycopg named params) via
 [`compile_postgres_statement`](../../src/yutome/hosted/sqlalchemy_core.py). Column references are
 type-checked against [`schema.py`](../../src/yutome/hosted/schema.py) — a wrong column raises at
-build time instead of failing as a runtime SQL error.
+build time instead of failing as a runtime SQL error. The resulting SQL and params are executed on a
+psycopg connection leased from the hosted pool.
 
 ## The idiom
 
@@ -42,26 +43,28 @@ Reference implementations: `account_jobs_sql` ([source_import.py](../../src/yuto
 
 ## JSONB
 
-- **Read**: `t.c.col["key"].astext` → `col ->> 'key'`; `t.c.col["key"]` → `col -> 'key'`.
-- **Write a plain JSONB column value**: pass the JSON **string** (`_json_param(...)`), **no cast** —
-  the column is JSONB, so Postgres coerces the bound value. (Confirmed by the live-Postgres-tested
-  billing upserts and the SQLAlchemy PostgreSQL docs: a cast is not needed when the column is
-  already JSONB.)
-- **JSONB as an operator operand** (`col || $param`): the bound value **must** be cast —
-  `cast(_json_param(x), JSONB)`. Not needed when the other operand is `EXCLUDED.col` (already
-  JSONB-typed), e.g. `t.c.metadata_json.op("||")(statement.excluded.metadata_json)`.
-- **Do not pass a Python dict** for a JSONB value: `compile_postgres_statement` extracts raw params
-  *before* type bind-processing, so psycopg would receive an un-adaptable `dict`. Always serialize
-  to a string first (`_json_param`).
+- **Read JSONB in Core expressions**: `t.c.col["key"].astext` → `col ->> 'key'`;
+  `t.c.col["key"]` → `col -> 'key'`.
+- **Write JSONB values**: bind Python JSON values with
+  `psycopg.types.json.Jsonb(value)`, either directly in `.values(...)` or via
+  `bindparam(..., value=Jsonb(value))`. Do not reintroduce `_json_param`, manual `json.dumps`, or
+  tests that depend on a particular `::jsonb` placeholder shape.
+- **Read JSONB rows**: hosted psycopg connections use `row_factory=dict_row`, so JSONB columns return
+  decoded Python dict/list values. Use small normalization helpers only to validate shape or default
+  missing values, not to parse JSON strings.
+- **JSONB operators**: when the other operand is `EXCLUDED.col`, it is already JSONB-typed, so
+  `t.c.metadata_json.op("||")(statement.excluded.metadata_json)` needs no cast. Raw SQL may still use
+  JSONB operators, defaults, and literal casts; the Python binding rule remains `Jsonb(value)`.
 
 ## Parameters
 
-- Pass Python values directly; SQLAlchemy **auto-names** params (`workspace_id_1`).
+- Pass Python values directly; SQLAlchemy **auto-names** ordinary params (`workspace_id_1`).
   `SqlStatement.params` is handed **wholesale** to `connection.execute(sql, params)`.
-- **Never** read an individual param by key in production code, and **never** assert on `%(name)s`
-  SQL text or on param-key names in tests. Assert on **behavior/output** and on **bound values**
-  (`statement.params.values()`). The raw→Core sweep changed param keys; tests that coupled to the
-  old `%(name)s`/keys were updated to value/behavior assertions.
+- Treat generated param names and `%(name)s` placeholder text as unstable. Do not assert on them in
+  tests; assert on **behavior/output** and, when needed, on **bound values**
+  (`statement.params.values()`). Explicit `bindparam("...")` names may be used inside a builder when
+  a stable value needs to be referenced during statement construction, but callers should treat
+  `SqlStatement.params` as opaque.
 - Nullable filters: branch in Python (omit the `.where(...)` when the value is `None`) instead of
   `%(x)s IS NULL OR col = %(x)s`.
 

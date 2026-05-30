@@ -54,7 +54,8 @@ Yutome already has:
 
 - local stdio MCP;
 - local/authenticated HTTP;
-- remote streamable HTTP MCP over the same `find`, `list`, `show`, and `q` query verbs.
+- remote streamable HTTP MCP over the same contract: query tools `find`, `list`, `show`, and `q`,
+  plus `index` and `jobs`.
 
 The capsule should preserve that contract. Connector layers must not invent a second retrieval API.
 
@@ -135,7 +136,7 @@ MCP servers can provide usage guidance directly in the protocol. The important a
 `SKILL.md` / Agent Skills are related but not identical. They are a packaging convention for clients that support skill discovery and progressive disclosure. A remote MCP server should not assume Claude, ChatGPT, or every MCP client will fetch a `SKILL.md` from the connector. For Yutome, the product contract is:
 
 - put concise "how to use Yutome" guidance in MCP `instructions`;
-- keep `find`, `list`, `show`, and `q` tool descriptions self-contained;
+- keep all six tool descriptions (`find`, `list`, `show`, `q`, `index`, and `jobs`) self-contained;
 - optionally ship a future Yutome Agent Skill for coding-agent clients that support skills, but treat it as an enhancement rather than the primary remote connector documentation path.
 
 ## Decision
@@ -155,7 +156,7 @@ Claude / ChatGPT
   -> https://<user-capsule>.workers.dev/mcp
   -> Cloudflare Worker + Durable Object session/router
   -> WebSocket bridge to Yutome Desktop (Cloudflare WebSocket Hibernation)
-  -> local api.py find/list/show/q
+  -> local contract.py handlers (find/list/show/q, index/jobs)
   -> Postgres + VectorChord + artifacts
 ```
 
@@ -174,7 +175,7 @@ Laptop off:
 
 This mode solves the "best app is no app" problem while keeping the same Postgres search store across desktop and hosted paths.
 
-Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome serve bridge`; the bridge runs the local `find/list/show/q` or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
+Implementation note: the bridge uses Cloudflare WebSocket Hibernation. Claude/ChatGPT call `/mcp`; the `McpAgent` request handler invokes `dispatch(kind, method, params)` on the `YutomeRelay` Durable Object; the DO sends a `{type:"job"}` frame over the live WebSocket to `yutome serve bridge`; the bridge runs the local contract tool handler or `resources/read` handler and posts a `{type:"result"}` frame back. The DO hibernates while idle (zero compute), and the bridge auto-reconnects with exponential backoff if the socket drops.
 
 ### Mode 2: Always-On Search Replica
 
@@ -395,7 +396,7 @@ This distinction keeps the replica useful while avoiding accidental cloud backup
 
 Requires no new provider accounts.
 
-If the configured corpus has only lexical indexes, remote MCP still works for lexical find/list/show/q. If semantic search is configured, Desktop uses the configured embedding provider and Postgres + VectorChord dense-vector indexes. If Webshare is not configured, that only affects future ingest reliability, not remote search over already-indexed data.
+If the configured corpus has only lexical indexes, remote MCP still works for lexical query tools (`find`/`list`/`show`/`q`). If semantic search is configured, Desktop uses the configured embedding provider and Postgres + VectorChord dense-vector indexes. If Webshare is not configured, that only affects future ingest reliability, not remote search over already-indexed data.
 
 ### Always-On Replica
 
@@ -497,7 +498,7 @@ This keeps the beginner path honest. If local assisted deploy is possible, it is
 4. Cloudflare provisions Worker, D1, R2, Vectorize, and needed secrets.
 5. CLI checks whether local semantic search/Voyage is configured.
 6. If semantic replica is enabled, CLI confirms uploading the local Voyage key as a Worker secret.
-7. CLI runs the initial remote sync.
+7. CLI runs the initial replica sync.
 8. User adds the same MCP URL to Claude/ChatGPT.
 9. If Desktop goes offline, Worker serves from the last synced replica.
 
@@ -563,7 +564,7 @@ The local implementation should keep beginner verbs aligned with the existing CL
 - `yutome connect` should be the direct user-facing command for connecting Claude/ChatGPT; without an endpoint it should generate a deployable Cloudflare Worker project, explain whether assisted deploy is available on this machine, and with `--deploy` it should use `npx`/Wrangler for the user.
 - `yutome status` shows remote connector health when configured (use `--json` for the detailed/operational view).
 - `yutome serve bridge` is the top-level group for the laptop bridge process (start, stop, status, install for launchd/systemd, uninstall). `connect --deploy` auto-spawns it; install registers it as a service so it survives reboots.
-- `yutome serve remote sync` should handle replica export/upload when always-on search is enabled.
+- A future replica-sync command should handle replica export/upload when always-on search is enabled.
 - `yutome disconnect` is the cleanup command. It removes local remote connector state and, when Yutome knows the deployed Worker name and Wrangler can run, removes that Worker from the user's Cloudflare account. Destructive nouns like `delete` are not part of the user-facing remote CLI.
 - An internal or advanced `capsule` module/package can still hold implementation code and state helpers.
 
@@ -617,7 +618,7 @@ Cloud should never treat a half-uploaded snapshot as active.
 
 - Add this decision doc.
 - Add Cloudflare Worker scaffold.
-- Add `yutome connect`, remote status, and remote sync scaffolding that persist state and print next steps.
+- Add `yutome connect`, remote status, and replica-sync scaffolding that persist state and print next steps.
 - Add tests that setup/status do not require provider keys.
 
 ### Milestone 2: Remote Connector Only
@@ -631,7 +632,7 @@ Cloud should never treat a half-uploaded snapshot as active.
 
 ### Milestone 3: Replica export
 
-- Add `yutome serve remote sync --dry-run`.
+- Add a dry-run path for the future replica-sync command.
 - Export corpus manifest and batches locally.
 - Verify secret exclusion.
 - Add deletion/tombstone tracking.
@@ -639,7 +640,8 @@ Cloud should never treat a half-uploaded snapshot as active.
 ### Milestone 4: Replica serving
 
 - Upload D1/R2/Vectorize data.
-- Serve `find/list/show/q` from cloud replica.
+- Serve query tools (`find`/`list`/`show`/`q`) and resources from the cloud replica; gate `index` and
+  `jobs` according to the active capability model.
 - Add offline mode fallback.
 - Compare local and replica result quality on fixed evals.
 

@@ -829,7 +829,7 @@ Important implementation facts:
 - `src/yutome/remote_connection.py` stores a local `connection.json` with `endpoint_url`, `mcp_url`, `relay_token`, `pairing_code`, `mode`, `replica_enabled`, and Cloudflare resource metadata.
 - `cloudflare/yutome-capsule/src/index.ts` exposes `/mcp`, `/authorize`, `/token`, `/register`, `/.well-known/oauth-*`, `/pair`, `/relay/connect`, `/relay/status`, and `/healthz`.
 - `cloudflare/yutome-capsule/src/pairing.ts` gates OAuth consent with a printed pairing code and stores short-lived OAuth state in `OAUTH_KV`.
-- `cloudflare/yutome-capsule/src/yutome-mcp-agent.ts` reads `contract.json`, registers the canonical `find`, `list`, `show`, `q` tools plus resources, and forwards calls to the relay.
+- `cloudflare/yutome-capsule/src/yutome-mcp-agent.ts` reads `contract.json`, registers the canonical `find`, `list`, `show`, `q`, `index`, and `jobs` tools plus resources, and forwards calls to the relay.
 - `cloudflare/yutome-capsule/src/yutome-relay.ts` is a Durable Object WebSocket relay. It accepts one local bridge, sends `{type:"job"}` frames, waits for `{type:"result"}`, and returns an offline error when no bridge is connected.
 - `tests/test_contract_parity.py` protects the Python/TypeScript MCP contract and canonical scope `yutome.search.read`.
 - `tests/test_setup_helpers.py` protects URL normalization, worker readiness polling, bridge start/status behavior, and deploy helper behavior.
@@ -935,10 +935,10 @@ Current code already uses `@cloudflare/workers-oauth-provider` with `/register`,
 
 The current MCP contract must remain the source of truth:
 
-- Tools: `find`, `list`, `show`, `q`.
+- Tools: `find`, `list`, `show`, `q`, `index`, `jobs`.
 - Resources: `yutome://chunk/{id}`, `yutome://video/{id}`, `yutome://channel/{id}`, `yutome://transcript/{id}`.
-- Scope: `yutome.search.read`.
-- Read-only tool annotations stay `readOnlyHint: true`.
+- Baseline read scope: `yutome.search.read`; source-indexing writes require `yutome.source.write` and `yutome.job.write`.
+- Read-only tool annotations stay `readOnlyHint: true` for read tools; `index` advertises write/open-world semantics.
 - Tool responses should keep both text `content` and `structuredContent`.
 
 Do not fork a separate hosted retrieval API. Instead:
@@ -1003,7 +1003,7 @@ Properties:
 - Query-time semantic embeddings or vector queries become billable hosted usage.
 - Ingestion, Webshare, Gemini fallback, transcript cleanup, and embedding jobs must pass through the entitlement/usage ledger.
 
-The same `find`, `list`, `show`, `q`, and resource reads should work in both modes. If parity is incomplete, hosted mode should return explicit capability metadata rather than silently degrading search quality.
+The same query tools (`find`, `list`, `show`, `q`) and resource reads should work in both modes. `index` and `jobs` should follow the active bridge/hosted capability model and required scopes. If parity is incomplete, hosted mode should return explicit capability metadata rather than silently degrading search quality.
 
 #### Mode 3: Hybrid
 

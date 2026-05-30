@@ -50,7 +50,13 @@ mindmap
       jobs
       usage
       source
+        add
       run
+        worker
+        stripe-meter-export
+        source-refresh
+        maintenance
+        balance-rollover
     doctor
       local
       proxy
@@ -81,15 +87,19 @@ The retrieval namespace is the load-bearing one and maps directly onto the libra
 
 ## 2. The retrieval algebra (three layers)
 
-Everything funnels through one primitive. Presets are ergonomic builders on top; the CLI and MCP are
-two thin front-ends over the presets — and they share the same `find`/`list`/`show`/`q` names.
+Everything on the query path funnels through one primitive. Presets are ergonomic builders on top;
+the CLI search commands and MCP query tools share the same `find`/`list`/`show`/`q` names. The MCP
+registry also exposes `index` and `jobs` outside this retrieval algebra for source import and job
+status.
 
 ```mermaid
 flowchart TB
-    subgraph surface["Surface — same four names everywhere"]
+    subgraph surface["Retrieval surface — query names"]
         cli["CLI: yutome search find/list/show/q"]
-        mcp["MCP tools: find/list/show/q (contract.py)"]
+        mcp["MCP query tools: find/list/show/q (contract.py)"]
     end
+    mcpwrite["MCP source/job tools: index/jobs"]
+    sourcejobs["hosted source import<br/>job status"]
     subgraph presets["Presets — ergonomic builders (api.py)"]
         find2["find()"]
         list2["list_()"]
@@ -103,6 +113,7 @@ flowchart TB
     list2 --> prim
     show2 -.->|chunk/video/channel/transcript| prim
     show2 -.->|context/source| ctx["context_expand / source (api.py)"]
+    mcpwrite --> sourcejobs
 ```
 
 `q` validates a `QueryRequest` and dispatches to the Postgres search store (`api.py`). `find`/`list`

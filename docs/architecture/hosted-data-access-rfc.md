@@ -1,13 +1,26 @@
 # RFC — Hosted Postgres data-access architecture
 
-> **Status:** Open · awaiting decision before further SQL-modernization work
+> **Status:** Resolved — Direction A adopted and implemented in `yt-indexer-e6g`
 > **Authored by:** Claude Opus 4.7 (handoff to Opus 5.5 for evaluation + implementation)
 > **Tracked in bd:** `yt-indexer-e6g`
-> **Related docs:** [`hosted-sql.md`](hosted-sql.md) (the current Core conventions guide, partly obsolete under Direction A or B)
+> **Related docs:** [`hosted-sql.md`](hosted-sql.md) (current Core + psycopg conventions after Direction A)
 
 ---
 
-## TL;DR
+## Resolution
+
+Direction A was adopted. Hosted data access now uses a bounded
+`psycopg_pool.ConnectionPool` behind a stable psycopg facade, and FastAPI installs a per-request
+connection lease so all DB work in one request reuses the same checked-out connection. JSONB writes
+now bind Python values with `psycopg.types.json.Jsonb(value)`, and JSONB reads arrive as decoded
+Python values under psycopg's `dict_row`.
+
+The hand-rolled `ThreadLocalConnection` and the old `_json_param` / JSON-string cast-helper pattern
+were removed from hosted code. SQLAlchemy Core remains a construction tool for joins, CTEs, dynamic
+filters, and upserts; execution still goes through psycopg. The analysis below is kept as historical
+record of the pre-resolution state and should not be read as current implementation guidance.
+
+## Historical TL;DR
 
 The hosted backend uses **SQLAlchemy Core only as a SQL-string generator**: `compile_postgres_statement(stmt)` returns `(sql, params)`, then those are executed on a **raw psycopg3 connection** via a hand-rolled `ThreadLocalConnection`. No `Engine`, no SQLAlchemy `Connection`, no execution-time SQLAlchemy. This is the **awkward middle**: it pays for SQLAlchemy's compile cost + dependency, gets **none** of its execution-time value (typing, pooling, result mapping), and forces three things to be hand-rolled — JSONB serialization (`_json_param`/`_json_value` + `::jsonb` casts), per-thread connection lifecycle, and result-row extraction.
 
@@ -127,7 +140,7 @@ A SQL-modernization sweep was in progress when this issue surfaced. State as of 
 
 ---
 
-## 5. Options under evaluation
+## 5. Historical options evaluated
 
 ### Option A — Lean psycopg3-native (small, high leverage)
 

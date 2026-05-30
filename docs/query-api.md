@@ -5,10 +5,13 @@ This is Yutome's **developer API** — the programmatic way into the same librar
 `yutome` exposes one retrieval model through three surfaces:
 
 - CLI: `yutome search find`, `yutome search list`, `yutome search show`, `yutome search q`
-- MCP: tools named `find`, `list`, `show`, `q`
+- MCP: query tools named `find`, `list`, `show`, `q`; the full MCP registry also includes `index` and `jobs`
 - HTTP: `POST /find`, `POST /list`, `POST /show`, `POST /q`
 
-The HTTP surface is the script/agent front door; the MCP surface is the assistant front door. Both run the same in-process API, so results match across surfaces. For how to stand the HTTP API up (single-device, multi-device, or behind a reverse proxy), see [`remote-access.md`](remote-access.md).
+The HTTP surface is the script/agent front door; the MCP surface is the assistant front door. The
+shared query tools run the same in-process API, so results match across surfaces. For how to stand
+the HTTP API up (single-device, multi-device, or behind a reverse proxy), see
+[`remote-access.md`](remote-access.md).
 
 The raw primitive is `QueryRequest` in `src/yutome/query.py`. The transport-neutral convenience verbs live in `src/yutome/api.py`.
 
@@ -62,19 +65,23 @@ FastAPI also exposes interactive OpenAPI docs at `/docs` when you are serving th
 
 ## Verbs
 
-`find` ranks results by relevance. It searches transcript chunks by default and can search video titles or descriptions lexically.
+`find` ranks transcript chunks by relevance. The search target is `chunk_text`; there is no `--in`
+selector and no title/description search mode. Use filters such as `--channel`, `--since`,
+`--until`, `--source`, and `--language` to narrow hits, and use `--mode lexical|semantic|hybrid`
+to choose the ranking path.
 
 ```bash
 uv run yutome search find "Crohn probiotics" --mode hybrid --limit 5 --json
-uv run yutome search find "cerebrolysin" --in titles --mode lexical --json
+uv run yutome search find "cerebrolysin" --mode lexical --json
+uv run yutome search find "Crohn probiotics" --mode hybrid --group-by video --limit 5 --json
 ```
 
-`list` enumerates corpus objects by filter.
+`list` enumerates corpus objects by filter. User-facing entities are `videos`, `channels`, and
+`status`.
 
 ```bash
 uv run yutome search list videos --status 'indexed' --limit 20
 uv run yutome search list channels --selected
-uv run yutome search list attention
 uv run yutome search list status
 ```
 

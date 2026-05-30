@@ -38,7 +38,7 @@ Root commands are only first-run and high-traffic status/connection jobs:
 Retrieval lives under `search`:
 
 - `yutome search find QUERY`
-- `yutome search list <videos|channels|attention|status>`
+- `yutome search list <videos|channels|status>`
 - `yutome search show <chunk|video|channel|transcript|context|source> [ID]`
 - `yutome search q REQUEST`
 
@@ -57,13 +57,13 @@ Transport adapters live under `serve`:
 - `yutome serve mcp`
 - `yutome serve http`
 - `yutome serve bridge <start|stop|status|install|uninstall>`
-- `yutome serve remote <prepare|sync|http|mcp>`
+- `yutome serve remote <prepare|http|mcp>`
 
 Hosted operations live under `hosted`, with diagnostics under `doctor`:
 
-- `yutome hosted <api|migrate|login|jobs|usage>`
+- `yutome hosted <api|migrate|login|jobs|usage|run|source>`
 - `yutome hosted source add SOURCE`
-- `yutome hosted run <worker|stripe-meter-export|source-refresh|maintenance>`
+- `yutome hosted run <worker|stripe-meter-export|source-refresh|maintenance|balance-rollover>`
 - `yutome doctor <local|proxy|gemini|eval|contract|remote|hosted-db>`
 
 Exports live under `export`:
@@ -91,16 +91,18 @@ when it improves operator ergonomics.
 The CLI command tree and MCP tool names are separate surfaces over the same
 transport-neutral APIs.
 
-- MCP tools remain `find`, `list`, `show`, and `q`.
+- MCP tools remain `find`, `list`, `show`, `q`, `index`, and `jobs`. The first four are the query
+  tools mirrored by `yutome search`; `index` and `jobs` are MCP source-indexing and job-status
+  capabilities.
 - MCP resource URIs remain `yutome://chunk/{id}`,
   `yutome://video/{id}`, `yutome://channel/{id}`, and
   `yutome://transcript/{id}`.
 - CLI nesting (`yutome search find`) must not rename or reshape the agent
   contract.
 
-Parity tests should ensure CLI search presets and MCP tools continue to resolve
-to the same `api.py` functions and compatible defaults. Full contract generation
-from one source can be improved separately.
+Parity tests should ensure CLI search presets and MCP query tools continue to
+resolve to the same `api.py` functions and compatible defaults. Full contract
+generation from one source can be improved separately.
 
 ## Glossary
 

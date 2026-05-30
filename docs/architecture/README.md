@@ -14,8 +14,8 @@ you can check it against the code.
 
 Yutome is **two delivery modes over one contract and one database shape.** A *local* mode runs on
 your laptop against Postgres + VectorChord; a *hosted* mode runs the same search store as a
-multi-tenant service. Both speak the same four tools (`find` / `list` / `show` / `q`) and four resources
-(`yutome://{chunk,video,channel,transcript}/{id}`) defined once in
+multi-tenant service. Both speak the same six tools (`find` / `list` / `show` / `q` plus `index` /
+`jobs`) and four resources (`yutome://{chunk,video,channel,transcript}/{id}`) defined once in
 [`src/yutome/contract.py`](../../src/yutome/contract.py).
 
 ## The contract is the spine
@@ -28,7 +28,7 @@ contract (per `CLAUDE.md`).
 
 ```mermaid
 flowchart TB
-    contract["contract.py<br/>TOOLS: find · list · show · q<br/>RESOURCES: chunk · video · channel · transcript<br/>(contract.py:213-306)"]
+    contract["contract.py<br/>TOOLS: find · list · show · q · index · jobs<br/>RESOURCES: chunk · video · channel · transcript<br/>(contract.py:280-398)"]
 
     subgraph local["LOCAL mode — your laptop"]
         direction TB
@@ -93,7 +93,7 @@ flowchart LR
 | The web dashboard: routes, the BFF seam to the hosted API, session auth, what each page shows (codex-built — **priority**) | [`frontend.md`](frontend.md) |
 | The CLI command surface and the local retrieval engine: query algebra, store dispatch, ingest pipeline, local storage, local MCP/HTTP serving | [`cli-and-engine.md`](cli-and-engine.md) |
 | How hosted SQL is built: SQLAlchemy Core conventions, JSONB rules, parameter naming, and which queries stay raw | [`hosted-sql.md`](hosted-sql.md) |
-| **RFC under evaluation:** hosted Postgres data-access architecture (Core-string-gen + raw psycopg vs. psycopg-native pool/`Jsonb()` vs. full SQLAlchemy Engine) | [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md) |
+| **Resolved RFC:** hosted Postgres data-access architecture; Direction A adopted (`psycopg_pool.ConnectionPool` + `Jsonb()` while keeping Core construction where it earns its keep) | [`hosted-data-access-rfc.md`](hosted-data-access-rfc.md) |
 
 ## How to read the diagrams
 
