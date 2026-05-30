@@ -5,7 +5,7 @@ import math
 import re
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -308,7 +308,6 @@ class HostedMcpQueryAdapter:
         *,
         auth: HostedMcpAuthContext,
         request: HostedFindRequest,
-        fallback_metadata: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         estimate = estimate_search_store_query(
             operation="lexical_query",
@@ -341,7 +340,6 @@ class HostedMcpQueryAdapter:
             reservation=reservation,
             rows=rows,
             usage=usage,
-            metadata=fallback_metadata,
         )
         return _find_query_result(rows=rows, request=request, backend=usage.backend)
 
@@ -352,21 +350,7 @@ class HostedMcpQueryAdapter:
             candidate_limit=_search_limit(request),
             query_vector_dimensions=self.embedding_dimension,
         )
-        try:
-            search_reservation = self._reserve_search_store(auth=auth, request=request, estimate=search_estimate)
-        except HostedMcpError as exc:
-            if request.mode == "hybrid" and _usage_error_allows_lexical_fallback(exc):
-                fallback_metadata = _usage_denial_fallback_metadata(
-                    request=request,
-                    operation=f"search_store.{search_operation}",
-                    error=exc,
-                )
-                return self._find_lexical_fallback(
-                    auth=auth,
-                    request=request,
-                    fallback_metadata=fallback_metadata,
-                )
-            raise
+        search_reservation = self._reserve_search_store(auth=auth, request=request, estimate=search_estimate)
         vector_context = self._voyage_query_context(auth=auth, request=request)
         try:
             query_vector = self.query_embedder(request.text, vector_context)
@@ -381,17 +365,6 @@ class HostedMcpQueryAdapter:
                     "provider_reservation_id": exc.reservation.id,
                 },
             )
-            if request.mode == "hybrid" and _reservation_denial_allows_lexical_fallback(exc.reservation):
-                fallback_metadata = _usage_denial_fallback_metadata(
-                    request=request,
-                    operation="voyage.embed_query",
-                    reservation=exc.reservation,
-                )
-                return self._find_lexical_fallback(
-                    auth=auth,
-                    request=request,
-                    fallback_metadata=fallback_metadata,
-                )
             raise HostedMcpError(
                 code="usage_denied",
                 message=exc.reservation.decision.message or exc.reservation.decision.reason,
@@ -407,22 +380,6 @@ class HostedMcpQueryAdapter:
             failure = classify_provider_http_error(
                 provider="voyage", status_code=_status_code_from_exception(exc), message=str(exc)
             )
-            if request.mode == "hybrid" and _provider_failure_allows_lexical_fallback(failure=failure, exc=exc):
-                fallback_metadata = _provider_fallback_metadata(
-                    request=request,
-                    failure=failure,
-                    operation="voyage.embed_query",
-                )
-                self._record_search_store_release(
-                    auth=auth,
-                    reservation=search_reservation,
-                    metadata=fallback_metadata,
-                )
-                return self._find_lexical_fallback(
-                    auth=auth,
-                    request=request,
-                    fallback_metadata=fallback_metadata,
-                )
             self._record_search_store_release(
                 auth=auth,
                 reservation=search_reservation,
@@ -474,23 +431,6 @@ class HostedMcpQueryAdapter:
                     **hybrid_kwargs,
                 )
         except Exception as exc:
-            if request.mode == "hybrid" and _search_store_exception_allows_lexical_fallback(exc):
-                fallback_metadata = _search_store_fallback_metadata(
-                    request=request,
-                    exc=exc,
-                    operation=f"search_store.{search_operation}",
-                )
-                self._record_search_store_failure(
-                    auth=auth,
-                    reservation=search_reservation,
-                    metadata=fallback_metadata,
-                    exc=exc,
-                )
-                return self._find_lexical_fallback(
-                    auth=auth,
-                    request=request,
-                    fallback_metadata=fallback_metadata,
-                )
             self._record_search_store_failure(
                 auth=auth,
                 reservation=search_reservation,
@@ -503,34 +443,6 @@ class HostedMcpQueryAdapter:
             raise
         self._record_search_store_success(auth=auth, reservation=search_reservation, rows=rows, usage=usage)
         return _find_query_result(rows=rows, request=request, backend=usage.backend)
-
-    def _find_lexical_fallback(
-        self,
-        *,
-        auth: HostedMcpAuthContext,
-        request: HostedFindRequest,
-        fallback_metadata: Mapping[str, Any],
-    ) -> QueryResult:
-        """Re-run a degraded hybrid query as lexical-only, tagging why it fell back.
-
-        Reached only when a hybrid find soft-denies or the vector path is unavailable;
-        semantic queries never fall back here. The fallback adds a note so the response
-        shows it was downgraded rather than silently served at lower quality.
-        """
-        fallback_request = replace(
-            request,
-            mode="lexical",
-            notes=[
-                *request.notes,
-                "hosted_find_fallback_to_lexical",
-                _fallback_metadata_note(fallback_metadata),
-            ],
-        )
-        return self._find_lexical(
-            auth=auth,
-            request=fallback_request,
-            fallback_metadata=fallback_metadata,
-        )
 
     def _reserve_search_store(
         self,
@@ -2049,83 +1961,6 @@ def _status_code_from_exception(exc: BaseException) -> int | None:
     return None
 
 
-def _provider_failure_allows_lexical_fallback(*, failure: ProviderFailure, exc: BaseException) -> bool:
-    if _looks_like_auth_or_tenant_error(exc):
-        return False
-    if failure.kind in {"rate_limit", "transient"}:
-        return True
-    return failure.kind == "unknown" and _looks_like_availability_error(exc)
-
-
-def _search_store_exception_allows_lexical_fallback(exc: BaseException) -> bool:
-    if _looks_like_auth_or_tenant_error(exc):
-        return False
-    status_code = _status_code_from_exception(exc)
-    if status_code in {408, 429, 500, 502, 503, 504}:
-        return True
-    return _looks_like_vector_availability_error(exc) or _looks_like_availability_error(exc)
-
-
-def _reservation_denial_allows_lexical_fallback(reservation: UsageReservation) -> bool:
-    return reservation.decision.denial_effect == "soft"
-
-
-def _usage_error_allows_lexical_fallback(error: HostedMcpError) -> bool:
-    return error.code == "usage_denied" and error.data.get("denial_effect") == "soft"
-
-
-def _usage_denial_fallback_metadata(
-    *,
-    request: HostedFindRequest,
-    operation: str,
-    error: HostedMcpError | None = None,
-    reservation: UsageReservation | None = None,
-) -> dict[str, Any]:
-    reason = (
-        reservation.decision.reason
-        if reservation is not None
-        else str(error.data.get("reason") if error else "usage_denied")
-    )
-    denial_effect = (
-        reservation.decision.denial_effect
-        if reservation is not None
-        else str(error.data.get("denial_effect") if error else "soft")
-    )
-    reservation_id = (
-        reservation.id if reservation is not None else (error.data.get("reservation_id") if error else None)
-    )
-    return {
-        "fallback": True,
-        "fallback_from": request.mode,
-        "fallback_to": "lexical",
-        "fallback_reason": "soft_usage_denial",
-        "fallback_subject": operation.partition(".")[0],
-        "fallback_operation": operation,
-        "fallback_denial_reason": reason,
-        "fallback_denial_effect": denial_effect,
-        "fallback_reservation_id": reservation_id,
-    }
-
-
-def _provider_fallback_metadata(
-    *,
-    request: HostedFindRequest,
-    failure: ProviderFailure,
-    operation: str,
-) -> dict[str, Any]:
-    return {
-        "fallback": True,
-        "fallback_from": request.mode,
-        "fallback_to": "lexical",
-        "fallback_reason": "provider_availability",
-        "fallback_subject": failure.provider,
-        "fallback_operation": operation,
-        "fallback_failure_kind": failure.kind,
-        "fallback_error_code": failure.code,
-        "fallback_retryable": failure.retryable,
-    }
-
-
 def _provider_failure_metadata(
     *,
     failure: ProviderFailure,
@@ -2140,31 +1975,6 @@ def _provider_failure_metadata(
         "error_code": failure.code,
         "retryable": failure.retryable,
         "exception_type": type(exc).__name__,
-    }
-
-
-def _search_store_fallback_metadata(
-    *,
-    request: HostedFindRequest,
-    exc: BaseException,
-    operation: str,
-) -> dict[str, Any]:
-    failure = classify_provider_http_error(
-        provider="search_store",
-        status_code=_status_code_from_exception(exc),
-        message=str(exc),
-    )
-    return {
-        "fallback": True,
-        "fallback_from": request.mode,
-        "fallback_to": "lexical",
-        "fallback_reason": "vector_store_availability",
-        "fallback_subject": "search_store",
-        "fallback_operation": operation,
-        "fallback_failure_kind": failure.kind,
-        "fallback_error_code": failure.code,
-        "fallback_retryable": failure.retryable,
-        "fallback_exception_type": type(exc).__name__,
     }
 
 
@@ -2186,101 +1996,6 @@ def _search_store_failure_metadata(
         "retryable": failure.retryable,
         "exception_type": type(exc).__name__,
     }
-
-
-def _fallback_metadata_note(metadata: Mapping[str, Any]) -> str:
-    public_metadata = {
-        key: value for key, value in metadata.items() if key == "fallback" or key.startswith("fallback_")
-    }
-    return "hosted_find_fallback_metadata:" + json.dumps(
-        public_metadata,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _looks_like_auth_or_tenant_error(exc: BaseException) -> bool:
-    if _status_code_from_exception(exc) in {401, 403}:
-        return True
-    text = _exception_text(exc)
-    return any(
-        marker in text
-        for marker in (
-            "api key",
-            "apikey",
-            "auth",
-            "credential",
-            "forbidden",
-            "invalid key",
-            "permission denied",
-            "policy",
-            "row-level security",
-            "rls",
-            "tenant",
-            "unauthorized",
-            "workspace mismatch",
-            "workspace_mismatch",
-        )
-    )
-
-
-def _looks_like_vector_availability_error(exc: BaseException) -> bool:
-    text = _exception_text(exc)
-    has_vector_marker = any(
-        marker in text
-        for marker in (
-            "chunk_embeddings",
-            "embedding",
-            "extension",
-            "pgvector",
-            "vchord",
-            "vector",
-        )
-    )
-    has_availability_marker = any(
-        marker in text
-        for marker in (
-            "does not exist",
-            "missing",
-            "not available",
-            "not installed",
-            "undefined",
-            "unavailable",
-        )
-    )
-    return has_vector_marker and has_availability_marker
-
-
-def _looks_like_availability_error(exc: BaseException) -> bool:
-    text = _exception_text(exc)
-    return any(
-        marker in text
-        for marker in (
-            "408",
-            "429",
-            "502",
-            "503",
-            "504",
-            "connection",
-            "dns",
-            "network",
-            "rate limit",
-            "service unavailable",
-            "temporarily",
-            "timed out",
-            "timeout",
-            "too many requests",
-            "unavailable",
-        )
-    )
-
-
-def _exception_text(exc: BaseException) -> str:
-    parts = [str(exc)]
-    response = getattr(exc, "response", None)
-    if response is not None:
-        parts.append(str(response))
-    return " ".join(part for part in parts if part).lower()
 
 
 def _snippet(text: str, *, max_chars: int = 240) -> str:

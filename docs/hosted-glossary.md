@@ -190,8 +190,10 @@ all of them.
   requires a `search_store` service reservation.
 - **semantic query** — vector / approximate-nearest-neighbour search over embeddings.
 - **hybrid query** — lexical and semantic candidates fused with reciprocal-rank fusion
-  (RRF). May fall back to lexical when the vector path is unavailable, *unless* policy
-  requires a hard denial; **semantic must not silently fall back** (it fails or soft-denies).
+  (RRF). On the hosted path, hybrid does not fall back to lexical; like semantic, it fails
+  on provider errors or denies on provider allocation / search store usage. Only the local
+  default-hybrid path may degrade to a lexical query, with an explicit `QueryResult.notes`
+  lexical-only notice.
 - **query mode** — the search strategy selector with values `lexical | semantic | hybrid`.
   This is a distinct concept from `credential_mode` and `worker_mode`. (Code rename
   `QueryRequest.mode → query_mode` is **deferred** to the whole-project pass because

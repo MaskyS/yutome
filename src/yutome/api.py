@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,6 +18,13 @@ from yutome.query import (
     QueryRequest,
     QueryResult,
     StringPredicate,
+)
+
+
+logger = logging.getLogger("yutome.api")
+EMBEDDINGS_UNAVAILABLE_LEXICAL_ONLY_NOTE = (
+    "embeddings_unavailable_lexical_only: Voyage embedding could not be produced; "
+    "results are lexical-only (no semantic ranking)."
 )
 
 
@@ -104,6 +112,8 @@ def q(*, config: AppConfig, paths: ProjectPaths, request: QueryRequest | dict[st
         filters=_filters_from_query_filter(query_request.filter),
         group_by=query_request.group_by,
         per_group_limit=query_request.per_group_limit,
+        # QueryRequest cannot distinguish explicit hybrid from its schema default.
+        mode_defaulted=search.mode == "hybrid",
     )
 
 
@@ -125,6 +135,7 @@ def find(
 ) -> QueryResult:
     del paths
     effective_mode = mode or config.find.default_mode
+    mode_defaulted = mode is None
     if effective_mode == "none":
         raise ValueError("find requires lexical, semantic, or hybrid mode")
     connection = _connect(config)
@@ -141,6 +152,7 @@ def find(
         filters=SearchFilters(channel=channel, since=since, until=until, source=source, language=language),
         group_by=group_by,
         per_group_limit=3,
+        mode_defaulted=mode_defaulted,
     )
 
 
@@ -356,9 +368,11 @@ def _find_chunks(
     filters: SearchFilters | None = None,
     group_by: str | None = None,
     per_group_limit: int = 3,
+    mode_defaulted: bool = False,
 ) -> QueryResult:
     search_limit = min(200, limit * max(1, per_group_limit) * 8) if group_by else limit
     search_offset = 0 if group_by else offset
+    degraded_to_lexical = False
     if mode == "lexical":
         rows, usage = store.lexical_search(
             workspace_id=workspace_id,
@@ -377,29 +391,54 @@ def _find_chunks(
             filters=filters,
         )
     elif mode == "hybrid":
-        vector = _embed_voyage_query(query=text, model=config.embeddings.model, dimension=config.embeddings.dimension)
-        rows, usage = store.hybrid_search(
-            workspace_id=workspace_id,
-            query=text,
-            query_vector=vector,
-            limit=search_limit,
-            offset=search_offset,
-            filters=filters,
-        )
+        try:
+            vector = _embed_voyage_query(
+                query=text,
+                model=config.embeddings.model,
+                dimension=config.embeddings.dimension,
+            )
+        except Exception as exc:  # noqa: BLE001 - voyage client raises mixed exception types.
+            if not mode_defaulted:
+                raise
+            logger.warning(
+                "Voyage embedding unavailable for hybrid query; returning lexical-only results. cause=%s",
+                exc,
+            )
+            rows, usage = store.lexical_search(
+                workspace_id=workspace_id,
+                query=text,
+                limit=search_limit,
+                offset=search_offset,
+                filters=filters,
+            )
+            degraded_to_lexical = True
+        else:
+            rows, usage = store.hybrid_search(
+                workspace_id=workspace_id,
+                query=text,
+                query_vector=vector,
+                limit=search_limit,
+                offset=search_offset,
+                filters=filters,
+            )
     else:
         raise ValueError(f"unsupported search mode: {mode}")
     detail = "thin" if project in {None, "thin"} else project
+    notes = [f"search_store_backend={usage.backend}"]
+    if degraded_to_lexical:
+        notes.insert(0, EMBEDDINGS_UNAVAILABLE_LEXICAL_ONLY_NOTE)
     if group_by:
         hits = [_format_chunk_row(row, detail=detail) for row in rows]
         grouped_rows = _group_chunk_hits(hits, group_by=group_by, limit=limit, offset=offset, per_group_limit=per_group_limit)
+        notes.append(f"group_by={group_by}")
         return QueryResult(
             rows=grouped_rows,
-            notes=[f"search_store_backend={usage.backend}", f"group_by={group_by}"],
+            notes=notes,
             total=len(grouped_rows),
         )
     return QueryResult(
         rows=[_format_chunk_row(row, detail=detail) for row in rows],
-        notes=[f"search_store_backend={usage.backend}"],
+        notes=notes,
         total=len(rows),
     )
 

@@ -803,22 +803,8 @@ def test_voyage_denial_prevents_embedding_and_search_store_execution() -> None:
     assert release.metadata["provider_operation"] == "voyage.embed_query"
 
 
-def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding() -> None:
-    store = RecordingSearchStore(
-        rows=[
-            {
-                "chunk_id": "chunk_soft_search",
-                "video_id": "vid_1",
-                "youtube_video_id": "dQw4w9WgXcQ",
-                "transcript_version_id": "tx_1",
-                "start_seconds": 1,
-                "end_seconds": 2,
-                "text": "Lexical fallback after search-store soft denial.",
-                "score": 0.4,
-                "match_type": "lexical",
-            }
-        ]
-    )
+def test_hybrid_search_store_soft_denial_does_not_fall_back_to_lexical() -> None:
+    store = RecordingSearchStore()
     ledger = RecordingLedger()
     embedded = False
 
@@ -859,37 +845,24 @@ def test_hybrid_search_store_soft_denial_falls_back_to_lexical_without_embedding
         query_embedder=embedder,
     )
 
-    result = adapter.call_tool(
-        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-        name="find",
-        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
-    )
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+        )
 
+    assert exc_info.value.code == "usage_denied"
+    assert exc_info.value.data["denial_effect"] == "soft"
     assert embedded is False
-    assert [call["mode"] for call in store.calls] == ["lexical"]
-    assert result["rows"][0]["chunk_id"] == "chunk_soft_search"
-    assert "hosted_find_fallback_to_lexical" in result["notes"]
-    assert [event.status for event in ledger.events] == ["denied", "succeeded"]
+    assert store.calls == []
+    assert [event.status for event in ledger.events] == ["denied"]
     assert ledger.events[0].error_code == "soft_limit_exceeded"
     assert ledger.events[0].metadata["mcp_search_mode"] == "hybrid"
 
 
-def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
-    store = RecordingSearchStore(
-        rows=[
-            {
-                "chunk_id": "chunk_soft_voyage",
-                "video_id": "vid_1",
-                "youtube_video_id": "dQw4w9WgXcQ",
-                "transcript_version_id": "tx_1",
-                "start_seconds": 1,
-                "end_seconds": 2,
-                "text": "Lexical fallback after Voyage soft denial.",
-                "score": 0.4,
-                "match_type": "lexical",
-            }
-        ]
-    )
+def test_hybrid_voyage_soft_denial_does_not_fall_back_to_lexical() -> None:
+    store = RecordingSearchStore()
     ledger = RecordingLedger()
     provider_called = False
 
@@ -933,42 +906,30 @@ def test_hybrid_voyage_soft_denial_falls_back_to_lexical() -> None:
         query_embedder=embedder,
     )
 
-    result = adapter.call_tool(
-        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-        name="find",
-        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
-    )
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+        )
 
+    assert exc_info.value.code == "usage_denied"
     assert provider_called is False
-    assert [call["mode"] for call in store.calls] == ["lexical"]
-    assert result["rows"][0]["chunk_id"] == "chunk_soft_voyage"
-    assert "hosted_find_fallback_to_lexical" in result["notes"]
-    assert [event.subject for event in ledger.events] == ["voyage", "search_store", "search_store"]
+    assert store.calls == []
+    assert [event.subject for event in ledger.events] == ["voyage", "search_store"]
     assert ledger.events[0].status == "denied"
     assert ledger.events[0].error_code == "soft_limit_exceeded"
     assert ledger.events[1].event_type == "usage_reservation_released"
     assert ledger.events[1].metadata["release_reason"] == "provider_usage_denied"
+    assert ledger.events[1].operation == "hybrid_query"
 
 
 @pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
-def test_hybrid_voyage_provider_availability_failure_falls_back_to_lexical(
+def test_hybrid_voyage_provider_availability_failure_does_not_fall_back_to_lexical(
     status_code: int,
     failure_kind: str,
 ) -> None:
-    store = RecordingSearchStore(
-        rows=[
-            {
-                "chunk_id": "chunk_lexical",
-                "video_id": "vid_1",
-                "start_ms": 0,
-                "end_ms": 1000,
-                "text": "Lexical fallback result.",
-                "lexical_score": 0.5,
-                "score": 0.5,
-                "match_type": "lexical",
-            }
-        ]
-    )
+    store = RecordingSearchStore()
     ledger = RecordingLedger()
 
     class FakeProviderError(RuntimeError):
@@ -985,24 +946,20 @@ def test_hybrid_voyage_provider_availability_failure_falls_back_to_lexical(
 
     adapter = _allowing_adapter(search_store=store, ledger=ledger, query_embedder=embedder)
 
-    payload = adapter.call_tool(
-        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-        name="find",
-        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
-    )
+    with pytest.raises(HostedMcpError) as exc_info:
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+        )
 
-    assert store.calls == [{"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5}]
-    assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
-    assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
-    note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
-    assert note_metadata["fallback_from"] == "hybrid"
-    assert note_metadata["fallback_reason"] == "provider_availability"
-    assert note_metadata["fallback_failure_kind"] == failure_kind
+    assert exc_info.value.code == "provider_call_failed"
+    assert exc_info.value.to_dict()["error"]["data"]["failure_kind"] == failure_kind
+    assert store.calls == []
     assert [event.event_type for event in ledger.events] == [
         "provider_attempt_started",
         "provider_attempt_failed",
         "usage_reservation_released",
-        "service_operation_succeeded",
     ]
     failed = ledger.events[1]
     assert failed.metadata["failure_kind"] == failure_kind
@@ -1011,12 +968,8 @@ def test_hybrid_voyage_provider_availability_failure_falls_back_to_lexical(
     release = ledger.events[2]
     assert release.status == "released"
     assert release.operation == "hybrid_query"
-    assert release.metadata["fallback_reason"] == "provider_availability"
-    fallback_event = ledger.events[3]
-    assert fallback_event.operation == "lexical_query"
-    assert fallback_event.metadata["fallback"] is True
-    assert fallback_event.metadata["fallback_from"] == "hybrid"
-    assert fallback_event.metadata["fallback_to"] == "lexical"
+    assert release.metadata["release_reason"] == "provider_failure"
+    assert release.metadata["failure_kind"] == failure_kind
 
 
 @pytest.mark.parametrize(("status_code", "failure_kind"), [(429, "rate_limit"), (503, "transient")])
@@ -1101,7 +1054,7 @@ def test_voyage_auth_failure_does_not_fall_back_to_lexical() -> None:
     assert release.metadata["failure_kind"] == "auth"
 
 
-def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> None:
+def test_hybrid_vector_store_availability_failure_does_not_fall_back_to_lexical() -> None:
     class VectorUnavailableStore(RecordingSearchStore):
         def hybrid_search(
             self,
@@ -1122,20 +1075,7 @@ def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> Non
             )
             raise RuntimeError("vector extension unavailable")
 
-    store = VectorUnavailableStore(
-        rows=[
-            {
-                "chunk_id": "chunk_lexical",
-                "video_id": "vid_1",
-                "start_ms": 0,
-                "end_ms": 1000,
-                "text": "Lexical fallback result.",
-                "lexical_score": 0.5,
-                "score": 0.5,
-                "match_type": "lexical",
-            }
-        ]
-    )
+    store = VectorUnavailableStore()
     ledger = RecordingLedger()
     adapter = HostedMcpQueryAdapter(
         search_store=store,
@@ -1145,11 +1085,12 @@ def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> Non
         query_embedder=_recording_embedder(vector=[0.1, 0.2], total_tokens=7),
     )
 
-    payload = adapter.call_tool(
-        auth=HostedMcpAuthContext(workspace_id="ws_alice"),
-        name="find",
-        arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
-    )
+    with pytest.raises(RuntimeError, match="vector extension unavailable"):
+        adapter.call_tool(
+            auth=HostedMcpAuthContext(workspace_id="ws_alice"),
+            name="find",
+            arguments={"text": "Crohn probiotics", "mode": "hybrid", "limit": 5},
+        )
 
     assert store.calls == [
         {
@@ -1158,27 +1099,18 @@ def test_hybrid_vector_store_availability_failure_falls_back_to_lexical() -> Non
             "query": "Crohn probiotics",
             "query_vector": [0.1, 0.2],
             "limit": 5,
-        },
-        {"mode": "lexical", "workspace_id": "ws_alice", "query": "Crohn probiotics", "limit": 5},
+        }
     ]
-    assert payload["rows"][0]["chunk_id"] == "chunk_lexical"
-    assert payload["notes"][0] == "hosted_find_fallback_to_lexical"
-    note_metadata = json.loads(payload["notes"][1].removeprefix("hosted_find_fallback_metadata:"))
-    assert note_metadata["fallback_reason"] == "vector_store_availability"
-    assert note_metadata["fallback_operation"] == "search_store.hybrid_query"
     assert [event.event_type for event in ledger.events] == [
         "provider_attempt_started",
         "provider_attempt_succeeded",
         "service_operation_failed",
-        "service_operation_succeeded",
     ]
     failed = ledger.events[2]
     assert failed.operation == "hybrid_query"
     assert failed.status == "failed"
-    assert failed.metadata["fallback_reason"] == "vector_store_availability"
-    fallback_event = ledger.events[3]
-    assert fallback_event.operation == "lexical_query"
-    assert fallback_event.metadata["fallback_reason"] == "vector_store_availability"
+    assert failed.metadata["failure_kind"] == "unknown"
+    assert failed.metadata["message"] == "vector extension unavailable"
 
 
 def test_semantic_vector_store_availability_failure_does_not_fall_back_to_lexical() -> None:
