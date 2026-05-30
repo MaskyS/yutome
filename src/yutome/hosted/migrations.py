@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE workspaces
+    ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'trialing';
+
+ALTER TABLE workspaces
+    ADD COLUMN IF NOT EXISTS trial_ends_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS workspace_members (
     workspace_id text NOT NULL REFERENCES workspaces(id),
     user_id text NOT NULL REFERENCES users(id),

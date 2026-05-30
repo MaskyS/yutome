@@ -74,6 +74,8 @@ def test_phase1_schema_includes_workspace_members_and_account_sessions() -> None
     assert "PRIMARY KEY (workspace_id, user_id)" in joined
     assert "CREATE TABLE IF NOT EXISTS account_sessions" in joined
     assert "idx_account_sessions_session_hash" in joined
+    assert "ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'trialing'" in joined
+    assert "ADD COLUMN IF NOT EXISTS trial_ends_at timestamptz" in joined
 
 
 def test_account_bootstrap_sql_creates_owner_membership_starter_entitlements_and_allocations() -> None:
