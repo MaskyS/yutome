@@ -64,7 +64,7 @@ uv run yutome serve remote http --host 0.0.0.0 --port 8765
 uv run yutome serve remote mcp --host 0.0.0.0 --port 8766
 ```
 
-`serve remote prepare` writes the shared `YUTOME_HTTP_TOKEN` into `.env` if it is missing. The token is not printed by default. Use `--show-token` when you need to copy it into a client.
+`serve remote prepare` writes the shared `YUTOME_HTTP_TOKEN` into `.env` if it is missing and prints the next remote serve command. The token is not printed by default. Use `--show-token` when you need to copy it into a client.
 
 `serve remote http` and `serve remote mcp` refuse to bind to a non-loopback interface unless `YUTOME_HTTP_TOKEN` is configured.
 

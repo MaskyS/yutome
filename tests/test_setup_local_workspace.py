@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -75,3 +76,89 @@ def test_setup_generates_and_persists_local_workspace_id(tmp_path: Path, monkeyp
     # Re-running setup is idempotent: it does not regenerate the id.
     runner.invoke(app, ["--config", str(cfg), "setup", "-y"])
     assert load_config(cfg).hosted.local_workspace_id == ws
+
+
+def test_setup_with_source_without_postgres_dsn_exits_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("YUTOME_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "yutome.toml"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(cfg),
+            "setup",
+            "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+            "-y",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "YUTOME_POSTGRES_URL or DATABASE_URL is not set" in result.output
+    assert "uv run yutome setup" in result.output
+    assert "uv run yutome hosted login" in result.output
+    assert "skipped and not saved or queued" in result.output
+    assert "Traceback" not in result.output
+    assert WS_RE.match(load_config(cfg).hosted.local_workspace_id)
+
+
+def test_corpus_add_without_postgres_dsn_exits_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("YUTOME_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "yutome.toml"
+    runner = CliRunner()
+
+    setup_result = runner.invoke(app, ["--config", str(cfg), "setup", "-y"])
+    assert setup_result.exit_code == 0, setup_result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(cfg),
+            "corpus",
+            "add",
+            "https://www.youtube.com/watch?v=OEDoJyhQhXs",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "YUTOME_POSTGRES_URL or DATABASE_URL is not set" in result.output
+    assert "uv run yutome setup" in result.output
+    assert "uv run yutome hosted login" in result.output
+    assert "skipped and not saved or queued" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_status_reports_setup_created_local_workspace_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("YUTOME_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "yutome.toml"
+    runner = CliRunner()
+
+    setup_result = runner.invoke(app, ["--config", str(cfg), "setup", "-y"])
+    assert setup_result.exit_code == 0, setup_result.output
+    workspace_id = load_config(cfg).hosted.local_workspace_id
+
+    result = runner.invoke(app, ["--config", str(cfg), "status", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["workspace_id"] == workspace_id
+    assert payload["workspace_mode"] == "local"
+    assert payload["hosted"]["workspace_id"] == ""
+    assert payload["hosted"]["local_workspace_id"] == workspace_id
+
+
+def test_remote_prepare_writes_generated_token_to_project_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("YUTOME_HTTP_TOKEN", raising=False)
+    monkeypatch.setattr(actions.secrets, "token_urlsafe", lambda _bytes: "generated-test-token")
+    cfg = tmp_path / "yutome.toml"
+    write_default_config(cfg)
+
+    result = CliRunner().invoke(app, ["--config", str(cfg), "serve", "remote", "prepare"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "YUTOME_HTTP_TOKEN=generated-test-token\n"
+    assert "YUTOME_HTTP_TOKEN=generated-test-token" not in result.output
+    assert "Next: uv run yutome serve remote http --host 0.0.0.0 --port 8765" in result.output

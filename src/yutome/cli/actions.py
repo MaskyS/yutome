@@ -123,6 +123,18 @@ def _workspace_id(app_config: AppConfig, explicit: str | None = None) -> str:
     return value
 
 
+def _missing_postgres_source_message(*, dsn_env: str, source_count: int, setup_saved_config: bool = False) -> str:
+    noun = "source" if source_count == 1 else "sources"
+    verb = "was" if source_count == 1 else "were"
+    saved_prefix = "config and local workspace were saved, but " if setup_saved_config else ""
+    return (
+        f"{dsn_env} or DATABASE_URL is not set; {saved_prefix}{source_count} {noun} {verb} skipped "
+        "and not saved or queued. Next: local: set the DSN in .env and run `uv run yutome setup`, "
+        "then rerun this add; hosted: run `uv run yutome hosted login` then "
+        "`uv run yutome hosted source add SOURCE`."
+    )
+
+
 def _jsonable(value: object) -> object:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")  # type: ignore[no-any-return, attr-defined]
@@ -334,6 +346,16 @@ def setup(
         applied = HostedCommandRunner(app_config).migrate(phase="hosted")
         typer.echo(f"[OK] Postgres reachable: {redact_postgres_url(url)}")
         typer.echo(f"[OK] Applied {applied} migration statements.")
+    elif channel:
+        typer.echo(
+            _missing_postgres_source_message(
+                dsn_env=app_config.database.postgres_url_env,
+                source_count=1,
+                setup_saved_config=True,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1)
     else:
         typer.echo(f"[WARN] Set {app_config.database.postgres_url_env} to a VectorChord Postgres DSN before indexing.")
 
@@ -345,8 +367,18 @@ def setup(
 
 def add_sources(*, targets: list[str], config: Path, title: str | None = None, selected: bool = True) -> None:
     rt = _load_runtime(config)
+    url = postgres_url_from_env(url_env=rt.config.database.postgres_url_env)
+    if not url:
+        typer.echo(
+            _missing_postgres_source_message(
+                dsn_env=rt.config.database.postgres_url_env,
+                source_count=len(targets),
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1)
     workspace_id = _workspace_id(rt.config)
-    connection = connect_postgres(url_env=rt.config.database.postgres_url_env)
+    connection = connect_postgres(url=url, url_env=rt.config.database.postgres_url_env)
     added = 0
     for target in targets:
         source = source_from_input(target, title=title if len(targets) == 1 else None, import_source="cli")
@@ -843,11 +875,30 @@ def http_serve(
 
 
 def remote_prepare(*, config: Path, rotate: bool, show_token: bool) -> None:
-    token = secrets.token_urlsafe(32) if rotate else os.environ.get("YUTOME_HTTP_TOKEN") or secrets.token_urlsafe(32)
-    typer.echo(f"YUTOME_HTTP_TOKEN={token}" if show_token else "Set YUTOME_HTTP_TOKEN to the generated token.")
-    if not show_token:
-        typer.echo("Pass --show-token to print it once.")
-    _load_runtime(config).paths.ensure_base_dirs()
+    rt = _load_runtime(config)
+    rt.paths.ensure_base_dirs()
+    env_path = _project_root(config) / ".env"
+    existing_token = os.environ.get("YUTOME_HTTP_TOKEN", "").strip()
+    persisted = False
+    token = existing_token
+    if rotate or not token:
+        token = secrets.token_urlsafe(32)
+        _set_env_var(env_path, "YUTOME_HTTP_TOKEN", token)
+        os.environ["YUTOME_HTTP_TOKEN"] = token
+        persisted = True
+    if show_token:
+        typer.echo(f"YUTOME_HTTP_TOKEN={token}")
+    if persisted:
+        action = "Rotated" if rotate and existing_token else "Wrote"
+        typer.echo(
+            f"[OK] {action} YUTOME_HTTP_TOKEN to {env_path}. "
+            "Next: uv run yutome serve remote http --host 0.0.0.0 --port 8765"
+        )
+    else:
+        typer.echo(
+            "[OK] YUTOME_HTTP_TOKEN is already configured. "
+            "Next: uv run yutome serve remote http --host 0.0.0.0 --port 8765"
+        )
 
 
 def remote_serve(*, config: Path, host: str, port: int, cors_origin: list[str] | None) -> None:
@@ -927,12 +978,28 @@ def disconnect_command(
 
 def status_command(*, config: Path, json_output: bool = False) -> None:
     rt = _load_runtime(config)
+    try:
+        active_workspace_id = _workspace_id(rt.config)
+    except HostedRuntimeError:
+        active_workspace_id = ""
+    workspace_mode = (
+        "hosted"
+        if rt.config.hosted.workspace_id
+        else "local"
+        if rt.config.hosted.local_workspace_id
+        else "unconfigured"
+    )
     status = {
         "postgres_url": redact_postgres_url(postgres_url_from_env(url_env=rt.config.database.postgres_url_env)),
-        "workspace_id": rt.config.hosted.workspace_id,
+        "workspace_id": active_workspace_id,
+        "workspace_mode": workspace_mode,
+        "hosted": {
+            "workspace_id": rt.config.hosted.workspace_id,
+            "local_workspace_id": rt.config.hosted.local_workspace_id,
+        },
         "remote": remote_status_payload(rt.paths, live=False),
     }
-    if rt.config.hosted.workspace_id and status["postgres_url"]:
+    if active_workspace_id and status["postgres_url"]:
         try:
             status["database"] = HostedCommandRunner(rt.config).db_check().model_dump(mode="json")
         except HostedRuntimeError as exc:
