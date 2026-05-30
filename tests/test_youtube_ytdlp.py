@@ -38,6 +38,36 @@ def test_ytdlp_english_subtitle_fallback_tries_en_orig_after_plain_en(monkeypatc
     assert result.raw_snippets == [{"text": "hello", "start": 0.0, "duration": 1.0}]
 
 
+def test_ytdlp_requests_translated_captions_when_allowed(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_fetch_language(**kwargs: Any) -> TranscriptFetchResult:
+        calls.append(dict(kwargs))
+        language = kwargs["language"]
+        if language in {"en", "en-orig"}:
+            raise RuntimeError("yt-dlp did not write json3 subtitles for video123")
+        return TranscriptFetchResult(
+            raw_snippets=[{"text": "translated hello", "start": 0.0, "duration": 1.0}],
+            source=f"yt-dlp-json3:translated:{language}",
+            language=language,
+            is_generated=True,
+        )
+
+    monkeypatch.setattr("yutome.youtube._fetch_subtitle_transcript_with_ytdlp_language", fake_fetch_language)
+
+    result = fetch_subtitle_transcript_with_ytdlp(
+        video_id="video123",
+        cwd=tmp_path,
+        language="en",
+        allow_translated_captions=True,
+    )
+
+    assert [call["language"] for call in calls] == ["en", "en-orig", "en-.*"]
+    assert all(call["allow_translated_captions"] for call in calls)
+    assert result.language == "en-.*"
+    assert result.raw_snippets == [{"text": "translated hello", "start": 0.0, "duration": 1.0}]
+
+
 def test_ytdlp_metadata_uses_python_no_js_profile_by_default(monkeypatch, tmp_path: Path) -> None:
     commands: list[list[str]] = []
 

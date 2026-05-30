@@ -39,7 +39,7 @@ max_change_ratio = 0.35
 max_patch_retries = 2
 
 [asr]
-provider = "faster-whisper"
+provider = "gemini"
 model = "small.en"
 device = "cpu"
 compute_type = "int8"

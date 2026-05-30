@@ -7,13 +7,21 @@ from typing import Any
 
 import pytest
 
-from yutome.config import AppConfig, ProxyConfig
+from yutome.config import AppConfig, GeminiConfig, ProxyConfig
 from yutome.hashing import sha256_json
 from yutome.hosted.control_plane import Job, Source
 from yutome.hosted.gate import UsageGate
 from yutome.hosted.mcp_query import HostedMcpUsageContext
-from yutome.hosted.models import EntitlementPolicy, ProviderAllocation, UsageEvent, UsageNormalization, WorkspaceBalance
-from yutome.hosted.provider_wrappers import ProviderCallContext, execute_provider_call
+from yutome.hosted.models import (
+    EntitlementPolicy,
+    ProviderAllocation,
+    UsageDecision,
+    UsageEvent,
+    UsageNormalization,
+    UsageReservation,
+    WorkspaceBalance,
+)
+from yutome.hosted.provider_wrappers import ProviderCallContext, UsageReservationDenied, execute_provider_call
 from yutome.hosted.indexing import (
     DEFAULT_EMBEDDING_DIMENSION,
     HostedIndexingError,
@@ -30,6 +38,8 @@ from yutome.youtube import DiscoveredVideo, TranscriptFetchResult
 
 
 NOW = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+ALWAYS_CLEAN_SOURCE_METADATA = {"gemini_cleanup": "always"}
+NEVER_CLEAN_SOURCE_METADATA = {"gemini_cleanup": "never"}
 
 
 class RecordingGate(UsageGate):
@@ -53,7 +63,13 @@ class RecordingLedger:
 
 
 class HostedExecutorConnection:
-    def __init__(self, *, policy: EntitlementPolicy, balance: WorkspaceBalance | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        policy: EntitlementPolicy,
+        balance: WorkspaceBalance | None = None,
+        source_metadata_json: dict[str, Any] | None = None,
+    ) -> None:
         self.policy = policy
         self.balance = balance or WorkspaceBalance(
             workspace_id="ws_alice",
@@ -65,6 +81,7 @@ class HostedExecutorConnection:
                 "embeddings": 100,
             },
         )
+        self.source_metadata_json = dict(source_metadata_json or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.transaction_events: list[str] = []
 
@@ -86,7 +103,7 @@ class HostedExecutorConnection:
                     "selected": True,
                     "auto_index_allowed": True,
                     "import_source": "manual_url",
-                    "metadata_json": {},
+                    "metadata_json": self.source_metadata_json,
                     "status": "active",
                 }
             ]
@@ -325,6 +342,19 @@ def _source() -> Source:
         source_id="src_oedo",
         value="https://www.youtube.com/watch?v=OEDoJyhQhXs",
         display_name="Real-world indexing fixture",
+    )
+
+
+def _corrupt_transcript_fetcher(_video_id: str, _source: Source, _job: Job) -> TranscriptFetchResult:
+    return TranscriptFetchResult(
+        raw_snippets=[
+            {"start": 0.0, "duration": 2.0, "text": "my brain is so scatterrained these days"},
+            {"start": 2.0, "duration": 2.0, "text": "I could publish the eepop format"},
+            {"start": 4.0, "duration": 2.0, "text": "the essay is about braed loops"},
+        ],
+        source="youtube-transcript-api",
+        language="en",
+        is_generated=True,
     )
 
 
@@ -603,10 +633,106 @@ def test_generated_postgres_and_search_store_operations_are_queryable() -> None:
     assert plan.search_operations == ()
 
 
+def test_hosted_executor_skips_gemini_cleanup_when_quality_is_ok() -> None:
+    provider_calls: list[str] = []
+    connection = HostedExecutorConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+    inserted_operations = [
+        params.get("operation")
+        for statement, params in connection.calls
+        if statement.startswith("INSERT INTO job_operations")
+    ]
+
+    assert result.status == "succeeded"
+    assert provider_calls == ["voyage"]
+    assert result.chunks_written >= 1
+    assert "gemini.cleanup_transcript" not in inserted_operations
+
+
+def test_hosted_executor_runs_gemini_cleanup_when_source_opts_in_always() -> None:
+    provider_calls: list[str] = []
+    connection = HostedExecutorConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "succeeded"
+    assert provider_calls == ["gemini", "voyage"]
+
+
+def test_hosted_executor_skips_gemini_cleanup_when_source_opts_out_never() -> None:
+    provider_calls: list[str] = []
+    connection = HostedExecutorConnection(
+        policy=_executor_policy(),
+        source_metadata_json=NEVER_CLEAN_SOURCE_METADATA,
+    )
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_corrupt_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "succeeded"
+    assert provider_calls == ["voyage"]
+
+
+def test_hosted_executor_runs_gemini_cleanup_when_quality_needs_cleanup_in_auto() -> None:
+    provider_calls: list[str] = []
+    connection = HostedExecutorConnection(policy=_executor_policy())
+    executor = HostedIndexingExecutor(
+        connection=connection,
+        config=AppConfig(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        metadata_fetcher=_metadata_fetcher,
+        transcript_fetcher=_corrupt_transcript_fetcher,
+        gemini_cleaner=_fake_gemini_cleaner(provider_calls),
+        voyage_embedder=_fake_voyage_embedder(provider_calls),
+    )
+
+    result = executor.execute(_executor_job(), lease_owner="worker-1", now=NOW)
+
+    assert result.status == "succeeded"
+    assert provider_calls == ["gemini", "voyage"]
+
+
 def test_real_hosted_executor_orders_provider_calls_before_transactional_writes() -> None:
     provider_calls: list[str] = []
     ledger = RecordingLedger()
-    connection = HostedExecutorConnection(policy=_executor_policy())
+    connection = HostedExecutorConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -698,7 +824,10 @@ def test_real_hosted_executor_reserves_usage_before_paid_calls_and_index_writes(
             ),
         )
 
-    connection = OrderedConnection(policy=_executor_policy())
+    connection = OrderedConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -721,7 +850,7 @@ def test_real_hosted_executor_reserves_usage_before_paid_calls_and_index_writes(
 def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() -> None:
     provider_calls: list[str] = []
     policy = _executor_policy({"gemini.cleanup_transcript": {"total_tokens": 1}})
-    connection = HostedExecutorConnection(policy=policy)
+    connection = HostedExecutorConnection(policy=policy, source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA)
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -746,7 +875,7 @@ def test_real_hosted_executor_denies_before_gemini_or_voyage_provider_calls() ->
 def test_real_hosted_executor_uses_entitlement_soft_limits_from_postgres_provider() -> None:
     provider_calls: list[str] = []
     policy = _executor_policy(soft_limits={"gemini.cleanup_transcript": {"total_tokens": 1}})
-    connection = HostedExecutorConnection(policy=policy)
+    connection = HostedExecutorConnection(policy=policy, source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA)
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -770,7 +899,7 @@ def test_real_hosted_executor_uses_entitlement_soft_limits_from_postgres_provide
 def test_real_hosted_executor_denies_search_write_before_transaction() -> None:
     provider_calls: list[str] = []
     policy = _executor_policy({"search_store.index_write": {"chunks": 0}})
-    connection = HostedExecutorConnection(policy=policy)
+    connection = HostedExecutorConnection(policy=policy, source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA)
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -796,7 +925,7 @@ def test_real_hosted_executor_reuses_persisted_provider_outputs() -> None:
 
     class CachedOutputConnection(HostedExecutorConnection):
         def __init__(self) -> None:
-            super().__init__(policy=_executor_policy())
+            super().__init__(policy=_executor_policy(), source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA)
             self.output_reads = 0
 
         def execute(self, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -866,7 +995,10 @@ def test_real_hosted_executor_refuses_provider_replay_after_success_event_withou
                 return [{"id": "evt_provider_success"}]
             return super().execute(statement, params)
 
-    connection = ProviderSucceededConnection(policy=_executor_policy())
+    connection = ProviderSucceededConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),
@@ -1033,6 +1165,127 @@ def test_hosted_transcript_fetch_routes_through_webshare(monkeypatch: pytest.Mon
     assert [event.status for event in ledger.events] == ["started", "succeeded"]
 
 
+def test_hosted_transcript_fetch_cascades_api_to_ytdlp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_fetch_transcript(**_kwargs):  # noqa: ANN003, ANN202
+        calls.append("api")
+        raise RuntimeError("transcript API blocked")
+
+    def fake_fetch_ytdlp(**kwargs):  # noqa: ANN003, ANN202
+        calls.append("yt-dlp")
+        assert kwargs["hosted_context"] is not None
+        return TranscriptFetchResult(
+            raw_snippets=[{"start": 0.0, "duration": 4.0, "text": "Cascaded yt-dlp transcript."}],
+            source="yt-dlp-json3:en",
+            language="en",
+            is_generated=True,
+        )
+
+    def fail_gemini(**_kwargs):  # noqa: ANN003, ANN202
+        raise AssertionError("Gemini fallback should not run when yt-dlp captions succeed")
+
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fake_fetch_transcript)
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_subtitle_transcript_with_ytdlp", fake_fetch_ytdlp)
+    monkeypatch.setattr("yutome.hosted.indexing.transcribe_youtube_url_with_gemini", fail_gemini)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=_webshare_config(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        usage_context_provider=AllowAnyProviderUsage(),
+    )
+
+    result = executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert calls == ["api", "yt-dlp"]
+    assert result.source == "yt-dlp-json3:en"
+
+
+def test_hosted_transcript_fetch_falls_back_to_gemini_after_both_caption_providers_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_fetch_transcript(**_kwargs):  # noqa: ANN003, ANN202
+        calls.append("api")
+        raise RuntimeError("transcript API blocked")
+
+    def fake_fetch_ytdlp(**_kwargs):  # noqa: ANN003, ANN202
+        calls.append("yt-dlp")
+        raise RuntimeError("yt-dlp did not write json3 subtitles for OEDoJyhQhXs")
+
+    def fake_gemini(**kwargs):  # noqa: ANN003, ANN202
+        calls.append("gemini")
+        assert kwargs["hosted_context"].subject == "gemini"
+        return TranscriptFetchResult(
+            raw_snippets=[{"start": 0.0, "duration": 4.0, "text": "Gemini media transcript."}],
+            source="gemini-media",
+            language="en",
+            is_generated=True,
+        )
+
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fake_fetch_transcript)
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_subtitle_transcript_with_ytdlp", fake_fetch_ytdlp)
+    monkeypatch.setattr("yutome.hosted.indexing.transcribe_youtube_url_with_gemini", fake_gemini)
+    webshare_config = _webshare_config()
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=AppConfig(proxy=webshare_config.proxy, gemini=GeminiConfig(fallback_enabled=True)),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        usage_context_provider=AllowAnyProviderUsage(),
+    )
+
+    result = executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert calls == ["api", "yt-dlp", "gemini"]
+    assert result.source == "gemini-media"
+
+
+def test_hosted_transcript_fetch_does_not_cascade_on_usage_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_fetch_transcript(**_kwargs):  # noqa: ANN003, ANN202
+        calls.append("api")
+        reservation = UsageReservation(
+            workspace_id="ws_alice",
+            subject="youtube",
+            operation="transcript_fetch",
+            credential_mode="hosted",
+            idempotency_key="denied",
+            status="denied",
+            decision=UsageDecision(allowed=False, reason="usage_limit_exceeded"),
+        )
+        event = UsageEvent(
+            workspace_id="ws_alice",
+            subject="youtube",
+            operation="transcript_fetch",
+            event_type="provider_attempt_denied",
+            status="denied",
+        )
+        raise UsageReservationDenied(reservation, event)
+
+    def fake_fetch_ytdlp(**_kwargs):  # noqa: ANN003, ANN202
+        calls.append("yt-dlp")
+        raise AssertionError("secondary caption provider should not run after usage denial")
+
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_transcript", fake_fetch_transcript)
+    monkeypatch.setattr("yutome.hosted.indexing.fetch_subtitle_transcript_with_ytdlp", fake_fetch_ytdlp)
+    executor = HostedIndexingExecutor(
+        connection=HostedExecutorConnection(policy=_executor_policy()),
+        config=_webshare_config(),
+        gate=UsageGate(),
+        ledger=RecordingLedger(),
+        usage_context_provider=AllowAnyProviderUsage(),
+    )
+
+    with pytest.raises(UsageReservationDenied):
+        executor._fetch_transcript("OEDoJyhQhXs", _source(), _executor_job())
+
+    assert calls == ["api"]
+
+
 def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
     class DiscoveryConnection:
         def __init__(self) -> None:
@@ -1131,7 +1384,10 @@ def test_source_discovery_executor_enqueues_real_index_video_jobs() -> None:
 
 
 def test_real_hosted_executor_replay_uses_stable_ids_and_upserts() -> None:
-    connection = HostedExecutorConnection(policy=_executor_policy())
+    connection = HostedExecutorConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
     results = []
     for _ in range(2):
         provider_calls: list[str] = []
@@ -1176,7 +1432,10 @@ def test_real_hosted_executor_redacts_provider_errors_before_persisting_job_fail
             "with api_key=pa-1234567890abcdef"
         )
 
-    connection = HostedExecutorConnection(policy=_executor_policy())
+    connection = HostedExecutorConnection(
+        policy=_executor_policy(),
+        source_metadata_json=ALWAYS_CLEAN_SOURCE_METADATA,
+    )
     executor = HostedIndexingExecutor(
         connection=connection,
         config=AppConfig(),

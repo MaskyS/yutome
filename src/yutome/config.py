@@ -55,7 +55,7 @@ max_change_ratio = 0.35
 max_patch_retries = 2
 
 [asr]
-provider = "faster-whisper"
+provider = "gemini"
 model = "small.en"
 device = "cpu"
 compute_type = "int8"
@@ -195,7 +195,7 @@ class TranscriptCleanupConfig(ConfigModel):
 
 
 class AsrConfig(ConfigModel):
-    provider: Literal["faster-whisper", "mlx-whisper", "openai", "gemini", "deepgram"] = "faster-whisper"
+    provider: Literal["mlx-whisper", "openai", "gemini", "deepgram"] = "gemini"
     model: str = "small.en"
     device: str = "cpu"
     compute_type: str = "int8"

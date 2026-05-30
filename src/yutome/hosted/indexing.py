@@ -57,6 +57,7 @@ from yutome.hosted.search_store import (
     validate_supported_embedding_profile,
 )
 from yutome.hosted.sqlalchemy_core import compile_postgres_statement
+from yutome.quality_heuristics import assess_transcript_quality
 from yutome.quality_llm import TranscriptCleanupContext, cleanup_transcript_with_gemini
 from yutome.transcripts import NormalizedTranscript, TranscriptSegment, normalize_transcript
 from yutome.youtube import (
@@ -592,45 +593,46 @@ class HostedIndexingExecutor:
 
             clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
             self._execute_statement(update_job_status_sql(job_id=job.id, lease_owner=lease_owner, status="cleaning", now=clock))
-            gemini_success_events: list[UsageEvent] = []
-            gemini_context = self._provider_context(
-                workspace_id=job.workspace_id,
-                subject="gemini",
-                operation="cleanup_transcript",
-                estimated_units={"total_tokens": float(_token_estimate(" ".join(segment.text for segment in transcript.segments)))},
-                subject_id=video.youtube_video_id,
-                input_payload={"transcript_version_id": transcript.version_id, "source": transcript.source},
-                metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
-                success_event_sink=gemini_success_events.append,
-            )
-            current_operation_name = "gemini.cleanup_transcript"
-            current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, gemini_context)
-            cached_transcript = self._operation_output(current_operation_id, workspace_id=job.workspace_id)
-            if cached_transcript:
-                transcript = _transcript_from_output(cached_transcript["transcript"])
-            else:
-                self._raise_if_provider_success_without_output(
+            if self._should_clean_transcript(transcript, source, video):
+                gemini_success_events: list[UsageEvent] = []
+                gemini_context = self._provider_context(
                     workspace_id=job.workspace_id,
-                    idempotency_key=gemini_context.idempotency_key,
+                    subject="gemini",
+                    operation="cleanup_transcript",
+                    estimated_units={"total_tokens": float(_token_estimate(" ".join(segment.text for segment in transcript.segments)))},
+                    subject_id=video.youtube_video_id,
+                    input_payload={"transcript_version_id": transcript.version_id, "source": transcript.source},
+                    metadata={"job_id": job.id, "source_id": source.id, "video_id": video.youtube_video_id},
+                    success_event_sink=gemini_success_events.append,
                 )
-                self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
-                transcript = self.gemini_cleaner(transcript, video, gemini_context)
-                cached_transcript = {"transcript": _transcript_to_output(transcript)}
-            clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
-            self._complete_provider_operation_success(
-                complete_job_operation_success_sql(
-                    workspace_id=job.workspace_id,
-                    operation_id=current_operation_id,
-                    output=cached_transcript,
-                    now=clock,
-                    job_id=job.id,
-                    lease_owner=lease_owner,
-                ),
-                success_events=gemini_success_events,
-                lost_lease_message="job lease expired before recording Gemini cleanup success",
-            )
-            current_operation_id = None
-            current_operation_name = None
+                current_operation_name = "gemini.cleanup_transcript"
+                current_operation_id = self._upsert_operation(job, source, video.youtube_video_id, current_operation_name, gemini_context)
+                cached_transcript = self._operation_output(current_operation_id, workspace_id=job.workspace_id)
+                if cached_transcript:
+                    transcript = _transcript_from_output(cached_transcript["transcript"])
+                else:
+                    self._raise_if_provider_success_without_output(
+                        workspace_id=job.workspace_id,
+                        idempotency_key=gemini_context.idempotency_key,
+                    )
+                    self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+                    transcript = self.gemini_cleaner(transcript, video, gemini_context)
+                    cached_transcript = {"transcript": _transcript_to_output(transcript)}
+                clock = self._renew_job_lease_or_raise(job, lease_owner=lease_owner, now=current_time(), lease_seconds=lease_seconds)
+                self._complete_provider_operation_success(
+                    complete_job_operation_success_sql(
+                        workspace_id=job.workspace_id,
+                        operation_id=current_operation_id,
+                        output=cached_transcript,
+                        now=clock,
+                        job_id=job.id,
+                        lease_owner=lease_owner,
+                    ),
+                    success_events=gemini_success_events,
+                    lost_lease_message="job lease expired before recording Gemini cleanup success",
+                )
+                current_operation_id = None
+                current_operation_name = None
 
             chunks = _chunks_from_normalized_transcript(transcript)
             if not chunks:
@@ -939,16 +941,41 @@ class HostedIndexingExecutor:
             metadata=_hosted_ytdlp_metadata(discovered),
         )
 
+    def _should_clean_transcript(
+        self,
+        transcript: NormalizedTranscript,
+        source: Source,
+        video: HostedVideoInput,
+    ) -> bool:
+        cleanup_mode = str(source.metadata_jsonb.get("gemini_cleanup") or "auto").strip().lower()
+        if cleanup_mode == "always":
+            return True
+        if cleanup_mode == "never":
+            return False
+
+        metadata_text = "\n".join(
+            str(value)
+            for value in (
+                video.title,
+                video.description,
+                (video.metadata or {}).get("channel_title"),
+                (video.metadata or {}).get("channel_handle"),
+            )
+            if value
+        )
+        report = assess_transcript_quality(
+            transcript.segments,
+            language=transcript.language or "en",
+            metadata_text=metadata_text,
+        )
+        return report.needs_cleanup
+
     def _fetch_transcript(self, video_id: str, source: Source, job: Job) -> TranscriptFetchResult:
+        # Hosted caption fetches try the configured primary provider first, then
+        # the other caption provider, before using Gemini media transcription
+        # when fallback transcription is explicitly enabled.
         proxy = self._require_hosted_webshare_proxy(operation="transcript fetch")
         metadata = {"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "transcript_fetch"}
-        youtube_context = self._youtube_fetch_context(
-            workspace_id=job.workspace_id,
-            subject_id=video_id,
-            operation="transcript_fetch",
-            source="transcript.fetch",
-            metadata=metadata,
-        )
         webshare_context = self._webshare_proxy_context(
             workspace_id=job.workspace_id,
             subject_id=video_id,
@@ -956,66 +983,94 @@ class HostedIndexingExecutor:
             bytes_estimate=2_000_000,
             metadata=metadata,
         )
-        try:
-            def call() -> TranscriptFetchResult:
-                if self.config.transcripts.prefer_ytdlp_subtitles:
-                    return fetch_subtitle_transcript_with_ytdlp(
-                        video_id=video_id,
-                        cwd=self.cwd,
-                        language=self.config.transcripts.preferred_languages[0],
-                        proxy=proxy,
-                        ytdlp_config=self.config.yt_dlp,
-                        allow_translated_captions=self.config.transcripts.allow_translated_captions,
-                        hosted_context=webshare_context,
-                    )
-                return fetch_transcript(
-                    video_id=video_id,
-                    languages=self.config.transcripts.preferred_languages,
-                    proxy=proxy,
-                    timeout_seconds=self.config.transcripts.request_timeout_seconds,
-                    hosted_context=webshare_context,
-                )
 
-            return execute_provider_call(
-                youtube_context,
-                call,
-                normalize_usage=lambda result: UsageNormalization(
-                    subject="youtube",
-                    operation="transcript_fetch",
-                    actual_units={"request_count": 1, "transcript_segments": len(result.raw_snippets)},
-                    raw_usage={"source": result.source, "language": result.language, "is_generated": result.is_generated},
-                    metadata={"fetch_source": result.source},
-                ),
-            )
-        except UsageReservationDenied:
-            raise
-        except Exception:
-            if not self.config.gemini.fallback_enabled:
-                raise
-            duration_seconds = _duration_seconds_from_job(job)
-            fallback_context = self._provider_context(
-                workspace_id=job.workspace_id,
-                subject="gemini",
-                operation="transcribe_media",
-                estimated_units={
-                    "media_seconds": max(1, int(duration_seconds or 0)),
-                    "total_tokens": max(1, int((duration_seconds or self.config.gemini.window_seconds) / 60) * 750),
-                },
-                subject_id=video_id,
-                input_payload={
-                    "video_id": video_id,
-                    "duration_seconds": duration_seconds,
-                    "media_resolution": self.config.gemini.media_resolution,
-                    "window_seconds": self.config.gemini.window_seconds,
-                },
-                metadata={"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "fallback_transcription"},
-            )
-            return transcribe_youtube_url_with_gemini(
+        def fetch_with_ytdlp() -> TranscriptFetchResult:
+            return fetch_subtitle_transcript_with_ytdlp(
                 video_id=video_id,
-                config=self.config.gemini,
-                duration_seconds=duration_seconds,
-                hosted_context=fallback_context,
+                cwd=self.cwd,
+                language=self.config.transcripts.preferred_languages[0],
+                proxy=proxy,
+                ytdlp_config=self.config.yt_dlp,
+                allow_translated_captions=self.config.transcripts.allow_translated_captions,
+                hosted_context=webshare_context,
             )
+
+        def fetch_with_api() -> TranscriptFetchResult:
+            return fetch_transcript(
+                video_id=video_id,
+                languages=self.config.transcripts.preferred_languages,
+                proxy=proxy,
+                timeout_seconds=self.config.transcripts.request_timeout_seconds,
+                hosted_context=webshare_context,
+            )
+
+        if self.config.transcripts.prefer_ytdlp_subtitles:
+            caption_attempts: tuple[tuple[str, Callable[[], TranscriptFetchResult]], ...] = (
+                ("transcript.fetch.ytdlp", fetch_with_ytdlp),
+                ("transcript.fetch.api", fetch_with_api),
+            )
+        else:
+            caption_attempts = (
+                ("transcript.fetch.api", fetch_with_api),
+                ("transcript.fetch.ytdlp", fetch_with_ytdlp),
+            )
+
+        last_caption_error: Exception | None = None
+        for fetch_source, call in caption_attempts:
+            youtube_context = self._youtube_fetch_context(
+                workspace_id=job.workspace_id,
+                subject_id=video_id,
+                operation="transcript_fetch",
+                source=fetch_source,
+                metadata=metadata,
+            )
+            try:
+                return execute_provider_call(
+                    youtube_context,
+                    call,
+                    normalize_usage=lambda result: UsageNormalization(
+                        subject="youtube",
+                        operation="transcript_fetch",
+                        actual_units={"request_count": 1, "transcript_segments": len(result.raw_snippets)},
+                        raw_usage={"source": result.source, "language": result.language, "is_generated": result.is_generated},
+                        metadata={"fetch_source": result.source},
+                    ),
+                )
+            except UsageReservationDenied:
+                raise
+            except Exception as exc:
+                last_caption_error = exc
+                continue
+
+        if not self.config.gemini.fallback_enabled:
+            if last_caption_error is not None:
+                raise last_caption_error
+            raise HostedIndexingError("transcript fetch failed without a recorded caption provider error")
+
+        duration_seconds = _duration_seconds_from_job(job)
+        fallback_context = self._provider_context(
+            workspace_id=job.workspace_id,
+            subject="gemini",
+            operation="transcribe_media",
+            estimated_units={
+                "media_seconds": max(1, int(duration_seconds or 0)),
+                "total_tokens": max(1, int((duration_seconds or self.config.gemini.window_seconds) / 60) * 750),
+            },
+            subject_id=video_id,
+            input_payload={
+                "video_id": video_id,
+                "duration_seconds": duration_seconds,
+                "media_resolution": self.config.gemini.media_resolution,
+                "window_seconds": self.config.gemini.window_seconds,
+            },
+            metadata={"job_id": job.id, "source_id": source.id, "video_id": video_id, "phase": "fallback_transcription"},
+        )
+        return transcribe_youtube_url_with_gemini(
+            video_id=video_id,
+            config=self.config.gemini,
+            duration_seconds=duration_seconds,
+            hosted_context=fallback_context,
+        )
 
     def _clean_with_gemini(
         self,

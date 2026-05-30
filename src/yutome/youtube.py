@@ -1025,13 +1025,22 @@ def fetch_subtitle_transcript_with_ytdlp(
     allow_translated_captions: bool = False,
     hosted_context: ProviderCallContext | None = None,
 ) -> TranscriptFetchResult:
+    """Fetch a JSON3 subtitle transcript with yt-dlp.
+
+    Native captions are tried first. When translated captions are allowed, yt-dlp
+    is given a translated subtitle-language regex like ``en-.*`` only after the
+    native target-language candidates were missing or empty.
+    """
     language_candidates = [language]
     if language == "en":
         # YouTube/yt-dlp may expose native English captions as either
         # plain `en` or `en-orig`. Try both before declaring English
-        # unavailable; translated-caption policy is handled by upstream
-        # provider ordering and this fallback remains English-only.
+        # unavailable.
         language_candidates = ["en", "en-orig"]
+    if allow_translated_captions:
+        translated_candidate = f"{language}-.*"
+        if translated_candidate not in language_candidates:
+            language_candidates.append(translated_candidate)
     last_error: str | None = None
     attempts_per_profile = _yt_dlp_attempts_per_profile(proxy, ytdlp_config)
     for profile in _yt_dlp_profile_sequence(ytdlp_config):
@@ -1047,6 +1056,7 @@ def fetch_subtitle_transcript_with_ytdlp(
                         ytdlp_config=ytdlp_config,
                         hosted_context=hosted_context,
                         profile=profile,
+                        allow_translated_captions=allow_translated_captions,
                     )
                 except UsageReservationDenied:
                     raise
@@ -1102,7 +1112,10 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
     ytdlp_config: YtDlpConfig | None,
     hosted_context: ProviderCallContext | None,
     profile: YtDlpProfile | None = None,
+    allow_translated_captions: bool = False,
 ) -> TranscriptFetchResult:
+    translated_caption_request = allow_translated_captions and language.endswith("-.*")
+    source_language = f"translated:{language}" if translated_caption_request else language
     with tempfile.TemporaryDirectory(prefix="yutome-subs-") as temp_dir:
         # Mirror the proxy-aware sleep policy from _run_ytdlp: per-IP rate
         # limits don't apply when a rotating proxy hands out fresh IPs.
@@ -1151,7 +1164,7 @@ def _fetch_subtitle_transcript_with_ytdlp_language(
         raise RuntimeError(f"yt-dlp wrote json3 subtitles with no text segments for {video_id}")
     return TranscriptFetchResult(
         raw_snippets=snippets,
-        source=f"yt-dlp-json3:{language}",
+        source=f"yt-dlp-json3:{source_language}",
         language=language,
         is_generated=True,
     )
